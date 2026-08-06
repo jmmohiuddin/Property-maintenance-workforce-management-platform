@@ -19,5 +19,10 @@ yarn-error.log*
 coverage/
 drizzle/meta/_journal.json.bak
 
-# Local database credentials
+# Local database credentials. `.env*` also covers .env.local, which the Vercel
+# CLI writes with real connection strings on every `env pull`.
 .env
+.env*
+# Re-stated after the wildcard above: the negation has to come last to win, and
+# this file is the only record of which variables a deployment needs.
+!.env.example

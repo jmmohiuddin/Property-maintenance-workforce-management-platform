@@ -13,6 +13,36 @@ one, so **nothing actually reaches a customer until a provider is wired**. The m
 are designed and scheduled but not implemented. See [docs/architecture/05-roadmap.md](docs/architecture/05-roadmap.md)
 for exactly what exists and what does not.
 
+**Live:** <https://meridian-platform-jmmohiuddins-projects.vercel.app> — Vercel, with Postgres on Neon
+(`ap-southeast-1`). Serverless functions are pinned to `sin1` in [apps/web/vercel.json](apps/web/vercel.json)
+so they sit beside the database rather than crossing an ocean for every query. Sign in with any seeded
+account below; the deployed database carries the same demo seed.
+
+---
+
+## Deploying
+
+The application connects as `meridian_app`, never as the database owner. That is the whole security
+model, so it survives deployment or it does not exist: the owner role Neon hands you has `BYPASSRLS`,
+and connecting as it silently disables every policy in `sql/rls.sql` with no error. After running the
+migrations and SQL files against the owner connection, give `meridian_app` a password and point
+`DATABASE_URL` at *that* role, through the pooled (`-pooler`) host.
+
+Only four variables belong in the deployment: `DATABASE_URL`, `DATABASE_POOL_MAX`,
+`PUBLIC_TENANT_SLUG`, `NEXT_PUBLIC_SITE_URL`. Managed Postgres integrations tend to inject a dozen
+more (`PGPASSWORD`, `POSTGRES_URL`, `DATABASE_URL_UNPOOLED`, …), all carrying owner credentials and
+none of them read by this codebase — delete them rather than leaving a `BYPASSRLS` connection string
+sitting in the runtime environment. `DATABASE_ADMIN_URL` is for migrations and seeding only and must
+never be set on the web deployment.
+
+Two deployment-specific notes worth keeping:
+
+- Set `NEXT_PUBLIC_SITE_URL` to the real production domain **before** the build. Every canonical URL,
+  the sitemap and all JSON-LD are generated from it at build time, so a wrong value is baked into the
+  static output rather than corrected at runtime.
+- Store `DATABASE_POOL_MAX` and `PUBLIC_TENANT_SLUG` as plain variables, not "sensitive" ones. Vercel
+  withholds sensitive values from the build step, and neither is a secret.
+
 ---
 
 ## What is here

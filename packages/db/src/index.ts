@@ -80,7 +80,13 @@ function getClient(): ReturnType<typeof postgres> {
   }
 
   _client = postgres(connectionString, {
-    max: Number(process.env["DATABASE_POOL_MAX"] ?? 10),
+    // `|| 10`, not `?? 10`. An unset variable is not the only bad input: a
+    // variable set to "" (which several hosts do for a value they cannot
+    // decrypt) coerces to 0, and a pool with max 0 never opens a connection -
+    // it hangs until the request dies, surfacing as "Connection closed" with
+    // nothing pointing at the real cause. `??` only guards undefined, so it
+    // lets "" straight through. There is no pool size below 1 worth honouring.
+    max: Number(process.env["DATABASE_POOL_MAX"]) || 10,
     idle_timeout: 20,
     connect_timeout: 10,
     prepare: false, // required when running behind a transaction-mode pooler
