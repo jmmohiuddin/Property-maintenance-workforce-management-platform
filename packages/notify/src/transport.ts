@@ -8,15 +8,17 @@ import type { RenderedMessage } from "./templates";
  * does not touch the ledger - all of that is the dispatcher's job, so that
  * swapping providers cannot change delivery semantics.
  *
- * ⚠️ NO REAL PROVIDER IS WIRED UP.
+ * ⚠️ THE DEFAULT STILL SENDS NOTHING.
  *
- * The default is `ConsoleTransport`, which logs and reports success. That is
- * deliberate and it is stated loudly here, in the ledger, and in the launch
+ * `ResendTransport` in ./email.ts is a real provider, but it is only used when
+ * `RESEND_API_KEY` and `NOTIFY_FROM` are both set - `selectTransport()` decides.
+ * With neither, the default remains `ConsoleTransport`, which logs and reports
+ * success. That fallback is stated loudly here, in the ledger and in the launch
  * checklist, because a notification system that silently does nothing is worse
  * than none at all: the ledger says "sent", the customer never hears from you,
  * and nobody finds out until they complain.
  *
- * To go live, implement this interface against a provider and pass it to
+ * To add another provider, implement this interface and pass it to
  * `dispatchPending`. The pipeline around it needs no changes.
  */
 

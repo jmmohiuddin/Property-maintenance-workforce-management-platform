@@ -152,6 +152,29 @@ export const referenceCounters = pgTable(
 );
 
 /**
+ * Rate-limit buckets for unauthenticated endpoints.
+ *
+ * Deliberately has no `tenant_id`. The public quote form is rate limited before
+ * a tenant is resolved - and an attacker must not be able to get a fresh
+ * allowance by aiming at a different tenant, which is exactly what keying this
+ * per tenant would hand them.
+ *
+ * In-process counters are not an option: every serverless invocation is its own
+ * process, so an in-memory limit resets on each request and limits nothing. The
+ * counter has to live somewhere shared, and the database is already shared.
+ *
+ * Written only by `app_public_rate_limit()`. RLS is enabled with no policy, so
+ * the application role cannot read or write it directly even though the blanket
+ * grant in rls.sql names it.
+ */
+export const rateLimits = pgTable("rate_limits", {
+  /** Opaque, caller-composed: "quote:<ip>". Never a bare user input. */
+  bucket: varchar("bucket", { length: 200 }).primaryKey(),
+  windowStart: timestamp("window_start", { withTimezone: true }).notNull().defaultNow(),
+  hits: integer("hits").notNull().default(0),
+});
+
+/**
  * A login that has passed the password but not yet the second factor.
  *
  * Deliberately not a session with a flag on it: a half-authenticated row in

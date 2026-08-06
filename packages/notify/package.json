@@ -7,7 +7,7 @@
   "exports": { ".": "./src/index.ts" },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx test/dispatch.test.ts"
+    "test": "tsx test/email.test.ts && tsx test/dispatch.test.ts"
   },
   "dependencies": {
     "@meridian/core": "*",

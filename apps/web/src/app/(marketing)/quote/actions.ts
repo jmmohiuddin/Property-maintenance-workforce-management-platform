@@ -2,7 +2,32 @@
 
 import { headers } from "next/headers";
 import { quoteRequestSchema, getService, tenant } from "@meridian/core";
-import { resolvePublicTenantId, createLeadFromEnquiry } from "@meridian/db";
+import { resolvePublicTenantId, createLeadFromEnquiry, checkRateLimit } from "@meridian/db";
+
+/**
+ * Five submissions per ten minutes from one address.
+ *
+ * Set from what a genuine visitor does, not from what feels safe: someone
+ * pricing a leak, a callout and an AC service in one sitting is three, and a
+ * mistyped phone number costs a retry. Five leaves room for that and still
+ * turns a scripted flood into a trickle. Both numbers are here rather than
+ * inline so the reasoning survives the next person who wants to change them.
+ */
+const QUOTE_RATE_LIMIT = 5;
+const QUOTE_RATE_WINDOW_SECONDS = 600;
+
+/**
+ * The address to attribute a submission to.
+ *
+ * `x-forwarded-for` is a client-controllable header and is trusted only because
+ * this deployment terminates TLS at a proxy that overwrites it. The left-most
+ * entry is the client; the rest are proxies. Behind a different proxy, or none,
+ * this must be revisited - a spoofable key means an attacker simply rotates it.
+ */
+function clientKey(h: Headers): string {
+  const forwarded = h.get("x-forwarded-for")?.split(",")[0]?.trim();
+  return forwarded || h.get("x-real-ip")?.trim() || "unknown";
+}
 
 export interface QuoteFormState {
   status: "idle" | "success" | "error";
@@ -70,11 +95,33 @@ export async function submitQuoteRequest(
     };
   }
 
+  const h = await headers();
+
+  // Counted here rather than at the top of the action on purpose. Validation
+  // costs no I/O, so rejecting a malformed payload before this point means a
+  // flood of junk never reaches the database at all - and a visitor who
+  // mistypes their phone number does not spend an attempt on it. What is being
+  // limited is the expensive path: the one that writes a row.
+  const limit = await checkRateLimit({
+    bucket: `quote:${clientKey(h)}`,
+    limit: QUOTE_RATE_LIMIT,
+    windowSeconds: QUOTE_RATE_WINDOW_SECONDS,
+  });
+
+  if (!limit.allowed) {
+    console.warn("[quote] rate limit reached", { key: clientKey(h) });
+    return {
+      status: "error",
+      // No counts, no window, no "try again in N minutes". Someone probing the
+      // limit learns nothing, and a real person who has genuinely sent five
+      // enquiries in ten minutes needs a phone number, not arithmetic.
+      message: `We have received several requests from you already. If something is urgent, please call ${tenant.emergencyPhone} and we will deal with it straight away.`,
+    };
+  }
+
   try {
     const tenantId = await resolvePublicTenantId(slug);
     if (!tenantId) throw new Error(`No active tenant with slug "${slug}"`);
-
-    const h = await headers();
 
     const { reference } = await createLeadFromEnquiry(tenantId, {
       name: parsed.data.name,

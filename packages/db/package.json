@@ -15,7 +15,7 @@
     "studio": "drizzle-kit studio",
     "typecheck": "tsc --noEmit",
     "seed": "tsx src/seed.ts",
-    "test": "tsx test/commerce.test.ts && tsx test/workforce.test.ts && tsx test/reference.test.ts && tsx test/customers.test.ts"
+    "test": "tsx test/commerce.test.ts && tsx test/workforce.test.ts && tsx test/reference.test.ts && tsx test/customers.test.ts && tsx test/ratelimit.test.ts"
   },
   "dependencies": {
     "@meridian/core": "*",

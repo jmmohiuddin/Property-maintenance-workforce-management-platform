@@ -38,14 +38,20 @@ Everything here applies to the **public website**, which is the only thing curre
 
 ## Technical
 
-- [ ] `npm run check` passes (typecheck + contrast gate)
-- [ ] `npx next build` succeeds
-- [ ] Deployed behind HTTPS; confirm HSTS preload is intended before submitting to the preload list
+- [x] `npm run check` passes (typecheck + contrast gate)
+- [x] `npx next build` succeeds
+- [x] Deployed behind HTTPS. HSTS is sent with `preload`, but **submitting to the preload list is
+      still a decision, not a default** — it is effectively irreversible for the apex domain and
+      every subdomain, so do not submit until the real domain is settled.
 - [ ] Add a Content-Security-Policy. Currently absent because inline JSON-LD needs a nonce or hash;
       see [the security model](../architecture/03-security.md)
-- [ ] Rate limiting on the quote form endpoint
-- [ ] Wire the quote form to a real destination. It currently validates and logs; the integration
-      point is documented in `apps/web/src/app/quote/actions.ts`
+- [x] Rate limiting on the quote form endpoint. Five submissions per ten minutes per address,
+      counted in Postgres via `app_public_rate_limit()` — an in-process counter would reset on every
+      serverless invocation and limit nothing. Proven by `packages/db/test/ratelimit.test.ts`,
+      including that ten concurrent callers against a limit of four yield exactly four.
+- [x] Wire the quote form to a real destination. It creates a `lead` in the tenant's queue; see
+      `apps/web/src/app/(marketing)/quote/actions.ts` and `packages/db/src/domain/leads.ts`.
+      **Nobody is notified of it yet** — see the notification transport item below.
 - [ ] Error monitoring
 - [ ] Uptime monitoring on `/` and `/emergency` specifically — the emergency page is the one that
       matters at 3am
