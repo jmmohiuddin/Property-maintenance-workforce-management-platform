@@ -1,0 +1,30 @@
+{
+  "name": "meridian-platform",
+  "private": true,
+  "version": "0.1.0",
+  "description": "AI-powered property maintenance & contract workforce management platform",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=@meridian/web",
+    "build": "npm run build --workspace=@meridian/web",
+    "start": "npm run start --workspace=@meridian/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "check": "npm run check --workspaces --if-present",
+    "db:verify-rls": "psql -d $DATABASE_NAME -v ON_ERROR_STOP=1 -f packages/db/sql/verify-rls.sql",
+    "lint": "npm run lint --workspaces --if-present",
+    "db:generate": "npm run generate --workspace=@meridian/db",
+    "db:migrate": "npm run migrate --workspace=@meridian/db",
+    "db:studio": "npm run studio --workspace=@meridian/db",
+    "db:seed": "npm run seed --workspace=@meridian/db",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  }
+}

@@ -1,0 +1,73 @@
+import type { NextConfig } from "next";
+import { readFileSync, existsSync } from "node:fs";
+import { resolve } from "node:path";
+
+/**
+ * Load the monorepo-root .env.
+ *
+ * Next only reads .env from its own project directory and does not walk up, so
+ * without this the app would need a duplicate .env in apps/web - two files
+ * holding the same database credentials, which drift. Existing environment
+ * variables always win, so a real deployment's injected config is never
+ * overwritten by a stray local file.
+ */
+function loadRootEnv(): void {
+  const path = resolve(process.cwd(), "../../.env");
+  if (!existsSync(path)) return;
+
+  for (const line of readFileSync(path, "utf8").split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+    process.env[key] ??= value;
+  }
+}
+
+loadRootEnv();
+
+const config: NextConfig = {
+  reactStrictMode: true,
+  poweredByHeader: false,
+  // The marketing site is statically rendered. AI crawlers frequently do not
+  // execute JavaScript, so anything they need to read has to exist in the HTML
+  // response, not be hydrated in.
+  transpilePackages: ["@meridian/core", "@meridian/auth", "@meridian/db", "@meridian/notify"],
+  // Native module; must not be bundled into the server build.
+  serverExternalPackages: ["@node-rs/argon2", "postgres"],
+  images: {
+    formats: ["image/avif", "image/webp"],
+    remotePatterns: [
+      // Placeholder photography. Replace with the client's own asset host
+      // before launch: see docs/ops/03-launch-checklist.md.
+      { protocol: "https", hostname: "picsum.photos" },
+    ],
+  },
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          { key: "X-Frame-Options", value: "SAMEORIGIN" },
+          { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(self)" },
+          {
+            key: "Strict-Transport-Security",
+            value: "max-age=63072000; includeSubDomains; preload",
+          },
+        ],
+      },
+      {
+        // llms.txt is a plain-text contract for AI crawlers; caching it hard
+        // costs nothing and it is requested often once a site is indexed.
+        source: "/llms.txt",
+        headers: [{ key: "Cache-Control", value: "public, max-age=3600, s-maxage=86400" }],
+      },
+    ];
+  },
+};
+
+export default config;

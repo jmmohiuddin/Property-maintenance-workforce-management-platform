@@ -1,0 +1,25 @@
+{
+  "name": "@meridian/core",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./catalog": "./src/catalog.ts",
+    "./tenant": "./src/tenant.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx test/transitions.test.ts && tsx test/money.test.ts && tsx test/qr.test.ts",
+    "check": "npm run typecheck && npm run test"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2",
+    "tsx": "^4.20.6"
+  }
+}

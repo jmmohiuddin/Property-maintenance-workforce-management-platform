@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // tenant.ts reads NEXT_PUBLIC_SITE_URL from the environment.
+    "types": ["node"],
+    // Lets the test import the package by name rather than by relative path,
+    // so it exercises the public barrel the way consumers do.
+    "paths": { "@meridian/core": ["./src/index.ts"] }
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules"]
+}

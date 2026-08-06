@@ -1,0 +1,48 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ],
+      "@meridian/core": [
+        "../../packages/core/src/index.ts"
+      ],
+      "@meridian/core/*": [
+        "../../packages/core/src/*"
+      ],
+      "@meridian/auth": [
+        "../../packages/auth/src/index.ts"
+      ],
+      "@meridian/db": [
+        "../../packages/db/src/index.ts"
+      ],
+      "@meridian/db/*": [
+        "../../packages/db/src/*"
+      ],
+      "@meridian/notify": [
+        "../../packages/notify/src/index.ts"
+      ]
+    }
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    "../../packages/core/src/**/*.ts",
+    "../../packages/auth/src/**/*.ts",
+    "../../packages/db/src/**/*.ts",
+    "../../packages/notify/src/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

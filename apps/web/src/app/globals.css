@@ -1,0 +1,290 @@
+@import "tailwindcss";
+
+/*
+ * Design system.
+ *
+ * Direction: technical, established, utilitarian. The audience is a procurement
+ * manager comparing contractors and a homeowner with water coming through the
+ * ceiling. Neither is impressed by a gradient.
+ *
+ * Palette is graphite + safety orange. The orange is the one accent on the
+ * site and it is semantically earned: it is the high-visibility colour of the
+ * trade, so it can carry emergency CTAs without needing a second alarm colour.
+ * Deliberately not the beige/brass "premium craft" palette, and deliberately
+ * not the AI-default violet.
+ *
+ * Radius system: 4px throughout, 2px on small controls. One scale, no pills.
+ */
+
+@theme {
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", monospace;
+
+  --color-ink-950: #0b0e12;
+  --color-ink-900: #12171d;
+  --color-ink-800: #1b222b;
+  --color-ink-700: #2a3542;
+  --color-ink-600: #46566a;
+  --color-ink-500: #6b7d92;
+  --color-ink-400: #94a3b4;
+  --color-ink-300: #c2cbd5;
+  --color-ink-200: #dfe4ea;
+  --color-ink-100: #eef1f4;
+  --color-ink-50: #f7f8fa;
+
+  --color-signal-700: #9c3608;
+  --color-signal-600: #c1450d;
+  --color-signal-500: #dd5514;
+  --color-signal-400: #ef7434;
+  --color-signal-100: #fdeadd;
+
+  --radius-sm: 2px;
+  --radius-DEFAULT: 4px;
+  --radius-md: 4px;
+  --radius-lg: 4px;
+}
+
+/*
+ * Semantic tokens. Components reference these, never raw palette values, so
+ * dark mode is one block of overrides rather than a `dark:` variant on every
+ * single utility.
+ */
+:root {
+  --surface: var(--color-ink-50);
+  --surface-raised: #ffffff;
+  --surface-sunken: var(--color-ink-100);
+  --surface-inverse: var(--color-ink-950);
+
+  --text-primary: var(--color-ink-950);
+  --text-secondary: var(--color-ink-600);
+  /* Not ink-500: that lands at 3.97:1 on the light surface, under AA. This
+     value clears 4.5:1 on all three light surfaces (base, raised, sunken).
+     Muted text here carries real content (prices, units, dates), so it has to
+     meet body-text contrast rather than decorative contrast. */
+  --text-muted: #5c6d81;
+  --text-on-inverse: var(--color-ink-100);
+
+  --border-hairline: var(--color-ink-200);
+  --border-strong: var(--color-ink-300);
+
+  --accent: var(--color-signal-600);
+  --accent-hover: var(--color-signal-700);
+  --accent-contrast: #ffffff;
+  --accent-wash: var(--color-signal-100);
+  /* Fills and text have different contrast requirements against the same
+     surface. signal-600 is fine as a button fill or a 2px border but lands at
+     4.49:1 as text on the sunken surface, so accent-coloured TEXT uses this
+     darker step. Same hue, so the page still reads as one accent. */
+  --accent-text: var(--color-signal-700);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: var(--color-ink-950);
+    --surface-raised: var(--color-ink-900);
+    --surface-sunken: #070a0d;
+    --surface-inverse: var(--color-ink-100);
+
+    --text-primary: var(--color-ink-100);
+    --text-secondary: var(--color-ink-400);
+    /* Lifted off ink-500 for the same reason as the light-mode value: ink-500
+       is 4.27:1 against the raised surface, which is the one muted text most
+       often sits on. */
+    --text-muted: #72849a;
+    --text-on-inverse: var(--color-ink-950);
+
+    --border-hairline: var(--color-ink-800);
+    --border-strong: var(--color-ink-700);
+
+    /* Lifted one step: signal-600 does not clear AA on a near-black surface. */
+    --accent: var(--color-signal-400);
+    --accent-hover: var(--color-signal-500);
+    --accent-contrast: var(--color-ink-950);
+    --accent-wash: #2a1509;
+    /* Already clears AA on every dark surface, so it matches --accent. */
+    --accent-text: var(--color-signal-400);
+  }
+}
+
+@layer base {
+  * {
+    border-color: var(--border-hairline);
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
+  body {
+    background-color: var(--surface);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Tabular figures everywhere a number is compared against another number. */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+    font-family: var(--font-mono);
+  }
+
+  ::selection {
+    background: var(--accent);
+    color: var(--accent-contrast);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  /* Headings own their own leading; descenders in italics need the clearance. */
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+    line-height: 1.08;
+    letter-spacing: -0.022em;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+}
+
+@layer components {
+  .container-page {
+    width: 100%;
+    max-width: 78rem;
+    margin-inline: auto;
+    padding-inline: 1rem;
+  }
+  @media (min-width: 768px) {
+    .container-page {
+      padding-inline: 2rem;
+    }
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    white-space: nowrap;
+    border-radius: 4px;
+    padding: 0.75rem 1.25rem;
+    font-size: 0.9375rem;
+    font-weight: 550;
+    line-height: 1;
+    transition:
+      background-color 160ms cubic-bezier(0.16, 1, 0.3, 1),
+      color 160ms cubic-bezier(0.16, 1, 0.3, 1),
+      transform 120ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .btn:active {
+    transform: translateY(1px);
+  }
+
+  .btn-primary {
+    background-color: var(--accent);
+    color: var(--accent-contrast);
+  }
+  .btn-primary:hover {
+    background-color: var(--accent-hover);
+  }
+
+  .btn-secondary {
+    background-color: transparent;
+    color: var(--text-primary);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+  .btn-secondary:hover {
+    background-color: var(--surface-sunken);
+  }
+
+  .btn-inverse {
+    background-color: var(--surface-inverse);
+    color: var(--text-on-inverse);
+  }
+  .btn-inverse:hover {
+    opacity: 0.88;
+  }
+
+  /* The answer block: the paragraph an answer engine is meant to lift. Styled
+     so it is genuinely the most prominent text on the page, because marking up
+     an answer the page visually buries is how you get ignored. */
+  .answer-lead {
+    font-size: 1.1875rem;
+    line-height: 1.55;
+    color: var(--text-primary);
+    max-width: 62ch;
+  }
+  @media (min-width: 768px) {
+    .answer-lead {
+      font-size: 1.3125rem;
+    }
+  }
+
+  .prose-body {
+    color: var(--text-secondary);
+    line-height: 1.65;
+    max-width: 68ch;
+  }
+
+  /* Legal pages only. Long-form prose needs list and link styling that the rest
+     of the site never uses, so it is scoped rather than applied globally. */
+  .legal-prose {
+    color: var(--text-secondary);
+    line-height: 1.7;
+    font-size: 0.9375rem;
+  }
+  .legal-prose > * + * {
+    margin-top: 1rem;
+  }
+  .legal-prose ul {
+    list-style: none;
+    padding-left: 0;
+  }
+  .legal-prose li {
+    padding-left: 1.25rem;
+    position: relative;
+  }
+  .legal-prose li + li {
+    margin-top: 0.625rem;
+  }
+  .legal-prose li::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0.6875em;
+    width: 5px;
+    height: 1px;
+    background: var(--accent);
+  }
+  .legal-prose strong {
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+  .legal-prose a {
+    color: var(--accent-text);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+}

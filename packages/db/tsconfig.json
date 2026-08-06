@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Declared explicitly rather than relying on ambient @types discovery:
+    // it is deterministic across TypeScript versions and it documents that
+    // this package is Node-only and must not reach for DOM globals.
+    "types": ["node"],
+    "paths": {
+      "@meridian/core": ["../core/src/index.ts"],
+      "@meridian/core/*": ["../core/src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "drizzle.config.ts"],
+  "exclude": ["node_modules"]
+}
