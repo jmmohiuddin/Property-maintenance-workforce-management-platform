@@ -141,6 +141,7 @@ server-rendered. The FAQ uses native `<details>` rather than a JS accordion for 
 
 | Document | Read it when |
 | --- | --- |
+| [**Product & Technical Master Document**](docs/master/00-README.md) | **Start here.** The post-hoc product/engineering audit and single source of truth: PRD, design spec, technical architecture, debt registers, risk register, backlog, roadmap. Where it disagrees with any older document, it wins. |
 | [Assumptions](docs/product/00-assumptions.md) | Before anything else. Several defaults are guesses that need confirming. |
 | [Personas and user stories](docs/product/01-personas-and-stories.md) | Deciding what to build next |
 | [System architecture](docs/architecture/01-system-architecture.md) | Understanding how the pieces fit |
