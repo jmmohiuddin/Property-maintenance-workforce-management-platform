@@ -141,7 +141,8 @@ server-rendered. The FAQ uses native `<details>` rather than a JS accordion for 
 
 | Document | Read it when |
 | --- | --- |
-| [**Product & Technical Master Document**](docs/master/00-README.md) | **Start here.** The post-hoc product/engineering audit and single source of truth: PRD, design spec, technical architecture, debt registers, risk register, backlog, roadmap. Where it disagrees with any older document, it wins. |
+| [**v2.0 Specification set**](docs/spec-v2/01-product-requirements.md) | **The statement of intent.** Forward-looking PRD, TRD, wireframes and design system ("SATS Operations Platform", 2026-08-12). Where it disagrees with anything else, it wins. |
+| [Product & Technical Master Document](docs/master/00-README.md) | The post-hoc audit of what was actually built (2026-08-09): debt registers, risk register, traceability, backlog. The v2.0 spec supersedes it as intent; it remains the record of current reality. |
 | [Assumptions](docs/product/00-assumptions.md) | Before anything else. Several defaults are guesses that need confirming. |
 | [Personas and user stories](docs/product/01-personas-and-stories.md) | Deciding what to build next |
 | [System architecture](docs/architecture/01-system-architecture.md) | Understanding how the pieces fit |
