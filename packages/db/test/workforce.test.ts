@@ -24,6 +24,7 @@ import {
   skillCoverage,
   certState,
   findCandidates,
+  blockedTechnicians,
   schema,
   closeConnection,
 } from "../src/index";
@@ -60,8 +61,28 @@ async function main(): Promise<void> {
     roster.some((t) => t.skillSlugs.length > 0),
   );
 
-  const subject = roster[0];
-  if (!subject) throw new Error("Seed data missing. Run `npm run db:seed` first.");
+  /*
+   * The subject must not be compliance-blocked (`HR-9`).
+   *
+   * This test asks "does signing off a skill make this person a candidate?",
+   * and the answer for someone with an expired work permit is correctly NO —
+   * a blocked technician is excluded before scoring, at any skill level. Taking
+   * `roster[0]` unconditionally made the test depend on whoever happens to sort
+   * first having valid documents, which is not a property of the code under
+   * test. Picking an unblocked technician keeps this test about skills.
+   */
+  const blocked = await withTenant(ctx, (tx) => blockedTechnicians(tx));
+  const blockedIds = new Set(blocked.map((b) => b.technicianId));
+
+  const subject = roster.find((t) => !blockedIds.has(t.id));
+  if (!subject) {
+    throw new Error(
+      roster.length === 0
+        ? "Seed data missing. Run `npm run db:seed` first."
+        : "Every technician in the roster is compliance-blocked, so none can be a candidate. " +
+          "Clear the demo data: delete from employees where employee_no like 'DEMO%';",
+    );
+  }
 
   // A real user id: `verified_by_id` is a foreign key, and signing off a skill
   // is meaningless without the person who vouched for it.

@@ -52,7 +52,7 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
             serviceSlug: job.serviceSlug,
             property: { lat: job.propertyLat, lng: job.propertyLng, city: job.propertyCity },
           })
-        : { candidates: [], disqualified: [] };
+        : { candidates: [], disqualified: [], blocked: [] };
 
       const quotes = await listQuotes(tx, { jobId: id });
       const invoices = await listInvoices(tx, { jobId: id });
@@ -321,6 +321,12 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
                   reason: c.reason,
                 }))}
                 disqualified={[...candidates.disqualified]}
+                blocked={candidates.blocked.map((b) => ({
+                  technicianId: b.technicianId,
+                  technicianName: b.technicianName,
+                  detail: b.detail,
+                  penalty: b.penalty,
+                }))}
               />
             ) : null}
           </aside>

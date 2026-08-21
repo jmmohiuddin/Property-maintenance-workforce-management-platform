@@ -42,6 +42,12 @@ export const PERMISSIONS = [
   "properties:write",
   "technicians:read",
   "technicians:write",
+  // ADM-1 / M10. Employment records, statutory documents and their expiry
+  // dates. Separate from technicians:write because the compliance board holds
+  // passport and visa data, and a dispatcher who may correct a technician's
+  // skill list has no business reading it.
+  "workforce:read",
+  "workforce:write",
   "contracts:read",
   "contracts:write",
   "reports:read",
@@ -61,6 +67,7 @@ export type Role =
   | "technician"
   | "accountant"
   | "sales"
+  | "hr"
   | "customer"
   | "readonly";
 
@@ -78,6 +85,7 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
   admin: ALL.filter((p) => p !== "settings:write"),
 
   operations_manager: [
+    "workforce:read",
     "jobs:read",
     "jobs:create",
     "jobs:update",
@@ -107,6 +115,7 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
   ],
 
   supervisor: [
+    "workforce:read",
     "jobs:read",
     "jobs:update",
     "jobs:close",
@@ -143,6 +152,22 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
     "properties:write",
     "contracts:read",
     "contracts:write",
+  ],
+
+  /**
+   * HR. Owns hiring and the statutory document register.
+   *
+   * Reads jobs and technicians because a compliance block has to be understood
+   * in the context of the work it stops, but holds no dispatch or money
+   * permissions — filling a role and paying an invoice are different jobs.
+   */
+  hr: [
+    "jobs:read",
+    "technicians:read",
+    "technicians:write",
+    "workforce:read",
+    "workforce:write",
+    "reports:read",
   ],
 
   // Portal users. Scoped to their own customer account at the query layer.

@@ -2,7 +2,9 @@ import { and, eq, sql, inArray, isNull, or, gte, lte } from "drizzle-orm";
 import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
 import { transitionJob } from "./jobs";
-import type { JobStatus } from "@meridian/core";
+import { blockForTechnician, blockedTechnicians, type DispatchBlock } from "./compliance";
+import { checkOutdoorWindow, type WorkingCalendar } from "@meridian/core";
+import { UserFacingError, type JobStatus } from "@meridian/core";
 
 /**
  * Technician assignment.
@@ -54,6 +56,18 @@ export interface DisqualifiedTechnician {
 
 export interface CandidateResult {
   readonly candidates: readonly Candidate[];
+  /**
+   * Technicians who cannot legally be dispatched (`HR-9`).
+   *
+   * Kept apart from `disqualified` because the two render differently and mean
+   * different things. A disqualified technician lacks a skill or is on leave —
+   * a scheduling fact. A blocked one has an expired permit, visa, Emirates ID,
+   * medical certificate or health insurance, and sending them carries a
+   * six-figure penalty. The design document is specific: a blocked technician
+   * gets no radio button at all, because a disabled control reads as "try again
+   * later" and the absence of a control reads as "this is not possible".
+   */
+  readonly blocked: readonly DispatchBlock[];
   /**
    * Technicians who have the skill but were excluded, with why.
    *
@@ -107,7 +121,13 @@ export async function findCandidates(
       ),
     );
 
-  if (skilled.length === 0) return { candidates: [], disqualified: [] };
+  if (skilled.length === 0) return { candidates: [], disqualified: [], blocked: [] };
+
+  // HR-9. Computed before anything else, because a blocked technician must not
+  // appear as a candidate at any score. Blocking is a legal question, not a
+  // ranking one — this is the difference between a wall and a sign.
+  const allBlocked = await blockedTechnicians(tx);
+  const blockedById = new Map(allBlocked.map((b) => [b.technicianId, b]));
 
   const ids = skilled.map((s) => s.technicianId);
 
@@ -163,6 +183,7 @@ export async function findCandidates(
 
   const candidates: Candidate[] = [];
   const disqualified: DisqualifiedTechnician[] = [];
+  const blocked: DispatchBlock[] = [];
 
   for (const t of skilled) {
     const lapsedCert = lapsedBy.get(t.technicianId);
@@ -172,6 +193,16 @@ export async function findCandidates(
         fullName: t.fullName,
         reason: `${lapsedCert.name} expired${lapsedCert.expiresOn ? ` on ${lapsedCert.expiresOn.toISOString().slice(0, 10)}` : ""}`,
       });
+      continue;
+    }
+
+    // HR-9, and it comes before the leave check on purpose: when someone is
+    // both on leave and carrying an expired permit, the permit is the thing the
+    // dispatcher needs to know about. Reporting the lesser reason would let the
+    // serious one stay invisible until the day they come back.
+    const block = blockedById.get(t.technicianId);
+    if (block) {
+      blocked.push(block);
       continue;
     }
 
@@ -228,7 +259,7 @@ export async function findCandidates(
   }
 
   candidates.sort((a, b) => a.score - b.score);
-  return { candidates: candidates.slice(0, input.limit ?? 10), disqualified };
+  return { candidates: candidates.slice(0, input.limit ?? 10), disqualified, blocked };
 }
 
 /**
@@ -250,16 +281,55 @@ export async function assignTechnician(
     method?: "manual" | "suggested" | "auto";
     score?: number | undefined;
     reason?: string | undefined;
+    /**
+     * JOB-10. Required when the dispatcher is overriding a warning. The server
+     * action refuses the assignment without it — an override with no recorded
+     * reason is indistinguishable from a mistake.
+     */
+    overrideWarningType?: string | undefined;
+    overrideReason?: string | undefined;
+    /** Supplied so the midday-ban check uses the configured calendar. */
+    calendar?: WorkingCalendar | undefined;
   },
 ): Promise<{ visitId: string; sequence: number }> {
   const jobRows = await tx
-    .select({ status: schema.jobs.status })
+    .select({ status: schema.jobs.status, isOutdoor: schema.jobs.isOutdoor })
     .from(schema.jobs)
     .where(eq(schema.jobs.id, input.jobId))
     .limit(1);
 
   const job = jobRows[0];
   if (!job) throw new Error("Job not found in this tenant");
+
+  // ── The two hard blocks, enforced in the domain layer ────────────────────
+  //
+  // Both are re-checked HERE, inside the transaction, and not only in the
+  // dialog that offered the choice. That is the point: a dialog rendered thirty
+  // seconds ago does not know a permit expired at midnight, and a check that
+  // lives only in the UI is an affordance rather than a control. The TRD is
+  // explicit — enforced in the domain layer, not the UI.
+
+  // HR-9. AED 100,000 to AED 1,000,000 per worker.
+  const block = await blockForTechnician(tx, input.technicianId);
+  if (block) {
+    throw new UserFacingError(
+      `${block.technicianName} cannot be dispatched: ${block.detail}. ${block.penalty ?? ""}`.trim(),
+    );
+  }
+
+  // JOB-6. AED 5,000 per worker, capped at AED 50,000, plus a classification
+  // downgrade. Only applies to work flagged outdoor — indoor work proceeds
+  // through the window normally, and blocking it would be the kind of
+  // over-blocking that gets a control worked around.
+  if (job.isOutdoor && input.scheduledStart) {
+    const end = input.scheduledEnd ?? new Date(input.scheduledStart.getTime() + 2 * 60 * 60 * 1000);
+    const check = checkOutdoorWindow(input.scheduledStart, end, input.calendar);
+    if (!check.allowed) {
+      throw new UserFacingError(
+        `${check.message} Next available window: ${check.nextAllowed?.toISOString() ?? "later today"}.`,
+      );
+    }
+  }
 
   const existing = await tx
     .select({ sequence: schema.jobVisits.sequence })
@@ -283,6 +353,8 @@ export async function assignTechnician(
       assignmentMethod: input.method ?? "manual",
       assignmentScore: input.score ?? null,
       assignmentReason: input.reason ?? null,
+      overrideWarningType: input.overrideWarningType ?? null,
+      overrideReason: input.overrideReason ?? null,
       assignedById: ctx.userId ?? null,
     })
     .returning({ id: schema.jobVisits.id });

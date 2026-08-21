@@ -57,7 +57,20 @@ export const jobs = pgTable(
     priority: jobPriority("priority").notNull().default("p3_standard"),
     source: jobSource("source").notNull().default("web_quote"),
     contractId: uuid("contract_id"),
+    projectId: uuid("project_id"),
     quoteId: uuid("quote_id"),
+    /**
+     * DB-6. Drives the summer midday ban (JOB-6).
+     *
+     * The ban applies to work in direct sun, not to a trade: painting a
+     * stairwell is indoors, painting an elevation is not. Flagging per job
+     * rather than per service is what lets the scheduler refuse the second and
+     * allow the first — and getting it wrong in the permissive direction costs
+     * AED 5,000 per worker.
+     */
+    isOutdoor: boolean("is_outdoor").notNull().default(false),
+    /** JOB-13. Controlled list, set when the visit ends. */
+    outcomeCode: varchar("outcome_code", { length: 32 }),
     /** SLA clock. Breach reporting compares actuals against these two. */
     respondByAt: timestamp("respond_by_at", { withTimezone: true }),
     resolveByAt: timestamp("resolve_by_at", { withTimezone: true }),
@@ -133,6 +146,17 @@ export const jobVisits = pgTable(
     assignmentMethod: varchar("assignment_method", { length: 24 }).notNull().default("manual"),
     assignmentScore: doublePrecision("assignment_score"),
     assignmentReason: text("assignment_reason"),
+    /**
+     * JOB-10. What warning was overridden, and why.
+     *
+     * The audit found overrides were silent, and a silent override is
+     * indistinguishable from a mistake. Overriding is often the right call — a
+     * technician twelve minutes away whose certificate expires in twelve days
+     * is usually the correct answer — but it is a decision, and it is recorded
+     * as one so it can be reviewed and counted.
+     */
+    overrideWarningType: varchar("override_warning_type", { length: 48 }),
+    overrideReason: text("override_reason"),
     assignedById: uuid("assigned_by_id").references(() => users.id, { onDelete: "set null" }),
     ...timestamps,
   },

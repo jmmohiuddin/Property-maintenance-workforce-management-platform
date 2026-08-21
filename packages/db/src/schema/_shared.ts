@@ -42,6 +42,12 @@ export const userRole = pgEnum("user_role", [
   "technician",
   "accountant",
   "sales",
+  // ADM-1. §5.2 adds a seventh staff persona: fill an open trade role in days,
+  // and never dispatch someone whose permit, visa, medical or certification has
+  // lapsed. The rule attached to it is that every role must have at least one
+  // screen it alone can reach — `hr` earns that with the recruitment pipeline
+  // (M9) and the workforce compliance board (M10).
+  "hr",
   "customer", // portal user belonging to a customer account
   "readonly",
 ]);

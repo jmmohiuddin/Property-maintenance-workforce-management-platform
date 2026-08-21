@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useActionState, useState } from "react";
 import { STATUS_LABEL, type JobStatus } from "@meridian/core";
 import { changeStatus, assign, type ActionState } from "./actions";
@@ -99,16 +100,79 @@ export function StatusActions({ jobId, allowed }: { jobId: string; allowed: JobS
   );
 }
 
+/**
+ * The compliance block, rendered per the design document's `ComplianceBlock`
+ * specification.
+ *
+ * The details matter and are worth stating, because it is easy to get subtly
+ * wrong in a way that undoes the point:
+ *
+ *  - **No control at all.** Not a disabled button, not a greyed radio. A
+ *    disabled control reads as "try again later"; the absence of one reads as
+ *    "this is not possible", which is the true statement.
+ *  - **The penalty as a number.** "AED 100,000–1,000,000" changes behaviour;
+ *    "a compliance risk" does not.
+ *  - **A route to fixing it.** A wall with no door gets climbed.
+ *  - **`role="note"`, not `role="alert"`.** This is a persistent condition, not
+ *    an event that just occurred, and announcing it as an alert every render
+ *    would be wrong for a screen-reader user.
+ */
+function ComplianceBlock({
+  block,
+}: {
+  block: { technicianId: string; technicianName: string; detail: string; penalty: string | null };
+}) {
+  return (
+    <li
+      role="note"
+      aria-label={`${block.technicianName} cannot be dispatched`}
+      className="rounded-sm border p-3"
+      style={{
+        // --status-blocked, not --status-critical. D-7: "impossible" must not
+        // look like "urgent", and the contrast gate now checks the two hues are
+        // at least 60 degrees apart so it stays that way.
+        borderColor: "var(--status-blocked)",
+        backgroundColor: "var(--status-blocked-wash)",
+      }}
+    >
+      <div className="flex items-baseline justify-between gap-3">
+        <span className="text-[14px] font-medium">{block.technicianName}</span>
+        <span
+          className="text-[11px] font-semibold uppercase tracking-wide"
+          style={{ color: "var(--status-blocked-text)" }}
+        >
+          Blocked
+        </span>
+      </div>
+      <p className="mt-1 text-[12px] font-medium">⛔ {block.detail}</p>
+      {block.penalty ? (
+        <p className="mt-1 text-[12px]" style={{ color: "var(--text-secondary)" }}>
+          {block.penalty}
+        </p>
+      ) : null}
+      <Link
+        href={`/technicians/${block.technicianId}`}
+        className="mt-2 inline-block text-[12px] font-medium"
+        style={{ color: "var(--accent-text)" }}
+      >
+        Open record →
+      </Link>
+    </li>
+  );
+}
+
 export function AssignPanel({
   jobId,
   serviceName,
   candidates,
   disqualified,
+  blocked,
 }: {
   jobId: string;
   serviceName: string;
   candidates: { technicianId: string; fullName: string; grade: string; score: number; reason: string }[];
   disqualified: { technicianId: string; fullName: string; reason: string }[];
+  blocked: { technicianId: string; technicianName: string; detail: string; penalty: string | null }[];
 }) {
   const [state, formAction, pending] = useActionState(assign, INITIAL);
 
@@ -130,6 +194,17 @@ export function AssignPanel({
               <li key={d.technicianId} className="text-[12px]" style={{ color: "var(--text-muted)" }}>
                 <span style={{ color: "var(--text-secondary)" }}>{d.fullName}</span> &middot; {d.reason}
               </li>
+            ))}
+          </ul>
+        ) : null}
+
+        {/* If everyone with the skill is compliance-blocked, that IS the answer
+            to "why is nobody available", and burying it would send the
+            dispatcher looking for a scheduling problem that does not exist. */}
+        {blocked.length > 0 ? (
+          <ul className="mt-4 space-y-2">
+            {blocked.map((b) => (
+              <ComplianceBlock key={b.technicianId} block={b} />
             ))}
           </ul>
         ) : null}
@@ -174,6 +249,20 @@ export function AssignPanel({
           </li>
         ))}
       </ul>
+
+      {/* HR-9. Above "Excluded" on purpose: consequence order applies inside a
+          panel as much as it does to a list. A lapsed permit is a six-figure
+          exposure; being on leave is a diary entry. */}
+      {blocked.length > 0 ? (
+        <div className="mt-5 border-t pt-4">
+          <h3 className="text-[13px] font-semibold">Cannot be assigned &mdash; {blocked.length}</h3>
+          <ul className="mt-2 space-y-2">
+            {blocked.map((b) => (
+              <ComplianceBlock key={b.technicianId} block={b} />
+            ))}
+          </ul>
+        </div>
+      ) : null}
 
       {/* Shown rather than silently dropped: a dispatcher who cannot see that
           their best technician was excluded will assume the tool is broken. */}
