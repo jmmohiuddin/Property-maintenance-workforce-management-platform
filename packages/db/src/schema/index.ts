@@ -1,5 +1,6 @@
 export * from "./_shared";
 export * from "./tenancy";
+export * from "./assets";
 export * from "./crm";
 export * from "./workforce";
 export * from "./operations";

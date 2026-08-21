@@ -10,6 +10,7 @@ import {
   DISPOSITION_BY_CODE,
   MAX_PIPELINE_STAGES,
   OUTCOME_MINIMUM_DELAY_HOURS,
+  RECRUITMENT_COOLOFF_DEFAULT_DAYS,
   TALENT_POOL_RECONFIRM_DAYS,
   UserFacingError,
   blockedState,
@@ -21,6 +22,9 @@ import {
   type CandidateGrade,
   type ContractType,
   type ExperienceBand,
+  type InterviewKind,
+  type InterviewReminderWindow,
+  type InterviewStatus,
   type PublicRequisition,
   type RequisitionStatus,
   type ScanStatus,
@@ -309,6 +313,29 @@ export interface ApplicantStatusView {
   readonly blockedNote: string | null;
   readonly currentStageSequence: number | null;
   readonly stages: readonly { name: string; sequence: number; reached: boolean }[];
+  /**
+   * `ATS-14`. The soonest interview that has not happened yet, or null.
+   *
+   * On this page as well as in the email, because the email is three days old
+   * by the morning of the interview, is underneath four others, and is what
+   * somebody is trying to find one-handed in a taxi. Timestamps are ISO strings
+   * because they come out of `jsonb_build_object` that way.
+   */
+  readonly interview: {
+    kind: "interview" | "site_trial";
+    scheduledAt: string;
+    durationMinutes: number;
+    locationName: string;
+    locationAddress: string;
+    locationArea: string | null;
+    locationMapUrl: string | null;
+    parkingNotes: string | null;
+    ppeRequired: readonly string[];
+    bringNotes: string | null;
+    contactName: string | null;
+    contactPhone: string | null;
+    rescheduleRequestedAt: string | null;
+  } | null;
 }
 
 /**
@@ -348,6 +375,8 @@ export interface RequisitionRow {
   readonly closesAt: Date | null;
   readonly approvedAt: Date | null;
   readonly hiringManagerUserId: string | null;
+  /** `ATS-12`. Null means the platform default; 0 means no cool-off at all. */
+  readonly cooloffDays: number | null;
 }
 
 const requisitionColumns = {
@@ -366,6 +395,7 @@ const requisitionColumns = {
   closesAt: schema.jobRequisitions.closesAt,
   approvedAt: schema.jobRequisitions.approvedAt,
   hiringManagerUserId: schema.jobRequisitions.hiringManagerUserId,
+  cooloffDays: schema.jobRequisitions.cooloffDays,
 };
 
 export async function listRequisitions(
@@ -654,6 +684,22 @@ export interface PipelineCard {
   readonly appliedAt: Date;
   /** `ATS-4`: an expired certificate is visible before the trade check, not after. */
   readonly expiredCertifications: number;
+  /**
+   * `ATS-12`. A badge, in the same visual language as the expired-certificate
+   * one above it, and for the same reason: it is a note next to a name, not a
+   * gate in front of one.
+   *
+   * `ATS-19` forbids automated rejection and `ATS-5` forbids automated
+   * filtering, so this field is read by a template and by nothing else. It
+   * appears in no `WHERE` clause on any path that creates, matches, ranks or
+   * orders an application — the board's own ordering is `stage_entered_at`,
+   * exactly as it was before this existed.
+   */
+  readonly cooloffFlag: boolean;
+  /** When the prior application for this same role was archived. */
+  readonly cooloffPriorArchivedAt: Date | null;
+  /** The window the flag was computed against, for the badge's wording. */
+  readonly cooloffWindowDays: number;
 }
 
 export interface ArchivedSummary {
@@ -714,6 +760,8 @@ export async function getPipelineBoard(
     blocked_note: string | null;
     applied_at: string;
     expired_certifications: number;
+    cooloff_flag: boolean;
+    cooloff_prior_archived_at: string | null;
   }>(sql`
     select a.id                as application_id,
            a.reference,
@@ -733,9 +781,15 @@ export async function getPipelineBoard(
               from candidate_certifications cc
              where cc.candidate_id = c.id
                and cc.deleted_at is null
-               and cc.expires_on < (now() at time zone 'Asia/Dubai')::date) as expired_certifications
+               and cc.expires_on < (now() at time zone 'Asia/Dubai')::date) as expired_certifications,
+           a.cooloff_flag,
+           prior.archived_at   as cooloff_prior_archived_at
       from applications a
       join candidates c on c.id = a.candidate_id
+      -- ATS-12. Left-joined to the application the flag points at, so the badge
+      -- can say WHEN rather than just THAT. A badge with no date on it is one
+      -- that gets ignored by the third time it is seen.
+      left join applications prior on prior.id = a.cooloff_of_application_id
      where a.requisition_id = ${requisitionId}
        and a.status = 'active'
        and a.deleted_at is null
@@ -756,6 +810,8 @@ export async function getPipelineBoard(
     blocked_note: string | null;
     applied_at: string;
     expired_certifications: number;
+    cooloff_flag: boolean;
+    cooloff_prior_archived_at: string | null;
   }[];
 
   const cards: PipelineCard[] = raw.map((r) => {
@@ -780,6 +836,9 @@ export async function getPipelineBoard(
       daysInStage: state.days,
       appliedAt: new Date(r.applied_at),
       expiredCertifications: Number(r.expired_certifications),
+      cooloffFlag: r.cooloff_flag === true,
+      cooloffPriorArchivedAt: rowDate(r.cooloff_prior_archived_at),
+      cooloffWindowDays: requisition.cooloffDays ?? RECRUITMENT_COOLOFF_DEFAULT_DAYS,
     };
   });
 
@@ -941,7 +1000,7 @@ export async function setVisaStatus(
   await writeAuditNote(tx, ctx, {
     tableName: "candidates",
     recordId: input.candidateId,
-    action: "visa_status_recorded",
+    action: "visa_recorded",
     // The status itself is not copied into the audit detail. It is exactly the
     // sort of field an audit trail is asked to prove was never used as a
     // filter, and a log of every value it has ever held is not evidence of that.
@@ -2745,6 +2804,23 @@ export interface CandidateDetail {
     dispositionReasonCode: string | null;
     appliedAt: Date;
   }[];
+  /**
+   * `ATS-12`. The cool-off note, if this application earned one.
+   *
+   * A note for whoever screens it, next to the prior-applications list it
+   * refers to. It is not a decision and nothing downstream reads it: `ATS-19`
+   * forbids automated rejection and `ATS-5` forbids automated filtering, so
+   * this is rendered and never queried.
+   */
+  readonly cooloff: {
+    priorReference: string;
+    priorRoleTitle: string;
+    priorArchivedAt: Date;
+    priorDispositionReasonCode: string | null;
+    windowDays: number;
+  } | null;
+  /** `ATS-14`. Scheduled interviews and site trials, soonest first. */
+  readonly interviews: readonly InterviewRow[];
   readonly duplicates: readonly DuplicateSuggestion[];
 }
 
@@ -2779,6 +2855,12 @@ type CandidateDetailRow = {
   title: string;
   stage_name: string | null;
   stage_type: string | null;
+  cooloff_flag: boolean;
+  cooloff_days: number | null;
+  prior_reference: string | null;
+  prior_title: string | null;
+  prior_archived_at: string | null;
+  prior_disposition_reason_code: string | null;
 };
 
 export async function getCandidateDetail(
@@ -2792,12 +2874,22 @@ export async function getCandidateDetail(
            a.outcome_message, a.disposition_reason_code, a.status_token,
            c.id as candidate_id, c.full_name, c.phone, c.email, c.primary_trade, c.grade,
            c.experience_band, c.current_location, c.visa_status, c.visa_current_sponsor,
-           r.id as requisition_id, r.title,
-           s.name as stage_name, s.stage_type
+           r.id as requisition_id, r.title, r.cooloff_days,
+           s.name as stage_name, s.stage_type,
+           a.cooloff_flag,
+           prior.reference                as prior_reference,
+           priorreq.title                 as prior_title,
+           prior.archived_at              as prior_archived_at,
+           prior.disposition_reason_code  as prior_disposition_reason_code
       from applications a
       join candidates c on c.id = a.candidate_id
       join job_requisitions r on r.id = a.requisition_id
       left join requisition_stages s on s.id = a.current_stage_id
+      -- ATS-12. The application the flag refers to, resolved here rather than
+      -- left as an id the screen would have to look up. A reference somebody
+      -- cannot follow is a bare boolean with extra characters.
+      left join applications prior on prior.id = a.cooloff_of_application_id
+      left join job_requisitions priorreq on priorreq.id = prior.requisition_id
      where a.id = ${applicationId}
        and a.deleted_at is null
      limit 1
@@ -2943,6 +3035,17 @@ export async function getCandidateDetail(
       downloadable: isDownloadable(d.scanStatus as ScanStatus),
     })),
     events,
+    cooloff:
+      row.cooloff_flag === true && row.prior_reference && row.prior_archived_at
+        ? {
+            priorReference: row.prior_reference,
+            priorRoleTitle: row.prior_title ?? row.title,
+            priorArchivedAt: requiredRowDate(row.prior_archived_at),
+            priorDispositionReasonCode: row.prior_disposition_reason_code,
+            windowDays: row.cooloff_days ?? RECRUITMENT_COOLOFF_DEFAULT_DAYS,
+          }
+        : null,
+    interviews: await interviewsForApplication(tx, applicationId),
     priorApplications: prior.map((p) => ({
       reference: p.reference,
       roleTitle: p.title,
@@ -3084,6 +3187,728 @@ export async function getCandidateDocumentForDownload(
     storageKey: row.storageKey,
     filename: row.filename,
     scanStatus: row.scanStatus as ScanStatus,
+  };
+}
+
+
+// ── ATS-14: interview logistics ─────────────────────────────────────────────
+//
+// The half of ATS-14 that is not blocked.
+//
+// ── WHAT IS BLOCKED, SAID PLAINLY ───────────────────────────────────────────
+//
+// ATS-14 asks for SMS or WhatsApp first and email second. Only email is wired,
+// and choosing a provider is an owner decision nobody has made — so no
+// transport is invented here. Everything below goes through `notify`'s existing
+// Channel abstraction, which means the day a provider is chosen the change is
+// the channel string and the transport behind it, not this file.
+//
+// The consequence is stated rather than hidden: an applicant with a phone
+// number and no email cannot be sent a confirmation or a reminder at all, and
+// /api/cron/recruitment counts them as unreached rather than as satisfied.
+
+export interface InterviewRow {
+  readonly interviewId: string;
+  readonly applicationId: string;
+  readonly kind: InterviewKind;
+  readonly status: InterviewStatus;
+  readonly scheduledAt: Date;
+  readonly durationMinutes: number;
+  readonly locationName: string;
+  readonly locationAddress: string;
+  readonly locationArea: string | null;
+  readonly locationMapUrl: string | null;
+  readonly parkingNotes: string | null;
+  readonly ppeRequired: readonly string[];
+  readonly bringNotes: string | null;
+  readonly contactName: string | null;
+  readonly contactPhone: string | null;
+  readonly confirmationSentAt: Date | null;
+  readonly reminder24hAt: Date | null;
+  readonly reminder24hSentAt: Date | null;
+  readonly reminder2hAt: Date | null;
+  readonly reminder2hSentAt: Date | null;
+  readonly rescheduleRequestedAt: Date | null;
+  readonly rescheduleRequestNote: string | null;
+  readonly rescheduledCount: number;
+  readonly cancelledAt: Date | null;
+  readonly cancellationReason: string | null;
+}
+
+/** Everything a confirmation or a reminder needs, in one object. */
+export interface InterviewNotice extends InterviewRow {
+  readonly reference: string;
+  readonly fullName: string;
+  readonly email: string | null;
+  readonly phone: string;
+  readonly roleTitle: string;
+  readonly statusToken: string;
+}
+
+type InterviewSqlRow = {
+  interview_id: string;
+  application_id: string;
+  kind: string;
+  status: string;
+  scheduled_at: string;
+  duration_minutes: number;
+  location_name: string;
+  location_address: string;
+  location_area: string | null;
+  location_map_url: string | null;
+  parking_notes: string | null;
+  ppe_required: unknown;
+  bring_notes: string | null;
+  contact_name: string | null;
+  contact_phone: string | null;
+  confirmation_sent_at: string | null;
+  reminder_24h_at: string | null;
+  reminder_24h_sent_at: string | null;
+  reminder_2h_at: string | null;
+  reminder_2h_sent_at: string | null;
+  reschedule_requested_at: string | null;
+  reschedule_request_note: string | null;
+  rescheduled_count: number;
+  cancelled_at: string | null;
+  cancellation_reason: string | null;
+};
+
+/**
+ * `ppe_required` is JSONB. It comes back as a parsed array on this driver and
+ * as a string on some others, and a screen that renders `[object Object]` at a
+ * site gate is a candidate who arrives without a hard hat. Narrowed rather than
+ * asserted.
+ */
+function ppeList(value: unknown): readonly string[] {
+  const raw = typeof value === "string" ? safeJson(value) : value;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((item): item is string => typeof item === "string" && item.trim() !== "");
+}
+
+function safeJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function toInterviewRow(r: InterviewSqlRow): InterviewRow {
+  return {
+    interviewId: r.interview_id,
+    applicationId: r.application_id,
+    kind: r.kind as InterviewKind,
+    status: r.status as InterviewStatus,
+    scheduledAt: requiredRowDate(r.scheduled_at),
+    durationMinutes: Number(r.duration_minutes),
+    locationName: r.location_name,
+    locationAddress: r.location_address,
+    locationArea: r.location_area,
+    locationMapUrl: r.location_map_url,
+    parkingNotes: r.parking_notes,
+    ppeRequired: ppeList(r.ppe_required),
+    bringNotes: r.bring_notes,
+    contactName: r.contact_name,
+    contactPhone: r.contact_phone,
+    confirmationSentAt: rowDate(r.confirmation_sent_at),
+    reminder24hAt: rowDate(r.reminder_24h_at),
+    reminder24hSentAt: rowDate(r.reminder_24h_sent_at),
+    reminder2hAt: rowDate(r.reminder_2h_at),
+    reminder2hSentAt: rowDate(r.reminder_2h_sent_at),
+    rescheduleRequestedAt: rowDate(r.reschedule_requested_at),
+    rescheduleRequestNote: r.reschedule_request_note,
+    rescheduledCount: Number(r.rescheduled_count),
+    cancelledAt: rowDate(r.cancelled_at),
+    cancellationReason: r.cancellation_reason,
+  };
+}
+
+const INTERVIEW_COLUMNS = sql`
+  i.id as interview_id, i.application_id, i.kind, i.status, i.scheduled_at,
+  i.duration_minutes, i.location_name, i.location_address, i.location_area,
+  i.location_map_url, i.parking_notes, i.ppe_required, i.bring_notes,
+  i.contact_name, i.contact_phone, i.confirmation_sent_at,
+  i.reminder_24h_at, i.reminder_24h_sent_at, i.reminder_2h_at, i.reminder_2h_sent_at,
+  i.reschedule_requested_at, i.reschedule_request_note, i.rescheduled_count,
+  i.cancelled_at, i.cancellation_reason
+`;
+
+/** Every interview on one application, soonest first. Cancelled ones included. */
+export async function interviewsForApplication(
+  tx: TenantScopedTx,
+  applicationId: string,
+): Promise<readonly InterviewRow[]> {
+  const rows = (await tx.execute<InterviewSqlRow>(sql`
+    select ${INTERVIEW_COLUMNS}
+      from interviews i
+     where i.application_id = ${applicationId}
+       and i.deleted_at is null
+     order by i.scheduled_at
+  `)) as unknown as InterviewSqlRow[];
+
+  return rows.map(toInterviewRow);
+}
+
+/**
+ * When each reminder is due, or null when the window has already gone.
+ *
+ * Null is a state and not a failure. An interview booked for three hours from
+ * now never had a 24-hour reminder to miss, and saying so with a null is honest
+ * where stamping the sent column would claim a message that never existed — a
+ * CHECK in migration 0020 refuses that second version outright.
+ */
+function reminderDueAt(scheduledAt: Date, hoursBefore: number, now: Date): Date | null {
+  const due = new Date(scheduledAt.getTime() - hoursBefore * 3_600_000);
+  return due.getTime() > now.getTime() ? due : null;
+}
+
+export interface ScheduleInterviewInput {
+  readonly applicationId: string;
+  readonly kind: InterviewKind;
+  readonly scheduledAt: Date;
+  readonly durationMinutes?: number | undefined;
+  readonly locationName: string;
+  readonly locationAddress: string;
+  readonly locationArea?: string | undefined;
+  readonly locationMapUrl?: string | undefined;
+  readonly parkingNotes?: string | undefined;
+  readonly ppeRequired?: readonly string[] | undefined;
+  readonly bringNotes?: string | undefined;
+  readonly contactName?: string | undefined;
+  readonly contactPhone?: string | undefined;
+}
+
+/**
+ * Book an interview or a site trial (`ATS-14`).
+ *
+ * Returns everything the confirmation message needs, so the caller can enqueue
+ * it **inside this same transaction** (TRD §7.3 step 7). That ordering is
+ * load-bearing rather than tidy: a confirmation enqueued after the commit is
+ * one that vanishes if the process dies in between, and a confirmation
+ * enqueued before it is one that promises a time that then rolled back.
+ *
+ * `ATS-15` and the delay: the confirmation is deliberately **not** delayed. The
+ * requirement's own words put the cancellable window on messages that are
+ * automated *and adverse* — nothing here rejects anybody, and an interview
+ * confirmation held for twenty-four hours is one that arrives after an
+ * interview booked for tomorrow morning. The automated messages this feature
+ * does add are the two reminders, and their delay is the whole of their
+ * definition: they fire at T-24h and T-2h, and cancelling or moving the
+ * interview stops them.
+ */
+export async function scheduleInterview(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: ScheduleInterviewInput,
+): Promise<InterviewNotice> {
+  const now = new Date();
+  if (input.scheduledAt.getTime() <= now.getTime()) {
+    throw new UserFacingError(
+      "That time has already passed. Pick when you want them to come, not when you wish you had asked.",
+    );
+  }
+  if (!input.locationAddress.trim() || !input.locationName.trim()) {
+    throw new UserFacingError(
+      "An interview needs a place. Nobody can find an address that is not there.",
+    );
+  }
+
+  const application = await interviewSubject(tx, input.applicationId);
+  if (application.status !== "active") {
+    throw new UserFacingError(
+      "This application is closed. Reopen it before asking the candidate to come in.",
+    );
+  }
+
+  const duration = input.durationMinutes ?? 60;
+
+  const [created] = await tx
+    .insert(schema.interviews)
+    .values({
+      tenantId: ctx.tenantId,
+      applicationId: input.applicationId,
+      kind: input.kind,
+      status: "scheduled",
+      scheduledAt: input.scheduledAt,
+      durationMinutes: duration,
+      locationName: input.locationName.trim(),
+      locationAddress: input.locationAddress.trim(),
+      locationArea: input.locationArea?.trim() || null,
+      locationMapUrl: input.locationMapUrl?.trim() || null,
+      parkingNotes: input.parkingNotes?.trim() || null,
+      ppeRequired: [...(input.ppeRequired ?? [])],
+      bringNotes: input.bringNotes?.trim() || null,
+      contactName: input.contactName?.trim() || null,
+      contactPhone: input.contactPhone?.trim() || null,
+      reminder24hAt: reminderDueAt(input.scheduledAt, 24, now),
+      reminder2hAt: reminderDueAt(input.scheduledAt, 2, now),
+      scheduledById: ctx.userId ?? null,
+    })
+    .returning({ id: schema.interviews.id });
+
+  if (!created) throw new Error("Failed to schedule the interview");
+
+  /*
+   * `ATS-8`. We have done our part, and from here the ball is with the
+   * candidate — so the card says so rather than going on quietly ageing in the
+   * stage it is in.
+   */
+  await tx
+    .update(schema.applications)
+    .set({
+      blockedOn: "candidate",
+      blockedNote: `Waiting for them at ${input.locationName.trim()}`,
+      blockedSince: now,
+      updatedAt: now,
+    })
+    .where(eq(schema.applications.id, input.applicationId));
+
+  await tx.insert(schema.applicationEvents).values({
+    tenantId: ctx.tenantId,
+    applicationId: input.applicationId,
+    eventType: "interview_scheduled",
+    note: `${input.kind === "site_trial" ? "Site trial" : "Interview"} at ${input.locationName.trim()}`,
+    payload: {
+      interviewId: created.id,
+      scheduledAt: input.scheduledAt.toISOString(),
+      kind: input.kind,
+    },
+    actorUserId: ctx.userId ?? null,
+    actorKind: "user",
+  });
+
+  await writeAuditNote(tx, ctx, {
+    tableName: "interviews",
+    recordId: created.id,
+    action: "scheduled",
+    detail: { rule: "ATS-14", applicationId: input.applicationId, kind: input.kind },
+  });
+
+  await touchCandidate(tx, application.candidateId);
+
+  return (await interviewNotice(tx, created.id)) as InterviewNotice;
+}
+
+export interface RescheduleInterviewInput {
+  readonly interviewId: string;
+  readonly scheduledAt: Date;
+  readonly note?: string | undefined;
+}
+
+/**
+ * Move a booked interview (`ATS-14`).
+ *
+ * Both reminder pairs are recomputed and both sent stamps are cleared, because
+ * a reminder that already went out was about the old time and a system that
+ * remembers having reminded somebody about a time that no longer exists will
+ * cheerfully never remind them about the one that does.
+ *
+ * `confirmation_sent_at` is cleared for the same reason: the confirmation the
+ * candidate is holding is now wrong, and the caller re-sends.
+ */
+export async function rescheduleInterview(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: RescheduleInterviewInput,
+): Promise<InterviewNotice> {
+  const now = new Date();
+  if (input.scheduledAt.getTime() <= now.getTime()) {
+    throw new UserFacingError("Pick a time that has not already happened.");
+  }
+
+  const existing = await interviewNotice(tx, input.interviewId);
+  if (!existing) throw new UserFacingError("That interview was not found.");
+  if (existing.status !== "scheduled") {
+    throw new UserFacingError(
+      "That interview has already been cancelled or completed. Book a new one.",
+    );
+  }
+
+  await tx
+    .update(schema.interviews)
+    .set({
+      scheduledAt: input.scheduledAt,
+      reminder24hAt: reminderDueAt(input.scheduledAt, 24, now),
+      reminder24hSentAt: null,
+      reminder2hAt: reminderDueAt(input.scheduledAt, 2, now),
+      reminder2hSentAt: null,
+      confirmationSentAt: null,
+      confirmationNotificationId: null,
+      rescheduledCount: existing.rescheduledCount + 1,
+      // The ask has been answered. Leaving it set would keep the candidate on a
+      // waiting-for-us list they are no longer on.
+      rescheduleRequestedAt: null,
+      rescheduleRequestNote: null,
+      updatedAt: now,
+    })
+    .where(eq(schema.interviews.id, input.interviewId));
+
+  await tx
+    .update(schema.applications)
+    .set({
+      blockedOn: "candidate",
+      blockedNote: `Waiting for them at ${existing.locationName}`,
+      blockedSince: now,
+      updatedAt: now,
+    })
+    .where(eq(schema.applications.id, existing.applicationId));
+
+  await tx.insert(schema.applicationEvents).values({
+    tenantId: ctx.tenantId,
+    applicationId: existing.applicationId,
+    eventType: "interview_rescheduled",
+    note: input.note?.trim() || null,
+    payload: {
+      interviewId: input.interviewId,
+      from: existing.scheduledAt.toISOString(),
+      to: input.scheduledAt.toISOString(),
+    },
+    actorUserId: ctx.userId ?? null,
+    actorKind: "user",
+  });
+
+  await writeAuditNote(tx, ctx, {
+    tableName: "interviews",
+    recordId: input.interviewId,
+    action: "rescheduled",
+    detail: { rule: "ATS-14", to: input.scheduledAt.toISOString() },
+  });
+
+  return (await interviewNotice(tx, input.interviewId)) as InterviewNotice;
+}
+
+/**
+ * Call it off (`ATS-14`).
+ *
+ * The row is kept and marked, never deleted. A cancelled interview is why the
+ * candidate is still in this stage a week later, and deleting it removes the
+ * only explanation. The reminders stop because the sweep only looks at
+ * `scheduled` rows.
+ */
+export async function cancelInterview(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: { interviewId: string; reason?: string | undefined },
+): Promise<InterviewNotice> {
+  const existing = await interviewNotice(tx, input.interviewId);
+  if (!existing) throw new UserFacingError("That interview was not found.");
+  if (existing.status === "cancelled") return existing;
+
+  const now = new Date();
+  await tx
+    .update(schema.interviews)
+    .set({
+      status: "cancelled",
+      cancelledAt: now,
+      cancellationReason: input.reason?.trim().slice(0, 200) || null,
+      rescheduleRequestedAt: null,
+      rescheduleRequestNote: null,
+      updatedAt: now,
+    })
+    .where(eq(schema.interviews.id, input.interviewId));
+
+  await tx.insert(schema.applicationEvents).values({
+    tenantId: ctx.tenantId,
+    applicationId: existing.applicationId,
+    eventType: "interview_cancelled",
+    note: input.reason?.trim() || null,
+    payload: { interviewId: input.interviewId },
+    actorUserId: ctx.userId ?? null,
+    actorKind: "user",
+  });
+
+  await writeAuditNote(tx, ctx, {
+    tableName: "interviews",
+    recordId: input.interviewId,
+    action: "cancelled",
+    detail: { rule: "ATS-14", applicationId: existing.applicationId },
+  });
+
+  return (await interviewNotice(tx, input.interviewId)) as InterviewNotice;
+}
+
+/** Stamp the confirmation, once it has actually been queued. */
+export async function markInterviewConfirmationSent(
+  tx: TenantScopedTx,
+  input: { interviewId: string; notificationId?: string | undefined },
+): Promise<void> {
+  await tx
+    .update(schema.interviews)
+    .set({
+      confirmationSentAt: new Date(),
+      confirmationNotificationId: input.notificationId ?? null,
+      updatedAt: new Date(),
+    })
+    .where(eq(schema.interviews.id, input.interviewId));
+}
+
+/**
+ * Reminders whose moment has arrived (`ATS-14`).
+ *
+ * `scheduled_at > now()` on both branches, so a reminder never chases an
+ * interview that has already happened: an unreachable candidate drops off this
+ * list when the appointment passes rather than being retried every fifteen
+ * minutes for ever.
+ *
+ * `FOR UPDATE SKIP LOCKED` on the interview rows, so two overlapping cron runs
+ * take different work instead of queueing behind each other. It is the second
+ * half of the idempotency guarantee; the first is `claimInterviewReminder`.
+ */
+export async function dueInterviewReminders(
+  tx: TenantScopedTx,
+  limit = 100,
+): Promise<readonly (InterviewNotice & { window: InterviewReminderWindow })[]> {
+  const rows = (await tx.execute<
+    InterviewSqlRow & {
+      window: string;
+      reference: string;
+      full_name: string;
+      email: string | null;
+      phone: string;
+      title: string;
+      status_token: string;
+    }
+  >(sql`
+    select ${INTERVIEW_COLUMNS},
+           w.window,
+           a.reference, a.status_token, c.full_name, c.email, c.phone, r.title
+      from interviews i
+      join applications a on a.id = i.application_id
+      join candidates c on c.id = a.candidate_id
+      join job_requisitions r on r.id = a.requisition_id
+      join lateral (
+        select '24h'::text as window, i.reminder_24h_at as due, i.reminder_24h_sent_at as sent
+        union all
+        select '2h'::text, i.reminder_2h_at, i.reminder_2h_sent_at
+      ) w on true
+     where i.status = 'scheduled'
+       and i.deleted_at is null
+       and a.deleted_at is null
+       and w.due is not null
+       and w.sent is null
+       and w.due <= now()
+       and i.scheduled_at > now()
+     order by w.due
+     limit ${limit}
+     for update of i skip locked
+  `)) as unknown as (InterviewSqlRow & {
+    window: string;
+    reference: string;
+    full_name: string;
+    email: string | null;
+    phone: string;
+    title: string;
+    status_token: string;
+  })[];
+
+  return rows.map((r) => ({
+    ...toInterviewRow(r),
+    window: r.window as InterviewReminderWindow,
+    reference: r.reference,
+    fullName: r.full_name,
+    email: r.email,
+    phone: r.phone,
+    roleTitle: r.title,
+    statusToken: r.status_token,
+  }));
+}
+
+/**
+ * Claim one reminder before sending it.
+ *
+ * The whole of the send-once guarantee, and the order is the guarantee: the
+ * caller claims first and enqueues second, both inside one transaction. Two
+ * overlapping runs that both selected the row serialise on this `UPDATE`; the
+ * loser sees `IS NULL` fail, gets no row back, and sends nothing. A run that
+ * dies after claiming rolls the claim back with the un-enqueued message, so the
+ * next run sends it — at most once, at least once, never twice.
+ *
+ * Returns false when somebody else already had it.
+ */
+export async function claimInterviewReminder(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: { interviewId: string; window: InterviewReminderWindow },
+): Promise<boolean> {
+  const column =
+    input.window === "24h"
+      ? sql`reminder_24h_sent_at`
+      : sql`reminder_2h_sent_at`;
+
+  const rows = (await tx.execute<{ id: string }>(sql`
+    update interviews
+       set ${column} = now(), updated_at = now()
+     where id = ${input.interviewId}
+       and status = 'scheduled'
+       and deleted_at is null
+       and ${column} is null
+    returning id
+  `)) as unknown as { id: string }[];
+
+  if (rows.length === 0) return false;
+
+  await tx.insert(schema.applicationEvents).values({
+    tenantId: ctx.tenantId,
+    applicationId: (await interviewSubjectByInterview(tx, input.interviewId)).applicationId,
+    eventType: "interview_reminded",
+    payload: { interviewId: input.interviewId, window: input.window },
+    actorKind: "system",
+  });
+
+  return true;
+}
+
+/**
+ * The candidate asking to move it (`ATS-14`), behind the token they already
+ * have.
+ *
+ * No second token and no new secret: `applications.status_token` identifies one
+ * application, an interview belongs to one application, and the person holding
+ * the token is the person whose interview it is. See
+ * `app_public_request_interview_reschedule` for why this asks rather than
+ * moves.
+ *
+ * `db` and not a tenant transaction, deliberately and for the same reason
+ * `submitApplication` uses it: this is an unauthenticated caller, and giving
+ * one an ambient tenant scope for the rest of its transaction is the property
+ * the whole public surface is shaped to avoid.
+ */
+export async function requestInterviewReschedule(
+  token: string,
+  note?: string | undefined,
+): Promise<boolean> {
+  if (!token || token.length < 32) return false;
+
+  const rows = (await db.execute<{ app_public_request_interview_reschedule: boolean }>(
+    sql`select app_public_request_interview_reschedule(${token}, ${note ?? null})`,
+  )) as unknown as { app_public_request_interview_reschedule: boolean }[];
+
+  return rows[0]?.app_public_request_interview_reschedule === true;
+}
+
+/** Interviews a candidate has asked to move and nobody has answered. */
+export async function interviewsAwaitingReschedule(
+  tx: TenantScopedTx,
+  limit = 100,
+): Promise<readonly InterviewNotice[]> {
+  const rows = (await tx.execute<
+    InterviewSqlRow & {
+      reference: string;
+      full_name: string;
+      email: string | null;
+      phone: string;
+      title: string;
+      status_token: string;
+    }
+  >(sql`
+    select ${INTERVIEW_COLUMNS},
+           a.reference, a.status_token, c.full_name, c.email, c.phone, r.title
+      from interviews i
+      join applications a on a.id = i.application_id
+      join candidates c on c.id = a.candidate_id
+      join job_requisitions r on r.id = a.requisition_id
+     where i.reschedule_requested_at is not null
+       and i.status = 'scheduled'
+       and i.deleted_at is null
+     order by i.reschedule_requested_at
+     limit ${limit}
+  `)) as unknown as (InterviewSqlRow & {
+    reference: string;
+    full_name: string;
+    email: string | null;
+    phone: string;
+    title: string;
+    status_token: string;
+  })[];
+
+  return rows.map((r) => ({
+    ...toInterviewRow(r),
+    reference: r.reference,
+    fullName: r.full_name,
+    email: r.email,
+    phone: r.phone,
+    roleTitle: r.title,
+    statusToken: r.status_token,
+  }));
+}
+
+async function interviewSubject(
+  tx: TenantScopedTx,
+  applicationId: string,
+): Promise<{ candidateId: string; status: string }> {
+  const rows = await tx
+    .select({
+      candidateId: schema.applications.candidateId,
+      status: schema.applications.status,
+    })
+    .from(schema.applications)
+    .where(and(eq(schema.applications.id, applicationId), isNull(schema.applications.deletedAt)))
+    .limit(1);
+
+  const row = rows[0];
+  if (!row) throw new UserFacingError("That application was not found.");
+  return row;
+}
+
+async function interviewSubjectByInterview(
+  tx: TenantScopedTx,
+  interviewId: string,
+): Promise<{ applicationId: string }> {
+  const rows = await tx
+    .select({ applicationId: schema.interviews.applicationId })
+    .from(schema.interviews)
+    .where(eq(schema.interviews.id, interviewId))
+    .limit(1);
+
+  const row = rows[0];
+  if (!row) throw new UserFacingError("That interview was not found.");
+  return row;
+}
+
+/** One interview with everything a message about it needs. */
+export async function interviewNotice(
+  tx: TenantScopedTx,
+  interviewId: string,
+): Promise<InterviewNotice | null> {
+  const rows = (await tx.execute<
+    InterviewSqlRow & {
+      reference: string;
+      full_name: string;
+      email: string | null;
+      phone: string;
+      title: string;
+      status_token: string;
+    }
+  >(sql`
+    select ${INTERVIEW_COLUMNS},
+           a.reference, a.status_token, c.full_name, c.email, c.phone, r.title
+      from interviews i
+      join applications a on a.id = i.application_id
+      join candidates c on c.id = a.candidate_id
+      join job_requisitions r on r.id = a.requisition_id
+     where i.id = ${interviewId}
+       and i.deleted_at is null
+     limit 1
+  `)) as unknown as (InterviewSqlRow & {
+    reference: string;
+    full_name: string;
+    email: string | null;
+    phone: string;
+    title: string;
+    status_token: string;
+  })[];
+
+  const row = rows[0];
+  if (!row) return null;
+
+  return {
+    ...toInterviewRow(row),
+    reference: row.reference,
+    fullName: row.full_name,
+    email: row.email,
+    phone: row.phone,
+    roleTitle: row.title,
+    statusToken: row.status_token,
   };
 }
 

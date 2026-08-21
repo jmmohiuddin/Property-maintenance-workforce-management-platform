@@ -541,8 +541,11 @@ export interface PortalInvoiceRow {
  * has not committed to, and the first anyone hears of it is a dispute about a
  * figure nobody meant to send.
  *
- * The portal home page shares this problem today. It calls `listInvoices`
- * directly and lists whatever comes back, drafts included.
+ * That mistake is no longer reachable. `listInvoices` now requires a `jobId`
+ * and is the per-job list only, so there is no unbounded staff invoice query
+ * for a portal path to pick up by accident; the tenant-wide one is
+ * `searchInvoices`, which is keyset-paginated and staff-scoped. The portal home
+ * page calls this function, and says so at the call site.
  *
  * Credit notes are netted off here rather than listed separately, because the
  * question this screen answers is "what do I owe". `portalStatement` below is

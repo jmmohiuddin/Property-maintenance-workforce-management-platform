@@ -1,12 +1,17 @@
 import { withTenant } from "@meridian/db";
 import {
   activeTenantIds,
+  alertRecipients,
+  claimInterviewReminder,
+  dueInterviewReminders,
   dueOutcomes,
+  interviewsAwaitingReschedule,
   markAcknowledged,
   markOutcomeSent,
   outcomeAccountability,
   pendingAcknowledgements,
   purgeExpiredCandidates,
+  recentlyNotified,
   talentPoolExpiringCertifications,
   talentPoolNeedingReconfirmation,
 } from "@meridian/db/domain";
@@ -67,6 +72,10 @@ export async function GET(request: Request) {
     let poolReconfirmationsDue = 0;
     let poolCertificatesLapsed = 0;
     let poolCertificatesExpiring = 0;
+    let poolCertificateAlertsSent = 0;
+    let interviewRemindersSent = 0;
+    let interviewRemindersUnreachable = 0;
+    let interviewRescheduleRequests = 0;
     const poolCertificateNames: string[] = [];
     const orphanedStorageKeys: string[] = [];
 
@@ -150,6 +159,77 @@ export async function GET(request: Request) {
           outcomesSent += 1;
         }
 
+        // ── ATS-14: interview reminders, at 24 hours and at 2 hours ─────────
+        //
+        // ── HOW THIS IS PREVENTED FROM SENDING TWICE ───────────────────────
+        //
+        // Claim first, enqueue second, both inside this one transaction. Two
+        // overlapping runs both select the row; they then serialise on the
+        // UPDATE inside claimInterviewReminder, and the loser's
+        // `... and reminder_Xh_sent_at is null` matches nothing, returns no row
+        // and sends nothing. A run that dies between the claim and the commit
+        // rolls the claim back together with the un-enqueued message, so the
+        // next run picks it up. At most once, at least once, never twice.
+        //
+        // The reverse order — enqueue then mark — is the one that double-sends
+        // on a retry, and it is the order the outcome loop above uses because
+        // an outcome is guarded by its own `outcome_sent_at` check at select
+        // time and is a once-per-application event rather than a repeating one.
+        for (const reminder of await dueInterviewReminders(tx, 200)) {
+          if (!reminder.email) {
+            // Not claimed, so not marked sent. ATS-14 asks for SMS or WhatsApp
+            // first and neither exists, so this person genuinely cannot be
+            // reminded — counting them as reminded would be the accountability
+            // lie this module is built to refuse. It stops repeating on its own
+            // when the interview time passes, because the sweep only looks at
+            // interviews that have not happened yet.
+            interviewRemindersUnreachable += 1;
+            continue;
+          }
+
+          const claimed = await claimInterviewReminder(tx, ctx, {
+            interviewId: reminder.interviewId,
+            window: reminder.window,
+          });
+          if (!claimed) continue;
+
+          await enqueue(tx, ctx, {
+            channel: "email",
+            template: "interview_reminder",
+            to: reminder.email,
+            subject: { table: "interviews", id: reminder.interviewId },
+            payload: {
+              window: reminder.window,
+              candidateFirstName: reminder.fullName.split(" ")[0] ?? reminder.fullName,
+              roleTitle: reminder.roleTitle,
+              applicationReference: reminder.reference,
+              kind: reminder.kind,
+              scheduledAt: reminder.scheduledAt,
+              durationMinutes: reminder.durationMinutes,
+              locationName: reminder.locationName,
+              locationAddress: reminder.locationAddress,
+              locationArea: reminder.locationArea,
+              locationMapUrl: reminder.locationMapUrl,
+              parkingNotes: reminder.parkingNotes,
+              ppeRequired: reminder.ppeRequired,
+              bringNotes: reminder.bringNotes,
+              contactName: reminder.contactName,
+              contactPhone: reminder.contactPhone,
+              statusUrl: applicationStatusUrl(reminder.statusToken),
+            },
+          });
+          interviewRemindersSent += 1;
+        }
+
+        // ── ATS-14: reschedule asks nobody has answered ─────────────────────
+        //
+        // Counted rather than emailed. The candidate has already been put on
+        // the ATS-8 blocked-on-us list by the definer function that recorded
+        // the ask, so the pipeline board is already red about it; what this
+        // adds is the number in the cron ledger, which is what makes "nobody
+        // has looked at the board this week" visible.
+        interviewRescheduleRequests += (await interviewsAwaitingReschedule(tx, 200)).length;
+
         // ── ATS-13: consent goes stale ──────────────────────────────────────
         poolReconfirmationsDue += (await talentPoolNeedingReconfirmation(tx, 500)).length;
 
@@ -161,21 +241,19 @@ export async function GET(request: Request) {
         // The screen names them and is where the phone calls get made from —
         // but a screen only alerts the people who open it, and the week nobody
         // opens it is the week a certificate lapses on somebody who is about to
-        // be offered a job. So: the cron carries the count and the warning, and
-        // the screen carries the names.
+        // be offered a job.
         //
-        // WHAT IS NOT BUILT, SAID PLAINLY: this does not email anybody. The
-        // pattern for that is next door in /api/cron/health — alertRecipients
-        // over owner/admin/hr, suppressed with recentlyNotified at 1440 minutes
-        // so it sends once a day rather than once every fifteen-minute run —
-        // and every piece of it exists except the template. The one template
-        // that looks close, `certification_expiring`, is the HR-3 message about
-        // an employee: its payload field is literally `technicianName`, and
-        // sending it about a pool member would tell an owner that a technician
-        // they do not employ has a lapsing ticket. A message that misdescribes
-        // who somebody is, is worse than a warning in a ledger. This needs a
-        // `talent_pool_certification_expiring` template in packages/notify,
-        // which is not this change's to write.
+        // So this now emails as well as counting, on the /api/cron/health
+        // pattern: alertRecipients over owner/admin/hr, suppressed with
+        // recentlyNotified at 1440 minutes so it arrives once a day rather than
+        // on every fifteen-minute run. Six identical emails an hour is a filter
+        // rule, after which the alert reaches nobody at all.
+        //
+        // It is its own template and not `certification_expiring`. That one is
+        // HR-3's message about an employee, and its payload field is literally
+        // `technicianName` — sending it about a pool member would tell an owner
+        // that a technician they do not employ has a lapsing ticket. A message
+        // that misdescribes who somebody is, is worse than a count in a ledger.
         const expiring = await talentPoolExpiringCertifications(tx);
         for (const certificate of expiring) {
           if (certificate.lapsed) poolCertificatesLapsed += 1;
@@ -184,6 +262,39 @@ export async function GET(request: Request) {
             poolCertificateNames.push(
               `${certificate.fullName} (${certificate.scheme}, ${certificate.lapsed ? "lapsed" : "expires"} ${certificate.expiresOn})`,
             );
+          }
+        }
+
+        if (expiring.length > 0) {
+          const recipients = await alertRecipients(tx, ["owner", "admin", "hr"]);
+          for (const recipient of recipients) {
+            const alreadyTold = await recentlyNotified(tx, {
+              template: "talent_pool_certification_expiring",
+              recipientUserId: recipient.userId,
+              withinMinutes: 1440,
+            });
+            if (alreadyTold) continue;
+
+            await enqueue(tx, ctx, {
+              channel: "email",
+              template: "talent_pool_certification_expiring",
+              to: recipient.email,
+              recipientUserId: recipient.userId,
+              payload: {
+                recipientName: recipient.fullName,
+                members: expiring.slice(0, 50).map((certificate) => ({
+                  candidateName: certificate.fullName,
+                  scheme: certificate.scheme,
+                  // Day-valued, as a string, end to end. Putting this through a
+                  // JS Date moves it by the local UTC offset, in the direction
+                  // that reports a ticket which lapsed yesterday as still
+                  // valid — which is the exact failure this alert exists for.
+                  expiresOn: certificate.expiresOn,
+                  lapsed: certificate.lapsed,
+                })),
+              },
+            });
+            poolCertificateAlertsSent += 1;
           }
         }
 
@@ -232,11 +343,26 @@ export async function GET(request: Request) {
       );
     }
 
-    if (unreachableTotal + outcomesUnreachable + acknowledgedUnreachable > 0) {
+    if (
+      unreachableTotal + outcomesUnreachable + acknowledgedUnreachable + interviewRemindersUnreachable >
+      0
+    ) {
       warnings.push(
         `${unreachableTotal} applicant(s) gave a phone number and no email address, and no SMS or ` +
           "WhatsApp transport exists (ATS-14 asks for that channel first). They cannot be told " +
-          "anything by this system. They are counted as unreached, not as satisfied.",
+          "anything by this system — including " +
+          `${interviewRemindersUnreachable} interview reminder(s) this run, which are the ` +
+          "messages that turn a no-show into an arrival. They are counted as unreached, not as " +
+          "satisfied. Choosing an SMS or WhatsApp provider is an owner decision and no transport " +
+          "has been invented in its place.",
+      );
+    }
+
+    if (interviewRescheduleRequests > 0) {
+      warnings.push(
+        `${interviewRescheduleRequests} candidate(s) have asked to move an interview and nobody ` +
+          "has answered. Each one is already flagged as waiting on us on the pipeline board " +
+          "(ATS-8); this is the number that shows when nobody has opened the board.",
       );
     }
 
@@ -255,11 +381,11 @@ export async function GET(request: Request) {
       warnings.push(
         `${poolCertificatesLapsed} talent-pool certificate(s) have already lapsed and ` +
           `${poolCertificatesExpiring} lapse within the next ${CERTIFICATION_EXPIRY_WINDOW_DAYS} ` +
-          "days. Nobody has been emailed about this — there is no template for it " +
-          "yet (see the note in this file). A pool member whose ticket " +
-          "has expired is not a prospect, they are a phone call — and under HR-9 an expired " +
-          "certificate blocks the dispatch the day after they are hired. The named list is on " +
-          "/recruitment/pool: " +
+          `days. ${poolCertificateAlertsSent} owner/admin/HR alert(s) were queued about it this ` +
+          "run (once a day per recipient, not once every fifteen minutes). A pool member whose " +
+          "ticket has expired is not a prospect, they are a phone call — and under HR-9 an " +
+          "expired certificate blocks the dispatch the day after they are hired. The named " +
+          "list is on /recruitment/pool: " +
           poolCertificateNames.join("; "),
       );
     }
@@ -274,7 +400,8 @@ export async function GET(request: Request) {
     }
 
     return {
-      processed: acknowledged + outcomesSent + candidatesPurged,
+      processed:
+        acknowledged + outcomesSent + candidatesPurged + interviewRemindersSent + poolCertificateAlertsSent,
       detail: {
         transport: transport.name,
         tenants: tenants.length,
@@ -293,6 +420,10 @@ export async function GET(request: Request) {
         poolReconfirmationsDue,
         poolCertificatesLapsed,
         poolCertificatesExpiring,
+        poolCertificateAlertsSent,
+        interviewRemindersSent,
+        interviewRemindersUnreachable,
+        interviewRescheduleRequests,
       },
       warnings,
     };

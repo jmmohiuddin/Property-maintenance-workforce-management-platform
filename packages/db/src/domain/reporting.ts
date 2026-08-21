@@ -12,6 +12,7 @@ import {
   type GoalVerdict,
   type ReliefPosition,
 } from "@meridian/core";
+import { requiredRowDate } from "./_rows";
 import { arAgeing, uninvoicedSignedOffJobs, invoiceSequenceGaps } from "./commerce";
 import {
   workforceSummary,
@@ -19,7 +20,7 @@ import {
   findExpiringEmployeeDocuments,
   findExpiringAccreditations,
 } from "./compliance";
-import { listDispatchBoard } from "./jobs";
+import { dispatchBoardCounts, dispatchBoardCountsByPriority } from "./jobs";
 import { findExpiringCertifications } from "./cron";
 import { listRequisitions } from "./recruitment";
 // Read, never written by this stream. The dashboard and the AMC screen have to
@@ -65,18 +66,23 @@ import { ppmCompliance } from "./contracts";
  *  * `trigger` — a database trigger from `0017_kpi_and_admin` or
  *    `0018_ats_product_events` emits it. It cannot be forgotten, it survives a
  *    hand-repair during an incident, and it is already recording.
+ *  * `call` — an application `recordProductEvent` call emits it. Strictly
+ *    weaker than a trigger, and an entry using it has to name its call site so
+ *    the claim can be checked rather than believed: a call fires from one code
+ *    path, a second path making the same change emits nothing, and a repair
+ *    made directly in SQL during an incident emits nothing at all.
  *  * `none` — declared, specified, and **not instrumented**. The reason is
  *    stated on the entry.
  *
- * There is deliberately no third value for "emitted by an application call".
- * There would be nothing in it: every family with a row transition behind it is
- * a trigger, and every family without one is currently uninstrumented. An enum
- * value with no members is how `portal_action` would end up marked as
+ * `call` was deliberately absent until there was a call site to point at. An
+ * enum value with no members is how `portal_action` would end up marked as
  * instrumented because somebody *intended* to add the call — which is precisely
- * the lie this registry exists to prevent. Add the value back in the same
- * commit as the first `recordProductEvent` call site, not before.
+ * the lie this registry exists to prevent. The rule this file set was to add
+ * the value in the same commit as the first `recordProductEvent` call site and
+ * not before; `JOB-10`'s override capture is that call site, and this is that
+ * commit.
  */
-export type EventEmitter = "trigger" | "none";
+export type EventEmitter = "trigger" | "call" | "none";
 
 export interface ProductEventName {
   readonly name: string;
@@ -211,18 +217,23 @@ export const PRODUCT_EVENT_NAMES: readonly ProductEventName[] = [
       "number is the one missing.",
   },
   {
-    name: "assignment_warning_override",
-    emitter: "none",
-    description: "A dispatcher assigned past a certification or availability warning (JOB-10).",
-    blockedOn:
-      "The dispatch UI, not the schema. This entry used to say the columns did not exist and to " +
-      "name a `job_assignments` table that has never existed in this repository. The columns are " +
-      "`job_visits.override_warning_type` and `job_visits.override_reason`, present since 0005, and " +
-      "`assignTechnician` in `domain/assignment.ts` accepts and writes both. But its only caller — " +
-      "the `assign` server action in `app/(app)/jobs/[id]/actions.ts` — reads jobId, technicianId, " +
-      "score and reason from the form and passes none of the override fields, so in practice both " +
-      "columns are always null. A trigger would faithfully emit nothing. JOB-10 has to capture the " +
-      "override at the point the dispatcher makes it before there is anything here to measure.",
+    // Spelled as `JOB-10` spells it. The registry declared
+    // `assignment_warning_override` and the PRD asks for
+    // `assignment_warning_overridden`, so the call site — which cannot emit a
+    // name the registry does not hold — was emitting the registry's spelling
+    // and the specification's name existed nowhere in the software. Renamed
+    // while the family is an hour old and no row has been written under either
+    // spelling; the registry implements the PRD, so where they disagree it is
+    // the registry that is wrong.
+    name: "assignment_warning_overridden",
+    emitter: "call",
+    description:
+      "A dispatcher assigned past a certification or availability warning, carrying the warning " +
+      "types overridden and the technician (JOB-10). Emitted by the `assign` server action in " +
+      "`app/(app)/jobs/[id]/actions.ts`, best-effort and outside the transaction: the record of the " +
+      "override is `job_visits.override_reason`, and this row exists so the weekly report can count " +
+      "overrides without reading every visit. A failure here loses a bar on a chart rather than a " +
+      "dispatch that has already happened.",
   },
   {
     name: "portal_action",
@@ -894,21 +905,31 @@ async function pipelinePosition(tx: TenantScopedTx, now: Date): Promise<Pipeline
  * a response deadline ÷ all jobs", so the rate uses the job count.
  */
 async function workPosition(tx: TenantScopedTx, now: Date): Promise<WorkPosition> {
-  // The dispatch board is the source of truth for what is open, so the
-  // dashboard cannot disagree with the board about how many jobs there are.
-  const board = await listDispatchBoard(tx, { now, limit: 1000 });
-
-  const priorities = ["p1_emergency", "p2_urgent", "p3_standard", "p4_planned"];
-  const byPriority = priorities
-    .map((priority) => {
-      const rows = board.filter((r) => r.priority === priority);
-      return {
-        priority,
-        jobs: rows.length,
-        breached: rows.filter((r) => r.sla === "breached").length,
-      };
-    })
-    .filter((p) => p.jobs > 0);
+  /*
+   * ── THE CAP THAT LOOKED LIKE A PLATEAU ──────────────────────────────────
+   *
+   * The dispatch board is the source of truth for what is open, so the
+   * dashboard cannot disagree with the board about how many jobs there are.
+   * That intent was right and the implementation was not: this read
+   * `listDispatchBoard(tx, { now, limit: 1000 })` and filtered the array, so
+   * every figure below — the open count, the unassigned count, the jobs
+   * breaching now, and each per-priority row — was a total of the first
+   * thousand open jobs rather than of the tenant's.
+   *
+   * At the PRD's stated volume, 5,000 jobs a year (§9), those numbers would
+   * have climbed to exactly 1000 and stopped. Nothing on the screen would have
+   * looked truncated; it would have looked like a plateau, which is the one
+   * shape of wrong number nobody investigates. This is the same `LEAD-8` trap
+   * the board's own header hit, and the fix is the same: agreeing with the
+   * board means asking the same question of the same table, not reading its
+   * rows. Both counters below are Postgres aggregates over every matching row,
+   * and they are the board's own, so the two screens now agree by
+   * construction rather than by coincidence.
+   */
+  const [counts, byPriority] = await Promise.all([
+    dispatchBoardCounts(tx, now),
+    dispatchBoardCountsByPriority(tx, now),
+  ]);
 
   const weekRows = (await tx.execute<{
     jobs_breached: string;
@@ -962,10 +983,10 @@ async function workPosition(tx: TenantScopedTx, now: Date): Promise<WorkPosition
       : null;
 
   return {
-    openJobs: board.length,
+    openJobs: counts.open,
     byPriority,
-    unassigned: board.filter((r) => r.technicianName === null).length,
-    breachingNow: board.filter((r) => r.sla === "breached").length,
+    unassigned: counts.unassigned,
+    breachingNow: counts.breached,
     jobsBreachedThisWeek,
     deadlinesMissedThisWeek: Number(weekRows[0]?.deadlines_missed ?? 0),
     jobsWithDeadlineThisWeek,
@@ -1547,6 +1568,77 @@ export interface AuditPage {
 }
 
 /**
+ * How far back one record's reconstruction reaches.
+ *
+ * Named rather than inline because the screen has to say which 200 it showed:
+ * a cap the reader cannot see is the silent truncation `LEAD-8` and §12.1 both
+ * forbid.
+ */
+export const RECORD_HISTORY_LIMIT = 200;
+
+/**
+ * A raw `audit_log` row, as `tx.execute` actually hands it back.
+ *
+ * `occurred_at` is typed `string` deliberately. The type parameter on
+ * `execute` is an assertion rather than a check, and postgres-js returns a
+ * space-separated timestamp string — so declaring `Date` there compiles and
+ * then throws at the first `.getTime()`. It is converted once, in
+ * `toAuditEntry`, through the coercion in `_rows.ts`.
+ *
+ * An alias rather than an `interface`, and it has to be: `tx.execute<T>`
+ * constrains `T` to `Record<string, unknown>`, which an object type satisfies
+ * implicitly and an interface does not.
+ */
+type AuditRow = {
+  id: string;
+  table_name: string;
+  record_id: string | null;
+  action: string;
+  actor_id: string | null;
+  actor_name: string | null;
+  actor_kind: string;
+  occurred_at: string;
+  ip_address: string | null;
+  request_id: string | null;
+  changed_fields: Record<string, unknown> | null;
+};
+
+/**
+ * The projection both audit readers use.
+ *
+ * Shared so that the feed and one record's history cannot drift into
+ * disagreeing about the same row — an audit screen where the reconstruction
+ * shows a different actor from the list it was opened from is worse than
+ * either screen alone.
+ */
+const AUDIT_SELECT = sql`
+  select a.id, a.table_name, a.record_id, a.action, a.actor_id,
+         u.full_name as actor_name,
+         a.actor_kind, a.occurred_at, a.ip_address, a.request_id, a.changed_fields
+    from audit_log a
+    -- LEFT, and it matters. The actor may have been deleted, and an audit
+    -- entry that disappears because the person who made it left the company
+    -- is the one entry an auditor most wants.
+    left join users u on u.id = a.actor_id
+`;
+
+function toAuditEntry(r: AuditRow): AuditEntry {
+  return {
+    id: r.id,
+    tableName: r.table_name,
+    recordId: r.record_id,
+    action: r.action as AuditEntry["action"],
+    actorId: r.actor_id,
+    actorName: r.actor_name,
+    actorKind: r.actor_kind,
+    occurredAt: requiredRowDate(r.occurred_at),
+    ipAddress: r.ip_address,
+    requestId: r.request_id,
+    changedFields: r.changed_fields,
+  };
+}
+
+/**
  * Read the audit log (`ADM-7`).
  *
  * The log has existed since 0000 with UPDATE and DELETE revoked from the
@@ -1594,43 +1686,12 @@ export async function auditTrail(
     and (${to}::date is null or (a.occurred_at at time zone 'Asia/Dubai')::date <= ${to}::date)
   `;
 
-  const rows = (await tx.execute<{
-    id: string;
-    table_name: string;
-    record_id: string | null;
-    action: string;
-    actor_id: string | null;
-    actor_name: string | null;
-    actor_kind: string;
-    occurred_at: Date | string;
-    ip_address: string | null;
-    request_id: string | null;
-    changed_fields: Record<string, unknown> | null;
-  }>(sql`
-    select a.id, a.table_name, a.record_id, a.action, a.actor_id,
-           u.full_name as actor_name,
-           a.actor_kind, a.occurred_at, a.ip_address, a.request_id, a.changed_fields
-      from audit_log a
-      -- LEFT, and it matters. The actor may have been deleted, and an audit
-      -- entry that disappears because the person who made it left the company
-      -- is the one entry an auditor most wants.
-      left join users u on u.id = a.actor_id
+  const rows = (await tx.execute<AuditRow>(sql`
+    ${AUDIT_SELECT}
      where ${where}
      order by a.occurred_at desc, a.id desc
      limit ${limit} offset ${offset}
-  `)) as unknown as {
-    id: string;
-    table_name: string;
-    record_id: string | null;
-    action: string;
-    actor_id: string | null;
-    actor_name: string | null;
-    actor_kind: string;
-    occurred_at: Date | string;
-    ip_address: string | null;
-    request_id: string | null;
-    changed_fields: Record<string, unknown> | null;
-  }[];
+  `)) as unknown as AuditRow[];
 
   const countRows = (await tx.execute<{ total: string }>(sql`
     select count(*)::text as total
@@ -1639,19 +1700,7 @@ export async function auditTrail(
   `)) as unknown as { total: string }[];
 
   return {
-    entries: rows.map((r) => ({
-      id: r.id,
-      tableName: r.table_name,
-      recordId: r.record_id,
-      action: r.action as AuditEntry["action"],
-      actorId: r.actor_id,
-      actorName: r.actor_name,
-      actorKind: r.actor_kind,
-      occurredAt: new Date(r.occurred_at),
-      ipAddress: r.ip_address,
-      requestId: r.request_id,
-      changedFields: r.changed_fields,
-    })),
+    entries: rows.map(toAuditEntry),
     total: Number(countRows[0]?.total ?? 0),
     limit,
     offset,
@@ -1689,22 +1738,51 @@ export async function auditActors(
 }
 
 /**
- * One record's complete history, oldest first.
+ * One record's history, oldest first (`ADM-7`).
  *
  * `ADM-7`'s actual requirement is "able to reconstruct any record's history",
- * which is a different query from the filtered list: it is unpaginated by
- * design and ordered forwards, because reconstruction means replaying the
- * changes in the order they happened. The cap is high and explicit rather than
- * absent — a record with more than 500 audited changes is itself the finding.
+ * which is a different query from the filtered list: it is ordered forwards,
+ * because reconstruction means replaying the changes in the order they
+ * happened, and it starts at the beginning rather than paginating from the
+ * newest end.
+ *
+ * ── WHY IT READS FORWARDS RATHER THAN REVERSING THE FEED ────────────────────
+ *
+ * This was `auditTrail(...).reverse()`, which is the same rows only while a
+ * record has fewer than `RECORD_HISTORY_LIMIT` of them. Past that the feed
+ * hands back the *newest* 200 and reversing them produces a history with no
+ * beginning — and the beginning is the load-bearing entry: the insert carries
+ * the whole row under `__new`, which is the state every later diff is replayed
+ * onto. A reconstruction missing its first entry cannot be performed at all,
+ * so the truncation has to happen at the recent end, where the feed can still
+ * reach what was cut.
+ *
+ * ── WHAT THE LOG CANNOT TELL YOU ────────────────────────────────────────────
+ *
+ * `occurred_at` is `now()`, which in Postgres is the *transaction* timestamp.
+ * Two changes written by one transaction therefore share it exactly, and the
+ * table has no sequence to break the tie — the id is a random uuid. Their
+ * relative order is not recorded, and this function does not invent one. The
+ * viewer says so rather than implying a sequence the evidence does not have.
+ *
+ * Returns an empty array for a record with nothing logged. That is a real
+ * answer — the record predates the trigger, or its table is not audited — and
+ * the caller renders it as the gap it is rather than as an error.
  */
 export async function recordHistory(
   tx: TenantScopedTx,
   input: { tableName: string; recordId: string },
 ): Promise<readonly AuditEntry[]> {
-  const page = await auditTrail(tx, {
-    tableName: input.tableName,
-    recordId: input.recordId,
-    limit: 200,
-  });
-  return [...page.entries].reverse();
+  // Bound parameters, like the feed. `tableName` arrives from a query string.
+  // Tenant scoping is the RLS policy on audit_log, the same one the feed
+  // relies on; there is no tenant predicate here to get wrong.
+  const rows = (await tx.execute<AuditRow>(sql`
+    ${AUDIT_SELECT}
+     where a.table_name = ${input.tableName}::text
+       and a.record_id = ${input.recordId}::uuid
+     order by a.occurred_at asc, a.id asc
+     limit ${RECORD_HISTORY_LIMIT}
+  `)) as unknown as AuditRow[];
+
+  return rows.map(toAuditEntry);
 }

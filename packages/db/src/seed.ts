@@ -18,6 +18,11 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import { hash } from "@node-rs/argon2";
 import * as schema from "./schema";
 import { STANDARD_JOB_OUTCOMES } from "./domain/reference";
+// M3 (`CON-13`). Same reasoning as the HR import below: a separate statement,
+// because several streams are editing this file at once.
+import { and, eq } from "drizzle-orm";
+import { STANDARD_ASSET_CATEGORIES } from "./domain/assets";
+import { dubaiDateKey } from "@meridian/core";
 import {
   computeSlaDeadlines,
   company,
@@ -110,6 +115,11 @@ async function main(): Promise<void> {
     schema.contracts,
     schema.communications,
     schema.leads,
+    // Before the jobs and visits it hangs off. It cascades from both, so the
+    // clear-down would work without it — but this file's rule is that anything
+    // referencing a seeded row is named, and its reference to `fault_codes` is
+    // ON DELETE restrict, which does not cascade at all.
+    schema.jobFaultCodes,
     schema.jobEvents,
     schema.jobVisits,
     schema.jobReports,
@@ -139,6 +149,11 @@ async function main(): Promise<void> {
     schema.technicianSkills,
     schema.technicians,
     schema.assets,
+    // After `assets`, which references it. `asset_categories` cascades from
+    // `tenants` and would be cleared anyway; it is named because this file's
+    // rule is that everything it writes is listed, and the next addition that
+    // does not cascade would otherwise fail here confusingly.
+    schema.assetCategories,
     schema.propertyUnits,
     schema.properties,
     schema.customerContacts,
@@ -550,6 +565,110 @@ async function main(): Promise<void> {
       .onConflictDoNothing();
   }
   console.log(`  ${STANDARD_JOB_OUTCOMES.length} standard job outcomes per tenant`);
+
+  // ── The asset register (CON-13) ───────────────────────────────────────────
+  //
+  // The kinds are seeded for the same reason the job outcomes above are: the
+  // seven are written into the requirement rather than chosen per business, and
+  // a picker that is empty on day one is a picker whose first entry everybody
+  // chooses. `on conflict do nothing`, so re-seeding leaves an operator's edits
+  // to a label alone.
+  for (const tenantId of [T1, T2]) {
+    await db
+      .insert(schema.assetCategories)
+      .values(
+        STANDARD_ASSET_CATEGORIES.map((c) => ({
+          tenantId,
+          code: c.code,
+          label: c.label,
+          description: c.description,
+          serviceSlug: c.serviceSlug,
+          defaultPpmIntervalDays: c.defaultPpmIntervalDays,
+          sortOrder: c.sortOrder,
+        })),
+      )
+      .onConflictDoNothing();
+  }
+
+  const categoryIds = new Map<string, string>();
+  for (const row of await db
+    .select({ id: schema.assetCategories.id, code: schema.assetCategories.code })
+    .from(schema.assetCategories)
+    .where(eq(schema.assetCategories.tenantId, T1))) {
+    categoryIds.set(row.code, row.id);
+  }
+
+  // Plant on the seeded buildings. Not decoration: an empty register cannot
+  // show that a warranty state is computed rather than typed, and three of
+  // these exist specifically to put the three states on the screen at once —
+  // one warranty long expired, one expiring inside the month, one with years
+  // left. Day-valued columns are `YYYY-MM-DD` strings, never Dates; a warranty
+  // that round-trips through a Date arrives a day early in Dubai.
+  const day = (offsetMs: number) => dubaiDateKey(new Date(Date.now() + offsetMs));
+
+  const assetSpecs = [
+    { tag: "BT-CH-01", property: "bay-tower", category: "chiller", name: "Chiller 1, main plant room", make: "Carrier", model: "30XA-1002", serial: "CAR-30XA-118842", location: "Roof plant room, north", installed: -6 * 365 * DAY, warranty: -400 * DAY, condition: "fair" as const, servicedAgo: 40 * DAY },
+    { tag: "BT-CH-02", property: "bay-tower", category: "chiller", name: "Chiller 2, main plant room", make: "Carrier", model: "30XA-1002", serial: "CAR-30XA-118843", location: "Roof plant room, north", installed: -6 * 365 * DAY, warranty: -400 * DAY, condition: "good" as const, servicedAgo: 40 * DAY },
+    { tag: "BT-PUMP-01", property: "bay-tower", category: "pump", name: "Domestic booster pump set", make: "Grundfos", model: "Hydro MPC-E 3", serial: "GF-HMPC-77120", location: "Basement 2, pump room", installed: -3 * 365 * DAY, warranty: 21 * DAY, condition: "good" as const },
+    { tag: "BT-TANK-01", property: "bay-tower", category: "water_tank", name: "Potable water tank, sector A", make: "Fibrelite", model: "GRP 40m3", serial: null, location: "Basement 2, tank room", installed: -8 * 365 * DAY, warranty: null, condition: "fair" as const },
+    { tag: "BT-LIFT-01", property: "bay-tower", category: "lift", name: "Passenger lift 1 (low rise)", make: "Otis", model: "Gen2 Premier", serial: "OT-G2P-44190", location: "Core A", installed: -6 * 365 * DAY, warranty: -1000 * DAY, condition: "good" as const },
+    { tag: "BT-FCU-0904", property: "bay-tower", category: "fcu", name: "FCU serving corridor, floor 9", make: "Zamil", model: "FCU-600", serial: "ZAM-600-90412", location: "Floor 9 riser cupboard", installed: -6 * 365 * DAY, warranty: -900 * DAY, condition: "poor" as const },
+    { tag: "MH-CH-01", property: "marina-heights", category: "chiller", name: "Chiller 1, high-rise loop", make: "York", model: "YVAA-0517", serial: "YRK-YVAA-20881", location: "Level 42 plant room", installed: -2 * 365 * DAY, warranty: 500 * DAY, condition: "new" as const },
+    { tag: "MH-DB-28", property: "marina-heights", category: "distribution_board", name: "Sub-main DB, floors 28 to 34", make: "Schneider", model: "Prisma iPM", serial: "SCH-IPM-51203", location: "Floor 28 electrical room", installed: -2 * 365 * DAY, warranty: 500 * DAY, condition: "good" as const },
+    { tag: "SD-DB-K1", property: "serai-downtown", category: "distribution_board", name: "Kitchen distribution board", make: "ABB", model: "TwinLine N", serial: "ABB-TLN-90455", location: "Back of house, level 1", installed: -9 * 365 * DAY, warranty: null, condition: "poor" as const },
+    { tag: "RV-SPLIT-01", property: "ranches-villa", category: "split_unit", name: "Ducted split, first floor", make: "Daikin", model: "FDMF-60", serial: "DK-FDMF-33018", location: "First floor ceiling void", installed: -400 * DAY, warranty: 330 * DAY, condition: "good" as const },
+  ];
+
+  const assetIds = new Map<string, string>();
+  for (const a of assetSpecs) {
+    const categoryId = categoryIds.get(a.category);
+    if (!categoryId) throw new Error(`no asset category seeded for ${a.category}`);
+    const lastServiced = a.servicedAgo ? ago(a.servicedAgo) : null;
+    const [row] = await db
+      .insert(schema.assets)
+      .values({
+        tenantId: T1,
+        propertyId: propertyIds.get(a.property)!,
+        categoryId,
+        tag: a.tag,
+        name: a.name,
+        manufacturer: a.make,
+        model: a.model,
+        serialNumber: a.serial,
+        location: a.location,
+        installedOn: day(a.installed),
+        warrantyExpiresOn: a.warranty === null ? null : day(a.warranty),
+        condition: a.condition,
+        ppmIntervalDays:
+          STANDARD_ASSET_CATEGORIES.find((c) => c.code === a.category)?.defaultPpmIntervalDays ??
+          null,
+        lastServicedAt: lastServiced,
+      })
+      .returning({ id: schema.assets.id });
+    if (!row) throw new Error(`failed to insert asset ${a.tag}`);
+    assetIds.set(a.tag, row.id);
+  }
+
+  // Three of the seeded jobs are attached to the plant they were done on, so
+  // the service history on those assets is a history rather than an empty
+  // heading. `jobs.asset_id` has existed since 0000 and nothing has ever
+  // written it — see `domain/assets.ts` for what that means and what is still
+  // missing.
+  const jobToAsset: [string, string][] = [
+    ["JOB-2026-00009", "BT-PUMP-01"],
+    ["JOB-2026-00004", "BT-FCU-0904"],
+    ["JOB-2026-00002", "MH-CH-01"],
+    ["JOB-2026-00003", "SD-DB-K1"],
+  ];
+  for (const [reference, tag] of jobToAsset) {
+    await db
+      .update(schema.jobs)
+      .set({ assetId: assetIds.get(tag)! })
+      .where(and(eq(schema.jobs.tenantId, T1), eq(schema.jobs.reference, reference)));
+  }
+  console.log(
+    `  ${STANDARD_ASSET_CATEGORIES.length} asset kinds per tenant, ${assetSpecs.length} assets, ${jobToAsset.length} jobs attached to plant`,
+  );
 
 
   // ── M3: contracts and AMC (CON-1 … CON-10) ────────────────────────────────

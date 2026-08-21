@@ -192,22 +192,29 @@ export default async function CustomerPage({ params }: { params: Promise<{ id: s
           ) : (
             <ul className="mt-5 divide-y rounded border">
               {properties.map((p) => (
-                <li key={p.id} className="flex flex-wrap items-baseline justify-between gap-3 p-4">
-                  <div>
-                    <p className="text-[14px] font-medium">
-                      {p.name}
-                      {p.isActive ? "" : " (inactive)"}
-                    </p>
-                    <p className="mt-1 text-[13px]" style={{ color: "var(--text-muted)" }}>
-                      {PROPERTY_TYPE_LABEL[p.type as PropertyType] ?? p.type}
-                      {p.area ? ` · ${p.area}` : ""} · {p.city}
-                      {p.floors ? ` · ${p.floors} floors` : ""}
-                      {p.unitCount ? ` · ${p.unitCount} units` : ""}
-                    </p>
-                  </div>
-                  <span className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
-                    {p.openJobs} open {p.openJobs === 1 ? "job" : "jobs"}
-                  </span>
+                <li key={p.id}>
+                  {/* CON-13. The property record is where the asset register
+                      lives, so the row that used to be inert is the way in. */}
+                  <Link
+                    href={`/properties/${p.id}`}
+                    className="flex flex-wrap items-baseline justify-between gap-3 p-4"
+                  >
+                    <div>
+                      <p className="text-[14px] font-medium">
+                        {p.name}
+                        {p.isActive ? "" : " (inactive)"}
+                      </p>
+                      <p className="mt-1 text-[13px]" style={{ color: "var(--text-muted)" }}>
+                        {PROPERTY_TYPE_LABEL[p.type as PropertyType] ?? p.type}
+                        {p.area ? ` · ${p.area}` : ""} · {p.city}
+                        {p.floors ? ` · ${p.floors} floors` : ""}
+                        {p.unitCount ? ` · ${p.unitCount} units` : ""}
+                      </p>
+                    </div>
+                    <span className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                      {p.openJobs} open {p.openJobs === 1 ? "job" : "jobs"}
+                    </span>
+                  </Link>
                 </li>
               ))}
             </ul>

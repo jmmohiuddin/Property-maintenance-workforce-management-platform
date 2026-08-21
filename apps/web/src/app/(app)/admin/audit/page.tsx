@@ -4,9 +4,12 @@ import {
   withTenant,
   auditTrail,
   auditActors,
+  recordHistory,
+  RECORD_HISTORY_LIMIT,
   AUDITED_TABLES,
   type AuditEntry,
 } from "@meridian/db";
+import type { SessionContext } from "@meridian/auth";
 import { tenant } from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
@@ -40,6 +43,27 @@ export const dynamic = "force-dynamic";
  * `audit:read` is held by `owner`, `admin` and `readonly`. `readonly` was an
  * orphan enum value the audit called out as having no differentiated UI; this
  * is the screen it exists for, and `ADM-8` builds on it.
+ *
+ * ── TWO SCREENS, BECAUSE ADM-7 ASKS TWO QUESTIONS ───────────────────────────
+ *
+ * "Who changed things this week" and "what happened to *this* record" are not
+ * the same question and they are not the same query. The feed answers the
+ * first: newest first, paginated, every filter optional. `?view=history`
+ * answers the second through `recordHistory` — oldest first, unpaginated, one
+ * record — because reconstruction means replaying the changes in the order
+ * they happened, and a screen that shows them newest-first is asking the
+ * reader to run the film backwards.
+ *
+ * ── HOW SOMEBODY GETS THERE ─────────────────────────────────────────────────
+ *
+ * By clicking the record id on any entry in the feed. Not by a lookup box, and
+ * the choice is not cosmetic: reconstruction needs a table name *and* a uuid,
+ * and the only place a person reliably has both is an entry that already names
+ * them. A lookup form would ask an auditor to type an internal table name and
+ * a uuid they would have had to copy out of this same screen — a control whose
+ * only honest instruction is "go and find it in the list first". The list is
+ * therefore the entry point, and the URL stays paste-able for the times
+ * somebody does have both in a ticket.
  */
 
 /** 50 rows fits a laptop screen and a phone scroll; 200 is the query's ceiling. */
@@ -56,6 +80,19 @@ const ACTION_TONE: Readonly<Record<string, { wash: string; text: string }>> = {
 function first(value: string | string[] | undefined): string | undefined {
   const v = Array.isArray(value) ? value[0] : value;
   return v && v.trim() !== "" ? v.trim() : undefined;
+}
+
+/**
+ * A table name as a thing: "properties" &rarr; "property", "invoice_lines"
+ * &rarr; "invoice line".
+ *
+ * Two rules, which is exactly enough for the audited tables and no more. A
+ * pluralisation library here would be a dependency earning its keep on one
+ * heading, and "propertie" is the only wrong answer the naive rule gives.
+ */
+function singularTable(table: string): string {
+  const words = table.replace(/_/g, " ");
+  return words.endsWith("ies") ? `${words.slice(0, -3)}y` : words.replace(/s$/, "");
 }
 
 export default async function AuditPage({
@@ -97,6 +134,29 @@ export default async function AuditPage({
   const page = Math.max(1, Number.parseInt(first(params["page"]) ?? "1", 10) || 1);
   const offset = (page - 1) * PAGE_SIZE;
 
+  /*
+   * Reconstruction mode, and it needs both halves.
+   *
+   * Written as one narrowed object rather than three booleans so that the type
+   * carries the requirement: there is no branch below that can reach
+   * `recordHistory` with a record id and no table. `view` is explicit rather
+   * than implied by "table and record are both set", because the feed filtered
+   * to one record is still a useful view — it is the one that reaches past
+   * the history's cap — and inferring the mode would make it unreachable.
+   */
+  const historyOf =
+    tableName && recordId && first(params["view"]) === "history"
+      ? { tableName, recordId }
+      : null;
+
+  if (historyOf) {
+    const history = await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      async (tx) => recordHistory(tx, historyOf),
+    );
+    return <RecordHistory session={session} of={historyOf} history={history} />;
+  }
+
   const { entries, total, actors } = await withTenant(
     { tenantId: session.principal.tenantId, userId: session.principal.userId },
     async (tx) => {
@@ -134,6 +194,18 @@ export default async function AuditPage({
     const query = next.toString();
     return query ? `/admin/audit?${query}` : "/admin/audit";
   };
+
+  /**
+   * The reconstruction of one record.
+   *
+   * Built from the entry rather than from the current filters: the table name
+   * comes from the row that was clicked, so this works from the unfiltered
+   * feed too. Deliberately not `withParam` — that carries the date range and
+   * the action filter, and a history with a date filter still on it is a
+   * history with pieces missing.
+   */
+  const historyHref = (table: string, id: string): string =>
+    `/admin/audit?table=${encodeURIComponent(table)}&record=${id}&view=history`;
 
   return (
     <AppShell session={session} active="admin/audit">
@@ -256,7 +328,19 @@ export default async function AuditPage({
             className="mt-4 rounded-sm border-l-2 px-4 py-3 text-[13px]"
             style={{ borderColor: "var(--status-info)", color: "var(--text-secondary)" }}
           >
-            Showing one record&rsquo;s complete history, oldest change at the bottom.{" "}
+            {/* This said "one record's complete history, oldest change at the
+                bottom". It was the feed: newest first, capped at a page, and
+                the sentence was doing the reconstruction's job in words while
+                the reconstruction itself had no way in. */}
+            Filtered to one record &mdash; newest change first, and paginated like the rest of the
+            feed.{" "}
+            {tableName ? (
+              <Link href={historyHref(tableName, recordId)} style={{ color: "var(--accent-text)" }}>
+                Reconstruct its history in order &rarr;
+              </Link>
+            ) : (
+              <>Choose its record type above to replay the changes in order.</>
+            )}{" "}
             <Link href={withParam("record", undefined)} style={{ color: "var(--accent-text)" }}>
               Back to everything
             </Link>
@@ -292,7 +376,13 @@ export default async function AuditPage({
               style={{ backgroundColor: "var(--surface-raised)" }}
             >
               {entries.map((entry) => (
-                <Entry key={entry.id} entry={entry} recordHref={withParam("record", entry.recordId ?? undefined)} />
+                <Entry
+                  key={entry.id}
+                  entry={entry}
+                  historyHref={
+                    entry.recordId ? historyHref(entry.tableName, entry.recordId) : undefined
+                  }
+                />
               ))}
             </ul>
 
@@ -332,6 +422,183 @@ export default async function AuditPage({
 }
 
 /**
+ * One record, replayed forwards (`ADM-7`'s other half).
+ *
+ * ── WHY THIS IS NOT THE FEED WITH A FILTER ON IT ────────────────────────────
+ *
+ * The feed can already be narrowed to one record, and for a long time that was
+ * the answer — with a sentence above it claiming to be "one record's complete
+ * history, oldest change at the bottom", which it was not: it was the newest
+ * fifty, newest first. Reconstruction is a different job. It starts at the
+ * creation, because the insert entry carries the whole row and every later
+ * diff is replayed onto it, and it runs forwards, because that is the order
+ * the changes happened in. Read the entries top to bottom and you have the
+ * record as it stands.
+ *
+ * ── WHAT IS DELIBERATELY ABSENT ─────────────────────────────────────────────
+ *
+ * There is no control here that writes anything, and there will not be one.
+ * `UPDATE` and `DELETE` on `audit_log` are revoked from the role this
+ * application connects as, and `verify-rls` check 8 proves it on every run. A
+ * "correct this entry" button is the exact affordance the design forbids: an
+ * audit trail somebody can tidy is not evidence. A wrong-looking entry is
+ * corrected by changing the record, which writes another entry underneath this
+ * one.
+ */
+function RecordHistory({
+  session,
+  of,
+  history,
+}: {
+  session: SessionContext;
+  of: { tableName: string; recordId: string };
+  history: readonly AuditEntry[];
+}) {
+  const noun = singularTable(of.tableName);
+  const feedHref = `/admin/audit?table=${encodeURIComponent(of.tableName)}&record=${of.recordId}`;
+
+  /*
+   * The one thing the log cannot tell you, said only when it applies.
+   *
+   * `occurred_at` is the transaction timestamp, so several changes committed
+   * together share it exactly and nothing records their order. Shown as a
+   * warning rather than hidden, because the alternative is a numbered list
+   * that implies a sequence the evidence does not contain.
+   */
+  const simultaneous = history.some(
+    (e, i) => i > 0 && history[i - 1]!.occurredAt.getTime() === e.occurredAt.getTime(),
+  );
+  const capped = history.length >= RECORD_HISTORY_LIMIT;
+
+  /*
+   * Whether there is a state to replay onto.
+   *
+   * The insert entry carries the whole row; every later entry is a diff
+   * against it. When the oldest entry the log holds is not the creation — the
+   * record predates the trigger, or its creation shares a timestamp with the
+   * changes that followed and sorted after them — there is no base state, and
+   * saying "the first entry is the record as it was created" would be a
+   * sentence the page below it contradicts.
+   */
+  const startsAtCreation = history[0]?.action === "insert";
+
+  return (
+    <AppShell session={session} active="admin/audit">
+      <div className="container-page py-8">
+        <p className="text-[12px]">
+          <Link href="/admin/audit" style={{ color: "var(--accent-text)" }}>
+            &larr; All audit entries
+          </Link>
+        </p>
+
+        <div className="mt-2 flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2">
+          <h1 className="text-2xl font-semibold tracking-tight md:text-3xl">
+            History of one {noun}
+          </h1>
+          <p className="tnum text-[14px]" style={{ color: "var(--text-secondary)" }}>
+            {history.length.toLocaleString("en-GB")} recorded{" "}
+            {history.length === 1 ? "change" : "changes"}
+          </p>
+        </div>
+
+        <p className="mt-2 text-[13px]" style={{ color: "var(--text-secondary)" }}>
+          {noun} <code className="tnum">{of.recordId}</code>
+        </p>
+
+        {history.length === 0 ? (
+          <div className="mt-8">
+            {/*
+              `gap`, not `filtered`. Nothing was filtered out — the log holds
+              nothing at all for this record, and that is a hole in the
+              evidence rather than a search that came back short. The three
+              causes are named because they are the three questions the next
+              person asks.
+            */}
+            <EmptyState kind="gap" title="Nothing has ever been recorded against this record.">
+              <p>
+                One of three things is true: this id does not exist, the record was created before
+                the audit trigger was attached to its table, or it belongs to another tenant &mdash;
+                in which case this application cannot see it and never will. What an empty history
+                does <em>not</em> mean is that changes were made and went unrecorded: the trigger
+                writes the creation entry itself, so anything created since it was attached has at
+                least one entry here.
+              </p>
+              <p className="mt-2">
+                <Link href={feedHref} style={{ color: "var(--accent-text)" }}>
+                  Look for it in the feed
+                </Link>
+              </p>
+            </EmptyState>
+          </div>
+        ) : (
+          <>
+            <p className="prose-body mt-6 max-w-3xl text-[14px]">
+              {startsAtCreation ? (
+                <>
+                  Oldest first. The first entry is the record as it was created, and each one after
+                  it is what changed &mdash; read them top to bottom and you have the record as it
+                  stands today.
+                </>
+              ) : (
+                <>
+                  Oldest first. The log&rsquo;s earliest entry for this record is not its creation,
+                  so there is no whole-row snapshot here to replay the changes onto &mdash; what
+                  follows is every change the log holds, in the order it holds them.
+                </>
+              )}{" "}
+              <strong>Nothing here can be edited or deleted</strong>, including by this application.
+            </p>
+
+            {simultaneous ? (
+              <p
+                className="mt-4 rounded-sm border-l-2 px-4 py-3 text-[13px]"
+                style={{ borderColor: "var(--status-warning)", color: "var(--text-secondary)" }}
+                role="status"
+              >
+                Some of these changes were committed together and share a timestamp to the
+                microsecond. The log records no order between those, so the numbering below is the
+                order they are stored in rather than the order they happened.
+              </p>
+            ) : null}
+
+            {/* An ordered list, because here the order *is* the content. The
+                feed stays a `<ul>`: it is a slice across many records, and
+                numbering it would imply a sequence that a page boundary and a
+                date filter can both cut in half. */}
+            <ol
+              className="mt-6 divide-y rounded border"
+              style={{ backgroundColor: "var(--surface-raised)" }}
+            >
+              {history.map((entry, i) => (
+                <Entry key={entry.id} entry={entry} ordinal={i + 1} />
+              ))}
+            </ol>
+
+            {capped ? (
+              <p className="mt-3 text-[12px]" style={{ color: "var(--text-secondary)" }} role="status">
+                Showing the first <span className="tnum">{RECORD_HISTORY_LIMIT}</span> changes. This
+                record has at least that many, and any later ones are not on this page &mdash;{" "}
+                <Link href={feedHref} style={{ color: "var(--accent-text)" }}>
+                  the feed reaches them
+                </Link>
+                , newest first.
+              </p>
+            ) : (
+              <p className="mt-3 text-[12px]" style={{ color: "var(--text-muted)" }}>
+                <Link href={feedHref} style={{ color: "var(--accent-text)" }}>
+                  See these entries in the feed
+                </Link>{" "}
+                to compare them against what else was happening at the time.
+              </p>
+            )}
+          </>
+        )}
+      </div>
+    </AppShell>
+  );
+}
+
+/**
  * One entry, with its diff behind a `<details>`.
  *
  * `<details>` rather than a client component: expanding a row needs no
@@ -339,8 +606,21 @@ export default async function AuditPage({
  * screen a server component. An auditor working through three hundred entries
  * expands a dozen of them, and paying for a hydration boundary to do that would
  * be paying for nothing.
+ *
+ * `historyHref` is optional because the same row renders inside the
+ * reconstruction, where a link to the record's history is a link to the page
+ * it is already on. `ordinal` numbers the steps there and is absent in the
+ * feed, where a number would imply an order the feed does not have.
  */
-function Entry({ entry, recordHref }: { entry: AuditEntry; recordHref: string }) {
+function Entry({
+  entry,
+  historyHref,
+  ordinal,
+}: {
+  entry: AuditEntry;
+  historyHref?: string | undefined;
+  ordinal?: number | undefined;
+}) {
   const tone = ACTION_TONE[entry.action] ?? {
     wash: "var(--status-neutral-wash)",
     text: "var(--status-neutral-text)",
@@ -364,6 +644,11 @@ function Entry({ entry, recordHref }: { entry: AuditEntry; recordHref: string })
     <li className="p-4">
       <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
         <p className="text-[14px] font-medium">
+          {ordinal ? (
+            <span className="tnum mr-2 text-[12px] font-normal" style={{ color: "var(--text-muted)" }}>
+              {ordinal}.
+            </span>
+          ) : null}
           <span
             className="mr-2 rounded-sm px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
             style={{ backgroundColor: tone.wash, color: tone.text }}
@@ -372,14 +657,20 @@ function Entry({ entry, recordHref }: { entry: AuditEntry; recordHref: string })
           </span>
           {entry.tableName.replace(/_/g, " ")}
           {entry.recordId ? (
-            <Link
-              href={recordHref}
-              className="tnum ml-2 text-[12px] font-normal"
-              style={{ color: "var(--accent-text)" }}
-              title="Show this record's complete history"
-            >
-              {entry.recordId.slice(0, 8)}
-            </Link>
+            historyHref ? (
+              <Link
+                href={historyHref}
+                className="tnum ml-2 text-[12px] font-normal"
+                style={{ color: "var(--accent-text)" }}
+                title="Replay this record's history in order"
+              >
+                {entry.recordId.slice(0, 8)}
+              </Link>
+            ) : (
+              <span className="tnum ml-2 text-[12px] font-normal" style={{ color: "var(--text-muted)" }}>
+                {entry.recordId.slice(0, 8)}
+              </span>
+            )
           ) : null}
         </p>
         <p className="tnum text-[12px]" style={{ color: "var(--text-muted)" }}>

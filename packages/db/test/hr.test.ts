@@ -31,7 +31,7 @@
 
 import { sql } from "drizzle-orm";
 import { withTenant, closeConnection } from "../src/index";
-import { testTenantId } from "./_tenant";
+import { testTenantId, otherTenantId } from "./_tenant";
 import {
   // HR-17
   ensureWageCycle,
@@ -52,10 +52,16 @@ import {
   leaveSummary,
   saveLeaveBalance,
   leaveOverview,
+  recordSickLeave,
+  sickLeaveYear,
+  sickLeaveOverview,
   // HR-8
   recordOvertime,
+  recordWorkedDay,
   listOvertime,
   workingHoursExceptions,
+  weeklyWorkingHours,
+  weeklyMinutesFor,
   hoursSourceWarning,
   activeTenantIds,
   // HR-6
@@ -65,7 +71,15 @@ import {
   recordSalaryDeduction,
   listSalaryDeductions,
 } from "../src/domain";
-import { addDays, addMonths, startOfMonth, today } from "@meridian/core";
+import {
+  addDays,
+  addMonths,
+  startOfMonth,
+  startOfWeek,
+  today,
+  fromDubai,
+  SICK_LEAVE_TOTAL_DAYS,
+} from "@meridian/core";
 
 let fail = 0;
 function check(label: string, got: unknown, expected: unknown): void {
@@ -159,6 +173,16 @@ async function purge(): Promise<void> {
           select id from employees where full_name like ${like}
         )
       `);
+      // Sick leave is recorded against the TECHNICIAN, because that is what the
+      // dispatcher reads. Purging only by employee would leave every sick
+      // absence this file records behind, and the next run's ladder would start
+      // eighteen days in — silently, and only in the direction that pays the
+      // full-pay stage twice.
+      await tx.execute(sql`
+        delete from leave_requests where technician_id in (
+          select id from technicians where full_name like ${like}
+        )
+      `);
       await tx.execute(sql`
         delete from employment_contract_terms where employee_id in (
           select id from employees where full_name like ${like}
@@ -182,12 +206,20 @@ async function main(): Promise<void> {
 
   const tenantId = await testTenantId();
 
-  // Resolved through the cron's own SECURITY DEFINER enumerator rather than
-  // through `otherTenantId()`. That helper queries `tenants` outside a tenant
-  // transaction, where the RLS policy on that table is `id = app_current_tenant()`
-  // and the setting is unset — so it returns null whether or not a second tenant
-  // exists, and the isolation check it guards silently never runs.
-  const otherId = (await activeTenantIds()).find((id) => id !== tenantId) ?? null;
+  // The second tenant, resolved rather than guessed at, and FATAL when there
+  // isn't one.
+  //
+  // This used to route around `otherTenantId()` with a `?? null` and a skip
+  // branch, because the helper queried `tenants` outside a tenant transaction
+  // and returned null whether or not a second tenant existed. The helper now
+  // enumerates through the cron's SECURITY DEFINER function and throws instead,
+  // so the workaround is gone with it — and so is the skip. A single-tenant
+  // database is a valid state for the product; it is not a valid state for a
+  // suite whose fixtures are `npm run db:seed`, which creates a second tenant
+  // for exactly this purpose. The isolation proof below covers payroll and
+  // employment records, which is the data a cross-tenant leak would be worst
+  // in, and it must not be capable of printing green without running.
+  const otherId = await otherTenantId();
 
   let employeeId = "";
   let unpayableId = "";
@@ -483,6 +515,129 @@ async function main(): Promise<void> {
     const overview = await leaveOverview(tx, NOW);
     checkTrue("the leave board includes the fixture", overview.some((r) => r.employeeId === employeeId));
 
+    console.log("\n— HR-7: sick leave, which is three rates and not one —");
+
+    // Two absences in the same leave year, in order, on the fixture whose
+    // service started 400 days ago — so the leave year began at the twelve-
+    // month anniversary, roughly five weeks back, and both absences fall
+    // inside it.
+    //
+    // The pair is chosen to land ON the boundary rather than near it. Twelve
+    // days first takes the full-pay stage to day 12; the six that follow are
+    // days 13, 14, 15 at full pay and 16, 17, 18 at half. Day 15 and day 16 are
+    // where the rate changes, and this proves the ladder crosses it through
+    // real rows rather than only in the unit test.
+    const firstAbsence = await recordSickLeave(tx, { tenantId }, {
+      employeeId,
+      startsOn: addDays(NOW, -25),
+      endsOn: addDays(NOW, -14),
+      reason: `${TAG} first absence`,
+    }, NOW);
+    check("a twelve-day absence is twelve days", firstAbsence.days, 12);
+    check("all of it at full pay", firstAbsence.year?.fullPayDays, 12);
+    check("none of it at half", firstAbsence.year?.halfPayDays, 0);
+    check("and 78 of the 90 remain", firstAbsence.year?.remainingDays, 78);
+
+    const secondAbsence = await recordSickLeave(tx, { tenantId }, {
+      employeeId,
+      startsOn: addDays(NOW, -10),
+      endsOn: addDays(NOW, -5),
+      reason: `${TAG} second absence`,
+    }, NOW);
+    check("a second six-day absence is six days", secondAbsence.days, 6);
+
+    const year = await sickLeaveYear(tx, employeeId, NOW);
+    check("eighteen sick days in the leave year", year?.takenDays, 18);
+    // The whole point: the second absence CONTINUES the ladder. Restarting it
+    // would pay all six of those days at full pay.
+    check("fifteen of them at full pay, not eighteen", year?.fullPayDays, 15);
+    check("and three at half pay", year?.halfPayDays, 3);
+    check("with none unpaid yet", year?.unpaidDays, 0);
+    check("seventy-two of the ninety remain", year?.remainingDays, 72);
+    check("the ladder is ninety days long", SICK_LEAVE_TOTAL_DAYS, 90);
+
+    const secondPeriod = year?.periods[1];
+    check("the second absence starts at day 12 of the year", secondPeriod?.daysAlreadyTaken, 12);
+    check("so three of its days are the rest of the full-pay stage", secondPeriod?.fullPayDays, 3);
+    check("and three fall past day 15, at half pay", secondPeriod?.halfPayDays, 3);
+
+    // AED 6,000 basic + AED 1,500 housing is AED 7,500 a month, so AED 250.00 a
+    // day over 30. Fifteen full days is AED 3,750.00 and three half days is
+    // AED 375.00 — AED 4,125.00 for the year, to the fil.
+    check("the year's sick pay, in fils", year?.payMinor, 412_500);
+
+    // Sick leave is a separate entitlement, not a draw on the annual one.
+    const afterSick = await leaveSummary(tx, employeeId, NOW);
+    check("annual leave taken is still nothing", afterSick?.takenDays, 0);
+    check("and the summary carries the sick year alongside it", afterSick?.sick?.takenDays, 18);
+
+    const sickBoard = await sickLeaveOverview(tx, NOW);
+    const boardRow = sickBoard.find((r) => r.employeeId === employeeId);
+    checkTrue("the HR board sees the absence", boardRow !== undefined);
+    check("with the same staging the record shows", boardRow?.fullPayDays, 15);
+
+    // The date contract again, on the new rows: calendar days as YYYY-MM-DD
+    // strings, never round-tripped through a JS Date.
+    const sickShape = /^\d{4}-\d{2}-\d{2}$/;
+    checkTrue("a sick period's start comes back as a string", typeof secondPeriod?.startsOn === "string");
+    checkTrue("of exactly YYYY-MM-DD", sickShape.test(secondPeriod?.startsOn ?? ""));
+    checkTrue("and so does its end", sickShape.test(secondPeriod?.endsOn ?? ""));
+    checkTrue("as does the leave year start", sickShape.test(year?.leaveYearStart ?? ""));
+
+    // An absence longer than the statutory year is refused, by name: past 90
+    // days it is a termination question under Article 34 and not a longer sick
+    // leave, and recording it as one hides the decision.
+    let tooLong = "";
+    try {
+      await recordSickLeave(tx, { tenantId }, {
+        employeeId,
+        startsOn: addDays(NOW, -200),
+        endsOn: addDays(NOW, -60),
+      }, NOW);
+    } catch (error) {
+      tooLong = error instanceof Error ? error.message : "";
+    }
+    checkTrue("an absence past the 90-day year is refused", tooLong.includes("Article 34"));
+
+    // An employment record with no technician link has nowhere to put an
+    // absence the dispatcher can see, and says so rather than storing it where
+    // nothing reads it. `unpayableId` is the fixture with no technician.
+    let noTechnician = "";
+    try {
+      await recordSickLeave(tx, { tenantId }, {
+        employeeId: unpayableId,
+        startsOn: addDays(NOW, -3),
+        endsOn: addDays(NOW, -2),
+      }, NOW);
+    } catch (error) {
+      noTechnician = error instanceof Error ? error.message : "";
+    }
+    checkTrue(
+      "an unlinked record cannot hold leave, and the refusal says why",
+      noTechnician.includes("dispatcher"),
+    );
+
+    // ── Sick leave is not short-notice annual leave ───────────────────────
+    //
+    // An absence starting today, notified today. The 30-day notice rule is the
+    // notice an EMPLOYER must give when it sets annual-leave dates; counting a
+    // sick day against it turns every illness into a compliance flag against
+    // the person who was ill, on a board about the employer's duties.
+    const beforeToday = (await leaveOverview(tx, NOW)).find((r) => r.employeeId === employeeId);
+    await recordSickLeave(tx, { tenantId }, {
+      employeeId,
+      startsOn: NOW,
+      endsOn: NOW,
+      reason: `${TAG} today`,
+    }, NOW);
+    const afterToday = (await leaveOverview(tx, NOW)).find((r) => r.employeeId === employeeId);
+    check(
+      "a sick day notified this morning is not short-notice annual leave",
+      afterToday?.shortNoticeCount,
+      beforeToday?.shortNoticeCount,
+    );
+    check("and it does not move the annual-leave balance", afterToday?.takenDays, beforeToday?.takenDays);
+
     console.log("\n— HR-8: hours by rate band —");
 
     // Three hours of overtime in one day is one hour past the statutory
@@ -547,6 +702,135 @@ async function main(): Promise<void> {
       "the hours report says when it is measuring nothing",
       sourceWarning === null || sourceWarning.includes("attendance events"),
     );
+
+    console.log("\n— HR-8: the 48-hour week —");
+
+    // A week nothing else in this file touches. 18 March 2019 is a Monday,
+    // which is what `startOfWeek` and Postgres date_trunc on week both return —
+    // and they have to agree, because one snaps the query window and the other
+    // groups the rows. A window that started on a Wednesday would report that
+    // week as the three days inside it and call a sixty-hour week compliant.
+    const WEEK_START = "2019-03-18";
+    check("the week snaps back to its Monday", startOfWeek("2019-03-20"), WEEK_START);
+    check("and a Sunday belongs to the week it ends", startOfWeek("2019-03-24"), WEEK_START);
+
+    // Six ordinary eight-hour days: 2,880 minutes, which is exactly 48 hours.
+    // Recorded as `standard` band rows, which is what makes a week countable at
+    // all — a table holding only the overtime can never see a week of ordinary
+    // days that ran long.
+    for (let i = 0; i < 6; i++) {
+      await recordOvertime(tx, { tenantId }, {
+        employeeId,
+        workedOn: addDays(WEEK_START, i),
+        band: "standard",
+        minutes: 480,
+      });
+    }
+
+    const window = { from: WEEK_START, to: addDays(WEEK_START, 6), employeeId };
+    const atLimit = (await weeklyWorkingHours(tx, window)).find((w) => w.weekStart === WEEK_START);
+    check("six eight-hour days is 2,880 minutes", atLimit?.recordedMinutes, 2_880);
+    check("counted over six days", atLimit?.daysRecorded, 6);
+    // Exactly at the maximum is lawful. A `>=` here would report a compliant
+    // week as a violation, and the same slip the other way on any other
+    // threshold in this module reports a violation as compliant.
+    check("exactly 48 hours is within the statutory maximum", atLimit?.assessment.withinLimit, true);
+    check("with nothing over", atLimit?.assessment.overMinutes, 0);
+    check(
+      "so it is not on the breach list",
+      (await weeklyWorkingHours(tx, { ...window, breachesOnly: true })).length,
+      0,
+    );
+
+    // One more minute.
+    const oneOver = await recordOvertime(tx, { tenantId }, {
+      employeeId,
+      workedOn: WEEK_START,
+      band: "overtime",
+      minutes: 1,
+    });
+    check("recording an hour reports the week back", oneOver.weekly.minutes, 2_881);
+    check("one minute past 48 hours is a breach", oneOver.weekly.withinLimit, false);
+    check("and the excess is that minute", oneOver.weekly.overMinutes, 1);
+
+    const breaches = await weeklyWorkingHours(tx, { ...window, breachesOnly: true });
+    check("the board reports exactly that week", breaches.length, 1);
+    check("at 2,881 minutes", breaches[0]?.recordedMinutes, 2_881);
+    check("starting on the Monday", breaches[0]?.weekStart, WEEK_START);
+    check("and ending on the Sunday", breaches[0]?.weekEnd, addDays(WEEK_START, 6));
+    checkTrue(
+      "week boundaries are calendar-day strings, not instants",
+      /^\d{4}-\d{2}-\d{2}$/.test(breaches[0]?.weekStart ?? ""),
+    );
+    check(
+      "and the same total is reachable from any day inside the week",
+      await weeklyMinutesFor(tx, employeeId, addDays(WEEK_START, 3)),
+      2_881,
+    );
+
+    // ── Ordinary hours are hours, not a second payment ────────────────────
+    //
+    // Those 2,880 standard minutes are inside the March wage month, and the
+    // monthly basic already pays for them. Re-preparing the file proves they
+    // add nothing: 120 minutes at +25% is AED 62.50 and the extra minute is
+    // AED 0.52. Were the standard band counted, this line would read
+    // AED 1,263.02 — an extra AED 1,200 of ordinary pay on top of a salary
+    // that had already paid it, every month, for everybody.
+    const rebuilt = await prepareWageFile(tx, { tenantId }, cycle.id, addDays(PAID_DUE, -3));
+    const rebuiltLine = rebuilt.lines.find((l) => l.employeeId === employeeId);
+    check("48 hours of ordinary time adds nothing to the wage line", rebuiltLine?.overtimeMinor, 6_302);
+    check("and the overtime minutes exclude it too", rebuiltLine?.overtimeMinutes, 121);
+
+    // ── A worked day, split from its start and end ────────────────────────
+    //
+    // 20:00 to 04:00 is eight hours, all of it ordinary time, and none of it
+    // earns the +50% night premium — the answer people get wrong in the
+    // expensive direction by classifying on the clock alone. This is the path
+    // that runs `splitWorkedWindow` against real rows.
+    const nightShiftDay = "2019-04-01";
+    const nightShift = await recordWorkedDay(tx, { tenantId }, {
+      employeeId,
+      workedOn: nightShiftDay,
+      start: fromDubai(2019, 4, 1, 20 * 60),
+      end: fromDubai(2019, 4, 2, 4 * 60),
+    });
+    check("eight hours worked", nightShift.split.totalMinutes, 480);
+    check("all of it ordinary time", nightShift.split.standardMinutes, 480);
+    check("and none of it at the night premium", nightShift.split.nightMinutes, 0);
+    check("one band on file for the day", nightShift.bandsRecorded.length, 1);
+    check("the standard one", nightShift.bandsRecorded[0], "standard");
+    check("and the week now knows about those hours", nightShift.weekly.minutes, 480);
+
+    // ── A correction must not leave the old bands standing ────────────────
+    //
+    // 14:00–00:00 is ten hours: eight ordinary and two of overtime that fall
+    // inside 22:00–04:00, so at +50%. Re-entered as 14:00–22:00 those two
+    // hours did not happen — and a correction that leaves them on file leaves
+    // them paid.
+    const correctedDay = "2019-04-08";
+    const beforeCorrection = await recordWorkedDay(tx, { tenantId }, {
+      employeeId,
+      workedOn: correctedDay,
+      start: fromDubai(2019, 4, 8, 14 * 60),
+      end: fromDubai(2019, 4, 9, 0),
+    });
+    check("ten hours worked", beforeCorrection.split.totalMinutes, 600);
+    check("two of them at the night rate", beforeCorrection.split.nightMinutes, 120);
+    check("recorded as two bands", beforeCorrection.bandsRecorded.length, 2);
+
+    const afterCorrection = await recordWorkedDay(tx, { tenantId }, {
+      employeeId,
+      workedOn: correctedDay,
+      start: fromDubai(2019, 4, 8, 14 * 60),
+      end: fromDubai(2019, 4, 8, 22 * 60),
+    });
+    check("the corrected day is eight hours", afterCorrection.split.totalMinutes, 480);
+    checkTrue("and the night band is withdrawn, not left standing", afterCorrection.bandsCleared.includes("night"));
+
+    const correctedRows = await listOvertime(tx, { from: correctedDay, to: correctedDay, employeeId });
+    check("one row left on the corrected day", correctedRows.length, 1);
+    check("the standard one", correctedRows[0]?.band, "standard");
+    check("and the week is eight hours, not ten", afterCorrection.weekly.minutes, 480);
 
     console.log("\n— HR-6: health insurance, and the deduction that must be impossible —");
 
@@ -661,55 +945,101 @@ async function main(): Promise<void> {
   // in as ten seconds after the first refusal.
   checkTrue("and so is 'other', because the list is a positive one", rawOtherRefused);
 
+  // ── The leave vocabulary, with the domain layer bypassed ─────────────────
+  //
+  // Same shape, same reason. The sick-leave ladder counts the rows whose kind
+  // is exactly 'sick', so a day recorded as 'sick_leave' is a day the ladder
+  // never sees — the employee reads as having more of the 90 statutory days
+  // left than they do, and the fifteenth day of full pay gets paid twice. A
+  // validator in a server action would not have stopped it arriving through
+  // `psql`, a script, or the next code path somebody writes.
+  console.log("\n— the leave vocabulary, with the domain layer bypassed —");
+  let rawKindRefused = false;
+  let rawKindConstraint = "";
+  try {
+    await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
+      await tx.execute(sql`
+        insert into leave_requests (tenant_id, technician_id, kind, starts_on, ends_on, status)
+        values (${tenantId}::uuid, ${technicianId}::uuid, 'sick_leave',
+                ${NOW}::date, ${NOW}::date, 'approved')
+      `);
+    });
+  } catch (error) {
+    rawKindRefused = true;
+    const cause = (error as { cause?: { constraint_name?: string; message?: string } }).cause;
+    rawKindConstraint = cause?.constraint_name ?? cause?.message ?? "";
+  }
+  checkTrue("a misspelt leave kind is refused by Postgres", rawKindRefused);
+  check("by the CHECK constraint specifically", rawKindConstraint, "leave_requests_kind_check");
+
+  // And the vocabulary is not so narrow that a real absence has nowhere to go.
+  let lawfulKindAccepted = false;
+  await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
+    await tx.execute(sql`
+      insert into leave_requests (tenant_id, technician_id, kind, starts_on, ends_on, status)
+      values (${tenantId}::uuid, ${technicianId}::uuid, 'bereavement',
+              ${NOW}::date, ${NOW}::date, 'approved')
+    `);
+    lawfulKindAccepted = true;
+  });
+  checkTrue("a kind on the list is accepted", lawfulKindAccepted);
+
   // ── Tenant isolation ─────────────────────────────────────────────────────
   //
   // Every table added by 0015 carries `tenant_id` and is covered by the generic
   // loop in sql/rls.sql. This proves the policy is actually in force rather
   // than merely written: the second tenant must see none of the rows above.
-  if (otherId) {
-    console.log("\n— tenant isolation —");
+  console.log("\n— tenant isolation —");
 
-    // A DELTA, not an absolute. The second tenant legitimately has wage cycles
-    // of its own — the compliance cron opens one per tenant per month — so
-    // "sees zero rows" would fail against a database the cron has ever run
-    // against, for a reason that has nothing to do with RLS. What must be zero
-    // is the number of THIS test's rows it can see, and the same query is run
-    // under both tenants so a zero that means "the predicate matched nothing"
-    // is distinguishable from a zero that means "the policy filtered it out".
-    const countMine = sql`
-      select (select count(*)::int from employees where full_name like ${`${TAG}%`}) as employees,
-             (select count(*)::int from salary_deductions where reason like ${`${TAG}%`}) as deductions,
-             (select count(*)::int from employment_contract_terms t
-                join employees e on e.id = t.employee_id where e.full_name like ${`${TAG}%`}) as terms,
-             (select count(*)::int from overtime_records o
-                join employees e on e.id = o.employee_id where e.full_name like ${`${TAG}%`}) as overtime,
-             (select count(*)::int from wage_payments p
-                join employees e on e.id = p.employee_id where e.full_name like ${`${TAG}%`}) as payments
-    `;
-    type Counts = { employees: number; deductions: number; terms: number; overtime: number; payments: number };
+  // A DELTA, not an absolute. The second tenant legitimately has wage cycles
+  // of its own — the compliance cron opens one per tenant per month — so
+  // "sees zero rows" would fail against a database the cron has ever run
+  // against, for a reason that has nothing to do with RLS. What must be zero
+  // is the number of THIS test's rows it can see, and the same query is run
+  // under both tenants so a zero that means "the predicate matched nothing"
+  // is distinguishable from a zero that means "the policy filtered it out".
+  const countMine = sql`
+    select (select count(*)::int from employees where full_name like ${`${TAG}%`}) as employees,
+           (select count(*)::int from salary_deductions where reason like ${`${TAG}%`}) as deductions,
+           (select count(*)::int from employment_contract_terms t
+              join employees e on e.id = t.employee_id where e.full_name like ${`${TAG}%`}) as terms,
+           (select count(*)::int from overtime_records o
+              join employees e on e.id = o.employee_id where e.full_name like ${`${TAG}%`}) as overtime,
+           (select count(*)::int from wage_payments p
+              join employees e on e.id = p.employee_id where e.full_name like ${`${TAG}%`}) as payments,
+           (select count(*)::int from leave_requests l
+              join technicians t on t.id = l.technician_id where t.full_name like ${`${TAG}%`}) as leave
+  `;
+  type Counts = {
+    employees: number;
+    deductions: number;
+    terms: number;
+    overtime: number;
+    payments: number;
+    leave: number;
+  };
 
-    const mine = ((await withTenant({ tenantId, actorKind: "system" }, (tx) =>
-      tx.execute<Counts>(countMine),
-    )) as unknown as Counts[])[0]!;
+  const mine = ((await withTenant({ tenantId, actorKind: "system" }, (tx) =>
+    tx.execute<Counts>(countMine),
+  )) as unknown as Counts[])[0]!;
 
-    checkTrue("the owning tenant can see this test's rows", mine.employees > 0);
-    checkTrue("including its deductions", mine.deductions > 0);
-    checkTrue("its contract terms", mine.terms > 0);
-    checkTrue("its overtime", mine.overtime > 0);
-    checkTrue("and its wage lines", mine.payments > 0);
+  checkTrue("the owning tenant can see this test's rows", mine.employees > 0);
+  checkTrue("including its deductions", mine.deductions > 0);
+  checkTrue("its contract terms", mine.terms > 0);
+  checkTrue("its overtime", mine.overtime > 0);
+  checkTrue("its wage lines", mine.payments > 0);
+  checkTrue("and its sick leave", mine.leave > 0);
 
-    const theirs = ((await withTenant({ tenantId: otherId, actorKind: "system" }, (tx) =>
-      tx.execute<Counts>(countMine),
-    )) as unknown as Counts[])[0]!;
+  const theirs = ((await withTenant({ tenantId: otherId, actorKind: "system" }, (tx) =>
+    tx.execute<Counts>(countMine),
+  )) as unknown as Counts[])[0]!;
 
-    check("the other tenant sees none of the employees", theirs.employees, 0);
-    check("none of the deductions", theirs.deductions, 0);
-    check("none of the contract terms", theirs.terms, 0);
-    check("none of the overtime", theirs.overtime, 0);
-    check("and none of the wage lines", theirs.payments, 0);
-  } else {
-    console.log("\n— tenant isolation — skipped, only one tenant in this database");
-  }
+  check("the other tenant sees none of the employees", theirs.employees, 0);
+  check("none of the deductions", theirs.deductions, 0);
+  check("none of the contract terms", theirs.terms, 0);
+  check("none of the overtime", theirs.overtime, 0);
+  check("none of the wage lines", theirs.payments, 0);
+  check("and none of the sick leave", theirs.leave, 0);
 
   await purge();
 

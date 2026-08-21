@@ -3,6 +3,7 @@ import {
   varchar,
   text,
   boolean,
+  date,
   integer,
   timestamp,
   uuid,
@@ -14,6 +15,7 @@ import {
 import { idCol, timestamps, money, currencyCol, propertyType, leadStage, assetCondition } from "./_shared";
 import { tenants, users } from "./tenancy";
 import { leadDispositionReasons } from "./reference";
+import { assetCategories } from "./assets";
 
 /**
  * A customer is the paying entity — a developer, an owners association, a
@@ -136,8 +138,25 @@ export const propertyUnits = pgTable(
 );
 
 /**
- * Asset register. Building maintenance and AMC pricing both depend on knowing
- * what plant exists, so this is a first-class table rather than a JSON blob.
+ * The asset register (`CON-13`).
+ *
+ * Building maintenance and AMC pricing both depend on knowing what plant
+ * exists, so this is a first-class table rather than a JSON blob.
+ *
+ * ── WHY THE DAY-VALUED COLUMNS ARE `date` AND NOT `timestamptz` ─────────────
+ *
+ * `installed_on` and `warranty_expires_on` are days, not instants. They were
+ * declared `timestamptz` and 0021 narrows them, because a day stored as an
+ * instant is read back through whatever offset the reader happens to be in: a
+ * warranty expiring on 1 July becomes 30 June at 20:00 UTC, and a check written
+ * against "today" reports an expired warranty as still valid for four hours
+ * every day. The direction of that error is the expensive one — it authorises a
+ * free repair the manufacturer will not pay for. As `date`, the value that comes
+ * back is the string that was stored, and the comparison happens in Postgres
+ * against `current_date`.
+ *
+ * `last_serviced_at` and `next_service_due_at` stay `timestamptz`: a PPM visit
+ * is scheduled to a time, and the dispatch board reads them as instants.
  */
 export const assets = pgTable(
   "assets",
@@ -150,6 +169,13 @@ export const assets = pgTable(
       .notNull()
       .references(() => properties.id, { onDelete: "cascade" }),
     unitId: uuid("unit_id").references(() => propertyUnits.id, { onDelete: "set null" }),
+    /**
+     * What kind of plant this is, from the controlled vocabulary in
+     * `./assets.ts`. Nullable in the column and required by a `NOT VALID` check
+     * added in 0021 — see the migration for why that is the shape rather than
+     * `NOT NULL`.
+     */
+    categoryId: uuid("category_id").references(() => assetCategories.id, { onDelete: "restrict" }),
     tag: varchar("tag", { length: 48 }).notNull(),
     name: varchar("name", { length: 160 }).notNull(),
     /** Matches a catalogue service slug, e.g. "hvac-ac-maintenance". */
@@ -158,8 +184,8 @@ export const assets = pgTable(
     model: varchar("model", { length: 120 }),
     serialNumber: varchar("serial_number", { length: 120 }),
     location: varchar("location", { length: 160 }),
-    installedOn: timestamp("installed_on", { withTimezone: true }),
-    warrantyExpiresOn: timestamp("warranty_expires_on", { withTimezone: true }),
+    installedOn: date("installed_on"),
+    warrantyExpiresOn: date("warranty_expires_on"),
     condition: assetCondition("condition").notNull().default("good"),
     /** Days between planned maintenance visits for this asset. */
     ppmIntervalDays: integer("ppm_interval_days"),
@@ -173,6 +199,10 @@ export const assets = pgTable(
     index("assets_property_idx").on(t.tenantId, t.propertyId),
     // Drives the "what PPM is due" job generator.
     index("assets_due_idx").on(t.tenantId, t.nextServiceDueAt),
+    // The register sorts and filters on the kind, and the AMC pricing question
+    // ("how many chillers do we cover") is this index.
+    index("assets_category_idx").on(t.tenantId, t.categoryId),
+    index("assets_warranty_idx").on(t.tenantId, t.warrantyExpiresOn),
   ],
 );
 

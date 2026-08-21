@@ -16,6 +16,7 @@ import {
   addDays,
   addMonths,
   startOfMonth,
+  startOfWeek,
   completedMonths,
   // HR-17
   WPS_ESCALATION,
@@ -35,7 +36,15 @@ import {
   accruedLeaveDays,
   checkLeaveNotice,
   leaveDayCount,
+  LEAVE_KINDS,
+  stageSickLeave,
+  sickLeavePayMinor,
+  SICK_LEAVE_FULL_PAY_DAYS,
+  SICK_LEAVE_HALF_PAY_DAYS,
+  SICK_LEAVE_TOTAL_DAYS,
+  SICK_PAY_BASIS_POINTS,
   // HR-8
+  assessWeeklyHours,
   splitWorkedWindow,
   nightMinutesBetween,
   overtimeAmountMinor,
@@ -77,6 +86,13 @@ check("adding days crosses months", addDays("2026-08-31", 1), "2026-09-01");
 check("adding months clamps rather than overflowing", addMonths("2026-08-31", 6), "2027-02-28");
 check("and handles leap years", addMonths("2024-08-31", 6), "2025-02-28");
 check("start of month", startOfMonth("2026-08-24"), "2026-08-01");
+// 24 August 2026 is a Monday. The week it starts is its own, and the Sunday
+// before it belongs to the week that began six days earlier — the off-by-one
+// that would otherwise put a Sunday's hours in the following week's total.
+check("start of week is the Monday", startOfWeek("2026-08-24"), "2026-08-24");
+check("a Wednesday snaps back to it", startOfWeek("2026-08-26"), "2026-08-24");
+check("and a Sunday snaps back, not forward", startOfWeek("2026-08-30"), "2026-08-24");
+check("the Monday after is the next week", startOfWeek("2026-08-31"), "2026-08-31");
 check("completed months ignores the part month", completedMonths("2026-01-15", "2026-07-14"), 5);
 check("and counts the exact anniversary", completedMonths("2026-01-15", "2026-07-15"), 6);
 
@@ -333,6 +349,92 @@ checkTrue(
   checkLeaveNotice({ requestedOn: "2026-08-01", startsOn: "2026-09-01" }).sufficient,
 );
 
+console.log("\n— HR-7: sick leave, which is three rates and not one —");
+
+check("fifteen days at full pay", SICK_LEAVE_FULL_PAY_DAYS, 15);
+check("then thirty at half", SICK_LEAVE_HALF_PAY_DAYS, 30);
+check("ninety days in all", SICK_LEAVE_TOTAL_DAYS, 90);
+check("half pay is half, as basis points", SICK_PAY_BASIS_POINTS.half_pay, 5_000);
+checkTrue("and sick is a recordable leave kind", LEAVE_KINDS.includes("sick"));
+
+// ── The ladder, rung by rung, by day number ──────────────────────────────────
+//
+// Each of these is the Nth sick day of the leave year: N-1 already taken, one
+// more day now. The boundaries are where the money changes, so both sides of
+// every one of them is asserted rather than the middle of the stage.
+const day = (n: number) => stageSickLeave({ days: 1, daysAlreadyTaken: n - 1 });
+
+check("day 1 is full pay", day(1).fullPayDays, 1);
+check("day 15 is still full pay", day(15).fullPayDays, 1);
+check("and not half", day(15).halfPayDays, 0);
+check("day 16 is half pay", day(16).halfPayDays, 1);
+check("and no longer full", day(16).fullPayDays, 0);
+check("day 45 is the last half-pay day", day(45).halfPayDays, 1);
+check("and is not yet unpaid", day(45).unpaidDays, 0);
+check("day 46 is unpaid", day(46).unpaidDays, 1);
+check("and no longer half pay", day(46).halfPayDays, 0);
+check("day 90 is the last statutory day", day(90).unpaidDays, 1);
+check("and is still inside the entitlement", day(90).beyondEntitlementDays, 0);
+check("day 91 is past the entitlement", day(91).beyondEntitlementDays, 1);
+check("and is not unpaid sick leave", day(91).unpaidDays, 0);
+check("day 90 leaves nothing", day(90).remainingDays, 0);
+check("and day 91 cannot go negative", day(91).remainingDays, 0);
+
+// ── The absence that spans two rates ─────────────────────────────────────────
+//
+// THE case this exists for. Twenty days is not twenty days at one rate, and
+// paying it as one is five days of wage paid twice in the direction nobody
+// notices.
+const twenty = stageSickLeave({ days: 20 });
+check("twenty days is fifteen at full pay", twenty.fullPayDays, 15);
+check("and five at half", twenty.halfPayDays, 5);
+check("with none unpaid", twenty.unpaidDays, 0);
+check("all twenty consume the entitlement", twenty.entitlementConsumedDays, 20);
+check("seventy of the ninety remain", twenty.remainingDays, 70);
+checkTrue("and it is not twenty days at one rate", twenty.fullPayDays !== 20);
+
+// ── The second absence continues; it does not restart ────────────────────────
+const march = stageSickLeave({ days: 12 });
+check("twelve days in March are all at full pay", march.fullPayDays, 12);
+const july = stageSickLeave({ days: 6, daysAlreadyTaken: march.entitlementConsumedDays });
+check("three of July's six days are the rest of the full-pay stage", july.fullPayDays, 3);
+check("and the other three are at half pay", july.halfPayDays, 3);
+check("the year has taken eighteen days", july.daysAlreadyTaken + july.days, 18);
+check("and seventy-two remain", july.remainingDays, 72);
+
+// A whole leave year at once, to prove the three stages fill in order.
+const wholeYear = stageSickLeave({ days: 100 });
+check("a hundred days fills the full-pay stage", wholeYear.fullPayDays, 15);
+check("the half-pay stage", wholeYear.halfPayDays, 30);
+check("the unpaid stage", wholeYear.unpaidDays, 45);
+check("and leaves ten days past the entitlement", wholeYear.beyondEntitlementDays, 10);
+
+// ── Probation ────────────────────────────────────────────────────────────────
+//
+// No paid sick leave during probation, and none of it consumes the ninety —
+// the entitlement runs from the end of probation, so a worker who was ill in
+// their second week still has all fifteen full-pay days afterwards.
+const inProbation = stageSickLeave({ days: 5, probationDays: 5 });
+check("five days inside probation are unpaid", inProbation.probationUnpaidDays, 5);
+check("none of them at full pay", inProbation.fullPayDays, 0);
+check("and none of them consume the entitlement", inProbation.entitlementConsumedDays, 0);
+check("so all ninety days remain", inProbation.remainingDays, 90);
+
+// An absence that straddles the end of probation: the first two days are
+// unpaid, the rest start the ladder at day 1.
+const straddling = stageSickLeave({ days: 6, probationDays: 2 });
+check("the probation days stay unpaid", straddling.probationUnpaidDays, 2);
+check("and the four after it are the first four full-pay days", straddling.fullPayDays, 4);
+check("with the entitlement consumed by four", straddling.entitlementConsumedDays, 4);
+
+// ── What it is worth ─────────────────────────────────────────────────────────
+//
+// AED 9,000 a month over 30 days is AED 300.00 a day. Fifteen full days is
+// AED 4,500.00 and five half days is AED 750.00 — AED 5,250.00, to the fil.
+check("full and half pay, in fils", sickLeavePayMinor(900_000, twenty), 525_000);
+check("unpaid days are worth nothing", sickLeavePayMinor(900_000, day(46)), 0);
+check("and a probation absence is unpaid", sickLeavePayMinor(900_000, inProbation), 0);
+
 console.log("\n— HR-8: working hours and overtime —");
 
 check("basic + 25%", PAY_BAND_BASIS_POINTS.overtime, 12_500);
@@ -425,6 +527,38 @@ checkTrue("eleven and a half hours warns", overCap.withinLimits === false);
 checkTrue(
   "and names the two-hour overtime cap",
   overCap.warnings.some((w) => w.includes("2 extra hours")),
+);
+
+// ── The 48-hour week ─────────────────────────────────────────────────────────
+//
+// Both sides of the line, to the minute. Exactly 48 hours is lawful; a `>=`
+// here would report a compliant week as a violation, and the same operator
+// slipped the other way on any other threshold in this file reports a
+// violation as compliant.
+const exactly48 = assessWeeklyHours(48 * 60);
+check("exactly 48 hours is within the statutory week", exactly48.withinLimit, true);
+check("with nothing over", exactly48.overMinutes, 0);
+check("and the limit is stated", exactly48.limitMinutes, 2_880);
+
+const oneMinuteOver = assessWeeklyHours(48 * 60 + 1);
+check("one minute past 48 hours is not", oneMinuteOver.withinLimit, false);
+check("and the excess is that minute", oneMinuteOver.overMinutes, 1);
+checkTrue(
+  "the detail names the weekly maximum rather than 'over'",
+  oneMinuteOver.detail.includes("48 hours per week"),
+);
+
+// The same verdict reached through a worked day, which is the path a real
+// clock-in/out pair takes: 47 hours already this week plus a nine-hour day.
+const weekBreach = assessWorkedDay({
+  start: dxb(2026, 8, 28, 8, 0),
+  end: dxb(2026, 8, 28, 17, 0),
+  minutesThisWeek: 47 * 60 + 9 * 60,
+  monthlyBasicMinor: 600_000,
+});
+checkTrue(
+  "a worked day that takes the week past 48 hours warns",
+  weekBreach.hours.warnings.some((w) => w.includes("48 hours per week")),
 );
 
 // ── Ramadan ──────────────────────────────────────────────────────────────────

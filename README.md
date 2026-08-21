@@ -51,7 +51,7 @@ Two deployment-specific notes worth keeping:
 | --- | --- | --- |
 | `apps/web` | Public site (60 static routes), operational app, and customer portal | Built, verified in browser |
 | `packages/core` | Service catalogue, area data, tenant profile, JSON-LD, exact-decimal money, validation, QR encoder | Built |
-| `packages/db` | Schema (31 tables), tenant + customer RLS, audit triggers, job/SLA/commerce/workforce domain, seed | Built, verified against real Postgres |
+| `packages/db` | Schema (81 tables), tenant + customer RLS, audit triggers, job/SLA/commerce/workforce/contracts/recruitment/HR/assets domain, seed | Built, verified against real Postgres |
 | `packages/auth` | Argon2id hashing, revocable sessions, 10-role RBAC, TOTP two-factor with recovery codes | Built, verified end to end |
 | `packages/notify` | Templates, transactional queue, retry with attempt limits, pluggable transport | Built, verified — console transport only |
 | `docs/` | Architecture, ADRs, security model, AEO/GEO playbook, roadmap | Written |
@@ -221,9 +221,15 @@ failure.
 
 Claims in this README that have been executed rather than asserted:
 
-- `npm run typecheck` passes across all six workspaces; `npm run test` passes 216 checks across ten suites
-- `npm run check:contrast` passes 36/36 token pairings at WCAG AA
-- `next build` produces 66 routes: 24 prerendered service pages, 19 area pages, the rest static or dynamic
+- `npm run typecheck` passes across all seven workspaces — `apps/web` included, which is easy to
+  assume is skipped and is not; `npm run test` passes 1,735 checks across 32 suites, no skips
+- `npm run check:contrast --workspace=@meridian/web` passes 72/72 token pairings at WCAG AA, light
+  and dark. It is workspace-scoped: there is no root `check:contrast`, and CI invokes it this way
+- `next build` produces 47 routes — 35 server-rendered, 7 static, 5 prerendered from
+  `generateStaticParams`, expanding to 30 static HTML pages of which 8 are services and 8 are areas.
+  That is fewer than this file used to claim, and deliberately: `WEB-1` rebuilt the service pages
+  one-to-one against the licensed activities and removed the rest, and `WEB-6` cut the area pages to
+  the ones the company will genuinely travel to
 - Schema applied to PostgreSQL 16; all 13 RLS isolation checks pass
 - JSON-LD parsed and validated across 10 blocks on 9 pages, 0 invalid
 - Quote form submitted end to end in a browser: success path and validation-failure path both confirmed

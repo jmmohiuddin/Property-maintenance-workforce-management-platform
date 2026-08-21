@@ -7,6 +7,7 @@ import {
   CANDIDATE_GRADE_LABEL,
   EXPERIENCE_BAND_LABEL,
   REQUISITION_STATUS_LABEL,
+  cooloffBadgeLabel,
   getService,
   type CandidateGrade,
   type ExperienceBand,
@@ -231,6 +232,34 @@ export default async function PipelinePage({
                             >
                               {card.expiredCertifications} expired certificate
                               {card.expiredCertifications === 1 ? "" : "s"}
+                            </p>
+                          ) : null}
+
+                          {/*
+                            ATS-12. A badge, in the same visual language as the
+                            expired-certificate line above it, and deliberately
+                            in the *warning* colour rather than the critical
+                            one: an expired ticket is a fact that blocks a
+                            dispatch, and this is a note that blocks nothing.
+
+                            ATS-19 forbids automated rejection and ATS-5 forbids
+                            automated filtering, so this card is still here, in
+                            the same column, in the same order — the board sorts
+                            on stage_entered_at and always did. Nothing about
+                            this flag moves, hides or ranks anybody. The full
+                            sentence is on the candidate page; this is the
+                            version that fits on a card.
+                          */}
+                          {card.cooloffFlag && card.cooloffPriorArchivedAt ? (
+                            <p
+                              className="mt-1.5 text-[12px]"
+                              style={{ color: "var(--status-warning-text)" }}
+                              title={cooloffBadgeLabel({
+                                priorArchivedAt: card.cooloffPriorArchivedAt,
+                                windowDays: card.cooloffWindowDays,
+                              })}
+                            >
+                              Applied before, inside the {card.cooloffWindowDays}-day cool-off
                             </p>
                           ) : null}
                         </Link>

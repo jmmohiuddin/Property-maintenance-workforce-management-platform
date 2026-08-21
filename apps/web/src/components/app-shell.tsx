@@ -24,6 +24,10 @@ const NAV = [
   // the dispatch board.
   { href: "/reports", label: "Reports", permission: "reports:read" },
   { href: "/dispatch", label: "Dispatch", permission: "jobs:read" },
+  // JOB-7. Beside Dispatch and not inside it, because they answer different
+  // questions: dispatch is "what needs assigning now", ordered by SLA
+  // consequence; the schedule is "who is doing what, when", ordered by time.
+  { href: "/schedule", label: "Schedule", permission: "jobs:read" },
   { href: "/jobs", label: "Jobs", permission: "jobs:read" },
   { href: "/leads", label: "Leads", permission: "customers:read" },
   { href: "/customers", label: "Customers", permission: "customers:read" },

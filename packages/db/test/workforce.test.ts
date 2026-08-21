@@ -155,7 +155,19 @@ async function main(): Promise<void> {
   });
   checkTrue("proficiency outside 1-5 is rejected", outOfRange);
 
-  // ── A lapsed mandatory certification is a hard block ─────────────────────
+  // ── A lapsed mandatory certification needs a recorded reason ─────────────
+  //
+  // A warning, not a block, and the distinction is `HR-9`'s own: five documents
+  // hard-block a dispatch — work permit, residence visa, Emirates ID, medical
+  // fitness, health insurance — and a trade certification is not one of them.
+  // It warns, and the override carries a reason (`JOB-10`). This used to drop
+  // the technician from the list entirely, which read as safer and was not: the
+  // dispatcher who needs that person anyway phones them instead, and then
+  // nothing is recorded at all.
+  //
+  // What must NOT move is what a warning can reach. `packages/db/test/
+  // compliance.test.ts` holds the other half: a technician with an expired work
+  // permit gets no control at any score.
   const cert = await withTenant(ctx, (tx) =>
     addCertification(
       tx,
@@ -173,13 +185,23 @@ async function main(): Promise<void> {
     findCandidates(tx, { serviceSlug: TEST_SERVICE, property }),
   );
   checkTrue(
-    "a lapsed mandatory certification removes the candidate",
+    "a lapsed mandatory certification removes the one-click candidate",
     !afterLapse.candidates.some((c) => c.technicianId === subject.id),
   );
   checkTrue(
+    "and offers them against a recorded reason instead",
+    afterLapse.warned.some((c) => c.technicianId === subject.id),
+  );
+  checkTrue(
     "and says why rather than silently dropping them",
-    afterLapse.disqualified.some(
-      (d) => d.technicianId === subject.id && d.reason.includes("__TEST generator permit"),
+    afterLapse.warned.some(
+      (c) =>
+        c.technicianId === subject.id &&
+        c.requiresOverride &&
+        c.warnings.some(
+          (w) =>
+            w.type === "certification_expired" && w.detail.includes("__TEST generator permit"),
+        ),
     ),
   );
 

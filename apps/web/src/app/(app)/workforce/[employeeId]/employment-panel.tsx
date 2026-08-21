@@ -5,7 +5,9 @@ import { Field, TextInput, TextArea, Select, FormBanner, SubmitButton } from "@/
 import {
   saveContractTerm,
   saveLeaveAdjustment,
+  saveSickLeave,
   saveOvertime,
+  saveWorkedDay,
   saveInsurance,
   recordDeduction,
   type HrFormState,
@@ -186,6 +188,118 @@ export function LeavePanel({
 
       <SubmitButton pending={pending} pendingLabel="Saving…" className="btn btn-secondary disabled:opacity-60">
         Save leave balance
+      </SubmitButton>
+    </form>
+  );
+}
+
+/**
+ * `HR-7`. An absence recorded as sick leave.
+ *
+ * There is no field for how much of it is at full pay. That depends on what the
+ * rest of the leave year already holds — the ladder is 15 days at full pay,
+ * then 30 at half, then 45 unpaid, and it continues across absences rather than
+ * restarting at each one. A field for it would be a field for recording fifteen
+ * full-pay days twice in one year, which is the mistake this exists to prevent.
+ */
+export function SickLeavePanel({ employeeId }: { employeeId: string }) {
+  const [state, formAction, pending] = useActionState(saveSickLeave, INITIAL);
+
+  return (
+    <form action={formAction} className="mt-4 space-y-5">
+      <input type="hidden" name="employeeId" value={employeeId} />
+
+      {state.error ? <FormBanner tone="error">{state.error}</FormBanner> : null}
+      {state.ok ? <FormBanner tone="success">{state.ok}</FormBanner> : null}
+
+      <div className="grid gap-5 sm:grid-cols-2">
+        <Field label="First day of the absence">
+          {({ id, describedBy }) => (
+            <TextInput id={id} name="startsOn" type="date" required aria-describedby={describedBy} />
+          )}
+        </Field>
+        <Field
+          label="Last day"
+          description="Calendar days, both ends included. The rate the days fall at is worked out from the leave year, not typed in."
+        >
+          {({ id, describedBy }) => (
+            <TextInput id={id} name="endsOn" type="date" required aria-describedby={describedBy} />
+          )}
+        </Field>
+      </div>
+
+      <Field label="Note" description="Optional. A medical certificate reference, if there is one.">
+        {({ id, describedBy }) => <TextArea id={id} name="reason" rows={2} aria-describedby={describedBy} />}
+      </Field>
+
+      <SubmitButton pending={pending} pendingLabel="Recording…" className="btn btn-secondary disabled:opacity-60">
+        Record sick leave
+      </SubmitButton>
+    </form>
+  );
+}
+
+/**
+ * `HR-8`. A whole worked day, from its start and end.
+ *
+ * The rate bands are not on this form and are not a choice. 20:00 to 04:00 is
+ * eight hours, all of it ordinary time, and none of it earns the night premium
+ * — the statutory day is worked first and only what follows it is overtime.
+ * Asking for a band here is asking somebody to make that judgement in their
+ * head, and it goes wrong in the direction that pays six hours at +50%.
+ *
+ * This form is also the only place ordinary hours get recorded at all, which is
+ * what makes the 48-hour week countable: a table holding nothing but overtime
+ * can never see a week of ordinary days that ran long.
+ */
+export function WorkedDayPanel({ employeeId }: { employeeId: string }) {
+  const [state, formAction, pending] = useActionState(saveWorkedDay, INITIAL);
+
+  return (
+    <form action={formAction} className="mt-4 space-y-5">
+      <input type="hidden" name="employeeId" value={employeeId} />
+
+      {state.error ? <FormBanner tone="error">{state.error}</FormBanner> : null}
+      {state.ok ? <FormBanner tone="success">{state.ok}</FormBanner> : null}
+
+      <div className="grid gap-5 sm:grid-cols-4">
+        <Field label="Date worked">
+          {({ id, describedBy }) => (
+            <TextInput id={id} name="workedOn" type="date" required aria-describedby={describedBy} />
+          )}
+        </Field>
+        <Field label="Started">
+          {({ id, describedBy }) => (
+            <TextInput id={id} name="startAt" type="time" required aria-describedby={describedBy} />
+          )}
+        </Field>
+        <Field label="Finished" description="Earlier than the start means the next morning.">
+          {({ id, describedBy }) => (
+            <TextInput id={id} name="endAt" type="time" required aria-describedby={describedBy} />
+          )}
+        </Field>
+        <Field label="Unpaid break, in minutes" description="An hour is due after five consecutive hours.">
+          {({ id, describedBy }) => (
+            <TextInput id={id} name="breakMinutes" type="number" min={0} max={480} defaultValue={60} aria-describedby={describedBy} />
+          )}
+        </Field>
+      </div>
+
+      <label className="flex items-start gap-2 text-[13px]">
+        <input type="checkbox" name="isRestDay" className="mt-0.5" />
+        <span>
+          This was a rest day. Every minute of it is rest-day work at +50% or a substitute day
+          &mdash; it is not split into ordinary and overtime hours, and the compensation is recorded
+          against the day afterwards.
+        </span>
+      </label>
+
+      <Field label="Note" description="Optional. Why the day ran the way it did, if it is not obvious.">
+        {({ id, describedBy }) => <TextArea id={id} name="note" rows={2} aria-describedby={describedBy} />}
+      </Field>
+
+      <SubmitButton pending={pending} pendingLabel="Recording…" className="btn btn-secondary disabled:opacity-60">
+        Record the day
       </SubmitButton>
     </form>
   );

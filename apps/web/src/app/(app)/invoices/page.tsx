@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import {
   withTenant,
-  listInvoices,
+  searchInvoices,
   arAgeing,
   uninvoicedSignedOffJobs,
   INVOICE_STATUS_LABEL,
@@ -14,25 +14,53 @@ import {
   ISSUANCE_WINDOW_DAYS,
   LATE_ISSUANCE_PENALTY,
 } from "@meridian/core";
-import { Warning } from "@phosphor-icons/react/dist/ssr";
+import { MagnifyingGlass, Warning } from "@phosphor-icons/react/dist/ssr";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 
 export const metadata: Metadata = { title: "Invoices" };
 export const dynamic = "force-dynamic";
 
-export default async function InvoicesPage() {
+/**
+ * `LEAD-8`. Search and paging state live in the query string, the same way the
+ * lead and customer lists do — so a filtered list is a URL somebody can send to
+ * a colleague, the back button works, and the page stays a server component
+ * running one indexed query.
+ */
+export default async function InvoicesPage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
   const session = await requireSessionWith("invoices:read");
   const now = new Date();
 
-  const { invoices, ageing, awaitingInvoice } = await withTenant(
+  const params = await searchParams;
+  const q = typeof params["q"] === "string" ? params["q"].trim() : "";
+  const cursor = typeof params["after"] === "string" ? params["after"] : undefined;
+
+  const { page, ageing, awaitingInvoice } = await withTenant(
     { tenantId: session.principal.tenantId, userId: session.principal.userId },
     async (tx) => ({
-      invoices: await listInvoices(tx, { now }),
+      page: await searchInvoices(tx, { q: q || undefined, cursor, limit: 25, now }),
+      // Its own aggregate over every open invoice, deliberately not a sum of
+      // the page above. The tiles have to keep saying what the business is owed
+      // no matter which page of the table is on screen.
       ageing: await arAgeing(tx, now),
       awaitingInvoice: await uninvoicedSignedOffJobs(tx),
     }),
   );
+
+  const invoices = page.rows;
+
+  /** Preserve the search term when building a "next page" link. */
+  const pageHref = (after: string | null) => {
+    const next = new URLSearchParams();
+    if (q) next.set("q", q);
+    if (after) next.set("after", after);
+    const query = next.toString();
+    return query ? `/invoices?${query}` : "/invoices";
+  };
 
   // INV-5, wireframes §7.2. Signed-off work has 14 days before the AED 2,500
   // applies, and the alert fires at day 10 — four days of margin, because
@@ -71,6 +99,36 @@ export default async function InvoicesPage() {
           Receivables aged from each invoice&apos;s due date, computed live rather than from a status
           column that drifts when a nightly job stops running.
         </p>
+
+        {/* GET, not a server action, and not a filter over a fetched array.
+            The term goes to the database, which is the only place that can see
+            past the first page. */}
+        <form method="get" action="/invoices" className="mt-6 flex flex-wrap items-center gap-2">
+          <div className="relative min-w-[16rem] flex-1">
+            <MagnifyingGlass
+              size={16}
+              aria-hidden
+              className="absolute left-3 top-1/2 -translate-y-1/2"
+              style={{ color: "var(--text-muted)" }}
+            />
+            <input
+              type="search"
+              name="q"
+              defaultValue={q}
+              placeholder="Invoice reference or customer"
+              aria-label="Search invoices"
+              className="w-full rounded-sm border py-2 pl-9 pr-3 text-[14px] outline-none focus:border-[var(--accent)]"
+            />
+          </div>
+          <button type="submit" className="btn btn-secondary !py-2 text-[14px]">
+            Search
+          </button>
+          {q ? (
+            <Link href="/invoices" className="text-[13px] underline" style={{ color: "var(--text-muted)" }}>
+              Clear
+            </Link>
+          ) : null}
+        </form>
 
         {oldest ? (
           <div
@@ -156,9 +214,15 @@ export default async function InvoicesPage() {
             className="mt-8 rounded border p-12 text-center"
             style={{ backgroundColor: "var(--surface-raised)" }}
           >
-            <h2 className="text-lg font-semibold">No invoices yet</h2>
+            <h2 className="text-lg font-semibold">
+              {q ? "Nothing matched" : cursor ? "No more invoices" : "No invoices yet"}
+            </h2>
             <p className="prose-body mx-auto mt-2 text-[14px]">
-              Invoices are raised from a job once the customer has signed off the work.
+              {q
+                ? "No invoice has that reference, and no customer has that name."
+                : cursor
+                  ? "This is the end of the list. A cursor from an old link can also land here."
+                  : "Invoices are raised from a job once the customer has signed off the work."}
             </p>
           </div>
         ) : (
@@ -210,6 +274,26 @@ export default async function InvoicesPage() {
             </table>
           </div>
         )}
+
+        {page.nextCursor ? (
+          <div className="mt-6">
+            {/* Keyset, so this is "everything after the last row on this page"
+                rather than "skip 25". An invoice raised while somebody pages
+                cannot push a row past the boundary and out of sight — which is
+                what the old flat limit of 200 did to every invoice behind it. */}
+            <Link href={pageHref(page.nextCursor)} className="btn btn-secondary">
+              Show older invoices
+            </Link>
+          </div>
+        ) : null}
+
+        {cursor ? (
+          <p className="mt-4 text-[13px]">
+            <Link href={pageHref(null)} className="underline" style={{ color: "var(--text-muted)" }}>
+              Back to the newest
+            </Link>
+          </p>
+        ) : null}
       </div>
     </AppShell>
   );

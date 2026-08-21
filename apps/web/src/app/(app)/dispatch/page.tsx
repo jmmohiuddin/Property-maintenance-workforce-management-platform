@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { withTenant, listDispatchBoard, dispatchBoardCounts } from "@meridian/db";
 import {
   getService,
@@ -48,7 +49,11 @@ export default async function DispatchPage() {
           <div>
             <h1 className="text-2xl font-semibold tracking-tight md:text-3xl">Dispatch board</h1>
             <p className="prose-body mt-2 text-[14px]">
-              Open work, ordered by priority then by how soon it breaches.
+              Open work, ordered by priority then by how soon it breaches.{" "}
+              <Link href="/schedule" className="underline underline-offset-2" style={{ color: "var(--accent-text)" }}>
+                The schedule
+              </Link>{" "}
+              is the other view: who is doing what, and when.
             </p>
           </div>
           <p className="tnum text-[13px]" style={{ color: "var(--text-muted)" }}>
@@ -190,6 +195,28 @@ export default async function DispatchPage() {
             </table>
           </div>
         )}
+
+        {/*
+          The cap, said out loud (`LEAD-8`).
+
+          This board is a top-N-by-urgency view and a cap is the right shape for
+          it — see the note on `listDispatchBoard`. What is not acceptable is a
+          cap nobody can see: 200 rows presented as the whole board is a screen
+          that quietly stops mentioning work. `counts.open` is a tenant-wide
+          aggregate, independent of this list, so the two disagreeing is exactly
+          how truncation becomes visible. The overflow is the least urgent end,
+          and the jobs list is where it can be paged through in full.
+        */}
+        {counts.open > rows.length ? (
+          <p className="mt-4 text-[13px]" style={{ color: "var(--text-muted)" }}>
+            Showing the {rows.length} most urgent of {counts.open} open jobs. The remaining{" "}
+            {counts.open - rows.length} are further from breaching &mdash;{" "}
+            <Link href="/jobs" className="underline underline-offset-2" style={{ color: "var(--accent-text)" }}>
+              the jobs list
+            </Link>{" "}
+            pages through all of them.
+          </p>
+        ) : null}
       </div>
     </AppShell>
   );

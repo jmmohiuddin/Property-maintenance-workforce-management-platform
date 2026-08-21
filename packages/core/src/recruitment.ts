@@ -400,6 +400,57 @@ export const OUTCOME_MINIMUM_DELAY_HOURS = 24;
  */
 export const OUTCOME_PROMISE_WORKING_DAYS = 3;
 
+// ── `ATS-12`: the cool-off flag ─────────────────────────────────────────────
+
+/**
+ * The platform default cool-off window, in days.
+ *
+ * `ATS-12` asks for a *configurable* flag on re-application within N days of a
+ * rejection for the same role. The configuration lives on the requisition
+ * (`job_requisitions.cooloff_days`); this is what a requisition that has not
+ * set one falls back to.
+ *
+ * Ninety days, because that is roughly the interval over which the two things
+ * that get somebody rejected in this trade actually change: a lapsed
+ * certificate gets renewed, and "not enough hands-on experience" stops being
+ * true. Shorter and the badge fires on people whose situation is genuinely
+ * different; much longer and it fires on people nobody remembers.
+ *
+ * ── THIS NUMBER EXISTS TWICE AND MUST NOT DISAGREE ──────────────────────────
+ *
+ * The other copy is the `coalesce` in `app_recruitment_cooloff_days`
+ * (`packages/db/sql/public-functions.sql`), which has to be there because the
+ * unauthenticated application path never enters TypeScript. Two implementations
+ * of one rule is one implementation and one bug waiting, so
+ * `packages/db/test/recruitment.test.ts` asserts the two agree rather than
+ * trusting that whoever changes one remembers the other.
+ */
+export const RECRUITMENT_COOLOFF_DEFAULT_DAYS = 90;
+
+/**
+ * The sentence the badge carries, wherever it is drawn.
+ *
+ * Written once so the pipeline card and the candidate page cannot describe the
+ * same fact two different ways, and written as a note rather than a verdict:
+ * `ATS-19` forbids automated rejection and `ATS-5` forbids automated filtering,
+ * so a recruiter reading this is free to conclude nothing at all from it. The
+ * copy has to say that, because a badge that reads like an instruction becomes
+ * one.
+ */
+export function cooloffBadgeLabel(input: {
+  priorArchivedAt: Date;
+  windowDays: number;
+  now?: Date;
+}): string {
+  const now = input.now ?? new Date();
+  const days = Math.max(
+    0,
+    Math.floor((now.getTime() - input.priorArchivedAt.getTime()) / 86_400_000),
+  );
+  const ago = days === 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`;
+  return `Applied for this role before and was not taken forward ${ago} — inside this role's ${input.windowDays}-day cool-off. Worth a look before you spend time on it; it decides nothing.`;
+}
+
 /**
  * Compose the message an applicant actually receives.
  *
@@ -764,6 +815,97 @@ export const talentPoolWithdrawSchema = z.object({
   candidateId: z.uuid("Pick somebody in the pool"),
   poolKey: z.string().trim().min(1).max(64),
   reason: z.string().trim().max(280).optional().or(z.literal("")),
+});
+
+// ── `ATS-14`: interview logistics ───────────────────────────────────────────
+
+export const INTERVIEW_KINDS = ["interview", "site_trial"] as const;
+export type InterviewKind = (typeof INTERVIEW_KINDS)[number];
+
+/**
+ * Two values, because the candidate needs to know which one they are coming to.
+ * One wants a shirt; the other wants boots, a hard hat and a full day.
+ */
+export const INTERVIEW_KIND_LABEL: Readonly<Record<InterviewKind, string>> = {
+  interview: "Interview",
+  site_trial: "Site trial",
+};
+
+export const INTERVIEW_STATUSES = ["scheduled", "cancelled", "completed"] as const;
+export type InterviewStatus = (typeof INTERVIEW_STATUSES)[number];
+
+/**
+ * The two reminder windows `ATS-14` asks for, as hours before the interview.
+ *
+ * Two and not one, and the second is the one that works. A day out is when a
+ * person can still move their other job around; two hours out is when they
+ * actually set off, and it is the message that turns a no-show into an arrival.
+ *
+ * `key` is what the database columns and the template payload are named after,
+ * so the three cannot drift apart.
+ */
+export const INTERVIEW_REMINDERS = [
+  { key: "24h", hoursBefore: 24, label: "Tomorrow" },
+  { key: "2h", hoursBefore: 2, label: "In about two hours" },
+] as const;
+
+export type InterviewReminderWindow = (typeof INTERVIEW_REMINDERS)[number]["key"];
+
+/**
+ * The PPE a Dubai maintenance site actually asks for at a gate.
+ *
+ * A suggested list on the scheduling form rather than free text, for the same
+ * reason the disposition reasons are a list: "hi-vis" typed five ways is five
+ * requirements, and the one a candidate does not recognise is the one they turn
+ * up without. The column is a JSON array, so a site with an unusual requirement
+ * can still carry it — this is the fast path, not the whole vocabulary.
+ */
+export const INTERVIEW_PPE_OPTIONS = [
+  "Safety boots",
+  "Hard hat",
+  "Hi-vis vest",
+  "Safety glasses",
+  "Gloves",
+  "Long sleeves and trousers",
+] as const;
+
+/**
+ * What scheduling an interview needs (`ATS-14`).
+ *
+ * The address is required and cannot be blank, and that is the one strictness
+ * worth having here: an address that is present but empty is the same missing
+ * address with an extra step, and the candidate finds out at the roundabout.
+ * Everything else is optional because a site with no parking problem should not
+ * have to invent a parking note.
+ */
+export const interviewScheduleSchema = z.object({
+  applicationId: z.uuid("Pick an application"),
+  kind: z.enum(INTERVIEW_KINDS),
+  /** Local Dubai wall-clock, as the browser's datetime-local control gives it. */
+  scheduledAt: z.string().trim().min(1, "Say when they should come"),
+  durationMinutes: z.coerce.number().int().min(15).max(600).default(60),
+  locationName: z.string().trim().min(1, "Name the site or the office").max(160),
+  locationAddress: z.string().trim().min(1, "They cannot find an empty address").max(2000),
+  locationArea: z.string().trim().max(120).optional().or(z.literal("")),
+  locationMapUrl: z.string().trim().max(2000).optional().or(z.literal("")),
+  parkingNotes: z.string().trim().max(2000).optional().or(z.literal("")),
+  ppeRequired: z.array(z.string().trim().min(1).max(80)).max(12).default([]),
+  bringNotes: z.string().trim().max(2000).optional().or(z.literal("")),
+  contactName: z.string().trim().max(160).optional().or(z.literal("")),
+  contactPhone: z.string().trim().max(24).optional().or(z.literal("")),
+});
+
+/**
+ * What the candidate's reschedule request needs (`ATS-14`).
+ *
+ * A note and nothing else. It is a request, not a move: the token behind it
+ * identifies the application, and a candidate silently moving a site trial that
+ * a supervisor has blocked two hours out for is not a feature. The note is
+ * optional because somebody whose shift changed should not have to compose a
+ * paragraph to say so at eleven at night.
+ */
+export const interviewRescheduleRequestSchema = z.object({
+  note: z.string().trim().max(400).optional().or(z.literal("")),
 });
 
 export type ParseStatus = "not_attempted" | "parsed" | "failed" | "unsupported";

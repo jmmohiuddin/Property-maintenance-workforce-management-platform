@@ -2,13 +2,14 @@
 #
 # `CI-1` / `CI-2`. Both the PRD and the TRD name this as the highest-leverage
 # item in the whole backlog, and the reason is arithmetic: the repository
-# already contains 12 test suites, a 12-check adversarial row-level-security
-# harness, a 36-pair WCAG contrast gate and typechecking across six workspaces.
+# already contains 32 test suites, a 13-check adversarial row-level-security
+# harness, a 72-pair WCAG contrast gate and typechecking across seven
+# workspaces — apps/web included, which is easy to assume is skipped and is not.
 # None of it ran automatically. Every regression risk in the system was
 # human-shaped — it depended on somebody remembering.
 #
 # The RLS harness is the one that matters most. `verify-rls.sql` proves the
-# tenant boundary holds by trying to cross it twelve different ways. A schema
+# tenant boundary holds by trying to cross it thirteen different ways. A schema
 # change that quietly drops a policy produces no error, no failing feature and
 # no visible symptom; it produces one tenant able to read another's data. This
 # workflow is what turns that from a thing somebody might check into a thing

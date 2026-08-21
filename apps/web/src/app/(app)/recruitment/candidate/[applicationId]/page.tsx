@@ -10,11 +10,13 @@ import {
   DISPOSITION_BY_CODE,
   EXPERIENCE_BAND_LABEL,
   HR16_NOTICE,
+  INTERVIEW_KIND_LABEL,
   PARSE_STATUS_LABEL,
   SCAN_STATUS_LABEL,
   VISA_STATUS_LABEL,
   VISA_STATUS_PLANNING_NOTE,
   applicationStatusUrl,
+  cooloffBadgeLabel,
   getService,
   type Availability,
   type CandidateGrade,
@@ -28,6 +30,28 @@ import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 import { CandidatePanels } from "./panels";
 import { ArrowLeft, Warning, CheckCircle } from "@phosphor-icons/react/dist/ssr";
+
+/**
+ * A Dubai wall-clock string for a `datetime-local` input.
+ *
+ * `toISOString().slice(0, 16)` would put UTC in the box, which on a 09:00 Dubai
+ * interview pre-fills 05:00 — and a recruiter who presses save without looking
+ * has just moved the appointment four hours. Built from the Dubai parts
+ * instead.
+ */
+function dubaiLocalInputValue(date: Date): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Dubai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? "00";
+  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}`;
+}
 
 export const metadata: Metadata = { title: "Candidate" };
 export const dynamic = "force-dynamic";
@@ -75,6 +99,29 @@ export default async function CandidatePage({
   if (!candidate) notFound();
 
   const canWrite = ["owner", "admin", "hr"].includes(session.principal.role);
+
+  /*
+   * `ATS-14`. The one interview that is still ahead of us, if there is one. A
+   * cancelled or finished one is history and belongs in the list below, not in
+   * the panel that offers to move it.
+   */
+  const live = candidate.interviews.find(
+    (row) => row.status === "scheduled" && row.scheduledAt.getTime() > Date.now(),
+  );
+  const liveInterview = live
+    ? {
+        interviewId: live.interviewId,
+        kind: live.kind,
+        scheduledAt: live.scheduledAt.toISOString(),
+        scheduledAtLocal: dubaiLocalInputValue(live.scheduledAt),
+        locationName: live.locationName,
+        rescheduleRequestedAt: live.rescheduleRequestedAt?.toISOString() ?? null,
+        rescheduleRequestNote: live.rescheduleRequestNote,
+        confirmationSentAt: live.confirmationSentAt?.toISOString() ?? null,
+        reminder24hSentAt: live.reminder24hSentAt?.toISOString() ?? null,
+        reminder2hSentAt: live.reminder2hSentAt?.toISOString() ?? null,
+      }
+    : null;
   const disposition = candidate.dispositionReasonCode
     ? DISPOSITION_BY_CODE[candidate.dispositionReasonCode]
     : undefined;
@@ -291,7 +338,94 @@ export default async function CandidatePage({
               )}
             </section>
 
+            {/* ── ATS-14 ─────────────────────────────────────────────── */}
+            {candidate.interviews.length > 0 ? (
+              <section>
+                <h2 className="text-[17px] font-semibold">Interviews and site trials</h2>
+                <p className="prose-body mt-2 text-[14px]">
+                  What they were told, and what has actually been sent. A confirmation the system
+                  cannot show you leaving is one nobody can say arrived.
+                </p>
+                <ul className="mt-3 space-y-2">
+                  {candidate.interviews.map((row) => (
+                    <li
+                      key={row.interviewId}
+                      className="rounded border p-4 text-[14px]"
+                      style={{ backgroundColor: "var(--surface-raised)" }}
+                    >
+                      <p className="font-medium">
+                        {INTERVIEW_KIND_LABEL[row.kind]} ·{" "}
+                        {row.scheduledAt.toLocaleString("en-GB", {
+                          timeZone: "Asia/Dubai",
+                          weekday: "short",
+                          day: "numeric",
+                          month: "short",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                        {row.status === "cancelled" ? " · cancelled" : ""}
+                      </p>
+                      <p className="mt-1" style={{ color: "var(--text-secondary)" }}>
+                        {row.locationName} — {row.locationAddress}
+                        {row.locationArea ? `, ${row.locationArea}` : ""}
+                      </p>
+                      {row.ppeRequired.length > 0 ? (
+                        <p className="mt-1" style={{ color: "var(--text-secondary)" }}>
+                          Wear: {row.ppeRequired.join(", ")}
+                        </p>
+                      ) : null}
+                      {row.bringNotes ? (
+                        <p className="mt-1" style={{ color: "var(--text-secondary)" }}>
+                          Bring: {row.bringNotes}
+                        </p>
+                      ) : null}
+                      <p className="mt-1.5 text-[13px]" style={{ color: "var(--text-muted)" }}>
+                        Confirmation {row.confirmationSentAt ? "queued" : "not sent"} · day-before
+                        reminder {row.reminder24hSentAt ? "sent" : "not yet"} · two-hour reminder{" "}
+                        {row.reminder2hSentAt ? "sent" : "not yet"}
+                      </p>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+
             {/* ── ATS-12 ─────────────────────────────────────────────── */}
+            {candidate.cooloff ? (
+              <section>
+                <h2 className="text-[17px] font-semibold">Applied for this role recently</h2>
+                {/*
+                  A note, and it says so in its own words. ATS-19 forbids
+                  automated rejection and ATS-5 forbids automated filtering, so
+                  the copy has to make clear that nothing has been decided —
+                  a badge that reads like an instruction becomes one.
+                */}
+                <p
+                  className="prose-body mt-2 rounded border p-4 text-[14px]"
+                  style={{
+                    backgroundColor: "var(--surface-raised)",
+                    color: "var(--status-warning-text)",
+                  }}
+                >
+                  {cooloffBadgeLabel({
+                    priorArchivedAt: candidate.cooloff.priorArchivedAt,
+                    windowDays: candidate.cooloff.windowDays,
+                  })}
+                </p>
+                <p className="prose-body mt-2 text-[14px]">
+                  {candidate.cooloff.priorReference} — {candidate.cooloff.priorRoleTitle}
+                  {candidate.cooloff.priorDispositionReasonCode
+                    ? ` — ${
+                        DISPOSITION_BY_CODE[candidate.cooloff.priorDispositionReasonCode]?.label ??
+                        candidate.cooloff.priorDispositionReasonCode
+                      }`
+                    : ""}
+                  . If that reason has been fixed since — a renewed certificate is the usual one —
+                  this is a stronger application than the last, not a weaker one.
+                </p>
+              </section>
+            ) : null}
+
             {candidate.priorApplications.length > 0 ? (
               <section>
                 <h2 className="text-[17px] font-semibold">
@@ -448,6 +582,7 @@ export default async function CandidatePage({
                 outcomeScheduledAt={candidate.outcomeScheduledAt?.toISOString() ?? null}
                 outcomeSentAt={candidate.outcomeSentAt?.toISOString() ?? null}
                 stages={board?.stages ?? []}
+                interview={liveInterview}
               />
             ) : (
               <p className="prose-body text-[14px]">

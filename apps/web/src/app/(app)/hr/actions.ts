@@ -8,7 +8,9 @@ import {
   currentWageCycle,
   recordContractTerm,
   saveLeaveBalance,
+  recordSickLeave,
   recordOvertime,
+  recordWorkedDay,
   saveHealthInsurance,
   recordSalaryDeduction,
 } from "@meridian/db";
@@ -16,6 +18,8 @@ import {
   toMinor,
   formatMoney,
   formatDay,
+  fromDubai,
+  addDays,
   HEALTH_PLANS,
   PAY_BAND_LABEL,
   type HealthPlan,
@@ -297,6 +301,58 @@ export async function saveLeaveAdjustment(
   return { ok: "Leave balance saved." };
 }
 
+/**
+ * Record an absence as sick leave (`HR-7`).
+ *
+ * The staging is not asked for and cannot be typed in. Which days are at full
+ * pay, which at half and which unpaid depends on what the rest of the leave
+ * year already holds, and a field that let somebody state it would let them
+ * state fifteen days of full pay for the second time in a year — which is the
+ * mistake this feature exists to prevent, not one it should offer.
+ */
+export async function saveSickLeave(_prev: HrFormState, formData: FormData): Promise<HrFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const employeeId = text(formData, "employeeId");
+  const startsOn = calendarDate(formData.get("startsOn"));
+  const endsOn = calendarDate(formData.get("endsOn"));
+  const reason = text(formData, "reason");
+
+  if (!employeeId) return { error: "Missing employment record." };
+  if (startsOn === null) return { error: "The first day of the absence is not a real date." };
+  if (!startsOn) return { error: "Record the first day of the absence." };
+  if (endsOn === null) return { error: "The last day of the absence is not a real date." };
+  if (!endsOn) return { error: "Record the last day of the absence." };
+
+  try {
+    const result = await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) =>
+        recordSickLeave(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          { employeeId, startsOn, endsOn, ...(reason ? { reason } : {}) },
+        ),
+    );
+
+    revalidatePath(`/workforce/${employeeId}`);
+    revalidatePath("/hr");
+
+    // The staged split, said back. Somebody recording a twenty-day absence
+    // needs to see that five of those days are at half pay before they leave
+    // the page, not when payroll is questioned two months later.
+    const period = result.year?.periods.find((p) => p.id === result.id);
+    return {
+      ok:
+        `${result.days} day${result.days === 1 ? "" : "s"} recorded as sick leave. ` +
+        (period ? `${period.explanation} ` : "") +
+        "Sick leave is a separate entitlement — it does not come out of annual leave.",
+    };
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the sick leave.", "hr") };
+  }
+}
+
 // ── HR-8: overtime ──────────────────────────────────────────────────────────
 
 export async function saveOvertime(_prev: HrFormState, formData: FormData): Promise<HrFormState> {
@@ -341,12 +397,118 @@ export async function saveOvertime(_prev: HrFormState, formData: FormData): Prom
 
     revalidatePath(`/workforce/${employeeId}`);
     revalidatePath("/hr");
-    return {
-      ok: `${(minutes / 60).toFixed(1)} hours recorded at ${PAY_BAND_LABEL[band]} — ${formatMoney(result.amountMinor)}.`,
-    };
+
+    const recorded = `${(minutes / 60).toFixed(1)} hours recorded at ${PAY_BAND_LABEL[band]} — ${formatMoney(result.amountMinor)}.`;
+
+    // The 48-hour week, at the moment the hours are entered rather than on a
+    // report somebody reads next month. Reported either way: a week that is
+    // still inside the maximum is worth seeing too, because the number is a
+    // floor and the person entering it is the one who knows what is missing.
+    return result.weekly.withinLimit
+      ? { ok: `${recorded} ${result.weekly.detail}` }
+      : { error: `Recorded — and this week is now over the statutory maximum. ${result.weekly.detail}` };
   } catch (error) {
     return { error: userMessage(error, "Could not record the overtime.", "hr") };
   }
+}
+
+/**
+ * A whole worked day, from its start and end (`HR-8`).
+ *
+ * ── WHY THE SPLIT IS NOT A FIELD ON THIS FORM ───────────────────────────────
+ *
+ * Because the split is the part that is easy to get wrong in the expensive
+ * direction. A shift from 20:00 to 04:00 is eight hours, all of it ordinary
+ * time, and none of it earns the +50% night premium — the statutory day is
+ * worked first and only what follows it is overtime. Classified on the clock it
+ * looks like six hours at +50%. So the times are asked for and
+ * `splitWorkedWindow` decides the bands, including the Ramadan reduction that
+ * shortens the ordinary day to six hours.
+ */
+export async function saveWorkedDay(_prev: HrFormState, formData: FormData): Promise<HrFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const employeeId = text(formData, "employeeId");
+  const workedOn = calendarDate(formData.get("workedOn"));
+  const startAt = text(formData, "startAt");
+  const endAt = text(formData, "endAt");
+  const breakRaw = text(formData, "breakMinutes");
+  const isRestDay = text(formData, "isRestDay") === "on";
+  const note = text(formData, "note");
+
+  if (!employeeId) return { error: "Missing employment record." };
+  if (workedOn === null) return { error: "The date worked is not a real date." };
+  if (!workedOn) return { error: "Record the date the day was worked." };
+
+  const start = minuteOfDay(startAt);
+  const end = minuteOfDay(endAt);
+  if (start === null || end === null) return { error: "Record the start and end times, as HH:MM." };
+
+  const breakMinutes = breakRaw === "" ? 0 : Number(breakRaw);
+  if (!Number.isInteger(breakMinutes) || breakMinutes < 0) {
+    return { error: "The unpaid break is a whole number of minutes." };
+  }
+
+  // A shift that ends at or before it starts ended the following day — 20:00
+  // to 04:00 is the ordinary night shift, not an eight-hour negative.
+  const [y, m, d] = workedOn.split("-").map(Number) as [number, number, number];
+  const endDay = end <= start ? addDays(workedOn, 1) : workedOn;
+  const [ey, em, ed] = endDay.split("-").map(Number) as [number, number, number];
+
+  try {
+    const result = await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) =>
+        recordWorkedDay(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          {
+            employeeId,
+            workedOn,
+            start: fromDubai(y, m, d, start),
+            end: fromDubai(ey, em, ed, end),
+            breakMinutes,
+            isRestDay,
+            ...(note ? { note } : {}),
+          },
+        ),
+    );
+
+    revalidatePath(`/workforce/${employeeId}`);
+    revalidatePath("/hr");
+
+    const hours = (minutes: number) => (minutes / 60).toFixed(1);
+    const bands = [
+      result.split.standardMinutes > 0 ? `${hours(result.split.standardMinutes)}h ordinary` : null,
+      result.split.overtimeMinutes > 0 ? `${hours(result.split.overtimeMinutes)}h at +25%` : null,
+      result.split.nightMinutes > 0 ? `${hours(result.split.nightMinutes)}h at +50% (night)` : null,
+      result.split.restDayMinutes > 0 ? `${hours(result.split.restDayMinutes)}h rest-day work` : null,
+    ].filter((part): part is string => part !== null);
+
+    const summary =
+      `${hours(result.split.totalMinutes)} hours on ${formatDay(result.workedOn)}: ${bands.join(", ")}. ` +
+      `${formatMoney(result.totalMinor)} of it is overtime pay on top of the salary. ` +
+      (result.bandsCleared.length > 0
+        ? `The ${result.bandsCleared.join(" and ")} band${result.bandsCleared.length === 1 ? "" : "s"} previously recorded for this day ${result.bandsCleared.length === 1 ? "was" : "were"} withdrawn. `
+        : "") +
+      result.weekly.detail;
+
+    return result.warnings.length > 0
+      ? { error: `Recorded. ${result.warnings.join(" ")} ${summary}` }
+      : { ok: summary };
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the worked day.", "hr") };
+  }
+}
+
+/** `"20:00"` → 1200. Null for anything that is not a time of day. */
+function minuteOfDay(value: string): number | null {
+  const match = /^(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return null;
+  return hours * 60 + minutes;
 }
 
 // ── HR-6: health insurance ──────────────────────────────────────────────────

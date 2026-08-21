@@ -3,9 +3,13 @@ import Link from "next/link";
 import { withTenant, hrLifecycleSummary } from "@meridian/db";
 import {
   formatDay,
+  formatMoney,
   WPS_MINIMUM_TRANSFER_PERCENT,
   MAX_OVERTIME_MINUTES_PER_DAY,
   LEAVE_NOTICE_DAYS,
+  SICK_LEAVE_FULL_PAY_DAYS,
+  SICK_LEAVE_HALF_PAY_DAYS,
+  SICK_LEAVE_TOTAL_DAYS,
   ESSENTIAL_BENEFITS_WAGE_CEILING_MINOR,
 } from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
@@ -40,6 +44,11 @@ export default async function HrPage() {
   );
 
   const { wages, unsettled, permitWarning, contracts, leave, hoursExceptions, hoursWarning } = summary;
+  const { sickLeave, weeklyBreaches } = summary;
+  // Anyone who has used more than the full-pay stage. Everybody else's sick
+  // leave is on their own record; what belongs on a board is the position that
+  // has a consequence attached — the next day of illness is paid at half.
+  const sickStaged = sickLeave.filter((r) => r.halfPayDays > 0 || r.unpaidDays > 0 || r.beyondEntitlementDays > 0);
 
   const olderUnsettled = unsettled.filter((c) => c.id !== wages.id);
   const autoRenewed = contracts.filter((c) => c.state === "auto_renewed");
@@ -371,6 +380,79 @@ export default async function HrPage() {
           ) : null}
         </section>
 
+        {/* ── 4b. Sick leave — a separate entitlement, on its own ladder ─── */}
+        <section aria-labelledby="sick-heading" className="mt-10">
+          <div id="sick-heading">
+            <SectionHeading tone="warning" title="Sick leave" count={sickLeave.length}>
+              {SICK_LEAVE_FULL_PAY_DAYS} days at full pay, then {SICK_LEAVE_HALF_PAY_DAYS} at half,
+              then 45 unpaid
+            </SectionHeading>
+          </div>
+
+          {sickLeave.length === 0 ? (
+            <div className="mt-4">
+              <EmptyState tone="success" title="No sick leave recorded in anybody's current leave year.">
+                <p>
+                  Sick leave is a separate entitlement from annual leave and does not come out of it.
+                  After probation the ladder is {SICK_LEAVE_FULL_PAY_DAYS} days at full pay, then{" "}
+                  {SICK_LEAVE_HALF_PAY_DAYS} at half, then 45 unpaid &mdash;{" "}
+                  {SICK_LEAVE_TOTAL_DAYS} days a year, consumed in that order and carried across
+                  absences. Record an absence on the employment record and the staging follows from
+                  the leave year rather than from the absence.
+                </p>
+              </EmptyState>
+            </div>
+          ) : (
+            <>
+              <ul className="mt-4 divide-y rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>
+                {sickLeave.map((row) => (
+                  <li
+                    key={row.employeeId}
+                    className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2 p-4"
+                  >
+                    <div>
+                      <Link href={`/workforce/${row.employeeId}`} className="text-[14px] font-medium">
+                        {row.fullName}
+                      </Link>
+                      <p className="mt-1 text-[12px]" style={{ color: "var(--text-muted)" }}>
+                        {row.fullPayDays} at full pay &middot; {row.halfPayDays} at half &middot;{" "}
+                        {row.unpaidDays} unpaid
+                        {row.probationUnpaidDays > 0
+                          ? ` · ${row.probationUnpaidDays} inside probation`
+                          : ""}
+                        {row.beyondEntitlementDays > 0
+                          ? ` · ${row.beyondEntitlementDays} past the ${SICK_LEAVE_TOTAL_DAYS}-day year`
+                          : ""}
+                        {" · "}
+                        {formatMoney(row.payMinor)} of sick pay
+                      </p>
+                    </div>
+                    <p className="tnum text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                      <strong style={{ color: "var(--text-primary)" }}>{row.remainingDays}</strong>{" "}
+                      of {SICK_LEAVE_TOTAL_DAYS} remaining &middot; {row.takenDays} taken
+                    </p>
+                  </li>
+                ))}
+              </ul>
+
+              {sickStaged.length > 0 ? (
+                <p
+                  className="mt-3 rounded-sm border-l-2 px-4 py-3 text-[13px]"
+                  style={{ borderColor: "var(--status-warning)", color: "var(--text-secondary)" }}
+                >
+                  <strong style={{ color: "var(--text-primary)" }}>
+                    {sickStaged.length}{" "}
+                    {sickStaged.length === 1 ? "person has" : "people have"} used the full-pay stage.
+                  </strong>{" "}
+                  Their next sick day is at half pay or below. The stages consume in order and carry
+                  across absences &mdash; a second illness continues where the first stopped, and
+                  restarting the ladder at each absence pays the first fifteen days twice.
+                </p>
+              ) : null}
+            </>
+          )}
+        </section>
+
         {/* ── 5. Working time ───────────────────────────────────────────── */}
         <section aria-labelledby="hours-heading" className="mt-10">
           <div id="hours-heading">
@@ -419,6 +501,53 @@ export default async function HrPage() {
                 </p>
               </EmptyState>
             </div>
+          )}
+        </section>
+
+        {/* ── 5b. The 48-hour week ──────────────────────────────────────── */}
+        <section aria-labelledby="weekly-heading" className="mt-10">
+          <div id="weekly-heading">
+            <SectionHeading tone="critical" title="Weeks past 48 hours" count={weeklyBreaches.length}>
+              the statutory weekly maximum, over the last four weeks
+            </SectionHeading>
+          </div>
+
+          {weeklyBreaches.length === 0 ? (
+            <div className="mt-4">
+              <EmptyState tone="warning" title="No recorded week is past 48 hours.">
+                <p>
+                  Read that as narrowly as it is meant. What is counted is what has been recorded
+                  &mdash; ordinary hours entered as a worked day, plus overtime and rest-day work
+                  &mdash; so this is a floor and not a measurement. A week that shows as over is
+                  genuinely over; a week that shows as under may only be under-recorded, and until
+                  clock-in and clock-out arrive with the field app there is no way to tell which
+                  from here.
+                </p>
+              </EmptyState>
+            </div>
+          ) : (
+            <ul className="mt-4 divide-y rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>
+              {weeklyBreaches.map((week) => (
+                <li
+                  key={`${week.employeeId}-${week.weekStart}`}
+                  className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2 p-4"
+                >
+                  <div>
+                    <Link href={`/workforce/${week.employeeId}`} className="text-[14px] font-medium">
+                      {week.fullName}
+                    </Link>
+                    <p className="mt-1 text-[12px]" style={{ color: "var(--status-critical-text)" }}>
+                      {week.assessment.detail}
+                    </p>
+                  </div>
+                  <p className="tnum text-[12px]" style={{ color: "var(--text-muted)" }}>
+                    {formatDay(week.weekStart)} &mdash; {formatDay(week.weekEnd)} &middot;{" "}
+                    {(week.recordedMinutes / 60).toFixed(1)}h over {week.daysRecorded}{" "}
+                    {week.daysRecorded === 1 ? "day" : "days"}
+                  </p>
+                </li>
+              ))}
+            </ul>
           )}
         </section>
 

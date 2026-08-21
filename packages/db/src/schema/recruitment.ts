@@ -116,6 +116,20 @@ export const jobRequisitions = pgTable(
      * record a health answer.
      */
     physicalRequirements: text("physical_requirements"),
+    /**
+     * `ATS-12`. How recently a rejection for this role makes a re-application
+     * worth a second look before anybody spends time on it.
+     *
+     * Null means the platform default (`RECRUITMENT_COOLOFF_DEFAULT_DAYS`), 0
+     * means no cool-off, and both are real answers rather than two spellings of
+     * one. Per requisition because the right number genuinely differs by role:
+     * a supervisor vacancy that runs a two-month process should not flag
+     * somebody re-applying after six weeks, and a helper vacancy that turns
+     * over monthly should.
+     *
+     * It produces a badge and nothing else. See `applications.cooloffFlag`.
+     */
+    cooloffDays: integer("cooloff_days"),
     opensAt: timestamp("opens_at", { withTimezone: true }),
     closesAt: timestamp("closes_at", { withTimezone: true }),
     hiringManagerUserId: uuid("hiring_manager_user_id").references(() => users.id, {
@@ -482,6 +496,44 @@ export const applications = pgTable(
      * and it grants read access to exactly one application.
      */
     statusToken: varchar("status_token", { length: 64 }).notNull(),
+
+    // ── ATS-12: the cool-off flag ───────────────────────────────────────────
+    /**
+     * Set when this application arrived within the requisition's cool-off
+     * window of a *rejection* for the same role.
+     *
+     * ── THIS IS A NOTE FOR A HUMAN AND CANNOT BECOME ANYTHING ELSE ──────────
+     *
+     * `ATS-19` forbids automated rejection and `ATS-5` forbids automated
+     * filtering, so the design has to make those impossible rather than
+     * discouraged. Three properties do that, and all three are structural:
+     *
+     *   * It is computed in `app_public_submit_application` **after** the
+     *     `INSERT` has already returned an id. There is no ordering in which it
+     *     could have decided whether to create the application, because the
+     *     application exists before the flag is calculated.
+     *   * Nothing in the creation, matching or offer path reads it. It appears
+     *     in no `WHERE` clause outside a staff screen.
+     *   * `app_public_application_status` does not return it. The applicant is
+     *     never told, because telling them would make it a decision.
+     *
+     * A recruiter who sees the badge is free to conclude nothing at all from
+     * it. That is the whole intended behaviour.
+     */
+    cooloffFlag: boolean("cooloff_flag").notNull().default(false),
+    /**
+     * The prior application the flag refers to.
+     *
+     * A reference and not a bare boolean, matching `archivedAtStageId` and
+     * `mergedIntoCandidateId`: "flagged" with nothing to click through to is a
+     * red dot that gets ignored by the third time, and a CHECK refuses the flag
+     * without it.
+     *
+     * A withdrawal is deliberately never the referent. The candidate deciding
+     * they were no longer available is not a rejection, and a badge implying we
+     * turned them down would misdescribe to staff what actually happened.
+     */
+    cooloffOfApplicationId: uuid("cooloff_of_application_id"),
     ...timestamps,
   },
   (t) => [
@@ -506,6 +558,8 @@ export const applications = pgTable(
     index("applications_outcome_owed_idx")
       .on(t.tenantId, t.outcomeDueAt)
       .where(sql`${t.outcomeSentAt} is null`),
+    // `ATS-12`. Partial, because on a real pipeline almost every row is false.
+    index("applications_cooloff_idx").on(t.tenantId, t.requisitionId).where(sql`${t.cooloffFlag}`),
   ],
 );
 
@@ -540,6 +594,122 @@ export const applicationEvents = pgTable(
     occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index("application_events_application_idx").on(t.tenantId, t.applicationId, t.occurredAt)],
+);
+
+// ── ATS-14: the interview, and where to stand ───────────────────────────────
+
+/**
+ * A scheduled interview or site trial, with the logistics on the row.
+ *
+ * ── WHY THIS TABLE EXISTS AT ALL ────────────────────────────────────────────
+ *
+ * Until it did, nothing in this system recorded that a candidate had been asked
+ * to come anywhere: no time, no place, no record that a message was sent. The
+ * arrangement lived in a WhatsApp thread on one person's phone, which is also
+ * where "bring your working-at-height card" lived — which is why the candidate
+ * turns up without it and the trade check is rebooked.
+ *
+ * `ATS-14` names four things the confirmation must carry: the site address,
+ * parking, PPE and what to bring. They are four columns and not one details
+ * blob, because a blob is what gets half-filled. The person typing it remembers
+ * the address, forgets the hard hat, and nothing anywhere says a field is
+ * missing.
+ *
+ * ── THE FOUR REMINDER COLUMNS ARE TWO PAIRS ─────────────────────────────────
+ *
+ *   * `reminder24hAt` / `reminder2hAt` — **when** each reminder is due. Null
+ *     means the window had already passed when the interview was booked: an
+ *     interview arranged for three hours from now never had a 24-hour reminder
+ *     to miss. Null says that honestly; stamping the sent column to keep the
+ *     queue tidy would claim a message that never existed, and a CHECK refuses
+ *     it.
+ *   * `reminder24hSentAt` / `reminder2hSentAt` — the claim. Written by a
+ *     conditional `UPDATE ... WHERE ... IS NULL` in the same transaction that
+ *     enqueues the message, so two overlapping cron runs cannot both send.
+ *
+ * ── AND WHY THERE IS NO RESCHEDULE TOKEN ────────────────────────────────────
+ *
+ * `applications.statusToken` already is one. It is 64 unguessable characters
+ * held by exactly one person — the candidate whose interview this is — and an
+ * interview belongs to exactly one application, so a second token would grant a
+ * strict subset of the first, to the same holder, for the same purpose. What it
+ * would add is a second secret to leak and a second lost-link support call.
+ *
+ * So `rescheduleRequestedAt` is written through
+ * `app_public_request_interview_reschedule`, behind that existing token. It
+ * records an ask and never moves anything: a candidate silently moving a site
+ * trial a supervisor has blocked two hours out for is not a feature.
+ */
+export const interviews = pgTable(
+  "interviews",
+  {
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    id: idCol(),
+    applicationId: uuid("application_id")
+      .notNull()
+      .references(() => applications.id, { onDelete: "cascade" }),
+    /**
+     * `interview` | `site_trial`.
+     *
+     * One table, because the logistics are identical. Two values, because the
+     * candidate needs to know which one they are coming to: one wants a shirt,
+     * the other wants boots and a hard hat.
+     */
+    kind: varchar("kind", { length: 24 }).notNull().default("interview"),
+    /** `scheduled` | `cancelled` | `completed`. */
+    status: varchar("status", { length: 16 }).notNull().default("scheduled"),
+    scheduledAt: timestamp("scheduled_at", { withTimezone: true }).notNull(),
+    durationMinutes: integer("duration_minutes").notNull().default(60),
+    locationName: varchar("location_name", { length: 160 }).notNull(),
+    locationAddress: text("location_address").notNull(),
+    locationArea: varchar("location_area", { length: 120 }),
+    locationMapUrl: text("location_map_url"),
+    parkingNotes: text("parking_notes"),
+    /** A list, so the confirmation and the reminder render the same items. */
+    ppeRequired: jsonb("ppe_required").notNull().default([]),
+    bringNotes: text("bring_notes"),
+    /**
+     * Who to ask for, and the number to call when the gate is shut. The single
+     * most common reason a trade candidate turns around and goes home.
+     */
+    contactName: varchar("contact_name", { length: 160 }),
+    contactPhone: varchar("contact_phone", { length: 24 }),
+    confirmationSentAt: timestamp("confirmation_sent_at", { withTimezone: true }),
+    confirmationNotificationId: uuid("confirmation_notification_id"),
+    reminder24hAt: timestamp("reminder_24h_at", { withTimezone: true }),
+    reminder24hSentAt: timestamp("reminder_24h_sent_at", { withTimezone: true }),
+    reminder2hAt: timestamp("reminder_2h_at", { withTimezone: true }),
+    reminder2hSentAt: timestamp("reminder_2h_sent_at", { withTimezone: true }),
+    /** The candidate's ask, behind the application's own status token. */
+    rescheduleRequestedAt: timestamp("reschedule_requested_at", { withTimezone: true }),
+    rescheduleRequestNote: varchar("reschedule_request_note", { length: 400 }),
+    rescheduledCount: integer("rescheduled_count").notNull().default(0),
+    cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+    cancellationReason: varchar("cancellation_reason", { length: 200 }),
+    scheduledById: uuid("scheduled_by_id").references(() => users.id, { onDelete: "set null" }),
+    ...timestamps,
+  },
+  (t) => [
+    index("interviews_application_idx").on(t.tenantId, t.applicationId, t.scheduledAt),
+    // The two cron predicates, each its own partial index. The sweep runs every
+    // fifteen minutes for ever, on a table where all but a handful of rows are
+    // already sent or already past.
+    index("interviews_reminder_24h_idx")
+      .on(t.reminder24hAt)
+      .where(
+        sql`${t.status} = 'scheduled' and ${t.reminder24hAt} is not null and ${t.reminder24hSentAt} is null and ${t.deletedAt} is null`,
+      ),
+    index("interviews_reminder_2h_idx")
+      .on(t.reminder2hAt)
+      .where(
+        sql`${t.status} = 'scheduled' and ${t.reminder2hAt} is not null and ${t.reminder2hSentAt} is null and ${t.deletedAt} is null`,
+      ),
+    index("interviews_reschedule_requested_idx")
+      .on(t.tenantId, t.rescheduleRequestedAt)
+      .where(sql`${t.rescheduleRequestedAt} is not null`),
+  ],
 );
 
 /**

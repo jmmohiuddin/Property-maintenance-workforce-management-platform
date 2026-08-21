@@ -11,7 +11,7 @@
  * and `npm run db:seed` run. Cleans up after itself.
  */
 
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import {
   withTenant,
   withCustomerScope,
@@ -27,13 +27,14 @@ import {
   listCreditNotes,
   customerCreditPosition,
   recordPayment,
-  listInvoices,
+  searchInvoices,
   arAgeing,
   transitionJob,
   schema,
   closeConnection,
 } from "../src/index";
 import { toDecimalString, formatMoney, toMinor, company, renderableProblems } from "@meridian/core";
+import { otherTenantId } from "./_tenant";
 
 const TENANT = "11111111-1111-4111-8111-111111111111";
 
@@ -49,6 +50,45 @@ function checkTrue(label: string, got: boolean): void {
 
 async function main(): Promise<void> {
   const ctx = { tenantId: TENANT };
+
+  // ── The test harness itself ───────────────────────────────────────────────
+  //
+  // A check of ./_tenant.ts, not of the product. `otherTenantId()` used to
+  // select from `tenants` on the plain `db` handle, outside a tenant
+  // transaction, where the policy is `id = app_current_tenant()` and the
+  // setting is unset — so it matched zero rows and returned null whether or not
+  // a second tenant existed. Every caller read that null as "single-tenant
+  // database, skip", and the cross-tenant isolation check underneath it never
+  // ran. Three suites hit it independently and routed around the helper.
+  //
+  // So the helper is now itself under test. If it ever goes back to returning
+  // something a caller can mistake for "nothing to compare against", these
+  // three lines fail here rather than quietly disarming the isolation checks in
+  // every suite that uses it.
+  const foreignTenantId = await otherTenantId();
+  checkTrue("otherTenantId() does not name the tenant under test", foreignTenantId !== TENANT);
+
+  const foreignTenant = await withTenant(
+    { tenantId: foreignTenantId, actorKind: "system" as const },
+    async (tx) => {
+      // Inside a tenant transaction the policy on `tenants` matches exactly the
+      // current tenant, so this returns one row if the helper named a real
+      // tenant and nothing at all if it did not.
+      const rows = await tx.select({ id: schema.tenants.id, slug: schema.tenants.slug }).from(schema.tenants);
+      return rows[0];
+    },
+  );
+  check("otherTenantId() names a tenant that really exists", foreignTenant?.id, foreignTenantId);
+
+  const ownSlug = await withTenant(ctx, async (tx) => {
+    const rows = await tx.select({ slug: schema.tenants.slug }).from(schema.tenants);
+    return rows[0]?.slug;
+  });
+  checkTrue(
+    "and it is a different tenant, not the same row under another name",
+    Boolean(ownSlug) && Boolean(foreignTenant?.slug) && foreignTenant?.slug !== ownSlug,
+  );
+
 
   // Work against a seeded job that is already signed off.
   const setup = await withTenant(ctx, async (tx) => {
@@ -212,17 +252,17 @@ async function main(): Promise<void> {
 
   const ownInvoices = await withCustomerScope(
     { tenantId: TENANT, customerId: setup.customerId },
-    (tx) => listInvoices(tx),
+    (tx) => searchInvoices(tx, { limit: 100 }),
   );
-  checkTrue("owning customer sees its invoice", ownInvoices.some((i) => i.id === invoice.invoiceId));
+  checkTrue("owning customer sees its invoice", ownInvoices.rows.some((i) => i.id === invoice.invoiceId));
 
   const foreignInvoices = await withCustomerScope(
     { tenantId: TENANT, customerId: otherCustomer!.id },
-    (tx) => listInvoices(tx),
+    (tx) => searchInvoices(tx, { limit: 100 }),
   );
   checkTrue(
     "another customer cannot see it",
-    !foreignInvoices.some((i) => i.id === invoice.invoiceId),
+    !foreignInvoices.rows.some((i) => i.id === invoice.invoiceId),
   );
 
   const foreignQuote = await withCustomerScope(
@@ -456,6 +496,144 @@ async function main(): Promise<void> {
       .update(schema.customers)
       .set({ taxRegistrationNumber: null, billingAddress: null })
       .where(eq(schema.customers.id, setup.customerId)),
+  );
+
+  // ── LEAD-8. The invoice list has a second page ────────────────────────────
+  //
+  // `listInvoices` was a flat `.limit(200)`. The AR ageing tiles above the
+  // table were right, so nothing looked broken — the failure was invoices
+  // silently missing from the bottom of the list with no indicator and no way
+  // to reach them. These checks are about reachability, and about the tiles
+  // staying independent of whichever page is on screen.
+  const DAY = 24 * 60 * 60 * 1000;
+  const RUN = Date.now().toString(36);
+  const oldReference = `ZZ-PAGE-${RUN}`;
+  const draftReference = `ZZ-DRAFT-${RUN}`;
+
+  const ageingBefore = await withTenant(ctx, (tx) => arAgeing(tx));
+
+  // An issued invoice dated three months back, so it sorts last and is
+  // certainly not on the first page.
+  await withTenant(ctx, (tx) =>
+    tx.insert(schema.invoices).values({
+      tenantId: TENANT,
+      reference: oldReference,
+      customerId: setup.customerId,
+      status: "issued",
+      issuedOn: new Date(Date.now() - 90 * DAY),
+      dueOn: new Date(Date.now() - 75 * DAY),
+      subtotal: "100.00",
+      taxAmount: "5.00",
+      total: "105.00",
+      amountPaid: "0",
+    }),
+  );
+
+  const ageingAfter = await withTenant(ctx, (tx) => arAgeing(tx));
+  check(
+    "AR ageing counts an invoice that is not on the first page",
+    ageingAfter.totalOutstandingMinor - ageingBefore.totalOutstandingMinor,
+    10500,
+  );
+
+  // A draft has no issue date at all. It is in this test because the sort key
+  // is `coalesce(issued_on, created_at)`: on `issued_on` alone the row-wise
+  // cursor comparison is null for these rows, and every draft would vanish from
+  // the second page onward — the same bug, one status along.
+  await withTenant(ctx, (tx) =>
+    tx.insert(schema.invoices).values({
+      tenantId: TENANT,
+      reference: draftReference,
+      customerId: setup.customerId,
+      status: "draft",
+      subtotal: "200.00",
+      taxAmount: "10.00",
+      total: "210.00",
+    }),
+  );
+
+  const firstPage = await withTenant(ctx, (tx) => searchInvoices(tx, { limit: 1 }));
+  check("a page is the size that was asked for", firstPage.rows.length, 1);
+  checkTrue("and says there is more behind it", firstPage.nextCursor !== null);
+  checkTrue(
+    "the three-month-old invoice is not on the first page",
+    firstPage.rows[0]?.reference !== oldReference,
+  );
+
+  // Walk the whole list one row at a time. A page size of one is the harshest
+  // version of the boundary: every row is a cursor round trip.
+  const walked: string[] = [];
+  let cursor: string | undefined;
+  let pages = 0;
+  for (;;) {
+    const page = await withTenant(ctx, (tx) => searchInvoices(tx, { limit: 1, cursor }));
+    walked.push(...page.rows.map((r) => r.reference));
+    pages += 1;
+    if (!page.nextCursor || pages > 200) break;
+    cursor = page.nextCursor;
+  }
+
+  const totalInvoices = await withTenant(ctx, async (tx) => {
+    const rows = (await tx.execute<{ n: string }>(
+      sql`select count(*)::text as n from invoices where deleted_at is null`,
+    )) as unknown as { n: string }[];
+    return Number(rows[0]?.n ?? 0);
+  });
+
+  checkTrue("paging terminates", pages <= 200);
+  check("paging reaches every invoice, exactly once", walked.length, totalInvoices);
+  check("and returns none of them twice", new Set(walked).size, walked.length);
+  checkTrue("including the one behind the first page", walked.includes(oldReference));
+  checkTrue("including a draft, which has no issue date", walked.includes(draftReference));
+
+  const byReference = await withTenant(ctx, (tx) => searchInvoices(tx, { q: oldReference }));
+  check("search finds an invoice by its reference", byReference.rows.length, 1);
+  check("and it is the right one", byReference.rows[0]?.reference, oldReference);
+
+  const customerName = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({ name: schema.customers.name })
+      .from(schema.customers)
+      .where(eq(schema.customers.id, setup.customerId));
+    return rows[0]?.name ?? "";
+  });
+  const byCustomer = await withTenant(ctx, (tx) =>
+    searchInvoices(tx, { q: customerName, limit: 100 }),
+  );
+  checkTrue("search finds invoices by customer name", byCustomer.rows.length > 0);
+
+  // A cursor arrives from a query string: bookmarked, pasted, or made up. The
+  // right answer for all three is the first page, not a 500.
+  const bogus = await withTenant(ctx, (tx) =>
+    searchInvoices(tx, { limit: 1, cursor: "not-a-real-cursor" }),
+  );
+  check("a junk cursor falls back to the first page", bogus.rows[0]?.id, firstPage.rows[0]?.id);
+
+  const overLimit = await withTenant(ctx, (tx) => searchInvoices(tx, { limit: 5000 }));
+  checkTrue("a caller cannot ask for an unbounded page", overLimit.rows.length <= 100);
+
+  // ── The tenant boundary, actually run ─────────────────────────────────────
+  //
+  // This is the check that used to skip. `foreignTenantId` comes from the
+  // repaired `otherTenantId()`, so if there is no second tenant this suite has
+  // already failed loudly above rather than printing a green tick here.
+  const acrossTenants = await withTenant(
+    { tenantId: foreignTenantId, actorKind: "system" as const },
+    (tx) => searchInvoices(tx, { limit: 100 }),
+  );
+  checkTrue(
+    "another tenant's invoices are not in this tenant's list",
+    !acrossTenants.rows.some((r) => r.reference === oldReference || r.reference === draftReference),
+  );
+
+  const acrossSearch = await withTenant(
+    { tenantId: foreignTenantId, actorKind: "system" as const },
+    (tx) => searchInvoices(tx, { q: oldReference }),
+  );
+  check("nor reachable by searching for one by reference", acrossSearch.rows.length, 0);
+
+  await withTenant(ctx, (tx) =>
+    tx.delete(schema.invoices).where(inArray(schema.invoices.reference, [oldReference, draftReference])),
   );
 
   // ── Cleanup ───────────────────────────────────────────────────────────────

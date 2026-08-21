@@ -16,16 +16,22 @@ import {
   checkLeaveNotice,
   leaveDayCount,
   LEAVE_NOTICE_DAYS,
+  stageSickLeave,
+  sickLeavePayMinor,
+  SICK_LEAVE_TOTAL_DAYS,
   type LeaveEntitlement,
   // HR-8
   splitWorkedWindow,
   overtimeAmountMinor,
   hourlyBasicMinor,
   ordinaryMinutesFor,
+  assessWorkedDay,
+  assessWeeklyHours,
   PAY_BAND_BASIS_POINTS,
   PAY_BAND_LABEL,
   MAX_OVERTIME_MINUTES_PER_DAY,
   type PayBand,
+  type WeeklyHoursAssessment,
   // HR-6
   refuseDeduction,
   checkHealthInsurance,
@@ -37,7 +43,9 @@ import {
   today,
   addDays,
   addMonths,
+  daysBetween,
   startOfMonth,
+  startOfWeek,
   formatDay,
   type CalendarDay,
 } from "@meridian/core";
@@ -330,6 +338,14 @@ export async function prepareWageFile(
              select sum(o.amount) from overtime_records o
               where o.employee_id = e.id
                 and o.deleted_at is null
+                -- Ordinary hours are already inside the monthly basic on this
+                -- line. A standard-band row is an HOURS record — it is what
+                -- makes the 48-hour week countable — and adding its amount here
+                -- would pay the ordinary day a second time, on top of the
+                -- salary. The minutes sum below has always excluded it; the
+                -- money sum did not, and nothing recorded a standard band until
+                -- recordWorkedDay did.
+                and o.band <> 'standard'
                 and o.worked_on between ${periodStart}::date and ${periodEnd}::date
            ), 0)::text as overtime_minor,
            coalesce((
@@ -1117,6 +1133,13 @@ export interface LeaveSummary {
   /** Accrued + carried over + adjustment − taken. Never stored. */
   readonly remainingDays: number;
   readonly requests: readonly LeaveRow[];
+  /**
+   * Sick leave is a separate entitlement with its own ladder, not a draw on
+   * this one. Carried alongside rather than folded in, because the two answer
+   * different questions and netting them off is how fifteen days of full-pay
+   * sick leave gets taken out of somebody's annual leave.
+   */
+  readonly sick: SickLeaveYear | null;
 }
 
 /**
@@ -1199,6 +1222,7 @@ export async function leaveSummary(
     accruedDays,
     remainingDays: accruedDays + balance.carried_over_days + balance.adjustment_days - takenDays,
     requests,
+    sick: await sickLeaveYear(tx, employeeId, now),
   };
 }
 
@@ -1243,7 +1267,18 @@ async function leaveRequestsFor(
   }[];
 
   return rows.map((r) => {
-    const notice = checkLeaveNotice({ requestedOn: r.requested_on, startsOn: r.starts_on });
+    // The 30-day minimum is the notice an EMPLOYER must give when it sets
+    // annual-leave dates. It has no application to sick leave, bereavement or
+    // anything else that happens to somebody — a sick day is by nature notified
+    // the morning it starts, and reporting that as insufficient notice turns
+    // every illness into a compliance flag against the person who was ill.
+    const notice =
+      r.kind === "annual"
+        ? checkLeaveNotice({ requestedOn: r.requested_on, startsOn: r.starts_on })
+        : {
+            sufficient: true,
+            message: `Notice does not apply to ${r.kind} leave — the ${LEAVE_NOTICE_DAYS}-day minimum is for annual-leave dates set by the employer.`,
+          };
     return {
       id: r.id,
       kind: r.kind,
@@ -1308,6 +1343,10 @@ export async function leaveOverview(
               from leave_requests l
              where l.technician_id = e.technician_id
                and l.status = 'approved'
+               -- Annual leave only. The notice rule is about the employer
+               -- setting leave dates; counting a sick day against it flags the
+               -- person who was ill, on a board about the employer's duties.
+               and l.kind = 'annual'
                and l.deleted_at is null
                and l.starts_on::date >= ${now}::date
                and l.starts_on::date - l.created_at::date < ${LEAVE_NOTICE_DAYS}) as short_notice
@@ -1350,6 +1389,395 @@ export async function leaveOverview(
       shortNoticeCount: r.short_notice ?? 0,
     };
   });
+}
+
+// ── HR-7: sick leave, which is three rates and not one ──────────────────────
+
+export interface SickLeavePeriod {
+  readonly id: string;
+  readonly startsOn: CalendarDay;
+  readonly endsOn: CalendarDay;
+  readonly days: number;
+  readonly status: string;
+  /** Sick days consumed earlier in the leave year, before this absence. */
+  readonly daysAlreadyTaken: number;
+  readonly probationUnpaidDays: number;
+  readonly fullPayDays: number;
+  readonly halfPayDays: number;
+  readonly unpaidDays: number;
+  readonly beyondEntitlementDays: number;
+  /** Full pay plus half pay, against the whole monthly wage. Minor units. */
+  readonly payMinor: number;
+  readonly explanation: string;
+}
+
+export interface SickLeaveYear {
+  readonly employeeId: string;
+  readonly fullName: string;
+  readonly leaveYearStart: CalendarDay;
+  readonly takenDays: number;
+  readonly fullPayDays: number;
+  readonly halfPayDays: number;
+  readonly unpaidDays: number;
+  readonly probationUnpaidDays: number;
+  readonly beyondEntitlementDays: number;
+  /** Of the 90, at the end of the last absence. */
+  readonly remainingDays: number;
+  readonly payMinor: number;
+  readonly periods: readonly SickLeavePeriod[];
+}
+
+type SickRow = {
+  id: string;
+  starts_on: string;
+  ends_on: string;
+  status: string;
+};
+
+/**
+ * Walk a leave year's sick absences through the statutory ladder, in order.
+ *
+ * The cursor belongs to the **year**, not to the absence, which is the whole
+ * reason this is a fold rather than a map. Twelve sick days in March leave
+ * three days of the full-pay stage; six more in July are three at full pay and
+ * three at half. Staging each absence from zero pays the first fifteen days of
+ * every absence at full pay, which for a worker with several short absences is
+ * most of the year at the wrong rate.
+ *
+ * `probationEndsOn` is nullable and the null case is not "no probation" — it is
+ * "no probation date recorded", which this treats as no probation. That is the
+ * employee-favourable reading, and it is the only one available: inventing a
+ * probation period nobody recorded would move days out of full pay.
+ */
+function stageSickPeriods(
+  rows: readonly SickRow[],
+  monthlyWageMinor: number,
+  probationEndsOn: CalendarDay | null,
+): { periods: SickLeavePeriod[]; consumed: number } {
+  const periods: SickLeavePeriod[] = [];
+  let consumed = 0;
+
+  for (const row of rows) {
+    const days = leaveDayCount(row.starts_on, row.ends_on);
+
+    // Days at the START of the absence that fall inside probation. Measured
+    // with string arithmetic, both ends inclusive — a Date round trip here
+    // shifts the boundary by the host's offset, and the direction that shifts
+    // is which days were paid.
+    const probationDays =
+      probationEndsOn && daysBetween(row.starts_on, probationEndsOn) >= 0
+        ? Math.min(days, daysBetween(row.starts_on, probationEndsOn) + 1)
+        : 0;
+
+    const stages = stageSickLeave({ days, daysAlreadyTaken: consumed, probationDays });
+    consumed += stages.entitlementConsumedDays;
+
+    periods.push({
+      id: row.id,
+      startsOn: row.starts_on,
+      endsOn: row.ends_on,
+      days,
+      status: row.status,
+      daysAlreadyTaken: stages.daysAlreadyTaken,
+      probationUnpaidDays: stages.probationUnpaidDays,
+      fullPayDays: stages.fullPayDays,
+      halfPayDays: stages.halfPayDays,
+      unpaidDays: stages.unpaidDays,
+      beyondEntitlementDays: stages.beyondEntitlementDays,
+      payMinor: sickLeavePayMinor(monthlyWageMinor, stages),
+      explanation: stages.explanation,
+    });
+  }
+
+  return { periods, consumed };
+}
+
+function summariseSickYear(
+  header: { employeeId: string; fullName: string; leaveYearStart: CalendarDay },
+  periods: readonly SickLeavePeriod[],
+  consumed: number,
+): SickLeaveYear {
+  const sum = (pick: (p: SickLeavePeriod) => number) => periods.reduce((t, p) => t + pick(p), 0);
+
+  return {
+    employeeId: header.employeeId,
+    fullName: header.fullName,
+    leaveYearStart: header.leaveYearStart,
+    takenDays: sum((p) => p.days),
+    fullPayDays: sum((p) => p.fullPayDays),
+    halfPayDays: sum((p) => p.halfPayDays),
+    unpaidDays: sum((p) => p.unpaidDays),
+    probationUnpaidDays: sum((p) => p.probationUnpaidDays),
+    beyondEntitlementDays: sum((p) => p.beyondEntitlementDays),
+    remainingDays: Math.max(0, SICK_LEAVE_TOTAL_DAYS - consumed),
+    payMinor: sum((p) => p.payMinor),
+    periods,
+  };
+}
+
+/**
+ * One employee's sick-leave position for the leave year in progress (`HR-7`).
+ *
+ * Bounded by the leave year rather than by a row limit. A `limit 50` here would
+ * be a silent truncation of the ladder — the absences it dropped are the ones
+ * that already consumed the full-pay stage, so the days that survived would all
+ * be paid at full pay again.
+ */
+export async function sickLeaveYear(
+  tx: TenantScopedTx,
+  employeeId: string,
+  now: CalendarDay = today(),
+): Promise<SickLeaveYear | null> {
+  const headers = (await tx.execute<{
+    id: string;
+    full_name: string;
+    technician_id: string | null;
+    service_start: string | null;
+    probation_ends_on: string | null;
+    basic_salary_minor: string | null;
+    allowances: unknown;
+  }>(sql`
+    select e.id, e.full_name, e.technician_id,
+           coalesce(e.contract_start, t.joined_on::date) as service_start,
+           coalesce(
+             (select c.probation_ends_on
+                from employment_contract_terms c
+               where c.employee_id = e.id and c.deleted_at is null
+                 and c.probation_ends_on is not null
+               order by c.sequence limit 1),
+             e.probation_end
+           ) as probation_ends_on,
+           e.basic_salary_minor::text as basic_salary_minor,
+           e.allowances
+      from employees e
+      left join technicians t on t.id = e.technician_id
+     where e.id = ${employeeId} and e.deleted_at is null
+  `)) as unknown as {
+    id: string;
+    full_name: string;
+    technician_id: string | null;
+    service_start: string | null;
+    probation_ends_on: string | null;
+    basic_salary_minor: string | null;
+    allowances: unknown;
+  }[];
+
+  const header = headers[0];
+  if (!header) return null;
+
+  const leaveYearStart = header.service_start
+    ? addMonths(header.service_start, Math.floor(monthsOfService(header.service_start, now) / 12) * 12)
+    : startOfMonth(now);
+
+  const rows = header.technician_id
+    ? ((await tx.execute<SickRow>(sql`
+        select id,
+               starts_on::date::text as starts_on,
+               ends_on::date::text as ends_on,
+               status
+          from leave_requests
+         where technician_id = ${header.technician_id}::uuid
+           and kind = 'sick'
+           and status = 'approved'
+           and deleted_at is null
+           and starts_on::date >= ${leaveYearStart}::date
+         order by starts_on, id
+      `)) as unknown as SickRow[])
+    : [];
+
+  const basic = header.basic_salary_minor ? Number(header.basic_salary_minor) : 0;
+  const { periods, consumed } = stageSickPeriods(
+    rows,
+    basic + allowanceTotalMinor(header.allowances),
+    header.probation_ends_on,
+  );
+
+  return summariseSickYear(
+    { employeeId: header.id, fullName: header.full_name, leaveYearStart },
+    periods,
+    consumed,
+  );
+}
+
+/**
+ * Everybody with sick leave recorded in the leave year in progress (`HR-7`).
+ *
+ * One query, then the ladder in TypeScript, for the same reason `leaveOverview`
+ * does its arithmetic there: the staging rule is unit-tested in
+ * `packages/core`, and a CASE expression restating it would be a second home
+ * nothing tests. The leave year is per employee — it is their service
+ * anniversary — so the query fetches a rolling year of absences and the fold
+ * discards the ones that fall before each person's own year start.
+ */
+export async function sickLeaveOverview(
+  tx: TenantScopedTx,
+  now: CalendarDay = today(),
+): Promise<readonly SickLeaveYear[]> {
+  const rows = (await tx.execute<{
+    employee_id: string;
+    full_name: string;
+    service_start: string | null;
+    probation_ends_on: string | null;
+    basic_salary_minor: string | null;
+    allowances: unknown;
+    id: string;
+    starts_on: string;
+    ends_on: string;
+    status: string;
+  }>(sql`
+    select e.id as employee_id,
+           e.full_name,
+           coalesce(e.contract_start, t.joined_on::date) as service_start,
+           coalesce(
+             (select c.probation_ends_on
+                from employment_contract_terms c
+               where c.employee_id = e.id and c.deleted_at is null
+                 and c.probation_ends_on is not null
+               order by c.sequence limit 1),
+             e.probation_end
+           ) as probation_ends_on,
+           e.basic_salary_minor::text as basic_salary_minor,
+           e.allowances,
+           l.id,
+           l.starts_on::date::text as starts_on,
+           l.ends_on::date::text as ends_on,
+           l.status
+      from employees e
+      left join technicians t on t.id = e.technician_id
+      join leave_requests l
+        on l.technician_id = e.technician_id
+       and l.kind = 'sick'
+       and l.status = 'approved'
+       and l.deleted_at is null
+       and l.starts_on::date >= ${now}::date - 400
+     where e.deleted_at is null and e.status = 'active'
+     order by e.full_name, l.starts_on, l.id
+  `)) as unknown as {
+    employee_id: string;
+    full_name: string;
+    service_start: string | null;
+    probation_ends_on: string | null;
+    basic_salary_minor: string | null;
+    allowances: unknown;
+    id: string;
+    starts_on: string;
+    ends_on: string;
+    status: string;
+  }[];
+
+  const byEmployee = new Map<string, typeof rows>();
+  for (const row of rows) {
+    const list = byEmployee.get(row.employee_id);
+    if (list) list.push(row);
+    else byEmployee.set(row.employee_id, [row]);
+  }
+
+  const out: SickLeaveYear[] = [];
+  for (const [employeeId, group] of byEmployee) {
+    const first = group[0];
+    if (!first) continue;
+
+    const leaveYearStart = first.service_start
+      ? addMonths(first.service_start, Math.floor(monthsOfService(first.service_start, now) / 12) * 12)
+      : startOfMonth(now);
+
+    const inYear = group.filter((r) => r.starts_on >= leaveYearStart);
+    if (inYear.length === 0) continue;
+
+    const basic = first.basic_salary_minor ? Number(first.basic_salary_minor) : 0;
+    const { periods, consumed } = stageSickPeriods(
+      inYear,
+      basic + allowanceTotalMinor(first.allowances),
+      first.probation_ends_on,
+    );
+
+    out.push(
+      summariseSickYear({ employeeId, fullName: first.full_name, leaveYearStart }, periods, consumed),
+    );
+  }
+
+  return out;
+}
+
+/**
+ * Record an absence as sick leave (`HR-7`).
+ *
+ * ── WHY THIS WRITES TO `leave_requests` AND NOT SOMEWHERE OF ITS OWN ────────
+ *
+ * Because the dispatcher reads `leave_requests` to decide who is available, and
+ * a sick day it cannot see is a technician assigned to a job on a day they were
+ * signed off. That table is keyed by technician rather than by employee, which
+ * is the one real cost: an employment record with no technician link has
+ * nowhere to put the absence, and this says so rather than storing it where
+ * nothing will read it.
+ *
+ * The staging is deliberately NOT stored. Which days were full pay depends on
+ * what else the leave year holds, and an absence recorded in April can be
+ * cancelled in May — a stored split would then be a number nothing recomputes,
+ * sitting next to the leave calendar that disagrees with it. It is derived on
+ * read, by `sickLeaveYear` above, and returned here so the person recording it
+ * sees what it cost before they leave the page.
+ */
+export async function recordSickLeave(
+  tx: TenantScopedTx,
+  ctx: { tenantId: string; userId?: string },
+  input: {
+    employeeId: string;
+    startsOn: CalendarDay;
+    endsOn: CalendarDay;
+    status?: "pending" | "approved";
+    reason?: string;
+  },
+  now: CalendarDay = today(),
+): Promise<{ id: string; days: number; year: SickLeaveYear | null }> {
+  if (daysBetween(input.startsOn, input.endsOn) < 0) {
+    throw new UserFacingError("The absence ends before it starts.");
+  }
+
+  const days = leaveDayCount(input.startsOn, input.endsOn);
+  if (days > SICK_LEAVE_TOTAL_DAYS) {
+    throw new UserFacingError(
+      `${days} days in one absence is longer than the ${SICK_LEAVE_TOTAL_DAYS}-day statutory sick-leave year. ` +
+        `Record what has actually happened so far — an absence that runs past the entitlement is a termination ` +
+        `question under Article 34, not a longer sick leave.`,
+    );
+  }
+
+  const employees = (await tx.execute<{ technician_id: string | null }>(sql`
+    select technician_id from employees where id = ${input.employeeId} and deleted_at is null
+  `)) as unknown as { technician_id: string | null }[];
+
+  const employee = employees[0];
+  if (!employee) throw new UserFacingError("That employment record does not exist.");
+  if (!employee.technician_id) {
+    throw new UserFacingError(
+      "This employment record is not linked to a technician, and leave is held against the technician roster — " +
+        "which is what the dispatcher reads to decide who is available. Recording the absence anywhere else would " +
+        "leave this person schedulable on a day they are signed off sick. Link the technician record first.",
+    );
+  }
+
+  // `starts_on` and `ends_on` are timestamptz on this table and have been since
+  // 0000, for what are calendar days. Not this module's column to change — the
+  // dispatcher's availability window reads them as instants — so every read and
+  // write here goes through ::date, which round-trips within a deployment and
+  // is what the rest of this file already does.
+  const rows = (await tx.execute<{ id: string }>(sql`
+    insert into leave_requests (
+      tenant_id, technician_id, kind, starts_on, ends_on, status, reason, approved_by_id, approved_at
+    ) values (
+      ${ctx.tenantId}::uuid, ${employee.technician_id}::uuid, 'sick',
+      ${input.startsOn}::date, ${input.endsOn}::date,
+      ${input.status ?? "approved"}, ${input.reason ?? null},
+      ${ctx.userId ?? null}::uuid, ${ctx.userId ? sql`now()` : sql`null`}
+    )
+    returning id
+  `)) as unknown as { id: string }[];
+
+  const row = rows[0];
+  if (!row) throw new Error("Could not record the sick leave.");
+
+  return { id: row.id, days, year: await sickLeaveYear(tx, input.employeeId, now) };
 }
 
 /**
@@ -1444,7 +1872,7 @@ export async function recordOvertime(
     source?: "attendance" | "manual";
     note?: string;
   },
-): Promise<{ id: string; amountMinor: number }> {
+): Promise<{ id: string; amountMinor: number; weekly: WeeklyHoursAssessment }> {
   if (input.minutes <= 0) throw new UserFacingError("Record the minutes actually worked.");
   if (input.minutes > 1440) throw new UserFacingError("More than 24 hours in one day is a data-entry error.");
 
@@ -1500,7 +1928,13 @@ export async function recordOvertime(
 
   const row = rows[0];
   if (!row) throw new Error("Could not record the overtime.");
-  return { id: row.id, amountMinor };
+
+  // Read back rather than added up, because this upserts: re-recording a day
+  // that already had three hours against it with two replaces the three, and a
+  // running total kept in TypeScript would have counted five.
+  const minutesThisWeek = await weeklyMinutesFor(tx, input.employeeId, input.workedOn);
+
+  return { id: row.id, amountMinor, weekly: assessWeeklyHours(minutesThisWeek) };
 }
 
 /** Overtime in a period, newest first. Drives the HR board and the wage file. */
@@ -1627,6 +2061,134 @@ export async function workingHoursExceptions(
   }));
 }
 
+// ── HR-8: the 48-hour week ──────────────────────────────────────────────────
+
+export interface WeeklyHoursRow {
+  readonly employeeId: string;
+  readonly fullName: string;
+  /** The Monday of the week, matching Postgres date_trunc on week. */
+  readonly weekStart: CalendarDay;
+  readonly weekEnd: CalendarDay;
+  readonly recordedMinutes: number;
+  readonly standardMinutes: number;
+  readonly overtimeMinutes: number;
+  readonly nightMinutes: number;
+  readonly restDayMinutes: number;
+  /** Days in the week with any hours recorded at all. */
+  readonly daysRecorded: number;
+  readonly assessment: WeeklyHoursAssessment;
+}
+
+/**
+ * Minutes recorded in the week containing `day`, for one employee (`HR-8`).
+ *
+ * This is the `minutesThisWeek` that `assessWorkedDay` has always taken as a
+ * parameter and that nothing in the database layer supplied — the reason the
+ * 48-hour maximum was unit-tested and unchecked at the same time.
+ *
+ * ── WHAT THIS NUMBER IS, EXACTLY ────────────────────────────────────────────
+ *
+ * The sum of the `overtime_records` rows for that week, every band included. It
+ * is a **lower bound on hours worked, not a measurement of them**: the only
+ * hours in that table are the ones somebody entered, and `HR-8` says hours come
+ * from clock-in/out in the field app, which is `FLD-3` and does not exist. So a
+ * week that crosses 48 hours here has genuinely crossed it; a week that does
+ * not may still have, unrecorded. `hoursSourceWarning` says that in the product
+ * rather than in this comment, because the person reading the board is the one
+ * who needs to know it.
+ */
+export async function weeklyMinutesFor(
+  tx: TenantScopedTx,
+  employeeId: string,
+  day: CalendarDay,
+): Promise<number> {
+  const weekStart = startOfWeek(day);
+  const rows = (await tx.execute<{ minutes: number }>(sql`
+    select coalesce(sum(minutes), 0)::int as minutes
+      from overtime_records
+     where employee_id = ${employeeId}::uuid
+       and deleted_at is null
+       and worked_on between ${weekStart}::date and ${addDays(weekStart, 6)}::date
+  `)) as unknown as { minutes: number }[];
+
+  return rows[0]?.minutes ?? 0;
+}
+
+/**
+ * Every employee's recorded hours, by week, against the 48-hour maximum.
+ *
+ * The window is snapped back to the Monday of the week `from` falls in, and the
+ * grouping is Postgres `date_trunc` on week, which is also Monday. Those two
+ * have to agree: a window starting on a Wednesday would report that week's
+ * total as the three days inside it and call a 60-hour week compliant.
+ *
+ * `worked_on` is a `date` column and the truncation runs through `timestamp`,
+ * not `timestamptz`, so no session timezone reaches the week boundary. The same
+ * cast through `timestamptz` would move a Monday's hours into the previous week
+ * for every deployment whose cluster is not in Dubai.
+ */
+export async function weeklyWorkingHours(
+  tx: TenantScopedTx,
+  input: { from: CalendarDay; to: CalendarDay; employeeId?: string; breachesOnly?: boolean },
+): Promise<readonly WeeklyHoursRow[]> {
+  const from = startOfWeek(input.from);
+
+  const rows = (await tx.execute<{
+    employee_id: string;
+    full_name: string;
+    week_start: string;
+    minutes: number;
+    standard_minutes: number;
+    overtime_minutes: number;
+    night_minutes: number;
+    rest_day_minutes: number;
+    days_recorded: number;
+  }>(sql`
+    select o.employee_id,
+           e.full_name,
+           date_trunc('week', o.worked_on::timestamp)::date::text as week_start,
+           coalesce(sum(o.minutes), 0)::int as minutes,
+           coalesce(sum(o.minutes) filter (where o.band = 'standard'), 0)::int as standard_minutes,
+           coalesce(sum(o.minutes) filter (where o.band = 'overtime'), 0)::int as overtime_minutes,
+           coalesce(sum(o.minutes) filter (where o.band = 'night'), 0)::int as night_minutes,
+           coalesce(sum(o.minutes) filter (where o.band = 'rest_day'), 0)::int as rest_day_minutes,
+           count(distinct o.worked_on)::int as days_recorded
+      from overtime_records o
+      join employees e on e.id = o.employee_id
+     where o.deleted_at is null
+       and o.worked_on between ${from}::date and ${input.to}::date
+       and (${input.employeeId ?? null}::uuid is null or o.employee_id = ${input.employeeId ?? null}::uuid)
+     group by o.employee_id, e.full_name, date_trunc('week', o.worked_on::timestamp)
+     order by week_start desc, e.full_name
+  `)) as unknown as {
+    employee_id: string;
+    full_name: string;
+    week_start: string;
+    minutes: number;
+    standard_minutes: number;
+    overtime_minutes: number;
+    night_minutes: number;
+    rest_day_minutes: number;
+    days_recorded: number;
+  }[];
+
+  const weeks = rows.map((r) => ({
+    employeeId: r.employee_id,
+    fullName: r.full_name,
+    weekStart: r.week_start,
+    weekEnd: addDays(r.week_start, 6),
+    recordedMinutes: r.minutes,
+    standardMinutes: r.standard_minutes,
+    overtimeMinutes: r.overtime_minutes,
+    nightMinutes: r.night_minutes,
+    restDayMinutes: r.rest_day_minutes,
+    daysRecorded: r.days_recorded,
+    assessment: assessWeeklyHours(r.minutes),
+  }));
+
+  return input.breachesOnly ? weeks.filter((w) => !w.assessment.withinLimit) : weeks;
+}
+
 /**
  * What the hours picture is NOT covering, in plain language.
  *
@@ -1644,10 +2206,12 @@ export async function hoursSourceWarning(tx: TenantScopedTx): Promise<string | n
   if ((rows[0]?.events ?? 0) > 0) return null;
 
   return (
-    "No attendance events in the last 30 days. Daily and weekly working-hour maxima (8 per day, 48 per week, " +
-    "one hour of break after five consecutive hours) are computed from clock-in/out, which arrives with the field " +
-    "app (FLD-3). Until then the only hours this system knows about are the overtime entries recorded by hand below — " +
-    "so an empty exception list means nothing is being measured, not that nobody is over."
+    "No attendance events in the last 30 days. HR-8 expects daily and weekly working-hour maxima (8 per day, " +
+    "48 per week, one hour of break after five consecutive hours) to be computed from clock-in/out, which arrives " +
+    "with the field app (FLD-3). Until then the only hours this system knows about are the ones recorded by hand " +
+    "below, so the weekly totals are a floor and not a measurement: a week shown as over 48 hours is genuinely over, " +
+    "but a week shown as under may only be under-recorded. An empty exception list means nothing is being measured, " +
+    "not that nobody is over."
   );
 }
 
@@ -1674,6 +2238,145 @@ export function splitWorkedDay(input: {
   });
 }
 
+export interface WorkedDayResult {
+  readonly workedOn: CalendarDay;
+  readonly split: ReturnType<typeof splitWorkedWindow>;
+  readonly totalMinor: number;
+  readonly bandsRecorded: readonly PayBand[];
+  readonly bandsCleared: readonly PayBand[];
+  /** The week this day lands in, INCLUDING the day just recorded. */
+  readonly weekly: WeeklyHoursAssessment;
+  readonly warnings: readonly string[];
+}
+
+/**
+ * Record one worked day from its start and end, split into rate bands.
+ *
+ * ── WHY THIS EXISTS, GIVEN THE PER-BAND FORM ALREADY DID ────────────────────
+ *
+ * `recordOvertime` takes a band and a number of minutes, which means whoever is
+ * typing has already done the split in their head — and the split is the part
+ * that is easy to get wrong in the expensive direction. A shift from 20:00 to
+ * 04:00 is eight hours, all of it ordinary time, and none of it earns the night
+ * premium; classified on the clock alone it looks like six hours at +50%.
+ * `splitWorkedWindow` is the function that gets that right, and until now
+ * nothing in the database layer called it.
+ *
+ * ── AND WHY IT IS NOT THE FIELD APP ─────────────────────────────────────────
+ *
+ * This is a start and an end somebody types in. `FLD-3` is a clock-in and a
+ * clock-out with a geofence on them, landing in `attendance_events`, and it
+ * does not exist. The difference matters for what may be claimed about the
+ * numbers: hours recorded here are as complete as whoever entered them, which
+ * is why the weekly total this returns is a floor rather than a measurement and
+ * why `hoursSourceWarning` says so on the board.
+ *
+ * The ordinary hours ARE stored, as a `standard` band row. That is the change
+ * that makes a 48-hour week countable at all — a table holding only the
+ * overtime can never see a week of ordinary days that ran long. They are
+ * excluded from the wage file's overtime money, because the monthly basic
+ * already pays them; see `prepareWageFile`.
+ */
+export async function recordWorkedDay(
+  tx: TenantScopedTx,
+  ctx: { tenantId: string; userId?: string },
+  input: {
+    employeeId: string;
+    workedOn: CalendarDay;
+    /** Dubai wall-clock instants for the day being recorded. */
+    start: Date;
+    end: Date;
+    breakMinutes?: number;
+    isRestDay?: boolean;
+    note?: string;
+  },
+): Promise<WorkedDayResult> {
+  const split = splitWorkedDay({
+    start: input.start,
+    end: input.end,
+    ...(input.breakMinutes === undefined ? {} : { breakMinutes: input.breakMinutes }),
+    ...(input.isRestDay === undefined ? {} : { isRestDay: input.isRestDay }),
+  });
+
+  if (split.totalMinutes <= 0) throw new UserFacingError("That day has no worked minutes in it.");
+  if (split.totalMinutes > 1440) throw new UserFacingError("More than 24 hours in one day is a data-entry error.");
+
+  const minutesByBand: Record<PayBand, number> = {
+    standard: split.standardMinutes,
+    overtime: split.overtimeMinutes,
+    night: split.nightMinutes,
+    rest_day: split.restDayMinutes,
+  };
+
+  const bandsRecorded: PayBand[] = [];
+  const bandsCleared: PayBand[] = [];
+  let totalMinor = 0;
+
+  for (const band of ["standard", "overtime", "night", "rest_day"] as const) {
+    const minutes = minutesByBand[band];
+
+    if (minutes > 0) {
+      const recorded = await recordOvertime(tx, ctx, {
+        employeeId: input.employeeId,
+        workedOn: input.workedOn,
+        band,
+        minutes,
+        source: "manual",
+        ...(input.note ? { note: input.note } : {}),
+      });
+      totalMinor += recorded.amountMinor;
+      bandsRecorded.push(band);
+      continue;
+    }
+
+    // A day re-entered with different times must not leave the bands it no
+    // longer has standing. Without this, correcting a 20:00–02:00 shift to
+    // 20:00–00:00 leaves the two night hours on file for ever, and they are
+    // paid at +50%. Soft-deleted rather than hard, so the correction is legible
+    // in a payroll dispute instead of the earlier figure simply vanishing.
+    const cleared = (await tx.execute<{ id: string }>(sql`
+      update overtime_records
+         set deleted_at = now(), updated_at = now()
+       where employee_id = ${input.employeeId}::uuid
+         and worked_on = ${input.workedOn}::date
+         and band = ${band}
+         and deleted_at is null
+      returning id
+    `)) as unknown as { id: string }[];
+
+    if (cleared.length > 0) bandsCleared.push(band);
+  }
+
+  // The weekly total, read back AFTER the writes so it includes this day, and
+  // then run through the same `assessWorkedDay` the unit tests exercise. This
+  // is the parameter that had no caller: `minutesThisWeek` from real rows.
+  const minutesThisWeek = await weeklyMinutesFor(tx, input.employeeId, input.workedOn);
+
+  const employees = (await tx.execute<{ basic_salary_minor: string | null }>(sql`
+    select basic_salary_minor::text as basic_salary_minor
+      from employees where id = ${input.employeeId} and deleted_at is null
+  `)) as unknown as { basic_salary_minor: string | null }[];
+
+  const assessment = assessWorkedDay({
+    start: input.start,
+    end: input.end,
+    ...(input.breakMinutes === undefined ? {} : { breakMinutes: input.breakMinutes }),
+    ...(input.isRestDay === undefined ? {} : { isRestDay: input.isRestDay }),
+    minutesThisWeek,
+    monthlyBasicMinor: employees[0]?.basic_salary_minor ? Number(employees[0].basic_salary_minor) : 0,
+  });
+
+  return {
+    workedOn: input.workedOn,
+    split,
+    totalMinor,
+    bandsRecorded,
+    bandsCleared,
+    weekly: assessWeeklyHours(minutesThisWeek),
+    warnings: assessment.warnings.concat(assessment.hours.warnings),
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // HR-6 — Health insurance
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1693,7 +2396,23 @@ export interface HealthInsuranceRow {
   readonly problems: readonly string[];
 }
 
-const HEALTH_COLUMNS = sql`
+/**
+ * The health-cover columns, measured against a day this module chose.
+ *
+ * ── WHY THIS IS A FUNCTION AND NOT A CONSTANT ───────────────────────────────
+ *
+ * It used to compare against `current_date`, which is the Postgres session's
+ * idea of today — and the session timezone is whatever the cluster was
+ * initialised with, not Asia/Dubai. For the hours where those two disagree,
+ * `current_date` is a different calendar day from the one every other date
+ * comparison in this module uses, and the error has a direction: a policy that
+ * expired at midnight Dubai keeps reporting as in date until midnight in the
+ * server's zone. A lapsed health-insurance policy reading as valid is the
+ * failure this whole module exists to prevent, so today is passed in, from
+ * `today()`, like every other day-valued comparison here.
+ */
+function healthColumns(now: CalendarDay) {
+  return sql`
   e.id as employee_id,
   e.full_name,
   e.health_plan,
@@ -1702,9 +2421,10 @@ const HEALTH_COLUMNS = sql`
   e.health_premium,
   e.basic_salary_minor::text as basic_salary_minor,
   e.allowances,
-  d.expires_at as policy_expires_on,
-  (d.expires_at is not null and d.expires_at >= current_date) as has_in_date_policy
+  d.expires_at::date::text as policy_expires_on,
+  (d.expires_at is not null and d.expires_at >= ${now}::date) as has_in_date_policy
 `;
+}
 
 type HealthDbRow = {
   employee_id: string;
@@ -1752,9 +2472,10 @@ function toHealthRow(r: HealthDbRow): HealthInsuranceRow {
 export async function healthInsuranceFor(
   tx: TenantScopedTx,
   employeeId: string,
+  now: CalendarDay = today(),
 ): Promise<HealthInsuranceRow | null> {
   const rows = (await tx.execute<HealthDbRow>(sql`
-    select ${HEALTH_COLUMNS}
+    select ${healthColumns(now)}
       from employees e
       left join employee_documents d
         on d.employee_id = e.id and d.kind = 'health_insurance' and d.deleted_at is null
@@ -1775,9 +2496,10 @@ export async function healthInsuranceFor(
  */
 export async function healthInsuranceGaps(
   tx: TenantScopedTx,
+  now: CalendarDay = today(),
 ): Promise<readonly HealthInsuranceRow[]> {
   const rows = (await tx.execute<HealthDbRow>(sql`
-    select ${HEALTH_COLUMNS}
+    select ${healthColumns(now)}
       from employees e
       left join employee_documents d
         on d.employee_id = e.id and d.kind = 'health_insurance' and d.deleted_at is null
@@ -1933,7 +2655,10 @@ export interface HrLifecycleSummary {
   readonly permitWarning: string | null;
   readonly contracts: readonly ContractAlert[];
   readonly leave: readonly LeaveOverviewRow[];
+  readonly sickLeave: readonly SickLeaveYear[];
   readonly hoursExceptions: readonly HoursException[];
+  /** Weeks over the 48-hour statutory maximum, most recent first. */
+  readonly weeklyBreaches: readonly WeeklyHoursRow[];
   readonly hoursWarning: string | null;
   readonly insuranceGaps: readonly HealthInsuranceRow[];
   readonly wageGaps: readonly WageFileGap[];
@@ -1960,9 +2685,19 @@ export async function hrLifecycleSummary(
     permitWarning: await permitIssuanceWarning(tx, ctx, now),
     contracts: await contractAlerts(tx, now),
     leave: await leaveOverview(tx, now),
+    sickLeave: await sickLeaveOverview(tx, now),
     hoursExceptions: await workingHoursExceptions(tx, { from: weekAgo, to: now }),
+    // Four weeks rather than one. A daily breach is visible the day it happens;
+    // a 48-hour week is only visible once the week is finished, so a seven-day
+    // window would show the current week — always partial, always under the
+    // limit — and never the completed one that went over.
+    weeklyBreaches: await weeklyWorkingHours(tx, {
+      from: startOfWeek(addDays(now, -21)),
+      to: now,
+      breachesOnly: true,
+    }),
     hoursWarning: await hoursSourceWarning(tx),
-    insuranceGaps: await healthInsuranceGaps(tx),
+    insuranceGaps: await healthInsuranceGaps(tx, now),
     wageGaps: await wageFileGaps(tx),
   };
 }

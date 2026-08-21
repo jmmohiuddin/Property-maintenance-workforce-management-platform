@@ -5,6 +5,9 @@ import {
   BLOCKED_ON_LABEL,
   DISPOSITION_REASONS,
   DISPOSITION_BY_CODE,
+  INTERVIEW_KINDS,
+  INTERVIEW_KIND_LABEL,
+  INTERVIEW_PPE_OPTIONS,
   VISA_STATUSES,
   VISA_STATUS_LABEL,
   outcomeMessage,
@@ -12,10 +15,13 @@ import {
 import { Field, TextInput, TextArea, Select, FormBanner, SubmitButton } from "@/components/form";
 import {
   archiveApplicationAction,
+  cancelInterviewAction,
   cancelOutcomeAction,
   hireAction,
   moveStageAction,
   reopenApplicationAction,
+  rescheduleInterviewAction,
+  scheduleInterviewAction,
   sendOutcomeNowAction,
   setBlockedOnAction,
   setVisaStatusAction,
@@ -29,6 +35,28 @@ interface Stage {
   name: string;
   stageType: string;
   sequence: number;
+}
+
+/**
+ * `ATS-14`. What the panel needs to know about a booked interview.
+ *
+ * Dates cross the server/client boundary as ISO strings, because a `Date` put
+ * through a server-component prop is serialised and revived and the revived one
+ * is a different object with the same instant — which is fine until somebody
+ * compares them.
+ */
+export interface LiveInterview {
+  interviewId: string;
+  kind: string;
+  scheduledAt: string;
+  /** Pre-filled into the datetime-local control, in Dubai wall-clock. */
+  scheduledAtLocal: string;
+  locationName: string;
+  rescheduleRequestedAt: string | null;
+  rescheduleRequestNote: string | null;
+  confirmationSentAt: string | null;
+  reminder24hSentAt: string | null;
+  reminder2hSentAt: string | null;
 }
 
 /**
@@ -69,6 +97,8 @@ export function CandidatePanels(props: {
   outcomeScheduledAt: string | null;
   outcomeSentAt: string | null;
   stages: readonly Stage[];
+  /** `ATS-14`. The live interview, when there is one. */
+  interview: LiveInterview | null;
 }) {
   const isLive = props.status === "active";
 
@@ -77,6 +107,7 @@ export function CandidatePanels(props: {
       {isLive ? <MovePanel {...props} /> : null}
       {isLive ? <BlockedPanel {...props} /> : null}
       {isLive && props.stageType === "trade_check" ? <VisaPanel {...props} /> : null}
+      {isLive ? <InterviewPanel {...props} /> : null}
 
       {/* The outcome controls, wherever the outcome currently stands. */}
       {!props.outcomeSentAt && props.outcomeScheduledAt ? <CancelPanel {...props} /> : null}
@@ -473,6 +504,261 @@ function HirePanel(props: { applicationId: string }) {
 
         <SubmitButton pending={pending} pendingLabel="Creating…" className="btn btn-primary">
           Create employee
+        </SubmitButton>
+      </form>
+    </Panel>
+  );
+}
+
+
+/**
+ * Book an interview or a site trial (`ATS-14`).
+ *
+ * ── WHY THE LOGISTICS FIELDS ARE ON THIS FORM AND NOT IN A FOLLOW-UP ────────
+ *
+ * `ATS-14` names four things the candidate must be sent: the site address,
+ * parking, PPE and what to bring. They are asked for here, at the moment the
+ * time is chosen, because that is the only moment the person filling this in
+ * knows all four — and because a second screen for "add the details" is a
+ * screen that gets skipped, after which the candidate is sent a time and no
+ * address.
+ *
+ * The PPE list is checkboxes rather than a text field for the same reason the
+ * disposition reasons are a list: "hi-vis" typed five ways is five
+ * requirements, and the one a candidate does not recognise is the one they turn
+ * up without.
+ */
+function InterviewPanel(props: {
+  applicationId: string;
+  candidateEmail: string | null;
+  interview: LiveInterview | null;
+}) {
+  const [state, action, pending] = useActionState(scheduleInterviewAction, INITIAL);
+
+  if (props.interview) return <BookedInterviewPanel {...props} interview={props.interview} />;
+
+  return (
+    <Panel
+      title="Book an interview or site trial"
+      description="They get the address, the parking, the PPE and what to bring — plus reminders a day before and two hours before. The two-hour one is the message that turns a no-show into an arrival."
+    >
+      <form action={action} className="space-y-3">
+        <input type="hidden" name="applicationId" value={props.applicationId} />
+        {state.error ? <FormBanner tone="error">{state.error}</FormBanner> : null}
+        {state.success ? <FormBanner tone="success">{state.success}</FormBanner> : null}
+
+        {!props.candidateEmail ? (
+          <FormBanner tone="info">
+            This candidate gave a phone number and no email address, and no SMS or WhatsApp
+            transport is configured (ATS-14 asks for that channel first). You can still book it —
+            nothing will be sent, and you will have to tell them yourself.
+          </FormBanner>
+        ) : null}
+
+        <Field label="What is it?">
+          {(ids) => (
+            <Select {...ids} name="kind" defaultValue="interview">
+              {INTERVIEW_KINDS.map((kind) => (
+                <option key={kind} value={kind}>
+                  {INTERVIEW_KIND_LABEL[kind]}
+                </option>
+              ))}
+            </Select>
+          )}
+        </Field>
+
+        <Field label="When (Dubai time)">
+          {(ids) => <TextInput {...ids} type="datetime-local" name="scheduledAt" required />}
+        </Field>
+
+        <Field label="How long, in minutes">
+          {(ids) => (
+            <TextInput
+              {...ids}
+              type="number"
+              name="durationMinutes"
+              defaultValue={60}
+              min={15}
+              max={600}
+            />
+          )}
+        </Field>
+
+        <Field label="Where — the name they will be told to ask for">
+          {(ids) => (
+            <TextInput
+              {...ids}
+              name="locationName"
+              placeholder="Al Quoz workshop"
+              maxLength={160}
+              required
+            />
+          )}
+        </Field>
+
+        <Field
+          label="Full address"
+          description="They are finding this on a phone, at a gate, in the sun. Write it the way you would say it to a taxi driver."
+        >
+          {(ids) => <TextArea {...ids} name="locationAddress" rows={3} required />}
+        </Field>
+
+        <Field label="Area (optional)">
+          {(ids) => (
+            <TextInput
+              {...ids}
+              name="locationArea"
+              placeholder="Al Quoz Industrial 3"
+              maxLength={120}
+            />
+          )}
+        </Field>
+
+        <Field label="Map link (optional)">
+          {(ids) => (
+            <TextInput {...ids} name="locationMapUrl" placeholder="https://maps.app.goo.gl/…" />
+          )}
+        </Field>
+
+        <Field
+          label="Parking (optional)"
+          description="The single most common reason somebody turns around and goes home."
+        >
+          {(ids) => <TextArea {...ids} name="parkingNotes" rows={2} />}
+        </Field>
+
+        <fieldset className="flex flex-col gap-2">
+          <legend className="text-[14px] font-medium">PPE they must arrive wearing</legend>
+          {INTERVIEW_PPE_OPTIONS.map((item) => (
+            <label key={item} className="flex items-center gap-2 text-[14px]">
+              <input type="checkbox" name="ppeRequired" value={item} />
+              {item}
+            </label>
+          ))}
+        </fieldset>
+
+        <Field
+          label="What to bring (optional)"
+          description="Certificates and tools. A trade test with no tools is a rebooked trade test."
+        >
+          {(ids) => (
+            <TextArea
+              {...ids}
+              name="bringNotes"
+              rows={2}
+              placeholder="Original HVAC certificate, Emirates ID, your own hand tools"
+            />
+          )}
+        </Field>
+
+        <Field label="Ask for (optional)">
+          {(ids) => (
+            <TextInput
+              {...ids}
+              name="contactName"
+              placeholder="Rashid, workshop supervisor"
+              maxLength={160}
+            />
+          )}
+        </Field>
+
+        <Field label="Number to call on arrival (optional)">
+          {(ids) => (
+            <TextInput {...ids} name="contactPhone" placeholder="+971 4 000 0000" maxLength={24} />
+          )}
+        </Field>
+
+        <SubmitButton pending={pending} pendingLabel="Booking…" className="btn btn-primary">
+          Book it
+        </SubmitButton>
+      </form>
+    </Panel>
+  );
+}
+
+/** What is already booked, what has gone out about it, and how to move it. */
+function BookedInterviewPanel(props: { applicationId: string; interview: LiveInterview }) {
+  const [moveState, moveAction, movePending] = useActionState(rescheduleInterviewAction, INITIAL);
+  const [cancelState, cancelAction, cancelPending] = useActionState(cancelInterviewAction, INITIAL);
+  const interview = props.interview;
+
+  const when = new Date(interview.scheduledAt).toLocaleString("en-GB", {
+    timeZone: "Asia/Dubai",
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+
+  return (
+    <Panel
+      title={`${INTERVIEW_KIND_LABEL[interview.kind as keyof typeof INTERVIEW_KIND_LABEL] ?? "Interview"} booked`}
+      description={`${when} — ${interview.locationName}`}
+    >
+      {interview.rescheduleRequestedAt ? (
+        <FormBanner tone="info">
+          They have asked to move this
+          {interview.rescheduleRequestNote ? `: “${interview.rescheduleRequestNote}”` : "."} Until
+          somebody answers, this application is showing as waiting on us.
+        </FormBanner>
+      ) : null}
+
+      {/*
+        What has actually been sent, said plainly. "Confirmation sent" is a
+        claim, and the columns behind it are the only evidence — a panel that
+        implied the candidate had been told when nothing left the queue would be
+        the same lie the outcome ledger exists to refuse.
+      */}
+      <ul className="mt-3 space-y-1 text-[13px]" style={{ color: "var(--text-secondary)" }}>
+        <li>
+          Confirmation: {interview.confirmationSentAt ? "queued" : "not sent"}
+        </li>
+        <li>
+          Day-before reminder: {interview.reminder24hSentAt ? "sent" : "not yet"}
+        </li>
+        <li>
+          Two-hour reminder: {interview.reminder2hSentAt ? "sent" : "not yet"}
+        </li>
+      </ul>
+
+      <form action={moveAction} className="mt-5 space-y-3">
+        <input type="hidden" name="applicationId" value={props.applicationId} />
+        <input type="hidden" name="interviewId" value={interview.interviewId} />
+        {moveState.error ? <FormBanner tone="error">{moveState.error}</FormBanner> : null}
+        {moveState.success ? <FormBanner tone="success">{moveState.success}</FormBanner> : null}
+
+        <Field
+          label="Move it to"
+          description="Both reminders are recomputed from the new time and a fresh confirmation goes out. The old one was about a time that no longer exists."
+        >
+          {(ids) => (
+            <TextInput
+              {...ids}
+              type="datetime-local"
+              name="scheduledAt"
+              defaultValue={interview.scheduledAtLocal}
+              required
+            />
+          )}
+        </Field>
+        <TextInput name="note" placeholder="Why (optional)" maxLength={400} />
+        <SubmitButton pending={movePending} pendingLabel="Moving…" className="btn btn-secondary">
+          Move it
+        </SubmitButton>
+      </form>
+
+      <form action={cancelAction} className="mt-5 space-y-3">
+        <input type="hidden" name="applicationId" value={props.applicationId} />
+        <input type="hidden" name="interviewId" value={interview.interviewId} />
+        {cancelState.error ? <FormBanner tone="error">{cancelState.error}</FormBanner> : null}
+        {cancelState.success ? (
+          <FormBanner tone="success">{cancelState.success}</FormBanner>
+        ) : null}
+
+        <TextInput name="reason" placeholder="Reason for cancelling (optional)" maxLength={200} />
+        <SubmitButton pending={cancelPending} pendingLabel="Cancelling…" className="btn btn-ghost">
+          Cancel it
         </SubmitButton>
       </form>
     </Panel>

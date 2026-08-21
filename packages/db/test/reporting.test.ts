@@ -31,9 +31,11 @@
  * the change its own fixtures cause.
  */
 
+import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
+import { join, relative, resolve, sep } from "node:path";
 import { sql } from "drizzle-orm";
 import { withTenant, closeConnection } from "../src/index";
-import { testTenantId } from "./_tenant";
+import { testTenantId, otherTenantId } from "./_tenant";
 import {
   ownerDashboard,
   productEventReport,
@@ -45,14 +47,17 @@ import {
   DASHBOARD_GAPS,
   AUDITED_TABLES,
 } from "../src/domain/reporting";
-import { activeTenantIds } from "../src/domain/cron";
 // Read-only, from the contracts stream. The dashboard calls this same function,
 // so the assertion below compares the headline against its own source.
 import { ppmCompliance } from "../src/domain/contracts";
+// The board's own counters. The dashboard's Work card calls these, so asserting
+// against them is asserting that the two screens cannot disagree.
+import { dispatchBoardCounts, dispatchBoardCountsByPriority } from "../src/domain/jobs";
 import {
   smallBusinessReliefPosition,
   gradeGoal,
   ppmCompletion,
+  slaState,
   DASHBOARD_GOALS,
   SMALL_BUSINESS_RELIEF_THRESHOLD_MINOR,
 } from "@meridian/core";
@@ -70,25 +75,24 @@ function checkTrue(label: string, got: boolean): void {
 const TAG = "REPORTING-TEST";
 
 async function main(): Promise<void> {
-  // Resolved by slug. `activeTenantIds()[0]` is the deliberately-empty tenant
-  // that exists to prove RLS isolation — see ./_tenant.ts.
+  // Both resolved by identity, never by index — `[0]` is the deliberately-empty
+  // tenant, which is the mistake ./_tenant.ts exists to stop.
   const tenantId = await testTenantId();
 
   /*
-   * The second tenant, for the isolation check.
+   * The second tenant, for the isolation checks below.
    *
-   * NOT `otherTenantId()` from ./_tenant. That helper selects from `tenants`
-   * through the plain `db` handle, which has no `app.tenant_id` set — so the
-   * policy on that table matches zero rows and it always returns null. The
-   * isolation check would then skip on every run while reporting itself as
-   * skipped, which is a check that never fails and never runs.
-   *
-   * `activeTenantIds()` goes through `app_cron_active_tenants()`, a SECURITY
-   * DEFINER function, which is the same answer the scheduled jobs reached for
-   * exactly this reason. Filtered rather than indexed — `[0]` is the mistake
-   * ./_tenant.ts was written to stop.
+   * This was a local workaround — `activeTenantIds().find(...) ?? null` — back
+   * when `otherTenantId()` read `tenants` through the plain `db` handle and
+   * always returned null. The helper now enumerates through the same SECURITY
+   * DEFINER function and *throws* rather than returning a value a caller can
+   * read as "skip", so the workaround is gone and there is no null left to
+   * branch on. On a single-tenant database this line fails the run and says to
+   * seed, which is the correct outcome: the isolation checks below are the
+   * only thing standing between two tenants' data, and a check that can
+   * quietly not run is worse than no check.
    */
-  const foreignTenantId = (await activeTenantIds()).find((id) => id !== tenantId) ?? null;
+  const foreignTenantId = await otherTenantId();
 
   // ── 1. Pure functions, no database ────────────────────────────────────────
   console.log("\n— thresholds —");
@@ -162,6 +166,68 @@ async function main(): Promise<void> {
       (e) => (e.blockedOn ?? "").trim().length > 10,
     ),
   );
+
+  const jobTen = PRODUCT_EVENT_NAMES.find((e) => e.name === "assignment_warning_overridden");
+  check(
+    "JOB-10's override family is registered under the name the PRD gives it, with a call emitter",
+    jobTen?.emitter,
+    "call",
+  );
+  checkTrue(
+    "and carries no blocker, because the call site it was waiting on now exists",
+    jobTen !== undefined && !jobTen.blockedOn,
+  );
+
+  /*
+   * ── THE NAME CANNOT DRIFT, AND NOTHING ELSE WOULD CATCH IT ───────────────
+   *
+   * `recordProductEvent` refuses an unregistered name, and that runtime gate is
+   * asserted further down. It is not enough here. JOB-10's call site emits
+   * best-effort inside a `try {} catch {}` that swallows on purpose — an
+   * analytics write must never roll back a dispatch that has already happened —
+   * so a name that drifted out of the registry would throw into that catch and
+   * disappear: no error, no row, and a chart reading nought for something that
+   * is happening every day. The gate cannot help when the caller is built to
+   * ignore it.
+   *
+   * So this reads the source. Every `eventName:` string literal in the
+   * application and package sources has to be a name `PRODUCT_EVENT_NAMES`
+   * holds. The registry's whole purpose is that a name cannot drift, and a
+   * literal typed at a call site is the one place it can.
+   */
+  const repoRoot = resolve(__dirname, "..", "..", "..");
+  const sourceRoots = [join(repoRoot, "apps", "web", "src")];
+  for (const pkg of readdirSync(join(repoRoot, "packages"))) {
+    // `src` only. This file deliberately emits `lead_creted` a few hundred
+    // lines below to prove the runtime gate rejects it, and a scan that swept
+    // the test directories would flag its own fixture.
+    const src = join(repoRoot, "packages", pkg, "src");
+    if (existsSync(src)) sourceRoots.push(src);
+  }
+
+  const emitted: { name: string; where: string }[] = [];
+  for (const root of sourceRoots) {
+    if (!existsSync(root)) continue;
+    for (const entry of readdirSync(root, { recursive: true }) as string[]) {
+      if (!/\.tsx?$/.test(entry)) continue;
+      const file = join(root, entry);
+      if (!statSync(file).isFile()) continue;
+      for (const match of readFileSync(file, "utf8").matchAll(/eventName:\s*"([^"]+)"/g)) {
+        emitted.push({ name: match[1]!, where: relative(repoRoot, file).split(sep).join("/") });
+      }
+    }
+  }
+
+  checkTrue(
+    "at least one call site emits a product event, so the check below is not scanning nothing",
+    emitted.length > 0,
+  );
+  const registered = new Set(PRODUCT_EVENT_NAMES.map((e) => e.name));
+  const unregistered = emitted.filter((e) => !registered.has(e.name));
+  for (const u of unregistered) {
+    console.log(`      ${u.name} — emitted in ${u.where}, and not in PRODUCT_EVENT_NAMES`);
+  }
+  check("every event name a call site emits is one the registry holds", unregistered.length, 0);
 
   await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
     // ── 3. The event stream ────────────────────────────────────────────────
@@ -427,18 +493,50 @@ async function main(): Promise<void> {
         await eventsFor("ats_stage_changed"),
         2,
       );
-      const closeEvent = (await tx.execute<{ properties: Record<string, unknown> }>(sql`
-        select properties from product_events
-         where entity_id = ${application.id}::uuid and event_name = 'ats_stage_changed'
-         order by occurred_at desc limit 1
-      `)) as unknown as { properties: Record<string, unknown> }[];
-      check("with the outcome as the discriminator", closeEvent[0]?.properties["to_status"], "hired");
-      check("and where it came from", closeEvent[0]?.properties["from_status"], "active");
+      /*
+       * ── FOUND BY ITS PAYLOAD, NOT BY BEING THE NEWEST ───────────────────
+       *
+       * This read used to be `order by occurred_at desc limit 1`, and it began
+       * returning the stage move instead of the hire. `occurred_at` is now(),
+       * which in Postgres is the TRANSACTION timestamp: the stage move above
+       * and the hire share it to the microsecond, and `product_events` has no
+       * sequence to break the tie. Which row came back was down to the heap,
+       * so the check passed for months and then reliably did not.
+       *
+       * The count is what proves the hire emitted with its outcome as the
+       * discriminator — if the hire had been emitted as `active`, or not
+       * emitted at all, this is zero. Reading a different property off that
+       * row afterwards is then not circular.
+       */
+      const closeEvents = (await tx.execute<{
+        from_status: string | null;
+        from_stage_id: string | null;
+        to_stage_id: string | null;
+      }>(sql`
+        select properties ->> 'from_status'   as from_status,
+               properties ->> 'from_stage_id' as from_stage_id,
+               properties ->> 'to_stage_id'   as to_stage_id
+          from product_events
+         where entity_id = ${application.id}::uuid
+           and event_name = 'ats_stage_changed'
+           and properties ->> 'to_status' = 'hired'
+      `)) as unknown as {
+        from_status: string | null;
+        from_stage_id: string | null;
+        to_stage_id: string | null;
+      }[];
+
+      check("with the outcome as the discriminator", closeEvents.length, 1);
+      check("and where it came from", closeEvents[0]?.from_status, "active");
       check(
         "the stage pointer did not move, and the payload says so rather than inventing one",
-        closeEvent[0]?.properties["from_stage_id"],
-        closeEvent[0]?.properties["to_stage_id"],
+        closeEvents[0]?.from_stage_id,
+        closeEvents[0]?.to_stage_id,
       );
+      // Not a null on both sides passing itself off as agreement: the emitter
+      // carries OLD and NEW current_stage_id raw, and on a status-only change
+      // both are the stage the application was actually sitting in.
+      check("and it is the stage it was actually sitting in", closeEvents[0]?.to_stage_id, second.id);
 
       const hiringAfter = (await ownerDashboard(tx)).hiring;
       check(
@@ -812,6 +910,157 @@ async function main(): Promise<void> {
         page.entries.every((e) => e.tableName.length > 0),
     );
 
+    /*
+     * ── THE WORK CARD COUNTS EVERY OPEN JOB, NOT THE FIRST PAGE ────────────
+     *
+     * `KPI-3`'s Work card was built by filtering `listDispatchBoard(tx, { now,
+     * limit: 1000 })` four ways, so the open count, the unassigned count, the
+     * jobs breaching now and every per-priority row were totals of the first
+     * thousand open jobs. It now asks `dispatchBoardCounts` and
+     * `dispatchBoardCountsByPriority`, which are aggregates over every matching
+     * row and are the same functions the board's own header calls.
+     *
+     * What this cannot prove at test volume is the cap itself — that would take
+     * a thousand and one fixtures, and a suite that inserts those is a suite
+     * nobody runs. What it does prove is the two things that would have to
+     * break for the numbers to be wrong again: the dashboard's figures ARE the
+     * board's counters rather than a page of them, and the SQL that restates
+     * `slaState` agrees with `slaState` on rows placed either side of its
+     * branches.
+     */
+    const [site] = (await tx.execute<{ id: string; customer_id: string }>(sql`
+      select id, customer_id from properties where deleted_at is null order by created_at limit 1
+    `)) as unknown as { id: string; customer_id: string }[];
+
+    if (site) {
+      const workNow = new Date();
+      const MIN = 60_000;
+      // Per-run, so a killed run's orphans can never be mistaken for this
+      // run's fixtures and the cleanup below can be anchored to exactly one
+      // run's rows.
+      const workRun = Date.now().toString(36).slice(-6).toUpperCase();
+      const workRef = `${TAG}-${workRun}`;
+
+      const workFixtures = [
+        {
+          suffix: "W1",
+          priority: "p1_emergency",
+          sla: "breached" as const,
+          createdAt: new Date(workNow.getTime() - 200 * MIN),
+          resolveByAt: new Date(workNow.getTime() - 10 * MIN),
+        },
+        {
+          suffix: "W2",
+          priority: "p1_emergency",
+          sla: "on_track" as const,
+          createdAt: new Date(workNow.getTime() - 5 * MIN),
+          resolveByAt: new Date(workNow.getTime() + 1000 * MIN),
+        },
+        {
+          suffix: "W3",
+          priority: "p2_urgent",
+          sla: "breached" as const,
+          createdAt: new Date(workNow.getTime() - 200 * MIN),
+          resolveByAt: new Date(workNow.getTime() - 1 * MIN),
+        },
+        // No deadline at all. `slaState` calls this "none", and the SQL mirror
+        // has to agree that it is open and not breached — a null resolve_by_at
+        // read as a missed deadline is the classic way this arithmetic goes
+        // wrong.
+        {
+          suffix: "W4",
+          priority: "p4_planned",
+          sla: "none" as const,
+          createdAt: workNow,
+          resolveByAt: null,
+        },
+      ];
+
+      const beforeCounts = await dispatchBoardCounts(tx, workNow);
+      const beforeByPriority = await dispatchBoardCountsByPriority(tx, workNow);
+      const beforeWork = (await ownerDashboard(tx, { now: workNow })).work;
+
+      for (const f of workFixtures) {
+        await tx.execute(sql`
+          insert into jobs (tenant_id, reference, customer_id, property_id, service_slug,
+                            title, status, priority, created_at, resolve_by_at)
+          values (${tenantId}::uuid, ${`${workRef}-${f.suffix}`}, ${site.customer_id}::uuid,
+                  ${site.id}::uuid, 'hvac-installation-maintenance',
+                  ${`${TAG} work ${f.suffix}`}, 'triaged', ${f.priority}::job_priority,
+                  ${f.createdAt.toISOString()}::timestamptz,
+                  ${f.resolveByAt ? f.resolveByAt.toISOString() : null}::timestamptz)
+        `);
+        check(
+          `slaState puts fixture ${f.suffix} in ${f.sla}`,
+          slaState({
+            createdAt: f.createdAt,
+            resolveByAt: f.resolveByAt,
+            completedAt: null,
+            now: workNow,
+          }),
+          f.sla,
+        );
+      }
+
+      const afterCounts = await dispatchBoardCounts(tx, workNow);
+      const afterByPriority = await dispatchBoardCountsByPriority(tx, workNow);
+      const afterWork = (await ownerDashboard(tx, { now: workNow })).work;
+
+      const priorityDelta = (priority: string, key: "jobs" | "breached") =>
+        (afterByPriority.find((r) => r.priority === priority)?.[key] ?? 0) -
+        (beforeByPriority.find((r) => r.priority === priority)?.[key] ?? 0);
+
+      check("both emergencies are counted under their own priority", priorityDelta("p1_emergency", "jobs"), 2);
+      check(
+        "and the SQL breach filter agrees with slaState about which of them is late",
+        priorityDelta("p1_emergency", "breached"),
+        1,
+      );
+      check("the urgent one lands in its own row", priorityDelta("p2_urgent", "jobs"), 1);
+      check("and is counted as breached there", priorityDelta("p2_urgent", "breached"), 1);
+      check("a job with no deadline is open", priorityDelta("p4_planned", "jobs"), 1);
+      check("and is never breached, because it has nothing to miss", priorityDelta("p4_planned", "breached"), 0);
+
+      // Absolute, not a delta, and deliberately so: two aggregates over the
+      // same rows have to agree exactly, whatever else is in the database. A
+      // breakdown that does not add up to its own total is the failure this
+      // whole file was written about.
+      const sumOf = (key: "jobs" | "breached") =>
+        afterByPriority.reduce((n, r) => n + r[key], 0);
+      check("the per-priority rows add up to the board's open count", sumOf("jobs"), afterCounts.open);
+      check("and their breaches add up to the board's breach count", sumOf("breached"), afterCounts.breached);
+
+      check("the dashboard's open count IS the board's, not a page of it", afterWork.openJobs, afterCounts.open);
+      check("as is the number breaching now", afterWork.breachingNow, afterCounts.breached);
+      check("and the unassigned count", afterWork.unassigned, afterCounts.unassigned);
+      check("the Work card sees all four new jobs", afterWork.openJobs - beforeWork.openJobs, 4);
+      check("and both of the late ones", afterWork.breachingNow - beforeWork.breachingNow, 2);
+      check(
+        "nobody has been sent to any of them, so all four are unassigned",
+        afterWork.unassigned - beforeWork.unassigned,
+        4,
+      );
+
+      const dashboardDelta = (priority: string) =>
+        (afterWork.byPriority.find((r) => r.priority === priority)?.jobs ?? 0) -
+        (beforeWork.byPriority.find((r) => r.priority === priority)?.jobs ?? 0);
+      check("and the card's emergency row moves with them", dashboardDelta("p1_emergency"), 2);
+
+      // Anchored to this run's reference prefix. A cleanup that swept `TAG%`
+      // would take a concurrent run's fixtures with it — which is exactly how
+      // one suite in this repository was deleting another's rows mid-run.
+      const workLike = `${workRef}-%`;
+      await tx.execute(
+        sql`delete from product_events where entity_id in (select id from jobs where reference like ${workLike})`,
+      );
+      await tx.execute(
+        sql`delete from job_events where job_id in (select id from jobs where reference like ${workLike})`,
+      );
+      await tx.execute(sql`delete from jobs where reference like ${workLike}`);
+    } else {
+      console.log("skip  no property to raise a job against — seed the database for the Work card checks");
+    }
+
     // ── Cleanup ────────────────────────────────────────────────────────────
     // withTenant commits, so the fixtures are deleted rather than rolled back —
     // the same reason compliance.test.ts does it this way.
@@ -822,7 +1071,125 @@ async function main(): Promise<void> {
     await tx.execute(sql`delete from leads where message = ${TAG}`);
   });
 
-  // ── 6. Tenant isolation on the new table ──────────────────────────────────
+  // ── 6. Reconstructing one record's history (ADM-7) ────────────────────────
+  //
+  // Deliberately outside the transaction above, and deliberately one
+  // transaction per change: `occurred_at` is `now()`, which in Postgres is the
+  // *transaction* timestamp. Two writes inside one transaction share it
+  // exactly, and `audit_log` has no sequence to break the tie — the id is a
+  // random uuid. A fixture that edited the row in the transaction that created
+  // it would be asserting an order the evidence does not contain, and would
+  // pass or fail on which uuid sorted first.
+  //
+  // A customer rather than an invoice: it is audited, it needs three columns,
+  // and it drags in no article-59 constraint that the fixture would have to
+  // work around.
+  console.log("\n— record reconstruction (ADM-7) —");
+
+  const historyName = `${TAG}-HISTORY`;
+  const historyCode = `HIST-${Date.now()}`;
+  const PHONE = "+971500000001";
+
+  const historyId = await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
+    const rows = (await tx.execute<{ id: string }>(sql`
+      insert into customers (tenant_id, code, name)
+      values (${tenantId}::uuid, ${historyCode}, ${historyName})
+      returning id
+    `)) as unknown as { id: string }[];
+    return rows[0]!.id;
+  });
+
+  await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
+    await tx.execute(sql`update customers set phone = ${PHONE} where id = ${historyId}::uuid`);
+  });
+  await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
+    await tx.execute(sql`update customers set payment_terms_days = 45 where id = ${historyId}::uuid`);
+  });
+
+  await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
+    const history = await recordHistory(tx, { tableName: "customers", recordId: historyId });
+
+    // The record was created by this test, so its entire history *is* the
+    // delta — three is the number of changes made above and nothing else can
+    // have touched it.
+    check("a record's history holds every change made to it and no others", history.length, 3);
+    checkTrue(
+      "and spans more than one kind of action, which is what makes it a history",
+      new Set(history.map((e) => e.action)).size > 1,
+    );
+    checkTrue(
+      "it runs oldest first, because reconstruction means replaying forwards",
+      history.every(
+        (e, i) => i === 0 || history[i - 1]!.occurredAt.getTime() <= e.occurredAt.getTime(),
+      ),
+    );
+    check(
+      "the first entry is the creation, which is the state every later diff replays onto",
+      history[0]?.action,
+      "insert",
+    );
+    checkTrue(
+      "and it carries the whole row rather than a diff",
+      Object.keys(history[0]?.changedFields ?? {}).includes("__new"),
+    );
+    checkTrue(
+      "an update records the column that changed and not updated_at",
+      Object.keys(history[1]?.changedFields ?? {}).includes("phone") &&
+        !Object.keys(history[1]?.changedFields ?? {}).includes("updated_at"),
+    );
+
+    /*
+     * The reconstruction itself.
+     *
+     * `ADM-7` says "able to reconstruct any record's history", and this is what
+     * that sentence means operationally: take the created row, apply each diff
+     * in order, and arrive at the row as it stands. An ordering bug, a diff
+     * written with old and new the wrong way round, or a missing first entry
+     * all fail here and nowhere else.
+     */
+    const created = (history[0]?.changedFields?.["__new"] ?? {}) as Record<string, unknown>;
+    const replayed: Record<string, unknown> = { ...created };
+    for (const entry of history.slice(1)) {
+      for (const [column, change] of Object.entries(entry.changedFields ?? {})) {
+        replayed[column] = (change as { new?: unknown }).new;
+      }
+    }
+    check("replaying the diffs onto the created row reproduces the phone", replayed["phone"], PHONE);
+    check(
+      "and the payment terms, which the second update changed",
+      replayed["payment_terms_days"],
+      45,
+    );
+    check("while the untouched columns are still the ones it was created with", replayed["code"], historyCode);
+
+    // The feed and the history are the same rows read in opposite directions.
+    // If this ever stops holding, one of the two screens is lying about time.
+    const feed = await auditTrail(tx, { tableName: "customers", recordId: historyId });
+    check("the feed's newest is the history's last", feed.entries[0]?.id, history.at(-1)?.id);
+    check("and the feed's oldest is where the history starts", feed.entries.at(-1)?.id, history[0]?.id);
+
+    const unknown = await recordHistory(tx, {
+      tableName: "customers",
+      recordId: "00000000-0000-4000-8000-000000000000",
+    });
+    check("an id with nothing logged returns empty rather than throwing", unknown.length, 0);
+  });
+
+  // Tenant scoping. The rows are committed by now, so an empty result here is
+  // the RLS policy and not an uncommitted transaction, and the assertion above
+  // proves the same call returns three rows on the side of the boundary that
+  // owns them. Unconditional: `otherTenantId()` threw at the top if there were
+  // no boundary to cross.
+  const leaked = await withTenant({ tenantId: foreignTenantId, actorKind: "system" }, async (tx) =>
+    recordHistory(tx, { tableName: "customers", recordId: historyId }),
+  );
+  check("another tenant reconstructs nothing from this record", leaked.length, 0);
+
+  await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
+    await tx.execute(sql`delete from customers where name = ${historyName}`);
+  });
+
+  // ── 7. Tenant isolation on the new table ──────────────────────────────────
   //
   // `product_events` is written by a SECURITY DEFINER function with an
   // unrestricted INSERT policy, exactly like `audit_log`. That is what lets the
@@ -830,33 +1197,29 @@ async function main(): Promise<void> {
   // and it is precisely why the READ side needs proving rather than assuming.
   console.log("\n— tenant isolation —");
 
-  if (foreignTenantId) {
-    const mine = await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
-      const rows = (await tx.execute<{ count: string }>(
-        sql`select count(*) as count from product_events`,
-      )) as unknown as { count: string }[];
-      return Number(rows[0]?.count ?? 0);
-    });
+  const mine = await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
+    const rows = (await tx.execute<{ count: string }>(
+      sql`select count(*) as count from product_events`,
+    )) as unknown as { count: string }[];
+    return Number(rows[0]?.count ?? 0);
+  });
 
-    const theirs = await withTenant({ tenantId: foreignTenantId, actorKind: "system" }, async (tx) => {
-      const rows = (await tx.execute<{ count: string; leaked: string }>(sql`
-        select count(*) as count,
-               count(*) filter (where tenant_id = ${tenantId}::uuid) as leaked
-          from product_events
-      `)) as unknown as { count: string; leaked: string }[];
-      return { total: Number(rows[0]?.count ?? 0), leaked: Number(rows[0]?.leaked ?? 0) };
-    });
+  const theirs = await withTenant({ tenantId: foreignTenantId, actorKind: "system" }, async (tx) => {
+    const rows = (await tx.execute<{ count: string; leaked: string }>(sql`
+      select count(*) as count,
+             count(*) filter (where tenant_id = ${tenantId}::uuid) as leaked
+        from product_events
+    `)) as unknown as { count: string; leaked: string }[];
+    return { total: Number(rows[0]?.count ?? 0), leaked: Number(rows[0]?.leaked ?? 0) };
+  });
 
-    check("the other tenant sees none of this tenant's events", theirs.leaked, 0);
-    checkTrue(
-      "and the two counts are independent rather than one shared table read twice",
-      mine !== theirs.total || mine === 0,
-    );
-  } else {
-    console.log("skip  only one tenant exists, so there is no boundary to cross");
-  }
+  check("the other tenant sees none of this tenant's events", theirs.leaked, 0);
+  checkTrue(
+    "and the two counts are independent rather than one shared table read twice",
+    mine !== theirs.total || mine === 0,
+  );
 
-  // ── 7. The log stays append-only from the application role ────────────────
+  // ── 8. The log stays append-only from the application role ────────────────
   //
   // `verify-rls.sql` check 8 proves the same thing at the privilege level. This
   // proves it through the connection the viewer actually uses, which is the one

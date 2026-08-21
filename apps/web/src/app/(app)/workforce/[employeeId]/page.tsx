@@ -9,6 +9,7 @@ import {
   leaveSummary,
   healthInsuranceFor,
   listOvertime,
+  weeklyWorkingHours,
   listSalaryDeductions,
   EMPLOYEE_DOCUMENT_KINDS,
   EMPLOYEE_DOCUMENT_LABEL,
@@ -24,6 +25,9 @@ import {
   HEALTH_PLANS,
   HEALTH_PLAN_LABEL,
   PAY_BAND_LABEL,
+  SICK_LEAVE_FULL_PAY_DAYS,
+  SICK_LEAVE_HALF_PAY_DAYS,
+  SICK_LEAVE_TOTAL_DAYS,
   LAWFUL_DEDUCTION_KINDS,
   DEDUCTION_KIND_LABEL,
   PROBATION_NOTICE_DAYS,
@@ -42,7 +46,9 @@ import { DocumentPanel, WithdrawDocument } from "./document-panel";
 import {
   ContractPanel,
   LeavePanel,
+  SickLeavePanel,
   OvertimePanel,
+  WorkedDayPanel,
   InsurancePanel,
   DeductionPanel,
 } from "./employment-panel";
@@ -67,7 +73,7 @@ export default async function EmployeeRecordPage({
   const canWrite = can(session.principal, "workforce:write");
   const { employeeId } = await params;
 
-  const { record, block, contract, leave, insurance, overtime, deductions } = await withTenant(
+  const { record, block, contract, leave, insurance, overtime, deductions, weeks } = await withTenant(
     { tenantId: session.principal.tenantId, userId: session.principal.userId },
     async (tx) => {
       const found = await getEmployeeRecord(tx, employeeId);
@@ -80,6 +86,7 @@ export default async function EmployeeRecordPage({
           insurance: null,
           overtime: [],
           deductions: [],
+          weeks: [],
         };
       }
       return {
@@ -96,6 +103,15 @@ export default async function EmployeeRecordPage({
         // is monthly, but the question this page answers is "what has this
         // person been asked to work", which is not a one-month question.
         overtime: await listOvertime(tx, { from: addDays(today(), -365), to: today(), employeeId }),
+        // Eight weeks of weekly totals against the 48-hour maximum. A week is
+        // only assessable once it is over, so a seven-day window would show the
+        // current week — always partial, always under — and never a finished
+        // one that went past.
+        weeks: await weeklyWorkingHours(tx, {
+          from: addDays(today(), -56),
+          to: today(),
+          employeeId,
+        }),
         deductions: await listSalaryDeductions(tx, employeeId),
       };
     },
@@ -107,6 +123,12 @@ export default async function EmployeeRecordPage({
   if (!record) notFound();
 
   const trade = tradeLabel(record.primaryTrade);
+  // Sick leave rides on the leave summary rather than being fetched again: it
+  // is measured against the same leave year, and a second call would compute
+  // that year a second time from the same dates for the pleasure of being able
+  // to disagree with the first.
+  const sick = leave?.sick ?? null;
+  const weeksOver = weeks.filter((w) => !w.assessment.withinLimit);
 
   // Built here rather than inside the form: the constants live in the database
   // package, and importing that from a client component pulls the postgres
@@ -452,6 +474,81 @@ export default async function EmployeeRecordPage({
           ) : null}
         </section>
 
+        {/* ── HR-7: sick leave ──────────────────────────────────────────── */}
+        <section aria-labelledby="sick-heading" className="mt-10">
+          <h2 id="sick-heading" className="text-lg font-semibold tracking-tight">
+            Sick leave
+          </h2>
+          <p className="prose-body mt-2 text-[14px]">
+            A separate entitlement, not a draw on the annual leave above. After probation:{" "}
+            {SICK_LEAVE_FULL_PAY_DAYS} days at full pay, then {SICK_LEAVE_HALF_PAY_DAYS} at half
+            pay, then 45 unpaid &mdash; {SICK_LEAVE_TOTAL_DAYS} days per leave year. The stages
+            consume in order and they carry across absences: a second illness continues where the
+            first stopped rather than starting the full-pay days again.
+          </p>
+
+          {sick && sick.takenDays > 0 ? (
+            <>
+              <p className="tnum mt-3 text-[14px]" style={{ color: "var(--text-secondary)" }}>
+                <strong style={{ color: "var(--text-primary)" }}>{sick.remainingDays}</strong> of{" "}
+                {SICK_LEAVE_TOTAL_DAYS} days remaining &middot; {sick.takenDays} taken &middot;{" "}
+                {sick.fullPayDays} at full pay &middot; {sick.halfPayDays} at half &middot;{" "}
+                {sick.unpaidDays} unpaid
+                {sick.probationUnpaidDays > 0
+                  ? ` · ${sick.probationUnpaidDays} inside probation, unpaid`
+                  : ""}
+              </p>
+              <p className="prose-body mt-1 text-[12px]">
+                {formatMoney(sick.payMinor)} of sick pay in the leave year beginning{" "}
+                {formatCalendarDay(sick.leaveYearStart)}, computed on the whole wage &mdash; basic
+                and allowances &mdash; because that is what Article 31 stages.
+              </p>
+
+              <ul className="mt-4 divide-y rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>
+                {sick.periods.map((period) => (
+                  <li key={period.id} className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2 p-4">
+                    <div>
+                      <p className="text-[14px] font-medium">
+                        {period.days} {period.days === 1 ? "day" : "days"}
+                        <span className="tnum font-normal" style={{ color: "var(--text-muted)" }}>
+                          {" "}
+                          &middot; {formatCalendarDay(period.startsOn)} &mdash;{" "}
+                          {formatCalendarDay(period.endsOn)}
+                        </span>
+                      </p>
+                      <p className="mt-1 text-[12px]" style={{ color: "var(--text-secondary)" }}>
+                        {period.explanation}
+                      </p>
+                    </div>
+                    <p className="tnum text-[13px] font-medium">{formatMoney(period.payMinor)}</p>
+                  </li>
+                ))}
+              </ul>
+
+              {sick.beyondEntitlementDays > 0 ? (
+                <div className="mt-4">
+                  <EmptyState tone="critical" title="This absence has run past the statutory year.">
+                    <p>
+                      {sick.beyondEntitlementDays} days beyond the {SICK_LEAVE_TOTAL_DAYS}. Past
+                      that point the absence is not sick leave at all &mdash; it is a decision under
+                      Article 34, and recording it as a longer sick leave hides the decision rather
+                      than making it.
+                    </p>
+                  </EmptyState>
+                </div>
+              ) : null}
+            </>
+          ) : (
+            <p className="mt-3 text-[13px]" style={{ color: "var(--text-muted)" }}>
+              {record.technicianId
+                ? `No sick leave recorded in this leave year, so all ${SICK_LEAVE_TOTAL_DAYS} days remain.`
+                : "Not linked to a technician. Leave is held against the technician roster — which is what the dispatcher reads to decide who is available — so an absence cannot be recorded here until the records are linked."}
+            </p>
+          )}
+
+          {canWrite && record.technicianId ? <SickLeavePanel employeeId={record.id} /> : null}
+        </section>
+
         {/* ── HR-8: hours ───────────────────────────────────────────────── */}
         <section aria-labelledby="hours-heading" className="mt-10">
           <h2 id="hours-heading" className="text-lg font-semibold tracking-tight">
@@ -490,14 +587,89 @@ export default async function EmployeeRecordPage({
             </p>
           )}
 
+          {/* ── The 48-hour week ──────────────────────────────────────── */}
+          <h3 className="mt-8 text-[15px] font-semibold tracking-tight">Weekly hours, last eight weeks</h3>
+          <p className="prose-body mt-2 text-[13px]">
+            48 hours is the statutory maximum. What is counted is what has been recorded &mdash;
+            ordinary hours entered as a worked day below, plus overtime and rest-day work. It is a
+            floor, not a measurement: clock-in and clock-out arrive with the field app, so a week
+            shown as over is genuinely over, and a week shown as under may only be under-recorded.
+          </p>
+
+          {weeks.length > 0 ? (
+            <ul className="mt-4 divide-y rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>
+              {weeks.slice(0, 8).map((week) => (
+                <li
+                  key={week.weekStart}
+                  className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2 p-4"
+                >
+                  <div>
+                    <p className="tnum text-[14px] font-medium">
+                      {formatCalendarDay(week.weekStart)} &mdash; {formatCalendarDay(week.weekEnd)}
+                    </p>
+                    <p
+                      className="mt-1 text-[12px]"
+                      style={{
+                        color: week.assessment.withinLimit
+                          ? "var(--text-muted)"
+                          : "var(--status-critical-text)",
+                      }}
+                    >
+                      {week.assessment.detail}
+                    </p>
+                  </div>
+                  <p className="tnum text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                    <strong style={{ color: "var(--text-primary)" }}>
+                      {(week.recordedMinutes / 60).toFixed(1)}h
+                    </strong>{" "}
+                    over {week.daysRecorded} {week.daysRecorded === 1 ? "day" : "days"}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-3 text-[13px]" style={{ color: "var(--text-muted)" }}>
+              No hours recorded in the last eight weeks. That is not the same as no hours worked
+              &mdash; nothing here is measuring them yet.
+            </p>
+          )}
+
+          {weeksOver.length > 0 ? (
+            <div className="mt-4">
+              <EmptyState
+                tone="critical"
+                title={`${weeksOver.length} ${weeksOver.length === 1 ? "week is" : "weeks are"} past the 48-hour statutory maximum`}
+              >
+                <p>
+                  Reported, not blocked. A system that refuses to record hours that were worked does
+                  not un-work them &mdash; it moves them somewhere nobody can see, which is worse for
+                  the labour claim than a flagged week.
+                </p>
+              </EmptyState>
+            </div>
+          ) : null}
+
           {canWrite ? (
-            <OvertimePanel
-              employeeId={record.id}
-              bands={(["overtime", "night", "rest_day"] as const).map((band) => ({
-                value: band,
-                label: PAY_BAND_LABEL[band],
-              }))}
-            />
+            <>
+              <h3 className="mt-8 text-[15px] font-semibold tracking-tight">Record a worked day</h3>
+              <p className="prose-body mt-2 text-[13px]">
+                Start and end times, and the split into ordinary, overtime and night hours follows
+                from them. This is also the only way ordinary hours get recorded, and without them
+                the weekly total above can never see a week of ordinary days that ran long.
+              </p>
+              <WorkedDayPanel employeeId={record.id} />
+
+              <h3 className="mt-8 text-[15px] font-semibold tracking-tight">
+                Or record one band directly
+              </h3>
+              <OvertimePanel
+                employeeId={record.id}
+                bands={(["overtime", "night", "rest_day"] as const).map((band) => ({
+                  value: band,
+                  label: PAY_BAND_LABEL[band],
+                }))}
+              />
+            </>
           ) : null}
         </section>
 

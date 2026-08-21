@@ -163,9 +163,10 @@ export default async function OutcomesPage() {
         </div>
 
         <p className="mt-10 max-w-3xl text-[13px]" style={{ color: "var(--text-muted)" }}>
-          Choosing an outcome on a job is part of the field app and is not built yet. The list is
-          here first on purpose: a visit closed before it existed has an outcome nobody recorded,
-          and that cannot be reconstructed afterwards.
+          These are what the job screen offers when the work is completed: a job on site cannot be
+          moved to work complete without one, which is what makes the first-time-fix rate countable.
+          The field app will sync against the same list. Deactivating an outcome removes it from the
+          picker and leaves every job that already carries it alone.
         </p>
       </main>
     </AppShell>

@@ -134,6 +134,48 @@
       "when": 1786625000000,
       "tag": "0018_ats_product_events",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1786650000000,
+      "tag": "0019_sick_leave_and_weekly_hours",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1786675000000,
+      "tag": "0020_ats_cooloff_and_interviews",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1786700000000,
+      "tag": "0021_asset_register",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1786725000000,
+      "tag": "0022_invoice_keyset",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1786750000000,
+      "tag": "0023_schedule_and_job_paging",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1786775000000,
+      "tag": "0024_outcome_capture",
+      "breakpoints": true
     }
   ]
 }

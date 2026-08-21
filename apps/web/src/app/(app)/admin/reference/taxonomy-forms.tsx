@@ -5,12 +5,15 @@ import { services } from "@meridian/core";
 import { Field, FormBanner, Select, SubmitButton, TextInput } from "@/components/form";
 import type { ReferenceState } from "./actions";
 import {
+  addAssetKind,
   addDisposition,
   addFault,
   addOutcome,
   addRate,
+  installAssetKinds,
   installOutcomes,
   stopRate,
+  toggleAssetKind,
   toggleDisposition,
   toggleFault,
   toggleOutcome,
@@ -53,13 +56,19 @@ export function RetireButton({
   label,
   isActive,
 }: {
-  kind: "disposition" | "fault" | "outcome";
+  kind: "disposition" | "fault" | "outcome" | "assetKind";
   id: string;
   label: string;
   isActive: boolean;
 }) {
   const action =
-    kind === "disposition" ? toggleDisposition : kind === "fault" ? toggleFault : toggleOutcome;
+    kind === "disposition"
+      ? toggleDisposition
+      : kind === "fault"
+        ? toggleFault
+        : kind === "assetKind"
+          ? toggleAssetKind
+          : toggleOutcome;
   const [state, formAction, pending] = useActionState(action, INITIAL);
 
   return (
@@ -255,6 +264,77 @@ export function AddOutcomeForm() {
       </label>
       <SubmitButton pending={pending} pendingLabel="Adding…" className="btn btn-primary disabled:opacity-60">
         Add outcome
+      </SubmitButton>
+    </form>
+  );
+}
+
+// ── Asset kinds (CON-13) ────────────────────────────────────────────────────
+
+export function InstallAssetKindsButton({ label }: { label: string }) {
+  const [state, formAction, pending] = useActionState(installAssetKinds, INITIAL);
+
+  return (
+    <form action={formAction} className="space-y-3">
+      <Feedback state={state} />
+      <SubmitButton pending={pending} pendingLabel="Adding…" className="btn btn-primary disabled:opacity-60">
+        {label}
+      </SubmitButton>
+    </form>
+  );
+}
+
+/**
+ * Add a kind of plant.
+ *
+ * The service interval belongs to the kind rather than to the asset because it
+ * is a property of the equipment, not of the building: a lift is inspected
+ * monthly and a tank cleaned twice a year whoever is entering it. It prefills
+ * the register and every asset can still override it.
+ */
+export function AddAssetKindForm() {
+  const [state, formAction, pending] = useActionState(addAssetKind, INITIAL);
+
+  return (
+    <form action={formAction} className="space-y-4">
+      <Feedback state={state} />
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field label="Kind" description="What a technician calls it — “Cooling tower”, “Fire pump”.">
+          {({ id }) => <TextInput id={id} name="label" required autoComplete="off" />}
+        </Field>
+        <Field label="Description" description="When to choose this one rather than the one next to it.">
+          {({ id }) => <TextInput id={id} name="description" autoComplete="off" />}
+        </Field>
+      </div>
+      <div className="grid gap-4 sm:grid-cols-3">
+        <Field label="Serviced by" description="Which trade attends it.">
+          {({ id }) => (
+            <Select id={id} name="serviceSlug" defaultValue="">
+              <option value="">No particular trade</option>
+              {services.map((service) => (
+                <option key={service.slug} value={service.slug}>
+                  {service.shortName}
+                </option>
+              ))}
+            </Select>
+          )}
+        </Field>
+        <Field
+          label="Service every (days)"
+          description="Left empty means the register asks per asset."
+        >
+          {({ id }) => (
+            <TextInput id={id} name="defaultPpmIntervalDays" type="number" inputMode="numeric" step={30} />
+          )}
+        </Field>
+        <Field label="Order">
+          {({ id }) => (
+            <TextInput id={id} name="sortOrder" type="number" inputMode="numeric" defaultValue="100" step={10} />
+          )}
+        </Field>
+      </div>
+      <SubmitButton pending={pending} pendingLabel="Adding…" className="btn btn-primary disabled:opacity-60">
+        Add kind
       </SubmitButton>
     </form>
   );

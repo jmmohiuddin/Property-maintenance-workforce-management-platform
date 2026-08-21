@@ -214,6 +214,43 @@ $$;
 REVOKE ALL ON FUNCTION app_recruitment_outcome_due(uuid, timestamptz, integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app_recruitment_outcome_due(uuid, timestamptz, integer) TO meridian_app;
 
+-- ── ATS-12: the cool-off window, per role ───────────────────────────────────
+--
+-- ATS-12 asks for a *configurable* flag when somebody re-applies for the same
+-- role within N days of a rejection. This resolves N: the requisition's own
+-- setting when it has one, and the platform default when it does not.
+--
+-- Zero is a real answer and not a way of spelling NULL. A tenant that wants
+-- re-application never flagged says 0, and it survives a change to the default.
+--
+-- ── THE NUMBER 90 EXISTS TWICE ──────────────────────────────────────────────
+--
+-- The other copy is RECRUITMENT_COOLOFF_DEFAULT_DAYS in
+-- packages/core/src/recruitment.ts. It has to exist twice because the
+-- unauthenticated application path never enters TypeScript at all, and the
+-- staff screens never enter this function. Two implementations of one rule is
+-- one implementation and one bug waiting, so packages/db/test/recruitment.test.ts
+-- asserts the two agree rather than trusting whoever changes one to remember
+-- the other.
+--
+-- Ninety days is roughly the interval over which the two things that get
+-- somebody rejected in this trade actually change: a lapsed certificate gets
+-- renewed, and "not enough hands-on experience" stops being true.
+CREATE OR REPLACE FUNCTION app_recruitment_cooloff_days(p_requisition uuid)
+RETURNS integer
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+  SELECT coalesce(r.cooloff_days, 90)
+    FROM job_requisitions r
+   WHERE r.id = p_requisition;
+$$;
+
+REVOKE ALL ON FUNCTION app_recruitment_cooloff_days(uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app_recruitment_cooloff_days(uuid) TO meridian_app;
+
 -- ── ATS-2: the open roles, as the careers site sees them ────────────────────
 --
 -- Returns published fields only. Not the hiring manager, not the approval
@@ -365,6 +402,11 @@ DECLARE
   v_next       int;
   v_cert       jsonb;
   v_expiry     date;
+  -- ATS-12. Declared here, used only at the very end of this function, and
+  -- deliberately never read by anything above the INSERT that creates the row.
+  v_cooloff    integer;
+  v_prior      uuid;
+  v_prior_when timestamptz;
 BEGIN
   IF p_tenant IS NULL OR coalesce(btrim(p_full_name), '') = '' OR length(v_local) < 7 THEN
     RAISE EXCEPTION 'app_public_submit_application: name and a contactable phone number are required';
@@ -548,6 +590,80 @@ BEGIN
   )
   RETURNING id INTO v_app;
 
+  -- ── ATS-12: the cool-off flag, and where it is deliberately placed ───────
+  --
+  -- HERE, and not one line earlier. Everything about this block is decided by
+  -- its position: the application has ALREADY been inserted and v_app already
+  -- holds its id, so there is no ordering in which this computation could have
+  -- decided whether to create the row. It annotates a row whose existence is
+  -- final.
+  --
+  -- ATS-19 forbids automated rejection and ATS-5 forbids automated filtering.
+  -- The requirement is a flag that informs a human, so the code has to be
+  -- structurally incapable of being anything else:
+  --
+  --   * It runs after the INSERT, so it cannot gate creation.
+  --   * It runs after the re-submission block above has already returned, so an
+  --     idempotent second submit never reaches it and no existing application
+  --     is ever annotated retrospectively.
+  --   * It writes two columns and returns nothing. The RETURN QUERY at the
+  --     bottom of this function does not carry it, so the applicant is never
+  --     told and the careers site cannot render it.
+  --   * app_public_application_status builds a fixed jsonb object and the key
+  --     is not in it, so the applicant's own page cannot leak it either.
+  --
+  -- Scoped to the SAME REQUISITION, because ATS-12 says "same person, same
+  -- role". A rejection for a different vacancy says nothing about this one.
+  --
+  -- A withdrawal is EXCLUDED. candidate_withdrew is the candidate's own
+  -- decision that they were no longer available; flagging it would tell a
+  -- recruiter we turned this person down when we did not, which is worse than
+  -- no flag at all.
+  --
+  -- A cool-off of 0 means the tenant has switched this off, and the whole block
+  -- is skipped rather than run and discarded.
+  v_cooloff := app_recruitment_cooloff_days(v_req.id);
+
+  IF v_cooloff > 0 THEN
+    SELECT a.id, a.archived_at INTO v_prior, v_prior_when
+      FROM applications a
+     WHERE a.tenant_id = p_tenant
+       AND a.candidate_id = v_candidate
+       AND a.requisition_id = v_req.id
+       AND a.id <> v_app
+       AND a.status = 'archived'
+       AND a.archived_at IS NOT NULL
+       AND a.deleted_at IS NULL
+       AND coalesce(a.disposition_reason_code, '') <> 'candidate_withdrew'
+       AND a.archived_at > now() - make_interval(days => v_cooloff)
+     ORDER BY a.archived_at DESC
+     LIMIT 1;
+
+    IF v_prior IS NOT NULL THEN
+      UPDATE applications
+         SET cooloff_flag = true,
+             cooloff_of_application_id = v_prior,
+             updated_at = now()
+       WHERE id = v_app;
+
+      -- Written to the feed as well as the row, so the badge has a date and an
+      -- author on a screen a recruiter is already reading. actor_kind is
+      -- system because nobody decided this.
+      INSERT INTO application_events (
+        tenant_id, application_id, event_type, note, actor_kind, payload
+      ) VALUES (
+        p_tenant, v_app, 'cooloff_flagged',
+        'Applied for this role before and was not taken forward, inside the cool-off window. A note for whoever screens this — it decides nothing.',
+        'system',
+        jsonb_build_object(
+          'priorApplicationId', v_prior,
+          'priorArchivedAt', v_prior_when,
+          'cooloffDays', v_cooloff
+        )
+      );
+    END IF;
+  END IF;
+
   -- ── ATS-4: certificates, expiry required ─────────────────────────────────
   FOR v_cert IN SELECT * FROM jsonb_array_elements(coalesce(p_certificates, '[]'::jsonb))
   LOOP
@@ -644,6 +760,43 @@ AS $$
     'blockedOn', a.blocked_on,
     'blockedNote', a.blocked_note,
     'currentStageSequence', s.sequence,
+    -- ATS-14. The logistics, to the person who has to find the gate.
+    --
+    -- On this page and not only in the email, because the email is three days
+    -- old by the morning of the interview, is underneath four others, and is
+    -- the thing somebody is trying to find one-handed in a taxi. The page is a
+    -- link they already have.
+    --
+    -- The soonest interview that has not finished yet. A cancelled one is not
+    -- returned at all — telling somebody about an appointment we cancelled is
+    -- worse than telling them nothing.
+    --
+    -- Note what is NOT in this object: no cool-off flag, no recruiter note, no
+    -- disposition. The candidate is never shown a flag about themselves.
+    'interview', (
+      SELECT jsonb_build_object(
+               'kind', i.kind,
+               'scheduledAt', i.scheduled_at,
+               'durationMinutes', i.duration_minutes,
+               'locationName', i.location_name,
+               'locationAddress', i.location_address,
+               'locationArea', i.location_area,
+               'locationMapUrl', i.location_map_url,
+               'parkingNotes', i.parking_notes,
+               'ppeRequired', i.ppe_required,
+               'bringNotes', i.bring_notes,
+               'contactName', i.contact_name,
+               'contactPhone', i.contact_phone,
+               'rescheduleRequestedAt', i.reschedule_requested_at
+             )
+        FROM interviews i
+       WHERE i.application_id = a.id
+         AND i.status = 'scheduled'
+         AND i.deleted_at IS NULL
+         AND i.scheduled_at + make_interval(mins => i.duration_minutes) > now()
+       ORDER BY i.scheduled_at
+       LIMIT 1
+    ),
     'stages', (
       SELECT coalesce(jsonb_agg(jsonb_build_object(
                'name', st.name, 'sequence', st.sequence,
@@ -664,3 +817,97 @@ $$;
 
 REVOKE ALL ON FUNCTION app_public_application_status(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app_public_application_status(text) TO meridian_app;
+
+-- ── ATS-14: the candidate asking to move an interview ───────────────────────
+--
+-- ── WHY THERE IS NO SECOND TOKEN ────────────────────────────────────────────
+--
+-- applications.status_token already is one: 64 unguessable characters, held by
+-- exactly one person, granting a read of exactly one application. An interview
+-- belongs to exactly one application, so a reschedule token would grant a
+-- strict subset of that, to the same holder, for the same purpose. What it
+-- would add is a second secret to leak, a second lookup to rate-limit, and a
+-- second "I have lost the link" phone call. So this is a write behind the token
+-- that already exists.
+--
+-- ── WHY IT ASKS RATHER THAN MOVES ───────────────────────────────────────────
+--
+-- The candidate cannot set a new time here and there is no argument that would
+-- let them. A site trial is a supervisor, a bay and a two-hour hole in a
+-- working day; a candidate silently moving it is not a convenience, it is two
+-- people standing in a yard. So this records the ask, with the note, and a
+-- person answers it. The staff screens list it and the pipeline card goes amber
+-- under ATS-8 because we are the ones now holding it up.
+--
+-- Returns true when a request was recorded and false when there was nothing to
+-- record — an unknown token, or no live interview. False rather than an
+-- exception, because the caller is a public form and "nothing to move" is an
+-- ordinary answer rather than an error worth a stack trace.
+CREATE OR REPLACE FUNCTION app_public_request_interview_reschedule(
+  p_token text,
+  p_note text DEFAULT NULL
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_interview uuid;
+  v_tenant    uuid;
+  v_app       uuid;
+BEGIN
+  IF p_token IS NULL OR length(p_token) < 32 THEN
+    RETURN false;
+  END IF;
+
+  SELECT i.id, i.tenant_id, i.application_id INTO v_interview, v_tenant, v_app
+    FROM interviews i
+    JOIN applications a ON a.id = i.application_id
+   WHERE a.status_token = p_token
+     AND a.deleted_at IS NULL
+     AND i.status = 'scheduled'
+     AND i.deleted_at IS NULL
+     AND i.scheduled_at + make_interval(mins => i.duration_minutes) > now()
+   ORDER BY i.scheduled_at
+   LIMIT 1;
+
+  IF v_interview IS NULL THEN
+    RETURN false;
+  END IF;
+
+  -- The timestamp is refreshed on a second ask rather than ignored. Somebody
+  -- asking twice is somebody who has not been answered, and the screen that
+  -- lists these sorts on this column.
+  UPDATE interviews
+     SET reschedule_requested_at = now(),
+         reschedule_request_note = nullif(left(btrim(coalesce(p_note, '')), 400), ''),
+         updated_at = now()
+   WHERE id = v_interview;
+
+  -- ATS-8, from the other side. The candidate has done the thing they can do;
+  -- from this moment the delay is ours, and the pipeline card has to say so
+  -- rather than showing green while nobody answers.
+  UPDATE applications
+     SET blocked_on = 'us',
+         blocked_note = 'Candidate has asked to move the interview',
+         blocked_since = now(),
+         updated_at = now()
+   WHERE id = v_app
+     AND status = 'active';
+
+  INSERT INTO application_events (
+    tenant_id, application_id, event_type, note, actor_kind, payload
+  ) VALUES (
+    v_tenant, v_app, 'interview_reschedule_requested',
+    nullif(left(btrim(coalesce(p_note, '')), 400), ''),
+    'candidate',
+    jsonb_build_object('interviewId', v_interview)
+  );
+
+  RETURN true;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION app_public_request_interview_reschedule(text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app_public_request_interview_reschedule(text, text) TO meridian_app;

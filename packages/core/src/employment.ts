@@ -98,6 +98,24 @@ export function addMonths(day: CalendarDay, count: number): CalendarDay {
   return keyOf(Date.UTC(year, month, Math.min(p.date, lastDay)));
 }
 
+/**
+ * The Monday of the week containing `day`.
+ *
+ * Monday because that is what the 48-hour week is measured over here and what
+ * Postgres `date_trunc('week', ...)` returns — the weekly aggregation in
+ * `domain/hr.ts` groups with one and snaps its window with the other, and two
+ * different week starts would put the same worked day in two different weeks
+ * depending on which end of the query you read. The UAE weekend is Saturday and
+ * Sunday (`DEFAULT_CALENDAR.weekend`), so a Monday start also keeps a week's
+ * worked days contiguous rather than splitting them across the boundary.
+ */
+export function startOfWeek(day: CalendarDay): CalendarDay {
+  // getUTCDay(): 0 is Sunday. Sunday belongs to the week that began six days
+  // earlier, not to the one starting tomorrow.
+  const weekday = new Date(toUtcMidnight(day)).getUTCDay();
+  return addDays(day, -((weekday + 6) % 7));
+}
+
 /** The first of the month containing `day`. */
 export function startOfMonth(day: CalendarDay): CalendarDay {
   const p = partsOf(day);
@@ -945,6 +963,216 @@ export function leaveDayCount(startsOn: CalendarDay, endsOn: CalendarDay): numbe
   return Math.max(0, daysBetween(startsOn, endsOn) + 1);
 }
 
+/**
+ * The kinds of leave a request may be recorded as.
+ *
+ * Mirrored by a CHECK constraint on `leave_requests.kind` in migration 0019.
+ * The vocabulary exists for one reason: the sick-leave ladder below counts the
+ * rows whose kind is exactly `sick`, and a day recorded as "Sick" or
+ * "sick_leave" is a day the ladder never sees — so the employee reads as having
+ * more of the 90 statutory days left than they do, and the fifteenth day of
+ * full pay gets paid twice.
+ *
+ * ── WHY `other` IS ON THIS LIST WHEN IT IS BANNED FROM THE DEDUCTION ONE ────
+ *
+ * `LAWFUL_DEDUCTION_KINDS` is a positive list precisely so that "other" cannot
+ * exist: there, an unlisted value is an unlawful deduction wearing a different
+ * label, and the constraint is what makes the rule true. Nothing of the kind is
+ * true here. A leave kind is a classification, not a permission, and the rows
+ * that predate this vocabulary have to land somewhere the constraint accepts.
+ * `other` is where migration 0019 puts them — visibly unclassified rather than
+ * silently relabelled as annual or sick, either of which would move somebody's
+ * balance.
+ */
+export const LEAVE_KINDS = [
+  "annual",
+  "sick",
+  "maternity",
+  "parental",
+  "bereavement",
+  "hajj",
+  "study",
+  "unpaid",
+  "other",
+] as const;
+
+export type LeaveKind = (typeof LEAVE_KINDS)[number];
+
+export const LEAVE_KIND_LABEL: Readonly<Record<LeaveKind, string>> = {
+  annual: "Annual leave",
+  sick: "Sick leave",
+  maternity: "Maternity leave",
+  parental: "Parental leave",
+  bereavement: "Bereavement leave",
+  hajj: "Hajj",
+  study: "Study leave",
+  unpaid: "Unpaid leave",
+  other: "Other — kind not recorded",
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HR-7 — Sick leave, which is three rates and not one
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Statutory sick leave, after probation: 15 days at full pay, then 30 at half
+ * pay, then 45 unpaid — 90 days in all, per leave year.
+ *
+ * ── THE ONE THING SYSTEMS GET WRONG HERE ────────────────────────────────────
+ *
+ * A twenty-day absence is not twenty days at one rate. It is fifteen at full
+ * pay and five at half pay, and the difference is five days of somebody's wage
+ * paid twice over — in the direction the employer never notices, because the
+ * payroll simply looks slightly high.
+ *
+ * The stages consume **in order**, and the cursor is the leave year rather than
+ * the absence: a worker who took twelve sick days in March and takes six more
+ * in July gets three of those six at full pay and three at half, because the
+ * first stage had three days left in it. Restarting the ladder at every absence
+ * is the same overpayment, spread out enough that nobody adds it up.
+ */
+export const SICK_LEAVE_FULL_PAY_DAYS = 15;
+export const SICK_LEAVE_HALF_PAY_DAYS = 30;
+export const SICK_LEAVE_UNPAID_DAYS = 45;
+
+/** 15 + 30 + 45. Past this, the absence is not statutory sick leave at all. */
+export const SICK_LEAVE_TOTAL_DAYS =
+  SICK_LEAVE_FULL_PAY_DAYS + SICK_LEAVE_HALF_PAY_DAYS + SICK_LEAVE_UNPAID_DAYS;
+
+/**
+ * What each stage pays, as integer basis points of the daily wage.
+ *
+ * Basis points for the same reason the overtime multipliers are: `0.5` is
+ * exactly representable but `wage * 0.5` on a wage that is itself a rounded
+ * float is not, and half pay is applied to thirty days of somebody's month.
+ */
+export const SICK_PAY_BASIS_POINTS = {
+  full_pay: 10_000,
+  half_pay: 5_000,
+  unpaid: 0,
+} as const;
+
+export interface SickLeaveStages {
+  readonly days: number;
+  readonly daysAlreadyTaken: number;
+  /** Days inside probation. Unpaid, and they do NOT consume the 90. */
+  readonly probationUnpaidDays: number;
+  readonly fullPayDays: number;
+  readonly halfPayDays: number;
+  readonly unpaidDays: number;
+  /** Days past the 90-day year. Not sick leave — an absence to be decided on. */
+  readonly beyondEntitlementDays: number;
+  /** full + half + unpaid: what the next absence's cursor advances by. */
+  readonly entitlementConsumedDays: number;
+  /** Of the 90, after this absence. */
+  readonly remainingDays: number;
+  readonly explanation: string;
+}
+
+/** Overlap of `[from, to)` with `[start, end)`, in whole days. */
+function overlap(from: number, to: number, start: number, end: number): number {
+  return Math.max(0, Math.min(to, end) - Math.max(from, start));
+}
+
+/**
+ * Split one sick absence across the three statutory rates (`HR-7`).
+ *
+ * `daysAlreadyTaken` is the position in the leave year, not in this absence,
+ * which is what makes the ladder continue rather than restart. The three stages
+ * are half-open ranges over that position — `[0, 15)`, `[15, 45)`, `[45, 90)` —
+ * so day 15 is the last full-pay day and day 16 is the first half-pay one, and
+ * there is no `<=` anywhere for somebody to get backwards.
+ */
+export function stageSickLeave(input: {
+  days: number;
+  /** Sick days consumed earlier in the same leave year. */
+  daysAlreadyTaken?: number;
+  /**
+   * Days at the START of this absence that fall inside the probation period.
+   *
+   * There is no paid sick leave during probation. Unpaid sick leave is
+   * available with the employer's agreement, and none of it consumes the 90
+   * days — the entitlement runs from the end of probation.
+   */
+  probationDays?: number;
+}): SickLeaveStages {
+  const days = Math.max(0, Math.floor(input.days));
+  const daysAlreadyTaken = Math.max(0, Math.floor(input.daysAlreadyTaken ?? 0));
+  const probationUnpaidDays = Math.min(days, Math.max(0, Math.floor(input.probationDays ?? 0)));
+
+  const staged = days - probationUnpaidDays;
+  const from = daysAlreadyTaken;
+  const to = daysAlreadyTaken + staged;
+
+  const fullEnd = SICK_LEAVE_FULL_PAY_DAYS;
+  const halfEnd = fullEnd + SICK_LEAVE_HALF_PAY_DAYS;
+  const unpaidEnd = halfEnd + SICK_LEAVE_UNPAID_DAYS;
+
+  const fullPayDays = overlap(from, to, 0, fullEnd);
+  const halfPayDays = overlap(from, to, fullEnd, halfEnd);
+  const unpaidDays = overlap(from, to, halfEnd, unpaidEnd);
+  const beyondEntitlementDays = Math.max(0, to - Math.max(from, unpaidEnd));
+
+  const entitlementConsumedDays = fullPayDays + halfPayDays + unpaidDays;
+  const remainingDays = Math.max(0, SICK_LEAVE_TOTAL_DAYS - (daysAlreadyTaken + entitlementConsumedDays));
+
+  const parts: string[] = [];
+  if (probationUnpaidDays > 0) {
+    parts.push(`${probationUnpaidDays} inside probation, unpaid and not counted against the ${SICK_LEAVE_TOTAL_DAYS}`);
+  }
+  if (fullPayDays > 0) parts.push(`${fullPayDays} at full pay`);
+  if (halfPayDays > 0) parts.push(`${halfPayDays} at half pay`);
+  if (unpaidDays > 0) parts.push(`${unpaidDays} unpaid`);
+  if (beyondEntitlementDays > 0) {
+    parts.push(
+      `${beyondEntitlementDays} past the ${SICK_LEAVE_TOTAL_DAYS}-day year, which is not sick leave at all`,
+    );
+  }
+
+  return {
+    days,
+    daysAlreadyTaken,
+    probationUnpaidDays,
+    fullPayDays,
+    halfPayDays,
+    unpaidDays,
+    beyondEntitlementDays,
+    entitlementConsumedDays,
+    remainingDays,
+    explanation:
+      days === 0
+        ? "No sick days recorded."
+        : `${days} day${days === 1 ? "" : "s"} — ${parts.join(", ")}. ` +
+          `${remainingDays} of the ${SICK_LEAVE_TOTAL_DAYS} statutory days remain this leave year.`,
+  };
+}
+
+/**
+ * What a staged absence is worth, in minor units.
+ *
+ * Against the **whole** monthly wage — basic plus allowances — because Article
+ * 31 stages the *wage*, and "wage" is basic plus every allowance in Article 1.
+ * Computing sick pay on basic alone is a systematic underpayment of exactly the
+ * housing and transport allowance, every sick day, for everybody.
+ *
+ * One rounding step per stage: the daily rate is rounded once from the month,
+ * and each stage is `daily × days × basisPoints ÷ 10000` rounded once. That is
+ * what makes the total equal what an employee gets multiplying it out by hand.
+ */
+export function sickLeavePayMinor(
+  monthlyWageMinor: number,
+  stages: SickLeaveStages,
+  options: { daysPerMonth?: number } = {},
+): number {
+  const daysPerMonth = options.daysPerMonth ?? PAYROLL_DAYS_PER_MONTH;
+  if (daysPerMonth <= 0) return 0;
+  const dailyMinor = Math.round(monthlyWageMinor / daysPerMonth);
+
+  const full = Math.round((dailyMinor * stages.fullPayDays * SICK_PAY_BASIS_POINTS.full_pay) / 10_000);
+  const half = Math.round((dailyMinor * stages.halfPayDays * SICK_PAY_BASIS_POINTS.half_pay) / 10_000);
+  return full + half;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // HR-8 — Working hours and overtime
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1238,6 +1466,56 @@ export function assessWorkedDay(
 function formatMinutes(minutes: number): string {
   const hours = minutes / 60;
   return `${Number.isInteger(hours) ? hours : hours.toFixed(1)} hour${hours === 1 ? "" : "s"}`;
+}
+
+export interface WeeklyHoursAssessment {
+  readonly minutes: number;
+  readonly limitMinutes: number;
+  /** How far past the statutory week. Zero when it is exactly at the limit. */
+  readonly overMinutes: number;
+  readonly withinLimit: boolean;
+  readonly detail: string;
+}
+
+/**
+ * One week's worked minutes against the 48-hour statutory maximum (`HR-8`).
+ *
+ * ── WHY THE COMPARISON IS NOT WRITTEN HERE ──────────────────────────────────
+ *
+ * `checkStatutoryHours` in `calendar.ts` already owns "more than 48 hours in a
+ * week is a breach", and it is the function `assessWorkedDay` runs a worked day
+ * through. A second `minutesThisWeek > 48 * 60` here would be a second copy of
+ * a statutory comparison, and the two would agree right up until somebody
+ * changed one of them — most likely by turning a `>` into a `>=`, which reports
+ * a lawful 48-hour week as a violation and, done the other way round on any
+ * other threshold in this file, reports a violation as lawful.
+ *
+ * So this delegates the verdict and only adds the numbers a report needs: the
+ * limit it was measured against and how far past it the week ran. Exactly 48
+ * hours is within the limit; 48 hours and one minute is not.
+ */
+export function assessWeeklyHours(
+  minutesThisWeek: number,
+  calendar: WorkingCalendar = DEFAULT_CALENDAR,
+): WeeklyHoursAssessment {
+  const limitMinutes = Math.max(0, calendar.maxHoursPerWeek * 60);
+  const minutes = Math.max(0, minutesThisWeek);
+
+  // `minutesToday: 0` is not a claim that nobody worked today — it is this
+  // function declining to answer the daily question, which it has no day to
+  // answer it for. Zero minutes produces no daily warning, so what comes back
+  // is the weekly verdict alone.
+  const check = checkStatutoryHours({ minutesToday: 0, minutesThisWeek: minutes }, calendar);
+
+  return {
+    minutes,
+    limitMinutes,
+    overMinutes: Math.max(0, minutes - limitMinutes),
+    withinLimit: check.withinLimits,
+    detail:
+      check.warnings[0] ??
+      `${formatMinutes(minutes)} this week, within the statutory maximum of ${calendar.maxHoursPerWeek} hours.`,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

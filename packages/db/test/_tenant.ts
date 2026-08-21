@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import { db } from "../src/index";
+import { activeTenantIds } from "../src/domain/cron";
 
 /**
  * Resolve the tenant a test should run against.
@@ -45,19 +46,41 @@ export async function testTenantId(
  * The other tenant — the one a test uses to prove it cannot see across the
  * boundary.
  *
- * Returns null when only one tenant exists, so an isolation check can skip
- * rather than fail: a single-tenant database is a valid state, and a test that
- * fails on it is a test that fails on a fresh deployment.
+ * ── WHY THIS THROWS INSTEAD OF RETURNING NULL ──────────────────────────────
+ *
+ * It used to select from `tenants` on the plain `db` handle, outside a tenant
+ * transaction. The policy on that table is `id = app_current_tenant()`, and
+ * with `app.tenant_id` unset it matches zero rows — so the helper returned
+ * null whether or not a second tenant existed. Every caller read that null as
+ * "only one tenant here, skip", printed `skip`, and the isolation check under
+ * it never ran once. Three suites — reporting, HR and recruitment — each found
+ * this separately and routed around the helper rather than through it.
+ *
+ * A check that cannot fail is worse than no check: it occupies the place where
+ * somebody would otherwise write one. So this now enumerates through
+ * `activeTenantIds()` — `app_cron_active_tenants()`, a SECURITY DEFINER
+ * function, which is the same answer the scheduled jobs reached for the same
+ * RLS reason — and throws when there is no second tenant. A single-tenant
+ * database is a valid state for the *product*; it is not a valid state for a
+ * suite whose fixtures are `npm run db:seed`, which creates two tenants
+ * precisely so that isolation can be proven.
+ *
+ * Filtered by identity rather than indexed. `[0]` is the mistake `testTenantId`
+ * above exists to stop, and it would pick the wrong tenant here too.
  */
 export async function otherTenantId(
   slug = process.env["PUBLIC_TENANT_SLUG"] ?? "meridian",
-): Promise<string | null> {
-  const rows = (await db.execute<{ id: string }>(sql`
-    select id from tenants
-     where slug <> ${slug} and is_active and deleted_at is null
-     order by created_at
-     limit 1
-  `)) as unknown as { id: string }[];
+): Promise<string> {
+  const tenantId = await testTenantId(slug);
+  const other = (await activeTenantIds()).find((id) => id !== tenantId);
 
-  return rows[0]?.id ?? null;
+  if (!other) {
+    throw new Error(
+      `Cross-tenant isolation cannot be proven: "${slug}" is the only active tenant in this ` +
+        "database. Run `npm run db:seed`, which creates a second one for exactly this purpose. " +
+        "This is deliberately fatal — the previous version returned null here and every " +
+        "isolation check that depended on it silently skipped.",
+    );
+  }
+  return other;
 }

@@ -2,6 +2,8 @@ import { randomBytes, createHash } from "node:crypto";
 import { and, eq, desc, sql, inArray, isNull } from "drizzle-orm";
 import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
+import { decodeCursor, encodeCursor, type Page } from "./leads";
+import { rowDate, requiredRowDate } from "./_rows";
 import {
   computeTotals,
   toMinor,
@@ -696,11 +698,22 @@ export interface InvoiceRow {
   readonly daysUntilDue: number | null;
 }
 
+/**
+ * Every invoice raised against one job.
+ *
+ * Bounded by the job rather than by a `LIMIT`: a job carries a handful of
+ * invoices — usually one, occasionally a re-issue after a credit — so this is
+ * a list that cannot grow without bound and does not need a cursor. The whole
+ * invoice list is `searchInvoices` below, which does.
+ *
+ * `jobId` is required for that reason. It used to be optional, and the call
+ * without one was the capped, unpageable list that `searchInvoices` replaces.
+ */
 export async function listInvoices(
   tx: TenantScopedTx,
-  options?: { limit?: number; now?: Date; jobId?: string },
+  options: { jobId: string; now?: Date },
 ): Promise<readonly InvoiceRow[]> {
-  const now = options?.now ?? new Date();
+  const now = options.now ?? new Date();
 
   const rows = await tx
     .select({
@@ -716,13 +729,8 @@ export async function listInvoices(
     })
     .from(schema.invoices)
     .innerJoin(schema.customers, eq(schema.customers.id, schema.invoices.customerId))
-    .where(
-      options?.jobId
-        ? and(isNull(schema.invoices.deletedAt), eq(schema.invoices.jobId, options.jobId))
-        : isNull(schema.invoices.deletedAt),
-    )
-    .orderBy(desc(schema.invoices.issuedOn))
-    .limit(options?.limit ?? 200);
+    .where(and(isNull(schema.invoices.deletedAt), eq(schema.invoices.jobId, options.jobId)))
+    .orderBy(desc(schema.invoices.issuedOn));
 
   return rows.map((r) => ({
     ...r,
@@ -731,6 +739,136 @@ export async function listInvoices(
       ? Math.round((r.dueOn.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))
       : null,
   }));
+}
+
+/**
+ * Search and page the invoice list (`LEAD-8`, closing `TD-10` on this screen).
+ *
+ * ── WHAT WAS WRONG ─────────────────────────────────────────────────────────
+ *
+ * `listInvoices` took a limit defaulting to 200 and had no second page. That
+ * is not "the newest two hundred invoices": it is "every invoice after the two
+ * hundredth is unreachable", with nothing on the screen admitting it. On a
+ * business raising a few invoices a day it is a little under a year before the
+ * oldest ones start disappearing, and the first symptom is somebody unable to
+ * find a document a customer is disputing.
+ *
+ * The AR ageing tiles above the table were never affected and still are not:
+ * `arAgeing` is its own aggregate over every open invoice, not a sum of this
+ * page. Keep it that way. Totalling a paginated array is how a page number
+ * ends up changing a headline figure.
+ *
+ * ── THE CURSOR, AND WHY IT COALESCES ───────────────────────────────────────
+ *
+ * `encodeCursor`/`decodeCursor` come from `./leads`, which is where `LEAD-8`
+ * was first built. One cursor format across the leads, customers and invoice
+ * lists is the point: three encodings would be three sets of edge cases.
+ *
+ * The sort key is `coalesce(issued_on, created_at)`, not `issued_on` alone,
+ * and that matters more than it looks. A draft invoice has no issue date, so
+ * `issued_on` is null; `(issued_on, id) < (…, …)` is null for those rows and
+ * null is not true, so a plain `issued_on` cursor would drop every draft from
+ * page two onward — the exact bug being fixed here, reintroduced for the
+ * documents nobody has sent yet. Coalescing gives every row a non-null key,
+ * and a draft sorts by when it was raised, which is what "newest first" means
+ * for a document that has no other date.
+ *
+ * `0022` indexes that expression exactly, so the ordering is an index scan
+ * rather than a sort of the whole table.
+ */
+export async function searchInvoices(
+  tx: TenantScopedTx,
+  options?: {
+    /** Matches an invoice reference or the customer's name. */
+    q?: string | undefined;
+    cursor?: string | undefined;
+    limit?: number | undefined;
+    now?: Date | undefined;
+  },
+): Promise<Page<InvoiceRow>> {
+  // The same ceiling `searchLeads` and `searchCustomers` apply. A limit the
+  // caller chooses is not a limit.
+  const limit = Math.min(Math.max(options?.limit ?? 25, 1), 100);
+  const cursor = decodeCursor(options?.cursor);
+  const now = options?.now ?? new Date();
+
+  const term = options?.q?.trim();
+  const like = term ? `%${term.replace(/[%_\\]/g, (m) => `\\${m}`)}%` : null;
+  // Reference or customer name, one box. Somebody looking for an invoice has
+  // either the document in front of them or the customer on the phone.
+  const search = like
+    ? sql`and (i.reference ilike ${like} or c.name ilike ${like})`
+    : sql``;
+
+  // Row-wise, so Postgres can drive it straight off the composite index; the
+  // `a < x OR (a = x AND b < y)` spelling usually cannot use one.
+  const keyset = cursor
+    ? sql`and (coalesce(i.issued_on, i.created_at), i.id) < (${cursor.createdAt.toISOString()}::timestamptz, ${cursor.id}::uuid)`
+    : sql``;
+
+  // Raw rather than the query builder because the ordering key is an
+  // expression and the cursor compares against the same expression; the two
+  // have to be written once, together, or they drift.
+  const rows = (await tx.execute<Record<string, never>>(sql`
+    select i.id, i.reference, i.status::text as status, i.total, i.amount_paid,
+           i.currency, i.issued_on, i.due_on, i.created_at,
+           coalesce(i.issued_on, i.created_at) as sort_at,
+           c.name as customer_name
+      from invoices i
+      join customers c on c.id = i.customer_id
+     where i.deleted_at is null
+       ${search}
+       ${keyset}
+     order by coalesce(i.issued_on, i.created_at) desc, i.id desc
+     limit ${limit + 1}
+  `)) as unknown as {
+    id: string;
+    reference: string;
+    status: string;
+    total: string;
+    amount_paid: string;
+    currency: string;
+    // Timestamps arrive from `tx.execute` as strings, never Dates. See _rows.ts.
+    issued_on: string | null;
+    due_on: string | null;
+    created_at: string;
+    sort_at: string;
+    customer_name: string;
+  }[];
+
+  const mapped = rows.map((r) => {
+    const dueOn = rowDate(r.due_on);
+    return {
+      sortAt: requiredRowDate(r.sort_at),
+      row: {
+        id: r.id,
+        reference: r.reference,
+        status: r.status as InvoiceStatus,
+        total: r.total,
+        amountPaid: r.amount_paid,
+        currency: r.currency,
+        issuedOn: rowDate(r.issued_on),
+        dueOn,
+        customerName: r.customer_name,
+        daysUntilDue: dueOn
+          ? Math.round((dueOn.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))
+          : null,
+      } satisfies InvoiceRow,
+    };
+  });
+
+  // The `limit + 1` trick, as in `./leads`: asking for one row more than the
+  // page needs makes "is there another page" a fact rather than a guess, and
+  // costs nothing next to a `count(*)` over the same filter. `toPage` there is
+  // not exported and keys on `created_at`; this one keys on the coalesced sort
+  // column, which is why it is spelled out rather than reused.
+  if (mapped.length <= limit) return { rows: mapped.map((m) => m.row), nextCursor: null };
+  const page = mapped.slice(0, limit);
+  const last = page[page.length - 1]!;
+  return {
+    rows: page.map((m) => m.row),
+    nextCursor: encodeCursor({ createdAt: last.sortAt, id: last.row.id }),
+  };
 }
 
 /**

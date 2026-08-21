@@ -3,12 +3,15 @@
 import { revalidatePath } from "next/cache";
 import { withTenant } from "@meridian/db";
 import {
+  addAssetCategory,
   addDispositionReason,
   addFaultCode,
   addJobOutcomeCode,
   addRateVersion,
   endRate,
+  installStandardAssetCategories,
   installStandardJobOutcomes,
+  setAssetCategoryActive,
   setDispositionReasonActive,
   setFaultCodeActive,
   setJobOutcomeActive,
@@ -343,6 +346,135 @@ export async function toggleOutcome(
 
   revalidatePath("/admin/reference/outcomes");
   return { success: activate ? `“${label}” is back in use.` : `“${label}” is retired.` };
+}
+
+// ── Asset kinds (CON-13) ────────────────────────────────────────────────────
+
+/**
+ * The asset register's vocabulary.
+ *
+ * The list this maintains is the one the AMC price and the tender answer are
+ * grouped by — "how many chillers are we contracted to maintain" is a count of
+ * rows carrying one of these kinds. Until this screen existed the list was
+ * whatever the migration seeded, which meant the first cooling tower somebody
+ * had to record went in as a pump, and that is worse than free text: it is
+ * wrong and it looks governed.
+ */
+export async function installAssetKinds(
+  _prev: ReferenceState,
+  _formData: FormData,
+): Promise<ReferenceState> {
+  const { session, ctx } = await context();
+
+  let added = 0;
+  try {
+    await withTenant(ctx, async (tx) => {
+      added = await installStandardAssetCategories(tx, ctx);
+      await writeAuditNote(tx, ctx, {
+        tableName: "asset_categories",
+        action: "kinds_added",
+        detail: { added, changedBy: session.user.email },
+      });
+    });
+  } catch (error) {
+    console.error("[admin] install standard asset kinds failed", error);
+    return fail("Could not add the standard asset kinds.");
+  }
+
+  revalidatePath("/admin/reference/asset-kinds");
+  return {
+    success:
+      added === 0
+        ? "Every standard kind was already here. Nothing was changed or overwritten."
+        : `${added} standard ${added === 1 ? "kind" : "kinds"} added. Existing wording was left alone.`,
+  };
+}
+
+export async function addAssetKind(
+  _prev: ReferenceState,
+  formData: FormData,
+): Promise<ReferenceState> {
+  const { session, ctx } = await context();
+
+  const label = String(formData.get("label") ?? "").trim();
+  const rawCode = String(formData.get("code") ?? "").trim();
+  const description = String(formData.get("description") ?? "").trim() || null;
+  const serviceSlug = String(formData.get("serviceSlug") ?? "").trim() || null;
+  const rawInterval = String(formData.get("defaultPpmIntervalDays") ?? "").trim();
+  const sortOrder = Number(String(formData.get("sortOrder") ?? "100"));
+
+  if (!label) return fail("Name the kind as a technician would say it on site.");
+
+  // `asset_categories.code` is varchar(32), same as the outcome codes.
+  const code = normaliseCode(rawCode || label).slice(0, 32);
+  if (!code) return fail("That name has no letters or numbers in it to build a code from.");
+
+  let defaultPpmIntervalDays: number | null = null;
+  if (rawInterval) {
+    const parsed = Number(rawInterval);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      return fail("A service interval is a whole number of days, such as 90 or 365.");
+    }
+    defaultPpmIntervalDays = parsed;
+  }
+
+  try {
+    await withTenant(ctx, async (tx) => {
+      await addAssetCategory(tx, ctx, {
+        code,
+        label,
+        description,
+        serviceSlug,
+        defaultPpmIntervalDays,
+        sortOrder: Number.isFinite(sortOrder) ? sortOrder : 100,
+      });
+      await writeAuditNote(tx, ctx, {
+        tableName: "asset_categories",
+        action: "kind_set",
+        detail: { code, label, serviceSlug, defaultPpmIntervalDays, changedBy: session.user.email },
+      });
+    });
+  } catch (error) {
+    if (error instanceof UserFacingError) return fail(error.message);
+    console.error("[admin] add asset kind failed", error);
+    return fail("Could not save that kind.");
+  }
+
+  revalidatePath("/admin/reference/asset-kinds");
+  return { success: `“${label}” saved as ${code}.` };
+}
+
+export async function toggleAssetKind(
+  _prev: ReferenceState,
+  formData: FormData,
+): Promise<ReferenceState> {
+  const { session, ctx } = await context();
+  const id = String(formData.get("id") ?? "");
+  const label = String(formData.get("label") ?? "that kind");
+  const activate = String(formData.get("activate") ?? "") === "true";
+  if (!id) return fail("No kind selected.");
+
+  try {
+    await withTenant(ctx, async (tx) => {
+      await setAssetCategoryActive(tx, id, activate);
+      await writeAuditNote(tx, ctx, {
+        tableName: "asset_categories",
+        recordId: id,
+        action: activate ? "kind_restored" : "kind_retired",
+        detail: { kind: label, changedBy: session.user.email },
+      });
+    });
+  } catch (error) {
+    console.error("[admin] toggle asset kind failed", error);
+    return fail("Could not change that kind.");
+  }
+
+  revalidatePath("/admin/reference/asset-kinds");
+  return {
+    success: activate
+      ? `“${label}” is back on the list.`
+      : `“${label}” is retired. Plant already registered under it keeps it.`,
+  };
 }
 
 // ── Rate card (QTE-4) ───────────────────────────────────────────────────────

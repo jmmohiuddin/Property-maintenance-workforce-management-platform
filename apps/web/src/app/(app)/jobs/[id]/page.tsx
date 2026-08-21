@@ -9,14 +9,36 @@ import {
   getQuoteWithLines,
   listInvoices,
   jobContractScope,
+  loadWorkingCalendar,
+  listJobOutcomeCodes,
+  faultCodeOptions,
+  getJobOutcome,
+  schema,
+  ASSIGNMENT_WARNING_LABEL,
   QUOTE_STATUS_LABEL,
   INVOICE_STATUS_LABEL,
+  type AssignmentWarningType,
 } from "@meridian/db";
-import { getService, allowedTransitions, STATUS_LABEL, PRIORITY_LABEL, SLA_STATE_LABEL, minutesUntil, formatDuration, formatMoney, toMinor } from "@meridian/core";
+import { eq } from "drizzle-orm";
+import {
+  getService,
+  allowedTransitions,
+  nextWorkingWindow,
+  toDubai,
+  STATUS_LABEL,
+  PRIORITY_LABEL,
+  SLA_STATE_LABEL,
+  minutesUntil,
+  formatDuration,
+  formatMoney,
+  toMinor,
+  type JobStatus,
+} from "@meridian/core";
 import { can } from "@meridian/auth";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
-import { StatusActions, AssignPanel } from "./job-actions";
+import { StatusActions, AssignPanel, type CandidateOption } from "./job-actions";
+import { OutcomePanel } from "./outcome-panel";
 import { QuotePanel, SendQuoteButton, QuoteDocumentLink } from "./quote-panel";
 import { InvoicePanel } from "./invoice-panel";
 import { OutOfScopePanel } from "./out-of-scope-panel";
@@ -27,6 +49,27 @@ export const dynamic = "force-dynamic";
 /** Statuses where adding a technician is a sensible next action. */
 const ASSIGNABLE_STATUSES: readonly string[] = ["triaged", "scheduled", "paused"];
 
+/**
+ * Statuses where the outcome can still be recorded or corrected (`JOB-13`).
+ *
+ * `on_site` records it and completes the work in one move. `work_complete`
+ * allows a correction before sign-off, which is the only window in which one is
+ * honest: after sign-off the customer has agreed to a version of events, and
+ * editing it afterwards changes what they signed for.
+ */
+const OUTCOME_STATUSES: readonly string[] = ["on_site", "work_complete"];
+
+/**
+ * `datetime-local` wants Dubai wall-clock, and so does the server that reads it
+ * back. Formatting through `toDubai` rather than `toISOString` is what keeps
+ * the two ends agreeing on what 16:00 means.
+ */
+function dubaiFieldValue(instant: Date): string {
+  const t = toDubai(instant);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${t.year}-${pad(t.month)}-${pad(t.day)}T${pad(t.hour)}:${pad(t.minute)}`;
+}
+
 export async function generateMetadata({
   params,
 }: {
@@ -34,6 +77,35 @@ export async function generateMetadata({
 }): Promise<Metadata> {
   const { id } = await params;
   return { title: `Job ${id.slice(0, 8)}` };
+}
+
+/**
+ * The shape the client panel takes. The warning label is resolved here rather
+ * than in the browser: `ASSIGNMENT_WARNING_LABEL` lives in `@meridian/db`, and
+ * importing that package into a client component would drag the Postgres
+ * driver into the bundle.
+ */
+function toCandidateOption(c: {
+  technicianId: string;
+  fullName: string;
+  grade: string;
+  score: number;
+  reason: string;
+  warnings: readonly { type: string; detail: string; requiresOverride: boolean }[];
+}): CandidateOption {
+  return {
+    technicianId: c.technicianId,
+    fullName: c.fullName,
+    grade: c.grade,
+    score: c.score,
+    reason: c.reason,
+    warnings: c.warnings.map((w) => ({
+      type: w.type,
+      label: ASSIGNMENT_WARNING_LABEL[w.type as AssignmentWarningType] ?? w.type,
+      detail: w.detail,
+      requiresOverride: w.requiresOverride,
+    })),
+  };
 }
 
 export default async function JobDetailPage({ params }: { params: Promise<{ id: string }> }) {
@@ -47,14 +119,50 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
       const job = await getJobDetail(tx, id, now);
       if (!job) return null;
 
+      // The tenant's own calendar, once, and passed to everything that needs
+      // it. `JOB-6` is explicit that this is a single service rather than a
+      // rule duplicated per screen — and `DEFAULT_CALENDAR` would get the
+      // weekend, the holidays and the working day wrong for any tenant that has
+      // configured them, which is the point of configuring them.
+      const calendar = await loadWorkingCalendar(tx);
+
+      const flags = await tx
+        .select({ isOutdoor: schema.jobs.isOutdoor })
+        .from(schema.jobs)
+        .where(eq(schema.jobs.id, id))
+        .limit(1);
+      const isOutdoor = flags[0]?.isOutdoor ?? false;
+
+      // JOB-8. Availability is a question about a window, so the panel opens on
+      // one: the next legal working slot, skipping the summer midday ban when
+      // the work is outdoors. "Now, for two hours" was the old implicit answer
+      // and it is wrong for every job booked for tomorrow morning.
+      const windowStart = nextWorkingWindow(now, { outdoor: isOutdoor, calendar });
+      const windowEnd = new Date(windowStart.getTime() + 2 * 60 * 60 * 1000);
+
       // Only look for candidates when the job could actually take one.
       const needsAssignment = ASSIGNABLE_STATUSES.includes(job.status);
       const candidates = needsAssignment
         ? await findCandidates(tx, {
             serviceSlug: job.serviceSlug,
             property: { lat: job.propertyLat, lng: job.propertyLng, city: job.propertyCity },
+            from: windowStart,
+            to: windowEnd,
+            calendar,
           })
-        : { candidates: [], disqualified: [], blocked: [] };
+        : { candidates: [], warned: [], disqualified: [], blocked: [] };
+
+      // JOB-13 and JOB-14. Loaded for every job rather than only for the ones
+      // being completed, because a closed job's outcome is the answer to "was
+      // this fixed first time" and hiding it behind a status check would make
+      // the record invisible exactly where it is being read.
+      const outcome = await getJobOutcome(tx, id);
+      const outcomeCodes = OUTCOME_STATUSES.includes(job.status)
+        ? await listJobOutcomeCodes(tx, { activeOnly: true })
+        : [];
+      const faults = OUTCOME_STATUSES.includes(job.status)
+        ? await faultCodeOptions(tx, job.serviceSlug)
+        : { symptom: [], cause: [], remedy: [] };
 
       const quotes = await listQuotes(tx, { jobId: id });
       const invoices = await listInvoices(tx, { jobId: id });
@@ -71,7 +179,20 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
       // note on `jobContractScope`.
       const contractScope = await jobContractScope(tx, id);
 
-      return { job, candidates, needsAssignment, quotes, invoices, approvedQuote, contractScope };
+      return {
+        job,
+        candidates,
+        needsAssignment,
+        quotes,
+        invoices,
+        approvedQuote,
+        contractScope,
+        outcome,
+        outcomeCodes,
+        faults,
+        windowStart,
+        windowEnd,
+      };
     },
   );
 
@@ -79,7 +200,20 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
   // here, which is exactly the intended behaviour.
   if (!data) notFound();
 
-  const { job, candidates, needsAssignment, quotes, invoices, approvedQuote, contractScope } = data;
+  const {
+    job,
+    candidates,
+    needsAssignment,
+    quotes,
+    invoices,
+    approvedQuote,
+    contractScope,
+    outcome,
+    outcomeCodes,
+    faults,
+    windowStart,
+    windowEnd,
+  } = data;
   const service = getService(job.serviceSlug);
   const remaining = job.resolveByAt ? minutesUntil(job.resolveByAt, now) : null;
   const canUpdate = can(session.principal, "jobs:update");
@@ -294,8 +428,73 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
               </div>
             ) : null}
 
+            {/*
+              `work_complete` is deliberately not in this list (`JOB-13`).
+
+              It is still a legal transition and the graph still allows it; what
+              changed is that on this screen it goes through the outcome panel,
+              which cannot complete the work without recording what happened.
+              Leaving the bare button here would leave the old door open, and a
+              job that reaches `work_complete` with a null outcome has lost that
+              fact permanently — `G11` is computed from that column and nobody
+              reconstructs a Tuesday in January from memory in March. The server
+              action refuses it too; this only stops it being offered.
+            */}
             {canUpdate ? (
-              <StatusActions jobId={job.id} allowed={[...allowedTransitions(job.status)]} />
+              <StatusActions
+                jobId={job.id}
+                allowed={allowedTransitions(job.status).filter(
+                  (t): t is JobStatus => t !== "work_complete",
+                )}
+              />
+            ) : null}
+
+            {canUpdate && OUTCOME_STATUSES.includes(job.status) ? (
+              <OutcomePanel
+                jobId={job.id}
+                outcomes={outcomeCodes.map((o) => ({
+                  code: o.code,
+                  label: o.label,
+                  description: o.description,
+                  requiresReturnVisit: o.requiresReturnVisit,
+                }))}
+                symptoms={faults.symptom.map((f) => ({ id: f.id, label: f.label }))}
+                causes={faults.cause.map((f) => ({ id: f.id, label: f.label }))}
+                remedies={faults.remedy.map((f) => ({ id: f.id, label: f.label }))}
+                visits={job.visits.map((v) => ({
+                  id: v.id,
+                  sequence: v.sequence,
+                  technicianName: v.technicianName,
+                }))}
+                recordedOutcome={
+                  outcome.outcomeCode
+                    ? { code: outcome.outcomeCode, label: outcome.outcomeLabel ?? outcome.outcomeCode }
+                    : null
+                }
+                recordedFaults={outcome.faultCodes.map((f) => ({ kind: f.kind, label: f.label }))}
+                isComplete={job.status === "work_complete"}
+              />
+            ) : null}
+
+            {/* Past sign-off the outcome is no longer editable, and it is still
+                the answer to "was this fixed first time". Read-only beats
+                absent. */}
+            {outcome.outcomeCode && !OUTCOME_STATUSES.includes(job.status) ? (
+              <div className="rounded border p-5" style={{ backgroundColor: "var(--surface-raised)" }}>
+                <h2 className="text-[14px] font-semibold">Outcome</h2>
+                <p className="mt-2 text-[15px] font-medium">
+                  {outcome.outcomeLabel ?? outcome.outcomeCode}
+                </p>
+                {outcome.faultCodes.length > 0 ? (
+                  <ul className="mt-2 space-y-0.5">
+                    {outcome.faultCodes.map((f) => (
+                      <li key={f.id} className="text-[12px]" style={{ color: "var(--text-muted)" }}>
+                        {f.kind}: {f.label}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
             ) : null}
 
             {can(session.principal, "quotes:read") ? (
@@ -395,13 +594,8 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
               <AssignPanel
                 jobId={job.id}
                 serviceName={service?.shortName ?? job.serviceSlug}
-                candidates={candidates.candidates.map((c) => ({
-                  technicianId: c.technicianId,
-                  fullName: c.fullName,
-                  grade: c.grade,
-                  score: c.score,
-                  reason: c.reason,
-                }))}
+                candidates={candidates.candidates.map(toCandidateOption)}
+                warned={candidates.warned.map(toCandidateOption)}
                 disqualified={[...candidates.disqualified]}
                 blocked={candidates.blocked.map((b) => ({
                   technicianId: b.technicianId,
@@ -409,6 +603,8 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
                   detail: b.detail,
                   penalty: b.penalty,
                 }))}
+                defaultStart={dubaiFieldValue(windowStart)}
+                defaultEnd={dubaiFieldValue(windowEnd)}
               />
             ) : null}
           </aside>

@@ -15,7 +15,7 @@
     "studio": "drizzle-kit studio",
     "typecheck": "tsc --noEmit",
     "seed": "tsx src/seed.ts",
-    "test": "tsx test/leads.test.ts && tsx test/commerce.test.ts && tsx test/compliance.test.ts && tsx test/workforce.test.ts && tsx test/reference.test.ts && tsx test/customers.test.ts && tsx test/ratelimit.test.ts && tsx test/hr.test.ts && tsx test/contracts.test.ts && tsx test/reporting.test.ts && tsx test/portal.test.ts && tsx test/recruitment.test.ts"
+    "test": "tsx test/leads.test.ts && tsx test/commerce.test.ts && tsx test/compliance.test.ts && tsx test/workforce.test.ts && tsx test/assignment.test.ts && tsx test/reference.test.ts && tsx test/customers.test.ts && tsx test/ratelimit.test.ts && tsx test/hr.test.ts && tsx test/contracts.test.ts && tsx test/reporting.test.ts && tsx test/portal.test.ts && tsx test/recruitment.test.ts && tsx test/assets.test.ts && tsx test/jobs.test.ts"
   },
   "dependencies": {
     "@meridian/core": "*",

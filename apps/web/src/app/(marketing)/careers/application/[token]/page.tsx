@@ -1,8 +1,17 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { BLOCKED_ON_LABEL, telLink, tenant, whatsappLink, type BlockedOn } from "@meridian/core";
+import {
+  BLOCKED_ON_LABEL,
+  INTERVIEW_KIND_LABEL,
+  telLink,
+  tenant,
+  whatsappLink,
+  type BlockedOn,
+  type InterviewKind,
+} from "@meridian/core";
 import { applicationStatusByToken } from "@meridian/db/domain";
+import { RescheduleForm } from "./reschedule-form";
 import { CheckCircle, Circle, Warning, WhatsappLogo } from "@phosphor-icons/react/dist/ssr";
 
 /**
@@ -55,6 +64,7 @@ export default async function ApplicationStatusPage({
   const outcomeSent = application.outcomeSentAt ? new Date(application.outcomeSentAt) : null;
   const outcomeDue = new Date(application.outcomeDueAt);
   const whatsapp = whatsappLink(`Hello, I am asking about application ${application.reference}.`);
+  const interview = application.interview;
 
   return (
     <div className="container-page max-w-2xl py-12 md:py-16">
@@ -120,6 +130,103 @@ export default async function ApplicationStatusPage({
           </p>
         </div>
       )}
+
+      {/* ── ATS-14: where to be, and what to bring ───────────────────────── */}
+      {interview ? (
+        <section
+          className="mt-6 rounded border p-6"
+          style={{ backgroundColor: "var(--surface-raised)" }}
+        >
+          <h2 className="text-[19px] font-semibold">
+            Your {INTERVIEW_KIND_LABEL[interview.kind as InterviewKind]?.toLowerCase() ??
+              "interview"}
+          </h2>
+          <p className="mt-2 text-[18px] font-medium">
+            {new Date(interview.scheduledAt).toLocaleString("en-GB", {
+              timeZone: "Asia/Dubai",
+              weekday: "long",
+              day: "numeric",
+              month: "long",
+              hour: "2-digit",
+              minute: "2-digit",
+            })}
+          </p>
+          <p className="mt-1 text-[14px]" style={{ color: "var(--text-secondary)" }}>
+            Allow about {interview.durationMinutes} minutes.
+          </p>
+
+          <dl className="mt-5 space-y-3 text-[15px]">
+            <div>
+              <dt className="font-medium">Where</dt>
+              <dd className="prose-body mt-0.5">
+                {interview.locationName}
+                <br />
+                {interview.locationAddress}
+                {interview.locationArea ? `, ${interview.locationArea}` : ""}
+                {interview.locationMapUrl ? (
+                  <>
+                    <br />
+                    <a href={interview.locationMapUrl} className="underline">
+                      Open the map
+                    </a>
+                  </>
+                ) : null}
+              </dd>
+            </div>
+
+            {interview.contactName || interview.contactPhone ? (
+              <div>
+                <dt className="font-medium">Ask for</dt>
+                <dd className="prose-body mt-0.5">
+                  {interview.contactName}
+                  {interview.contactName && interview.contactPhone ? " — " : ""}
+                  {interview.contactPhone ? (
+                    <a href={telLink(interview.contactPhone)} className="underline">
+                      {interview.contactPhone}
+                    </a>
+                  ) : null}
+                </dd>
+              </div>
+            ) : null}
+
+            {/*
+              Headings with nothing under them are omitted rather than filled
+              with "none specified". A parking heading that says nothing tells
+              somebody sitting at a barrier that the question was asked and
+              then abandoned.
+            */}
+            {interview.parkingNotes ? (
+              <div>
+                <dt className="font-medium">Parking</dt>
+                <dd className="prose-body mt-0.5">{interview.parkingNotes}</dd>
+              </div>
+            ) : null}
+
+            {interview.ppeRequired.length > 0 ? (
+              <div>
+                <dt className="font-medium">Wear</dt>
+                <dd className="prose-body mt-0.5">{interview.ppeRequired.join(", ")}</dd>
+              </div>
+            ) : null}
+
+            {interview.bringNotes ? (
+              <div>
+                <dt className="font-medium">Bring</dt>
+                <dd className="prose-body mt-0.5">{interview.bringNotes}</dd>
+              </div>
+            ) : null}
+          </dl>
+
+          {interview.rescheduleRequestedAt ? (
+            <p role="status" className="prose-body mt-5 text-[15px]">
+              You have asked us to move this. Somebody will come back to you with a new time — do
+              not travel to the original one until you hear from us.
+            </p>
+          ) : (
+            <RescheduleForm token={token} />
+          )}
+        </section>
+      ) : null}
 
       {/* ── ATS-8, mirrored to the candidate ─────────────────────────────── */}
       {application.status === "active" && application.blockedOn === "candidate" ? (

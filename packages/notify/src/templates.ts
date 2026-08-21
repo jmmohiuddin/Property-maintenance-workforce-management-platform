@@ -72,7 +72,21 @@ export type TemplateId =
   // reapply. In a referral-driven trades market that is a supply problem, not a
   // courtesy problem.
   | "application_received"
-  | "application_outcome";
+  | "application_outcome"
+  // ATS-14. Interview logistics: the confirmation, and the two reminders.
+  //
+  // The reminders are ONE template with a window field rather than two, for the
+  // same reason `wps_payroll_countdown` is: the 2-hour message is the 24-hour
+  // message two-and-twenty hours later, and two templates would be two places
+  // for the site address to be wrong in.
+  | "interview_scheduled"
+  | "interview_reminder"
+  // ATS-13. Separate from `certification_expiring`, and it has to be. That one
+  // is HR-3's message about an employee and its payload field is literally
+  // `technicianName`; sending it about a talent-pool member would tell an owner
+  // that a technician they do not employ has a lapsing ticket. A message that
+  // misdescribes who somebody is, is worse than no message.
+  | "talent_pool_certification_expiring";
 
 export interface RenderedMessage {
   readonly subject: string;
@@ -486,6 +500,75 @@ export interface TemplatePayloads {
     message: string;
     statusUrl: string;
   };
+  /**
+   * `ATS-14`. The confirmation, with everything needed to arrive prepared.
+   *
+   * The four logistics fields are the requirement's own list — site address,
+   * parking, PPE, what to bring — and they are four fields rather than one
+   * details string because a string is what gets half-filled. Every one of them
+   * is nullable, and the renderer omits a heading it has nothing to put under
+   * rather than printing "Parking: none specified", which is a sentence that
+   * tells somebody standing at a barrier nothing at all.
+   */
+  interview_scheduled: InterviewLogistics;
+  /**
+   * `ATS-14`. The same logistics, one day out and two hours out.
+   *
+   * One template with a `window`, not two templates. The two-hour message is
+   * the twenty-four-hour message twenty-two hours later, and splitting them
+   * would give the site address two places to be wrong in. The suppression that
+   * stops a double send is a column per window on the interview row, not a
+   * template name, so nothing is lost by sharing this.
+   */
+  interview_reminder: InterviewLogistics & {
+    window: "24h" | "2h";
+  };
+  /**
+   * `ATS-13`. Talent-pool certificates that have lapsed or are about to.
+   *
+   * Its own template rather than `certification_expiring`, because that one is
+   * about an employee and says so in its payload. Everything here says
+   * "candidate", including the sentence explaining why the recipient is being
+   * told: an expired ticket does not merely make a pool member a weaker
+   * prospect, it means that under `HR-9` they are blocked from dispatch the day
+   * after they are hired.
+   */
+  talent_pool_certification_expiring: {
+    recipientName: string;
+    members: readonly {
+      candidateName: string;
+      scheme: string;
+      /** ISO date, as stored. Day-valued end to end. */
+      expiresOn: string;
+      lapsed: boolean;
+    }[];
+  };
+}
+
+/**
+ * Shared by the confirmation and the two reminders, so the address, the parking
+ * note and the PPE list are described once and cannot disagree between the
+ * message that books somebody and the message that reminds them.
+ */
+export interface InterviewLogistics {
+  candidateFirstName: string;
+  roleTitle: string;
+  applicationReference: string;
+  /** `interview` | `site_trial`. Decides what the candidate turns up wearing. */
+  kind: "interview" | "site_trial";
+  scheduledAt: PayloadDate;
+  durationMinutes: number;
+  locationName: string;
+  locationAddress: string;
+  locationArea: string | null;
+  locationMapUrl: string | null;
+  parkingNotes: string | null;
+  ppeRequired: readonly string[];
+  bringNotes: string | null;
+  contactName: string | null;
+  contactPhone: string | null;
+  /** The page they already have. Also where the reschedule request lives. */
+  statusUrl: string;
 }
 
 function toDate(d: PayloadDate): Date | null {
@@ -1278,7 +1361,92 @@ export const TEMPLATES: {
       `If anyone asks you to pay a fee in connection with a job here, tell us.` +
       sign,
   }),
+
+  interview_scheduled: (p) => ({
+    subject: `${p.kind === "site_trial" ? "Site trial" : "Interview"} confirmed — ${dateTime(p.scheduledAt)}`,
+    body:
+      `Hi ${p.candidateFirstName},\n\n` +
+      `You are booked in for a ${p.kind === "site_trial" ? "site trial" : "an interview"} for ` +
+      `${p.roleTitle}.\n\n` +
+      interviewFacts(p) +
+      `\nIf that time does not work, say so on your application page and we will move it — ` +
+      `there is a button on it. Do not just not come; we would rather rebook you.\n` +
+      `${p.statusUrl}` +
+      sign,
+  }),
+
+  interview_reminder: (p) => ({
+    // The window is in the subject line because the subject line is all that is
+    // read on a phone at 06:40, and "tomorrow" and "in two hours" are different
+    // instructions.
+    subject:
+      p.window === "2h"
+        ? `Today: ${p.kind === "site_trial" ? "site trial" : "interview"} at ${dateTime(p.scheduledAt)}`
+        : `Tomorrow: ${p.kind === "site_trial" ? "site trial" : "interview"} at ${dateTime(p.scheduledAt)}`,
+    body:
+      `Hi ${p.candidateFirstName},\n\n` +
+      (p.window === "2h"
+        ? `This is the short reminder — you are due at ${dateTime(p.scheduledAt)}, about two hours from now.\n\n`
+        : `A reminder that you are due tomorrow, ${dateTime(p.scheduledAt)}.\n\n`) +
+      interviewFacts(p) +
+      `\nIf something has come up, tell us on your application page rather than not arriving. ` +
+      `We would rather move it.\n${p.statusUrl}` +
+      sign,
+  }),
+
+  talent_pool_certification_expiring: (p) => ({
+    subject: `${p.members.length} talent-pool certificate${p.members.length === 1 ? "" : "s"} lapsing`,
+    body:
+      `${p.recipientName},\n\n` +
+      // Who these people are, first and unambiguously. This message is next to
+      // one about employees in the same inbox, and the whole reason it is a
+      // separate template is that confusing the two is the failure.
+      `These are people in the talent pool — candidates, not employees. Nobody here is on a ` +
+      `job today.\n\n` +
+      p.members
+        .map(
+          (m) =>
+            `  ${m.candidateName} — ${m.scheme}\n` +
+            `    ${m.lapsed ? "EXPIRED" : "expires"} ${m.expiresOn}`,
+        )
+        .join("\n") +
+      `\n\nWorth a phone call rather than a filter. A lapsed ticket is usually a renewal ` +
+      `somebody has not got round to, and under HR-9 it blocks the dispatch the day after they ` +
+      `are hired — so the call is cheaper now than it is then.\n\n` +
+      `${absoluteUrl("/recruitment/pool")}` +
+      sign,
+  }),
 };
+
+/**
+ * The logistics block, rendered once for the confirmation and both reminders.
+ *
+ * Headings with nothing under them are omitted rather than filled with "none
+ * specified". A parking heading that says nothing is worse than no parking
+ * heading: it tells somebody sitting at a barrier that the question was asked
+ * and abandoned.
+ */
+function interviewFacts(p: InterviewLogistics): string {
+  const lines = [
+    `  When        ${dateTime(p.scheduledAt)} (allow about ${p.durationMinutes} minutes)`,
+    `  Where       ${p.locationName}`,
+    `              ${p.locationAddress}${p.locationArea ? `, ${p.locationArea}` : ""}`,
+  ];
+
+  if (p.locationMapUrl) lines.push(`              ${p.locationMapUrl}`);
+  if (p.contactName || p.contactPhone) {
+    lines.push(
+      `  Ask for     ${[p.contactName, p.contactPhone].filter(Boolean).join(" — ")}`,
+    );
+  }
+  if (p.parkingNotes) lines.push(`  Parking     ${p.parkingNotes}`);
+  if (p.ppeRequired.length > 0) lines.push(`  Wear        ${p.ppeRequired.join(", ")}`);
+  if (p.bringNotes) lines.push(`  Bring       ${p.bringNotes}`);
+
+  lines.push(`  Reference   ${p.applicationReference}`);
+
+  return lines.join("\n") + "\n";
+}
 
 /** "expired 4 days ago" / "expires in 12 days". Negative days read naturally. */
 function remaining(days: number): string {

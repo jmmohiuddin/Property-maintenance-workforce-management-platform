@@ -15,6 +15,7 @@ export function ReferenceTabs({ active }: { active: string }) {
     { href: "/admin/reference/dispositions", label: "Lost and dormant reasons" },
     { href: "/admin/reference/fault-codes", label: "Fault codes" },
     { href: "/admin/reference/outcomes", label: "Job outcomes" },
+    { href: "/admin/reference/asset-kinds", label: "Asset kinds" },
     { href: "/admin/reference/rate-card", label: "Rate card" },
   ];
 

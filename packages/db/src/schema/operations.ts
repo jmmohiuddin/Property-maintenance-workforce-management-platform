@@ -26,6 +26,7 @@ import {
 import { tenants, users } from "./tenancy";
 import { customers, properties, propertyUnits, assets } from "./crm";
 import { technicians } from "./workforce";
+import { faultCodes } from "./reference";
 
 /**
  * A job is one unit of work owed to a customer. It may take several visits
@@ -292,4 +293,63 @@ export const jobEvents = pgTable(
     occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index("job_events_job_time_idx").on(t.tenantId, t.jobId, t.occurredAt)],
+);
+
+/**
+ * The three-part fault diagnosis recorded against a job (`JOB-14`).
+ *
+ * ── WHY A ROW PER PART AND NOT THREE COLUMNS ON `jobs` ──────────────────────
+ *
+ * Three columns would have been less code. They would also have said that a
+ * job has exactly one symptom, forever — and the multi-visit case `JOB-12`
+ * exists for is precisely the one where that is false: a chiller that trips on
+ * Monday for a blocked filter and on Thursday for a failed contactor is two
+ * diagnoses, and flattening it to one is the loss the taxonomy was built to
+ * prevent. `visit_id` is what keeps them apart, and it is nullable because a
+ * single-visit job has no choice to make.
+ *
+ * `fault_code_id` is a real foreign key with `ON DELETE restrict`, matching how
+ * `lead_disposition_reasons` is referenced: a code cited by last quarter's work
+ * cannot be deleted without rewriting last quarter, so the admin screen
+ * deactivates instead — it disappears from the picker and stays in the data.
+ *
+ * `kind` is denormalised from `fault_codes.kind` deliberately. It is what the
+ * unique index groups on, so "one symptom, one cause, one remedy per visit" is
+ * a constraint the database holds rather than a rule the application remembers.
+ */
+export const jobFaultCodes = pgTable(
+  "job_fault_codes",
+  {
+    id: idCol(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    jobId: uuid("job_id")
+      .notNull()
+      .references(() => jobs.id, { onDelete: "cascade" }),
+    visitId: uuid("visit_id").references(() => jobVisits.id, { onDelete: "set null" }),
+    faultCodeId: uuid("fault_code_id")
+      .notNull()
+      .references(() => faultCodes.id, { onDelete: "restrict" }),
+    /** `symptom` | `cause` | `remedy`, copied from the code it points at. */
+    kind: varchar("kind", { length: 8 }).notNull(),
+    /** The technician's words. Beside the codes, never instead of them. */
+    note: text("note"),
+    recordedById: uuid("recorded_by_id").references(() => users.id, { onDelete: "set null" }),
+    // Written out rather than the shared `timestamps` spread, because this
+    // table has no soft delete and should not gain one. Re-recording a
+    // diagnosis replaces it; a `deleted_at` column would leave the superseded
+    // symptom in the table for every reliability query that forgot to filter,
+    // which is the one query this table exists to answer correctly.
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("job_fault_codes_job_idx").on(t.tenantId, t.jobId),
+    // The reliability question this table exists to answer runs the other way:
+    // "how many times has this code been recorded", not "what did this job
+    // have". Without this index that query is a sequential scan over every
+    // diagnosis ever made.
+    index("job_fault_codes_code_idx").on(t.tenantId, t.faultCodeId, t.createdAt),
+  ],
 );

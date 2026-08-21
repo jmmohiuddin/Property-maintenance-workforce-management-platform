@@ -5,16 +5,20 @@ import { redirect } from "next/navigation";
 import { withTenant } from "@meridian/db";
 import {
   approveRequisition,
+  cancelInterview,
   cancelScheduledOutcome,
   closeApplication,
   closeRequisition,
   createRequisition,
   hireCandidate,
+  markInterviewConfirmationSent,
   markOutcomeSent,
   mergeCandidates,
   moveApplicationStage,
   publishRequisition,
   reconfirmTalentPoolMember,
+  rescheduleInterview,
+  scheduleInterview,
   reopenApplication,
   withdrawTalentPoolConsent,
   setBlockedOn,
@@ -22,6 +26,7 @@ import {
 } from "@meridian/db/domain";
 import {
   applicationStatusUrl,
+  interviewScheduleSchema,
   talentPoolReconfirmSchema,
   talentPoolWithdrawSchema,
 } from "@meridian/core";
@@ -34,8 +39,11 @@ import type {
   BlockedOn,
   CandidateGrade,
   ContractType,
+  InterviewKind,
   VisaStatus,
 } from "@meridian/core";
+import type { InterviewNotice } from "@meridian/db/domain";
+import type { InterviewLogistics } from "@meridian/notify";
 
 /**
  * Recruitment actions.
@@ -668,4 +676,254 @@ export async function hireAction(_prev: ActionState, formData: FormData): Promis
   } catch (error) {
     return { error: userMessage(error, "Could not complete the hire.", "recruitment") };
   }
+}
+
+
+// ── ATS-14: interview logistics ─────────────────────────────────────────────
+
+/**
+ * Dubai wall-clock, from a `datetime-local` input, to an instant.
+ *
+ * `new Date("2026-09-14T09:00")` is parsed in the *server's* zone, which on a
+ * serverless host is UTC — so a 09:00 site trial becomes 13:00 Dubai, and the
+ * candidate is told to arrive four hours after the supervisor expects them.
+ * The offset is fixed at +04:00 all year: the UAE does not observe daylight
+ * saving, so this is arithmetic rather than a guess.
+ */
+function dubaiWallClock(raw: string): Date | null {
+  const trimmed = raw.trim();
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(trimmed)) return null;
+  const withSeconds = trimmed.length === 16 ? `${trimmed}:00` : trimmed;
+  const date = new Date(`${withSeconds}+04:00`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/** The payload the confirmation carries, built once for both entry points. */
+function confirmationPayload(notice: InterviewNotice): InterviewLogistics {
+  return {
+    candidateFirstName: notice.fullName.split(" ")[0] ?? notice.fullName,
+    roleTitle: notice.roleTitle,
+    applicationReference: notice.reference,
+    kind: notice.kind,
+    scheduledAt: notice.scheduledAt,
+    durationMinutes: notice.durationMinutes,
+    locationName: notice.locationName,
+    locationAddress: notice.locationAddress,
+    locationArea: notice.locationArea,
+    locationMapUrl: notice.locationMapUrl,
+    parkingNotes: notice.parkingNotes,
+    ppeRequired: notice.ppeRequired,
+    bringNotes: notice.bringNotes,
+    contactName: notice.contactName,
+    contactPhone: notice.contactPhone,
+    statusUrl: applicationStatusUrl(notice.statusToken),
+  };
+}
+
+/**
+ * The one sentence that has to be said when a candidate cannot be reached.
+ *
+ * `ATS-14` asks for SMS or WhatsApp first and email second, and only email is
+ * wired — choosing a provider is an owner decision nobody has made. So an
+ * applicant who gave a phone number and no email genuinely cannot be sent the
+ * address they need. Said out loud on the screen that booked the interview,
+ * because the alternative is a candidate who never learns where to go and a
+ * recruiter who never learns they were not told.
+ */
+const NO_CHANNEL_NOTE =
+  "This candidate gave a phone number and no email address, and no SMS or WhatsApp transport is configured — so nothing has been sent. Call or message them the address, the parking, the PPE and what to bring.";
+
+/**
+ * Book an interview or a site trial (`ATS-14`).
+ *
+ * TRD §7.3, in order: parse, authorise, open the transaction, check the state,
+ * mutate, write the activity event and the audit note, **enqueue inside the
+ * same transaction**, commit, revalidate. The enqueue placement is the
+ * load-bearing one: a confirmation queued after the commit is lost if the
+ * process dies in between, and one queued before it promises a time that then
+ * rolled back.
+ */
+export async function scheduleInterviewAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const { session, ctx } = await staff();
+  try {
+    requirePermission(session.principal, "recruitment:write");
+  } catch {
+    return { error: "Your role cannot book an interview." };
+  }
+
+  const applicationId = String(formData.get("applicationId") ?? "");
+
+  const parsed = interviewScheduleSchema.safeParse({
+    applicationId,
+    kind: String(formData.get("kind") ?? "interview"),
+    scheduledAt: String(formData.get("scheduledAt") ?? ""),
+    durationMinutes: String(formData.get("durationMinutes") ?? "60"),
+    locationName: String(formData.get("locationName") ?? ""),
+    locationAddress: String(formData.get("locationAddress") ?? ""),
+    locationArea: String(formData.get("locationArea") ?? ""),
+    locationMapUrl: String(formData.get("locationMapUrl") ?? ""),
+    parkingNotes: String(formData.get("parkingNotes") ?? ""),
+    ppeRequired: formData.getAll("ppeRequired").map((value) => String(value)),
+    bringNotes: String(formData.get("bringNotes") ?? ""),
+    contactName: String(formData.get("contactName") ?? ""),
+    contactPhone: String(formData.get("contactPhone") ?? ""),
+  });
+
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Check the interview details." };
+  }
+
+  const scheduledAt = dubaiWallClock(parsed.data.scheduledAt);
+  if (!scheduledAt) return { error: "That is not a time. Pick a date and a time." };
+
+  let unreachable = false;
+  try {
+    await withTenant(ctx, async (tx) => {
+      const notice = await scheduleInterview(tx, ctx, {
+        applicationId: parsed.data.applicationId,
+        kind: parsed.data.kind as InterviewKind,
+        scheduledAt,
+        durationMinutes: parsed.data.durationMinutes,
+        locationName: parsed.data.locationName,
+        locationAddress: parsed.data.locationAddress,
+        locationArea: parsed.data.locationArea || undefined,
+        locationMapUrl: parsed.data.locationMapUrl || undefined,
+        parkingNotes: parsed.data.parkingNotes || undefined,
+        ppeRequired: parsed.data.ppeRequired,
+        bringNotes: parsed.data.bringNotes || undefined,
+        contactName: parsed.data.contactName || undefined,
+        contactPhone: parsed.data.contactPhone || undefined,
+      });
+
+      if (!notice.email) {
+        unreachable = true;
+        return;
+      }
+
+      const queued = await enqueue(tx, ctx, {
+        channel: "email",
+        template: "interview_scheduled",
+        to: notice.email,
+        subject: { table: "interviews", id: notice.interviewId },
+        payload: confirmationPayload(notice),
+      });
+
+      await markInterviewConfirmationSent(tx, {
+        interviewId: notice.interviewId,
+        notificationId: "notificationId" in queued ? queued.notificationId : undefined,
+      });
+    });
+  } catch (error) {
+    return { error: userMessage(error, "Could not book that interview.", "recruitment") };
+  }
+
+  revalidatePath(`/recruitment/candidate/${applicationId}`);
+  revalidatePath("/recruitment");
+
+  return {
+    success: unreachable
+      ? `Booked. ${NO_CHANNEL_NOTE}`
+      : "Booked, and the confirmation is queued with the address, the parking, the PPE and what to bring. Reminders go out a day before and two hours before.",
+  };
+}
+
+/** Move it, and re-send. Both reminders are recomputed from the new time. */
+export async function rescheduleInterviewAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const { session, ctx } = await staff();
+  try {
+    requirePermission(session.principal, "recruitment:write");
+  } catch {
+    return { error: "Your role cannot move an interview." };
+  }
+
+  const applicationId = String(formData.get("applicationId") ?? "");
+  const scheduledAt = dubaiWallClock(String(formData.get("scheduledAt") ?? ""));
+  if (!scheduledAt) return { error: "Pick the new date and time." };
+
+  let unreachable = false;
+  try {
+    await withTenant(ctx, async (tx) => {
+      const notice = await rescheduleInterview(tx, ctx, {
+        interviewId: String(formData.get("interviewId") ?? ""),
+        scheduledAt,
+        note: String(formData.get("note") ?? "").trim() || undefined,
+      });
+
+      if (!notice.email) {
+        unreachable = true;
+        return;
+      }
+
+      const queued = await enqueue(tx, ctx, {
+        channel: "email",
+        template: "interview_scheduled",
+        to: notice.email,
+        subject: { table: "interviews", id: notice.interviewId },
+        payload: confirmationPayload(notice),
+      });
+
+      await markInterviewConfirmationSent(tx, {
+        interviewId: notice.interviewId,
+        notificationId: "notificationId" in queued ? queued.notificationId : undefined,
+      });
+    });
+  } catch (error) {
+    return { error: userMessage(error, "Could not move that interview.", "recruitment") };
+  }
+
+  revalidatePath(`/recruitment/candidate/${applicationId}`);
+  revalidatePath("/recruitment");
+
+  return {
+    success: unreachable
+      ? `Moved. ${NO_CHANNEL_NOTE}`
+      : "Moved. A fresh confirmation is queued and both reminders now count from the new time.",
+  };
+}
+
+/**
+ * Call it off (`ATS-14`).
+ *
+ * The row stays, marked cancelled. It is why this candidate is still in this
+ * stage a week later, and deleting it deletes the explanation. No message is
+ * sent from here on purpose: a cancellation is a phone call, and an automated
+ * "your interview is cancelled" with nothing after it is the ghosting failure
+ * `ATS-16` exists to stop, one stage earlier.
+ */
+export async function cancelInterviewAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const { session, ctx } = await staff();
+  try {
+    requirePermission(session.principal, "recruitment:write");
+  } catch {
+    return { error: "Your role cannot cancel an interview." };
+  }
+
+  const applicationId = String(formData.get("applicationId") ?? "");
+  try {
+    await withTenant(ctx, (tx) =>
+      cancelInterview(tx, ctx, {
+        interviewId: String(formData.get("interviewId") ?? ""),
+        reason: String(formData.get("reason") ?? "").trim() || undefined,
+      }),
+    );
+  } catch (error) {
+    return { error: userMessage(error, "Could not cancel that interview.", "recruitment") };
+  }
+
+  revalidatePath(`/recruitment/candidate/${applicationId}`);
+  revalidatePath("/recruitment");
+
+  return {
+    success:
+      "Cancelled, and the reminders stop. Nothing was sent — call them; an automated cancellation with nothing after it is how a candidate is lost.",
+  };
 }

@@ -5,6 +5,8 @@ import {
   withTenant,
   transitionJob,
   assignTechnician,
+  recordJobOutcome,
+  recordProductEvent,
   createQuote,
   sendQuote,
   getQuoteForNotification,
@@ -13,12 +15,14 @@ import {
   getInvoiceForNotification,
   jobContractScope,
   quoteOutOfScopeWork,
+  ASSIGNMENT_WARNING_LABEL,
+  type AssignmentWarningType,
   type DraftLine,
 } from "@meridian/db";
 import { enqueue, dispatchPending } from "@meridian/notify";
 import { sendCustomerNotification } from "@/lib/customer-notifications";
 import { materialiseInvoiceDocument, materialiseQuoteDocument } from "@meridian/docs";
-import { InvalidTransitionError, absoluteUrl, formatMoney, type JobStatus } from "@meridian/core";
+import { InvalidTransitionError, absoluteUrl, formatMoney, fromDubai, type JobStatus } from "@meridian/core";
 import { requirePermission } from "@meridian/auth";
 import { requireSession } from "@/lib/session";
 import { userMessage } from "@/lib/errors";
@@ -70,12 +74,27 @@ export interface ActionState {
  * The transition graph is enforced in the domain layer, so an invalid move is
  * rejected here even though the UI only renders buttons for legal ones. The UI
  * is a convenience; this is the check.
+ *
+ * One move is not offered from here: `work_complete`. It is legal in the graph
+ * and it stays legal — the cron sweeps and the field app will both need it —
+ * but on this screen it goes through `recordOutcomeAction`, which cannot
+ * complete the work without an outcome code (`JOB-13`). A job that reached
+ * `work_complete` with a null outcome is a job whose outcome is unrecoverable,
+ * and `G11` is computed from exactly that column.
  */
 export async function changeStatus(_prev: ActionState, formData: FormData): Promise<ActionState> {
   const session = await requireSession();
   const jobId = String(formData.get("jobId") ?? "");
   const to = String(formData.get("to") ?? "") as JobStatus;
   const note = String(formData.get("note") ?? "").trim();
+
+  if (to === "work_complete") {
+    return {
+      error:
+        "Completing the work needs an outcome. Use the Outcome panel — it records what happened " +
+        "and completes the job in one step.",
+    };
+  }
 
   try {
     requirePermission(session.principal, to === "closed" ? "jobs:close" : "jobs:update");
@@ -104,13 +123,49 @@ export async function changeStatus(_prev: ActionState, formData: FormData): Prom
   return { ok: "Status updated." };
 }
 
-/** Assign a technician, creating a visit and dispatching the job. */
+/**
+ * A `datetime-local` field, read as Dubai wall-clock time.
+ *
+ * The browser sends a naive `YYYY-MM-DDTHH:mm` with no zone in it, so somebody
+ * has to decide what zone it meant. It meant the dispatcher's, and every
+ * dispatcher of this system is in Asia/Dubai — which is UTC+4 with no daylight
+ * saving, ever, so `fromDubai` is exact rather than approximate. Parsing it
+ * with `new Date()` would instead use the SERVER's zone, and a server in UTC
+ * would move every scheduled visit four hours earlier: an outdoor job booked
+ * for 16:00 would be stored as 12:00 and land inside the summer midday ban.
+ */
+function dubaiDateTime(value: string): Date | null {
+  const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(value.trim());
+  if (!parts) return null;
+  const [, year, month, day, hour, minute] = parts;
+  return fromDubai(Number(year), Number(month), Number(day), Number(hour) * 60 + Number(minute));
+}
+
+/**
+ * Assign a technician, creating a visit and dispatching the job.
+ *
+ * ── JOB-10: WHERE THE OVERRIDE IS ACTUALLY ENFORCED ────────────────────────
+ *
+ * Not here. This action collects the reason and passes it on; `assignTechnician`
+ * recomputes the warnings inside the transaction and refuses the assignment if
+ * one of them is unanswered. That split matters: a form rendered thirty seconds
+ * ago does not know a certificate expired at midnight, so a check that lives in
+ * the action — let alone in the browser — is an affordance rather than a
+ * control. The TRD is explicit that the rule belongs in the domain layer.
+ *
+ * What this action owes the domain layer is the dispatcher's words, and the
+ * warning they were looking at when they typed them.
+ */
 export async function assign(_prev: ActionState, formData: FormData): Promise<ActionState> {
   const session = await requireSession();
   const jobId = String(formData.get("jobId") ?? "");
   const technicianId = String(formData.get("technicianId") ?? "");
   const score = Number(formData.get("score") ?? "");
   const reason = String(formData.get("reason") ?? "").trim();
+  const overrideWarningType = String(formData.get("overrideWarningType") ?? "").trim();
+  const overrideReason = String(formData.get("overrideReason") ?? "").trim();
+  const startRaw = String(formData.get("scheduledStart") ?? "").trim();
+  const endRaw = String(formData.get("scheduledEnd") ?? "").trim();
 
   try {
     requirePermission(session.principal, "jobs:assign");
@@ -120,32 +175,47 @@ export async function assign(_prev: ActionState, formData: FormData): Promise<Ac
 
   if (!technicianId) return { error: "Choose a technician." };
 
+  const scheduledStart = startRaw ? dubaiDateTime(startRaw) : null;
+  const scheduledEnd = endRaw ? dubaiDateTime(endRaw) : null;
+  if (startRaw && !scheduledStart) return { error: "That start time could not be read." };
+  if (endRaw && !scheduledEnd) return { error: "That end time could not be read." };
+  if (scheduledStart && scheduledEnd && scheduledEnd <= scheduledStart) {
+    return { error: "The visit has to end after it starts." };
+  }
+
   let unreachable = false;
+  let overrode: readonly { type: string; detail: string }[] = [];
 
   try {
     await withTenant(
       { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
       async (tx) => {
-        const { visitId } = await assignTechnician(
+        const result = await assignTechnician(
           tx,
           { tenantId: session.principal.tenantId, userId: session.principal.userId },
           {
             jobId,
             technicianId,
+            scheduledStart: scheduledStart ?? undefined,
+            scheduledEnd: scheduledEnd ?? undefined,
             // Recorded so the optimiser can later be measured against the
             // dispatcher rather than simply trusted.
             method: "suggested",
             score: Number.isFinite(score) ? score : undefined,
             reason: reason || undefined,
+            overrideWarningType: overrideWarningType || undefined,
+            overrideReason: overrideReason || undefined,
           },
         );
+        overrode = result.overrode;
+        const visitId = result.visitId;
 
         // Same transaction as the assignment: a technician is never told about
         // a visit that did not survive the commit.
         const detail = await getVisitForNotification(tx, visitId);
         if (!detail) return;
 
-        const result = await enqueue(
+        const enqueued = await enqueue(
           tx,
           { tenantId: session.principal.tenantId, userId: session.principal.userId },
           {
@@ -165,7 +235,7 @@ export async function assign(_prev: ActionState, formData: FormData): Promise<Ac
             },
           },
         );
-        if ("skipped" in result) unreachable = true;
+        if ("skipped" in enqueued) unreachable = true;
       },
     );
   } catch (error) {
@@ -174,14 +244,135 @@ export async function assign(_prev: ActionState, formData: FormData): Promise<Ac
 
   await dispatchPending(session.principal.tenantId);
 
+  // JOB-10, the counting half. `job_visits.override_reason` is the record; this
+  // is what makes the override countable in the weekly report without reading
+  // every visit row. Best-effort and outside the transaction, per TRD 7.3: an
+  // analytics write must never roll back a dispatch that has already happened.
+  if (overrode.length > 0) {
+    try {
+      await withTenant(
+        { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
+        (tx) =>
+          recordProductEvent(tx, {
+            tenantId: session.principal.tenantId,
+            eventName: "assignment_warning_overridden",
+            entityType: "jobs",
+            entityId: jobId,
+            properties: {
+              warnings: overrode.map((w) => w.type),
+              technicianId,
+            },
+          }),
+      );
+    } catch {
+      // Swallowed on purpose, and it is the only thing in this file that is.
+      // The dispatch is done and the reason is on the visit; losing the
+      // analytics row is a gap in a chart, not a gap in the record.
+    }
+  }
+
   revalidatePath(`/jobs/${jobId}`);
   revalidatePath("/dispatch");
   revalidatePath("/technicians");
+
+  const overrideNote =
+    overrode.length > 0
+      ? ` Override recorded against ${overrode
+          .map((w) => ASSIGNMENT_WARNING_LABEL[w.type as AssignmentWarningType] ?? w.type)
+          .join(", ")
+          .toLowerCase()}.`
+      : "";
+
   return {
-    ok: unreachable
-      ? "Assigned. No email went out — this technician has no address on file, so tell them by phone."
-      : "Technician assigned and notified.",
+    ok:
+      (unreachable
+        ? "Assigned. No email went out — this technician has no address on file, so tell them by phone."
+        : "Technician assigned and notified.") + overrideNote,
   };
+}
+
+/**
+ * Record the outcome of the work and complete it (`JOB-13`, `JOB-14`).
+ *
+ * ── WHY COMPLETION LIVES HERE AND NOT ON THE STATUS BUTTONS ────────────────
+ *
+ * Because a job that reached `work_complete` without an outcome is a job whose
+ * outcome is gone: nobody remembers in March what happened on a Tuesday in
+ * January, and `G11` — first-time fix rate — has no numerator without it. The
+ * status panel therefore stops offering "Work complete" as a bare move, and
+ * this action is the only door. The domain layer holds the same line: the
+ * transition happens inside `recordJobOutcome`, in the transaction that writes
+ * the outcome, so the two states cannot disagree.
+ *
+ * `jobs:update` rather than a new permission. Recording what happened on a job
+ * is updating a job, and inventing a permission for it would leave every
+ * existing role unable to complete work until somebody remembered to grant it.
+ */
+export async function recordOutcomeAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const session = await requireSession();
+  const jobId = String(formData.get("jobId") ?? "");
+  const outcomeCode = String(formData.get("outcomeCode") ?? "").trim();
+  const visitId = String(formData.get("visitId") ?? "").trim();
+  const note = String(formData.get("note") ?? "").trim();
+  const symptomCodeId = String(formData.get("symptomCodeId") ?? "").trim();
+  const causeCodeId = String(formData.get("causeCodeId") ?? "").trim();
+  const remedyCodeId = String(formData.get("remedyCodeId") ?? "").trim();
+
+  try {
+    requirePermission(session.principal, "jobs:update");
+  } catch {
+    return { error: "Your role cannot record job outcomes." };
+  }
+
+  if (!outcomeCode) return { error: "Choose what happened on the visit." };
+
+  let label = "";
+  let requiresReturnVisit = false;
+  let transitioned = false;
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
+      async (tx) => {
+        const result = await recordJobOutcome(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          {
+            jobId,
+            outcomeCode,
+            visitId: visitId || null,
+            note: note || null,
+            symptomCodeId: symptomCodeId || null,
+            causeCodeId: causeCodeId || null,
+            remedyCodeId: remedyCodeId || null,
+          },
+        );
+        label = result.outcomeLabel;
+        requiresReturnVisit = result.requiresReturnVisit;
+        transitioned = result.transitioned;
+      },
+    );
+  } catch (error) {
+    if (error instanceof InvalidTransitionError) return { error: error.message };
+    return { error: userMessage(error, "Could not record the outcome.", "jobs") };
+  }
+
+  revalidatePath(`/jobs/${jobId}`);
+  revalidatePath("/dispatch");
+  revalidatePath("/jobs");
+
+  // Three sentences for three different situations, because "saved" would hide
+  // the one that still needs doing. An outcome that leaves work owing is the
+  // requirement's actual point: no access and return-visit-required are a large
+  // share of real visits and are not failures to be tidied away.
+  const moved = transitioned ? " The job is now work complete and awaiting sign-off." : "";
+  const owing = requiresReturnVisit
+    ? " This outcome leaves work owing — assign a return visit."
+    : "";
+  return { ok: `Recorded as ${label}.${moved}${owing}` };
 }
 
 /** Create a draft quotation from the job detail panel. */

@@ -40,22 +40,29 @@
 
 import postgres from "postgres";
 import { closeConnection, withTenant } from "../src/index";
-import { activeTenantIds } from "../src/domain/cron";
 import {
   applicationStatusByToken,
   applicationsOwedAnOutcome,
   attachCandidateDocument,
+  cancelInterview,
+  claimInterviewReminder,
   closeApplication,
   closeRequisition,
   createRequisition,
+  dueInterviewReminders,
   getCandidateDocumentForDownload,
+  getCandidateDetail,
   getPipelineBoard,
   hireCandidate,
   listTalentPool,
   moveApplicationStage,
   outcomeAccountability,
+  interviewsForApplication,
   publishRequisition,
   approveRequisition,
+  requestInterviewReschedule,
+  rescheduleInterview,
+  scheduleInterview,
   purgeExpiredCandidates,
   reconfirmTalentPoolMember,
   submitApplication,
@@ -64,11 +71,12 @@ import {
 import {
   PROHIBITED_APPLICANT_FIELDS,
   PROHIBITED_SCORING_FIELDS,
+  RECRUITMENT_COOLOFF_DEFAULT_DAYS,
   UserFacingError,
   isDownloadable,
   phoneLocalDigits,
 } from "@meridian/core";
-import { testTenantId } from "./_tenant";
+import { otherTenantId, testTenantId } from "./_tenant";
 
 const admin = postgres(
   process.env["DATABASE_ADMIN_URL"] ??
@@ -91,29 +99,108 @@ function checkTrue(label: string, got: boolean): void {
 const RUN = `${process.pid}${Math.floor(Math.random() * 1e6)}`;
 const SLUG = `zz-test-role-${RUN}`;
 const PHONE_MARK = `+971 50 ${RUN.slice(-3)} 0`;
+/** Every fixture name and slug ends with this, and `cleanup()` matches on it. */
+const RUN_SUFFIX = `%${RUN}`;
 
 /**
- * Remove everything this run created.
+ * Remove everything THIS RUN created, and nothing anybody else's did.
  *
- * By slug and by phone marker rather than by "everything in the tenant", so it
- * is safe against a seeded database and against a developer's own data.
+ * ── WHY THIS IS SCOPED TO `RUN` AND NOT TO THE `zz-test-` PREFIX ────────────
+ *
+ * It used to delete `candidates WHERE full_name LIKE 'ZZTest%'` and
+ * `job_requisitions WHERE public_slug LIKE 'zz-test-role-%'` — every run's
+ * fixtures, not this one's. That is correct on a developer's laptop, where one
+ * copy of this suite runs at a time, and it is destructive the moment two do.
+ *
+ * The dev Postgres is shared. Two concurrent runs each open with `cleanup()`,
+ * and the second one deletes the first one's LIVE rows halfway through it. The
+ * first run then fails somewhere unrelated and unrepeatable — the observed
+ * shapes were `applications_candidate_fk` (the candidate it was writing against
+ * had just been deleted), `application_events_application_fk` (same, one table
+ * along), a `_bt_check_unique` violation when a re-created fixture raced a
+ * surviving one, and two ATS-18 purge assertions failing because their subjects
+ * had been removed by somebody else. All four are one bug.
+ *
+ * So: every fixture this file creates carries `RUN` in its name or slug, and
+ * every DELETE below is anchored to it. Nothing here can reach a row this
+ * process did not write.
+ *
+ * ── AND WHY THERE IS STILL A BROAD SWEEP, AGE-GATED ─────────────────────────
+ *
+ * Scoping to `RUN` alone would leak: a run that is killed halfway leaves rows
+ * tagged with a `RUN` no future run will ever match, and they accumulate for
+ * ever. `sweepStale()` is what reaps those — the same broad patterns, but only
+ * against rows older than an hour, which is far longer than this suite takes
+ * and therefore cannot be a concurrent run's live fixtures.
+ *
  * Deleting the requisition cascades to its stages; applications reference it
- * with ON DELETE restrict, so they go first.
+ * with ON DELETE restrict, so they go first. `interviews` cascades from
+ * `applications`, so it needs no line of its own.
  */
 async function cleanup(): Promise<void> {
   await admin`
     delete from applications
-     where requisition_id in (select id from job_requisitions where public_slug like ${"zz-test-role-%"})
-        or candidate_id in (select id from candidates where phone like ${"%" + RUN.slice(-3) + "%"})
+     where requisition_id in (select id from job_requisitions where public_slug like ${RUN_SUFFIX})
+        or candidate_id in (select id from candidates where full_name like ${RUN_SUFFIX})
   `;
-  await admin`delete from candidates where phone like ${"%" + RUN.slice(-3) + "%"}`;
-  await admin`delete from candidates where full_name like ${"ZZTest%"}`;
-  await admin`delete from recruitment_costs where note like ${"zz-test-%"}`;
-  await admin`delete from job_requisitions where public_slug like ${"zz-test-role-%"}`;
-  await admin`delete from rate_limits where bucket like ${"__test:%"}`;
+  // By name and not by phone. PHONE_MARK carries only `RUN.slice(-3)`, which
+  // two concurrent runs collide on once in a thousand — and a collision there
+  // would let one run's cleanup take the other's candidates, which is the whole
+  // failure this function was rewritten to stop.
+  await admin`delete from candidates where full_name like ${RUN_SUFFIX}`;
+  await admin`delete from recruitment_costs where note like ${"zz-test-%-" + RUN}`;
+  await admin`delete from job_requisitions where public_slug like ${RUN_SUFFIX}`;
+  // There is deliberately no `rate_limits` line here any more. This suite does
+  // not create a rate-limit bucket — it never calls checkRateLimit — and the
+  // line that used to sit here deleted `bucket LIKE '__test:%'`, which is
+  // exactly the namespace `ratelimit.test.ts` allocates its own buckets in.
+  // On a shared database that is one suite silently emptying another's
+  // fixtures mid-run, and it is a plausible source of the "flaky ratelimit"
+  // failures that have been written off as contention.
+}
+
+/**
+ * Reap what killed runs left behind.
+ *
+ * An hour, because this suite takes seconds and a concurrent run's fixtures are
+ * therefore never in range. Run once at the start; there is nothing to sweep at
+ * the end that `cleanup()` has not already taken.
+ */
+async function sweepStale(): Promise<void> {
+  const cutoff = "1 hour";
+  await admin`
+    delete from applications
+     where created_at < now() - ${cutoff}::interval
+       and (
+         requisition_id in (
+           select id from job_requisitions
+            where (public_slug like ${"zz-test-role-%"} or public_slug like ${"zztest-%"})
+              and created_at < now() - ${cutoff}::interval
+         )
+         or candidate_id in (
+           select id from candidates
+            where full_name like ${"ZZTest%"}
+              and created_at < now() - ${cutoff}::interval
+         )
+       )
+  `;
+  await admin`
+    delete from candidates
+     where full_name like ${"ZZTest%"} and created_at < now() - ${cutoff}::interval
+  `;
+  await admin`
+    delete from recruitment_costs
+     where note like ${"zz-test-%"} and created_at < now() - ${cutoff}::interval
+  `;
+  await admin`
+    delete from job_requisitions
+     where (public_slug like ${"zz-test-role-%"} or public_slug like ${"zztest-%"})
+       and created_at < now() - ${cutoff}::interval
+  `;
 }
 
 async function main(): Promise<void> {
+  await sweepStale();
   await cleanup();
   const tenantId = await testTenantId();
   const ctx = { tenantId, actorKind: "system" as const };
@@ -131,7 +218,7 @@ async function main(): Promise<void> {
     try {
       await admin`
         insert into recruitment_costs (tenant_id, kind, amount_minor, borne_by, incurred_on, note)
-        values (${tenantId}::uuid, 'visa_and_permit', 500000, 'worker', current_date, 'zz-test-hr16')
+        values (${tenantId}::uuid, 'visa_and_permit', 500000, 'worker', current_date, ${'zz-test-hr16-' + RUN})
       `;
     } catch {
       refused = true;
@@ -142,7 +229,7 @@ async function main(): Promise<void> {
     // doing its job rather than the table being unwritable.
     const ok = await admin`
       insert into recruitment_costs (tenant_id, kind, amount_minor, incurred_on, note)
-      values (${tenantId}::uuid, 'visa_and_permit', 500000, current_date, 'zz-test-hr16-ok')
+      values (${tenantId}::uuid, 'visa_and_permit', 500000, current_date, ${'zz-test-hr16ok-' + RUN})
       returning borne_by
     `;
     check("HR-16: an employer-borne cost is recorded, and can only say 'employer'", ok[0]?.["borne_by"], "employer");
@@ -153,7 +240,7 @@ async function main(): Promise<void> {
     try {
       await admin`
         insert into recruitment_costs (tenant_id, kind, amount_minor, incurred_on, note)
-        values (${tenantId}::uuid, 'agency_fee', -100000, current_date, 'zz-test-negative')
+        values (${tenantId}::uuid, 'agency_fee', -100000, current_date, ${'zz-test-negative-' + RUN})
       `;
     } catch {
       negativeRefused = true;
@@ -175,7 +262,12 @@ async function main(): Promise<void> {
          and table_name in (
            'candidates', 'applications', 'candidate_certifications',
            'candidate_documents', 'job_requisitions', 'requisition_stages',
-           'application_events', 'talent_pool_members', 'recruitment_costs'
+           'application_events', 'talent_pool_members', 'recruitment_costs',
+           -- 0020. Added to the sweep in the same change that added the table:
+           -- a new recruitment table outside this list is a table ATS-6 stops
+           -- applying to, silently, which is the failure this assertion exists
+           -- to prevent.
+           'interviews'
          )
     `).map((r) => `${r.table_name}.${r.column_name}`);
 
@@ -389,25 +481,26 @@ async function main(): Promise<void> {
     // The one that matters. Same uuid, different tenant context: RLS must
     // return nothing, so the route's "there is no such document" is the truth
     // rather than a message it prints while serving the file anyway.
-    // Through `activeTenantIds()`, a SECURITY DEFINER enumerator, and NOT
-    // through `otherTenantId()` in ./_tenant. That helper selects from
-    // `tenants` on the plain handle, outside a tenant transaction, where the
-    // policy is `id = app_current_tenant()` and the setting is unset — so it
-    // returns null whether or not a second tenant exists, and this check would
-    // report itself as skipped on every run for ever. The same footnote is on
-    // the reporting and HR suites; it is the third time it has been stepped in.
-    const other = (await activeTenantIds()).find((id) => id !== tenantId) ?? null;
-    if (other) {
-      const across = await withTenant(
-        { tenantId: other, actorKind: "system" as const },
-        (tx) => getCandidateDocumentForDownload(tx, attached.documentId),
-      );
-      check("ATS-9: the same document id resolves to nothing under another tenant", across, null);
-    } else {
-      // Said out loud rather than passing quietly. A single-tenant database is
-      // a valid state; a green tick that proved nothing is not.
-      console.log("skip  ATS-9: RLS isolation not proven — only one tenant exists in this database");
-    }
+    //
+    // Straight through `otherTenantId()`, with no fallback and no skip branch.
+    // This block used to route around that helper, because the helper selected
+    // from `tenants` on the plain handle where the policy is
+    // `id = app_current_tenant()` with the setting unset — it returned null
+    // whether or not a second tenant existed, and every caller read that null
+    // as "skip". The helper now resolves through the SECURITY DEFINER
+    // enumerator and THROWS when there is no second tenant, so there is no
+    // longer a value this line could mistake for permission to not run.
+    //
+    // The skip branch that used to sit under here is gone deliberately. This
+    // is the assertion that proves one tenant's recruiter cannot download
+    // another tenant's CV; a version of it that can print "skip" is a version
+    // that will, on the one database where it mattered.
+    const other = await otherTenantId();
+    const across = await withTenant(
+      { tenantId: other, actorKind: "system" as const },
+      (tx) => getCandidateDocumentForDownload(tx, attached.documentId),
+    );
+    check("ATS-9: the same document id resolves to nothing under another tenant", across, null);
 
     // A flagged file, end to end: the status the route reads is the status that
     // was written, not a default the lookup filled in.
@@ -749,7 +842,36 @@ async function main(): Promise<void> {
   }
 
   // ── ATS-18: retention ────────────────────────────────────────────────────
-  {
+  //
+  // ── THE ONE BLOCK IN THIS FILE THAT CANNOT BE MADE RUN-SCOPED ──────────────
+  //
+  // Everything else here is namespaced by `RUN`, so two copies of this suite on
+  // one database cannot touch each other's rows. This block cannot be, because
+  // the thing under test is `purgeExpiredCandidates`, and a retention purge is
+  // TENANT-WIDE by definition — that is the whole of its job. It deletes every
+  // candidate in the tenant whose `delete_after` has passed, including the ones
+  // a concurrent run has just deliberately backdated so that it can assert on
+  // them.
+  //
+  // That is not a bug in the purge and it must not be "fixed" by narrowing it.
+  // The observed damage was a concurrent run's purge deleting this run's
+  // fixture between the candidate INSERT and the application INSERT that
+  // references it — `applications_candidate_fk`, from a line that has nothing
+  // wrong with it — and, when the timing fell the other way, this block's own
+  // assertions failing because their subjects were already gone.
+  //
+  // So the block is serialised across processes with a Postgres advisory lock
+  // rather than made narrower. One run at a time creates, purges and asserts;
+  // the others wait. The lock is taken on a RESERVED connection because
+  // `pg_advisory_lock` is session-scoped and a pooled handle may give the
+  // release statement a different session, which would leak the lock for the
+  // life of the process.
+  // A bigint literal would be cleaner and the driver will not bind one; a
+  // number inside int8 range binds fine and pg_advisory_lock takes it.
+  const ATS18_LOCK = 841290731;
+  const lock = await admin.reserve();
+  await lock`select pg_advisory_lock(${ATS18_LOCK})`;
+  try {
     // Three candidates whose delete_after has passed, each of which must be
     // treated differently. The purge deleting all three would be a data-loss
     // incident; deleting none would be the policy document TRD §10 warns about.
@@ -818,8 +940,11 @@ async function main(): Promise<void> {
     `;
     checkTrue("ATS-18: the purge writes to the append-only audit log", Number(logged[0]?.["count"] ?? 0) > 0);
 
-    await admin`delete from applications where reference like ${"APP-ZZ-%"}`;
-    await admin`delete from job_requisitions where public_slug like ${"zz-test-role-live-%"}`;
+    await admin`delete from applications where reference = ${"APP-ZZ-LIVE-" + RUN}`;
+    await admin`delete from job_requisitions where public_slug like ${"zz-test-role-live-" + RUN}`;
+  } finally {
+    await lock`select pg_advisory_unlock(${ATS18_LOCK})`;
+    await lock.release();
   }
 
   // ── ATS-17: the conversion ───────────────────────────────────────────────
@@ -946,6 +1071,431 @@ async function main(): Promise<void> {
         checkTrue("ATS-7: a stage from another role cannot be used", refused);
       }
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ATS-12 — the cool-off flag, and the four ways it must not behave
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // The requirement is a flag that INFORMS A HUMAN. `ATS-19` forbids automated
+  // rejection and `ATS-5` forbids automated filtering, so the assertions below
+  // are not "the flag is set" — that is the easy half. They are "the flag is
+  // set AND the application was still created, is still active, and has its own
+  // id". A design that blocked the second application would satisfy a test that
+  // only checked nothing threw.
+
+  /** Open a second requisition, namespaced so `cleanup()` finds it by pattern. */
+  async function openRequisition(
+    suffix: string,
+    cooloffDays?: number,
+  ): Promise<{ id: string; slug: string }> {
+    const created = await withTenant(ctx, (tx) =>
+      createRequisition(tx, ctx, {
+        title: `ZZTest ${suffix} ${RUN}`,
+        trade: "hvac-installation-maintenance",
+        grade: "technician",
+        headcount: 1,
+        contractType: "full_time",
+        locationCity: "Dubai",
+      }),
+    );
+    const slug = `zz-test-role-${suffix}-${RUN}`;
+    await admin`update job_requisitions set public_slug = ${slug} where id = ${created.requisitionId}::uuid`;
+    if (cooloffDays !== undefined) {
+      await admin`update job_requisitions set cooloff_days = ${cooloffDays} where id = ${created.requisitionId}::uuid`;
+    }
+    await withTenant(ctx, async (tx) => {
+      await approveRequisition(tx, ctx, created.requisitionId);
+      await publishRequisition(tx, ctx, created.requisitionId);
+    });
+    return { id: created.requisitionId, slug };
+  }
+
+  /** One application, with a phone and email unique to this sub-test. */
+  async function applyAs(slug: string, mark: string) {
+    return submitApplication(tenantId, {
+      roleSlug: slug,
+      fullName: `ZZTest ${mark} ${RUN}`,
+      phone: `${PHONE_MARK}${mark}`,
+      email: `zztest-${mark}-${RUN}@example.com`,
+      trade: "hvac-installation-maintenance",
+      grade: "technician",
+      experienceBand: "2_to_5",
+      currentLocation: "in_uae",
+      availability: "immediate",
+      hasDrivingLicence: false,
+      essentialFunctions: "yes",
+      certificates: [],
+      talentPoolConsent: false,
+    });
+  }
+
+  /**
+   * Archive an application with a reason, then move its archive date into the
+   * past.
+   *
+   * The backdating is the whole point of several of the assertions below: a
+   * window can only be shown to be READ rather than accepted-and-ignored if the
+   * fixture sits at a distance where two candidate windows disagree.
+   */
+  async function archiveDaysAgo(
+    applicationId: string,
+    dispositionCode: string,
+    days: number,
+  ): Promise<void> {
+    await withTenant(ctx, (tx) => closeApplication(tx, ctx, { applicationId, dispositionCode }));
+    await admin`
+      update applications
+         set archived_at = now() - make_interval(days => ${days})
+       where id = ${applicationId}::uuid
+    `;
+  }
+
+  let cooloffRole = { id: "", slug: "" };
+  {
+    cooloffRole = await openRequisition("cool");
+
+    // ── The default, and the fact that there is only one of it ──────────────
+    //
+    // 90 lives in TypeScript (RECRUITMENT_COOLOFF_DEFAULT_DAYS) and in the
+    // coalesce inside app_recruitment_cooloff_days, because the unauthenticated
+    // path never enters TypeScript and the staff screens never enter the SQL.
+    // Two implementations of one rule is one implementation and one bug
+    // waiting, so they are checked against each other rather than against a
+    // literal — exactly as phone_local_digits is above.
+    const sqlDefault = await admin<{ days: number }[]>`
+      select app_recruitment_cooloff_days(${cooloffRole.id}::uuid) as days
+    `;
+    check(
+      "ATS-12: the SQL default and RECRUITMENT_COOLOFF_DEFAULT_DAYS are the same number",
+      Number(sqlDefault[0]?.["days"]),
+      RECRUITMENT_COOLOFF_DEFAULT_DAYS,
+    );
+
+    // ── Flagged, and NOT blocked ────────────────────────────────────────────
+    const first = await applyAs(cooloffRole.slug, "70");
+    await archiveDaysAgo(first.applicationId, "insufficient_experience", 10);
+
+    const second = await applyAs(cooloffRole.slug, "70");
+
+    // The three assertions that matter more than the flag itself. A design
+    // that refused, deduplicated or quietly returned the old application would
+    // pass "the flag is set" and fail every one of these.
+    check("ATS-12: re-applying inside the cool-off is NOT refused", second.wasExisting, false);
+    checkTrue(
+      "ATS-12: the second application has its own id — nothing was reused",
+      second.applicationId !== first.applicationId,
+    );
+
+    const secondRow = await admin<{
+      status: string;
+      cooloff_flag: boolean;
+      cooloff_of_application_id: string | null;
+    }[]>`
+      select status, cooloff_flag, cooloff_of_application_id
+        from applications where id = ${second.applicationId}::uuid
+    `;
+    check("ATS-12/ATS-19: and it is live, not auto-rejected", secondRow[0]?.["status"], "active");
+    check("ATS-12: it carries the cool-off flag", secondRow[0]?.["cooloff_flag"], true);
+    check(
+      "ATS-12: pointing at the prior application, not merely asserting one existed",
+      secondRow[0]?.["cooloff_of_application_id"],
+      first.applicationId,
+    );
+
+    // The flag is a note for staff and nothing else. The applicant's own view
+    // is built from a fixed jsonb object; if the key were ever added to it,
+    // this is what would catch it.
+    const applicantView = await applicationStatusByToken(second.statusToken);
+    checkTrue(
+      "ATS-12: the applicant is never shown the flag on their own page",
+      applicantView !== null && !JSON.stringify(applicantView).toLowerCase().includes("cooloff"),
+    );
+
+    // And the staff screen resolves it to something a human can follow.
+    const detail = await withTenant(ctx, (tx) => getCandidateDetail(tx, second.applicationId));
+    check(
+      "ATS-12: the candidate screen names the prior application it refers to",
+      detail?.cooloff?.priorReference,
+      first.reference,
+    );
+
+    // ── A withdrawal is the candidate's own decision, not a rejection ───────
+    //
+    // Its own candidate, deliberately. Reusing the one above would leave the
+    // rejection from ten days ago inside the window, and this assertion would
+    // pass or fail for the wrong reason.
+    const withdrew = await applyAs(cooloffRole.slug, "71");
+    await archiveDaysAgo(withdrew.applicationId, "candidate_withdrew", 10);
+    const afterWithdrawal = await applyAs(cooloffRole.slug, "71");
+
+    const withdrawalRow = await admin<{ cooloff_flag: boolean }[]>`
+      select cooloff_flag from applications where id = ${afterWithdrawal.applicationId}::uuid
+    `;
+    check(
+      "ATS-12: a candidate who withdrew is not flagged — we did not turn them down",
+      withdrawalRow[0]?.["cooloff_flag"],
+      false,
+    );
+
+    // ── Same person, DIFFERENT role ────────────────────────────────────────
+    //
+    // ATS-12 says "same person, same role". A rejection for the AC vacancy says
+    // nothing about the plumbing one, and flagging it would make the badge mean
+    // "has been rejected here before", which is a different and much worse
+    // thing to put next to somebody's name.
+    const otherRole = await openRequisition("other");
+    const onOtherRole = await applyAs(otherRole.slug, "72");
+    await archiveDaysAgo(onOtherRole.applicationId, "failed_trade_check", 5);
+    const onThisRole = await applyAs(cooloffRole.slug, "72");
+
+    const crossRoleRow = await admin<{ cooloff_flag: boolean }[]>`
+      select cooloff_flag from applications where id = ${onThisRole.applicationId}::uuid
+    `;
+    check(
+      "ATS-12: a rejection for a different role does not flag this one",
+      crossRoleRow[0]?.["cooloff_flag"],
+      false,
+    );
+  }
+
+  // ── ATS-12: the requisition's own window is READ, not accepted and ignored ─
+  //
+  // The fixture is chosen so the two candidate answers disagree: the rejection
+  // is 30 days old, the role's own window is 5 days, and the platform default
+  // is 90. A flag here would mean the column was written and then never looked
+  // at — which is exactly what "configurable" turns into when nobody checks.
+  {
+    const shortRole = await openRequisition("short", 5);
+    const rejected = await applyAs(shortRole.slug, "73");
+    await archiveDaysAgo(rejected.applicationId, "insufficient_experience", 30);
+    const again = await applyAs(shortRole.slug, "73");
+
+    const row = await admin<{ cooloff_flag: boolean }[]>`
+      select cooloff_flag from applications where id = ${again.applicationId}::uuid
+    `;
+    check(
+      "ATS-12: a 5-day window on the requisition beats the 90-day default on a 30-day-old rejection",
+      row[0]?.["cooloff_flag"],
+      false,
+    );
+
+    // And the same fixture flags once the window is widened past the gap, so
+    // the assertion above is the window being read rather than the flag being
+    // broken.
+    await admin`update job_requisitions set cooloff_days = 60 where id = ${shortRole.id}::uuid`;
+    await archiveDaysAgo(again.applicationId, "insufficient_experience", 30);
+    const third = await applyAs(shortRole.slug, "73");
+    const widenedRow = await admin<{ cooloff_flag: boolean }[]>`
+      select cooloff_flag from applications where id = ${third.applicationId}::uuid
+    `;
+    check(
+      "ATS-12: widening the same window to 60 days flags the same 30-day-old rejection",
+      widenedRow[0]?.["cooloff_flag"],
+      true,
+    );
+
+    // Zero is a real answer and not a way of spelling null.
+    await admin`update job_requisitions set cooloff_days = 0 where id = ${shortRole.id}::uuid`;
+    await archiveDaysAgo(third.applicationId, "insufficient_experience", 1);
+    const withZero = await applyAs(shortRole.slug, "73");
+    const zeroRow = await admin<{ cooloff_flag: boolean }[]>`
+      select cooloff_flag from applications where id = ${withZero.applicationId}::uuid
+    `;
+    check("ATS-12: a cool-off of 0 switches the flag off entirely", zeroRow[0]?.["cooloff_flag"], false);
+
+    // The flag cannot exist without something to click through to. Asserted on
+    // the ADMIN connection: a validator in the domain layer would let the owner
+    // connection past, and the CHECK is what an importer meets.
+    let bareBooleanRefused = false;
+    try {
+      await admin`
+        update applications set cooloff_flag = true, cooloff_of_application_id = null
+         where id = ${withZero.applicationId}::uuid
+      `;
+    } catch {
+      bareBooleanRefused = true;
+    }
+    checkTrue(
+      "ATS-12: a cool-off flag with nothing to point at is refused by the database",
+      bareBooleanRefused,
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ATS-14 — interview logistics
+  // ═══════════════════════════════════════════════════════════════════════════
+  {
+    const role = await openRequisition("iv");
+    const applied = await applyAs(role.slug, "80");
+
+    // ── The booking, and the two reminder windows ──────────────────────────
+    const threeDaysOut = new Date(Date.now() + 3 * 86_400_000);
+    const booked = await withTenant(ctx, (tx) =>
+      scheduleInterview(tx, ctx, {
+        applicationId: applied.applicationId,
+        kind: "site_trial",
+        scheduledAt: threeDaysOut,
+        locationName: "ZZTest yard",
+        locationAddress: "Warehouse 4, Al Quoz Industrial 3",
+        ppeRequired: ["Safety boots", "Hard hat"],
+        bringNotes: "Original HVAC certificate",
+      }),
+    );
+
+    checkTrue("ATS-14: an interview is stored with a time and a place", booked.interviewId !== "");
+    checkTrue(
+      "ATS-14: an interview three days out has both reminders due",
+      booked.reminder24hAt !== null && booked.reminder2hAt !== null,
+    );
+
+    // An interview booked for two hours from now never had a 24-hour reminder
+    // to miss. Null says so; stamping the sent column would claim a message
+    // that never existed, and the CHECK in 0020 refuses that version.
+    const soon = await applyAs(role.slug, "81");
+    const shortNotice = await withTenant(ctx, (tx) =>
+      scheduleInterview(tx, ctx, {
+        applicationId: soon.applicationId,
+        kind: "interview",
+        scheduledAt: new Date(Date.now() + 3 * 3_600_000),
+        locationName: "ZZTest office",
+        locationAddress: "Office 12, Business Bay",
+      }),
+    );
+    check(
+      "ATS-14: an interview three hours out has no 24-hour reminder to send",
+      shortNotice.reminder24hAt,
+      null,
+    );
+    checkTrue("ATS-14: but it still has a two-hour one", shortNotice.reminder2hAt !== null);
+
+    let sentWithoutDue = false;
+    try {
+      await admin`
+        update interviews
+           set reminder_24h_sent_at = now()
+         where id = ${shortNotice.interviewId}::uuid
+      `;
+    } catch {
+      sentWithoutDue = true;
+    }
+    checkTrue(
+      "ATS-14: a reminder cannot be marked sent for a window that was never due",
+      sentWithoutDue,
+    );
+
+    // ── ATS-8: booking it puts the ball with the candidate ─────────────────
+    const blocked = await admin<{ blocked_on: string }[]>`
+      select blocked_on from applications where id = ${applied.applicationId}::uuid
+    `;
+    check("ATS-8: booking an interview marks the application as waiting on them",
+      blocked[0]?.["blocked_on"], "candidate");
+
+    // ── The reminder fires once, and only once ─────────────────────────────
+    //
+    // The whole idempotency guarantee, tested the way it fails in production:
+    // claim, then claim again, as an overlapping cron run would.
+    await admin`
+      update interviews set reminder_24h_at = now() - interval '5 minutes'
+       where id = ${booked.interviewId}::uuid
+    `;
+
+    const due = await withTenant(ctx, (tx) => dueInterviewReminders(tx, 50));
+    checkTrue(
+      "ATS-14: a reminder whose moment has arrived is picked up by the sweep",
+      due.some((r) => r.interviewId === booked.interviewId && r.window === "24h"),
+    );
+
+    const claims = await withTenant(ctx, async (tx) => [
+      await claimInterviewReminder(tx, ctx, { interviewId: booked.interviewId, window: "24h" }),
+      await claimInterviewReminder(tx, ctx, { interviewId: booked.interviewId, window: "24h" }),
+    ]);
+    check("ATS-14: the first run claims the reminder", claims[0], true);
+    check("ATS-14: an overlapping second run does not — it cannot send twice", claims[1], false);
+
+    const afterClaim = await withTenant(ctx, (tx) => dueInterviewReminders(tx, 50));
+    checkTrue(
+      "ATS-14: and it drops out of the sweep once claimed",
+      !afterClaim.some((r) => r.interviewId === booked.interviewId && r.window === "24h"),
+    );
+
+    // ── Moving it recomputes both windows and forgets both sends ───────────
+    const moved = await withTenant(ctx, (tx) =>
+      rescheduleInterview(tx, ctx, {
+        interviewId: booked.interviewId,
+        scheduledAt: new Date(Date.now() + 5 * 86_400_000),
+      }),
+    );
+    check(
+      "ATS-14: moving an interview clears the reminder that was about the old time",
+      moved.reminder24hSentAt,
+      null,
+    );
+    check("ATS-14: and the confirmation, which is now wrong", moved.confirmationSentAt, null);
+    check("ATS-14: the move is counted", moved.rescheduledCount, 1);
+
+    // ── The candidate asking to move it, behind the token they already have ─
+    //
+    // No second token exists and none is minted. The application's own
+    // status_token is the credential, which is why this call takes one.
+    const askedUnknown = await requestInterviewReschedule("0".repeat(64));
+    check("ATS-14: an unknown token moves nothing", askedUnknown, false);
+
+    const asked = await requestInterviewReschedule(applied.statusToken, "My shift changed");
+    check("ATS-14: the candidate can ask, through the token they already have", asked, true);
+
+    const askedRow = await admin<{
+      reschedule_requested_at: string | null;
+      reschedule_request_note: string | null;
+      scheduled_at: string;
+    }[]>`
+      select reschedule_requested_at, reschedule_request_note, scheduled_at
+        from interviews where id = ${booked.interviewId}::uuid
+    `;
+    checkTrue(
+      "ATS-14: the ask is recorded",
+      askedRow[0]?.["reschedule_requested_at"] !== null,
+    );
+    check(
+      "ATS-14: with what they said",
+      askedRow[0]?.["reschedule_request_note"],
+      "My shift changed",
+    );
+    // The one that matters: asking does not move it. A candidate silently
+    // moving a site trial a supervisor has blocked out is two people standing
+    // in a yard, not a feature.
+    check(
+      "ATS-14: and the interview has NOT moved — a request is not a reschedule",
+      new Date(askedRow[0]?.["scheduled_at"] ?? 0).getTime(),
+      moved.scheduledAt.getTime(),
+    );
+
+    const nowBlocked = await admin<{ blocked_on: string }[]>`
+      select blocked_on from applications where id = ${applied.applicationId}::uuid
+    `;
+    check("ATS-8: once they have asked, the delay is ours and the board says so",
+      nowBlocked[0]?.["blocked_on"], "us");
+
+    // ── Cancelling stops the reminders and keeps the row ───────────────────
+    await withTenant(ctx, (tx) =>
+      cancelInterview(tx, ctx, { interviewId: shortNotice.interviewId, reason: "zz-test" }),
+    );
+    const afterCancel = await withTenant(ctx, (tx) =>
+      dueInterviewReminders(tx, 50),
+    );
+    checkTrue(
+      "ATS-14: a cancelled interview sends no reminders",
+      !afterCancel.some((r) => r.interviewId === shortNotice.interviewId),
+    );
+    const kept = await withTenant(ctx, (tx) =>
+      interviewsForApplication(tx, soon.applicationId),
+    );
+    check(
+      "ATS-14: but the row is kept — it is why this candidate is still in this stage",
+      kept.length,
+      1,
+    );
+    check("ATS-14: marked cancelled rather than deleted", kept[0]?.status, "cancelled");
   }
 
   await cleanup();
