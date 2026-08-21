@@ -1,12 +1,13 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { withTenant, getCustomer, listStaffUsers } from "@meridian/db";
+import {
+  listPortalUsers, withTenant, getCustomer, listStaffUsers } from "@meridian/db";
 import { getService, formatMoney, STATUS_LABEL, PROPERTY_TYPE_LABEL, type PropertyType, type JobStatus } from "@meridian/core";
 import { can } from "@meridian/auth";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
-import { TermsPanel, ContactsPanel, AddPropertyForm } from "./panels";
+import { TermsPanel, ContactsPanel, AddPropertyForm, PortalAccessPanel } from "./panels";
 import { Buildings, UserCircle, Warning } from "@phosphor-icons/react/dist/ssr";
 
 export const metadata: Metadata = { title: "Customer" };
@@ -24,6 +25,11 @@ export default async function CustomerPage({ params }: { params: Promise<{ id: s
     async (tx) => ({
       detail: await getCustomer(tx, id),
       managers: await listStaffUsers(tx),
+      // POR-8 needs more than getCustomer's summary: whether access is
+      // currently active, and whether the invitation has been accepted at all.
+      // "Invited three weeks ago and never signed in" and "revoked last month"
+      // look identical without those, and they need opposite responses.
+      portalAccess: await listPortalUsers(tx, id),
     }),
   );
 
@@ -133,6 +139,26 @@ export default async function CustomerPage({ params }: { params: Promise<{ id: s
             canWrite={canWriteCustomer}
           />
         </div>
+
+        {/* POR-8. Only for staff who can write the customer: granting portal
+            access is granting somebody a login, and it belongs with the other
+            things that change who can see this customer's data. */}
+        {canWriteCustomer ? (
+          <div className="mt-6">
+            <PortalAccessPanel
+              customerId={customer.id}
+              users={data.portalAccess.map((u) => ({
+                userId: u.userId,
+                fullName: u.fullName,
+                email: u.email,
+                isActive: u.isActive,
+                lastLoginAt: u.lastLoginAt,
+                hasPassword: u.hasPassword,
+              }))}
+              contacts={contacts.map((c) => ({ fullName: c.fullName, email: c.email }))}
+            />
+          </div>
+        ) : null}
 
         {/* ── Properties ─────────────────────────────────────────────────── */}
         <section

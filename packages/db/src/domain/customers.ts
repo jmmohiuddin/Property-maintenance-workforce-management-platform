@@ -485,3 +485,110 @@ export async function listStaffUsers(
     .where(and(isNull(schema.memberships.customerId), eq(schema.memberships.isActive, true)))
     .orderBy(asc(schema.users.fullName));
 }
+
+// ── Portal access (POR-8) ────────────────────────────────────────────────────
+
+export interface PortalUser {
+  readonly userId: string;
+  readonly membershipId: string;
+  readonly fullName: string;
+  readonly email: string;
+  readonly isActive: boolean;
+  readonly lastLoginAt: Date | null;
+  readonly hasPassword: boolean;
+}
+
+/**
+ * Who can sign in to the portal on this customer's behalf.
+ *
+ * `POR-8`. Granting, revoking and re-inviting portal access previously required
+ * SQL — which meant that in practice it never happened, and the portal that
+ * exists to deflect phone calls was reachable by almost nobody.
+ *
+ * A portal membership is a `customer` role WITH a `customer_id`. Both halves
+ * matter: the role keeps them out of the staff application, and the
+ * `customer_id` is what `withCustomerScope()` sets so the RESTRICTIVE policies
+ * narrow every query to this customer's rows. A `customer` membership with a
+ * null `customer_id` would be a portal login scoped to nothing, which
+ * `requirePortalSession` refuses rather than rendering an empty portal.
+ */
+export async function listPortalUsers(
+  tx: TenantScopedTx,
+  customerId: string,
+): Promise<readonly PortalUser[]> {
+  const rows = (await tx.execute<{
+    user_id: string;
+    membership_id: string;
+    full_name: string;
+    email: string;
+    is_active: boolean;
+    last_login_at: Date | string | null;
+    has_password: boolean;
+  }>(sql`
+    select u.id as user_id,
+           m.id as membership_id,
+           u.full_name,
+           u.email,
+           m.is_active,
+           u.last_login_at,
+           (u.password_hash is not null) as has_password
+      from memberships m
+      join users u on u.id = m.user_id
+     where m.customer_id = ${customerId}::uuid
+       and u.deleted_at is null
+     order by u.full_name
+  `)) as unknown as {
+    user_id: string;
+    membership_id: string;
+    full_name: string;
+    email: string;
+    is_active: boolean;
+    last_login_at: Date | string | null;
+    has_password: boolean;
+  }[];
+
+  return rows.map((r) => ({
+    userId: r.user_id,
+    membershipId: r.membership_id,
+    fullName: r.full_name,
+    email: r.email,
+    isActive: r.is_active,
+    lastLoginAt: r.last_login_at ? new Date(r.last_login_at) : null,
+    hasPassword: r.has_password,
+  }));
+}
+
+/**
+ * Turn portal access on or off for one person.
+ *
+ * Revoking deactivates the membership and kills their sessions in the same
+ * transaction. Without the second half, somebody whose access is withdrawn at
+ * 09:00 keeps reading this customer's invoices until their session expires —
+ * which is the entire window a revocation is meant to close.
+ *
+ * Deactivation rather than deletion, for the same reason as staff: a portal
+ * user has approved quotes and raised requests, and those records name them.
+ */
+export async function setPortalAccess(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: { userId: string; customerId: string; isActive: boolean },
+): Promise<void> {
+  await tx.execute(sql`
+    update memberships
+       set is_active = ${input.isActive}, updated_at = now()
+     where user_id = ${input.userId}::uuid
+       and customer_id = ${input.customerId}::uuid
+       and tenant_id = ${ctx.tenantId}::uuid
+  `);
+
+  if (!input.isActive) {
+    await tx.execute(sql`
+      update sessions
+         set revoked_at = now()
+       where user_id = ${input.userId}::uuid
+         and tenant_id = ${ctx.tenantId}::uuid
+         and revoked_at is null
+    `);
+  }
+}

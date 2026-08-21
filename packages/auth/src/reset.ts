@@ -237,6 +237,15 @@ export async function inviteStaff(
     email: string;
     fullName: string;
     role: string;
+    /**
+     * Set for a portal invitation (`POR-8`), null for staff.
+     *
+     * Carried through to the membership on acceptance. A `customer` role
+     * without this would be a portal login scoped to nothing —
+     * `requirePortalSession` refuses that rather than rendering an unscoped
+     * portal, which is the safe failure but not a useful one.
+     */
+    customerId?: string | undefined;
   },
 ): Promise<IssuedInvitation> {
   // Takes a scoped transaction rather than opening its own, and that is a
@@ -270,12 +279,13 @@ export async function inviteStaff(
   `);
 
   await tx.execute(sql`
-    insert into user_invitations (tenant_id, email, full_name, role, token_hash, expires_at, invited_by_id)
+    insert into user_invitations (tenant_id, email, full_name, role, customer_id, token_hash, expires_at, invited_by_id)
     values (
       ${ctx.tenantId}::uuid,
       ${email},
       ${input.fullName.trim()},
       ${input.role}::user_role,
+      ${input.customerId ?? null},
       ${hashToken(token)},
       ${expiresAt.toISOString()}::timestamptz,
       ${ctx.userId ?? null}
@@ -292,6 +302,8 @@ export interface InvitationSubject {
   readonly fullName: string;
   readonly role: string;
   readonly brandName: string;
+  /** Non-null for a portal invitation. */
+  readonly customerId: string | null;
 }
 
 export async function peekInvitation(token: string): Promise<InvitationSubject | null> {
@@ -304,6 +316,7 @@ export async function peekInvitation(token: string): Promise<InvitationSubject |
     full_name: string;
     role: string;
     brand_name: string;
+    customer_id: string | null;
   }>(sql`select * from app_invite_peek(${hashToken(token)})`)) as unknown as {
     invitation_id: string;
     tenant_id: string;
@@ -311,6 +324,7 @@ export async function peekInvitation(token: string): Promise<InvitationSubject |
     full_name: string;
     role: string;
     brand_name: string;
+    customer_id: string | null;
   }[];
 
   const row = rows[0];
@@ -323,6 +337,7 @@ export async function peekInvitation(token: string): Promise<InvitationSubject |
     fullName: row.full_name,
     role: row.role,
     brandName: row.brand_name,
+    customerId: row.customer_id,
   };
 }
 

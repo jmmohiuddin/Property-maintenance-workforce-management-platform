@@ -180,6 +180,8 @@ $$;
 -- ── Invitations ─────────────────────────────────────────────────────────────
 
 -- Resolve an invitation token without accepting it.
+DROP FUNCTION IF EXISTS app_invite_peek(text);
+
 CREATE OR REPLACE FUNCTION app_invite_peek(p_token_hash text)
 RETURNS TABLE (
   invitation_id uuid,
@@ -187,13 +189,15 @@ RETURNS TABLE (
   email text,
   full_name text,
   role text,
-  brand_name text
+  brand_name text,
+  customer_id uuid
 )
 LANGUAGE sql
 SECURITY DEFINER
 SET search_path = public
 AS $$
-  SELECT i.id, i.tenant_id, i.email::text, i.full_name::text, i.role::text, t.brand_name::text
+  SELECT i.id, i.tenant_id, i.email::text, i.full_name::text, i.role::text, t.brand_name::text,
+         i.customer_id
     FROM user_invitations i
     JOIN tenants t ON t.id = i.tenant_id
    WHERE i.token_hash = p_token_hash
@@ -228,7 +232,7 @@ BEGIN
      AND accepted_at IS NULL
      AND revoked_at IS NULL
      AND expires_at > now()
-  RETURNING id, tenant_id, email, full_name, role INTO v_inv;
+  RETURNING id, tenant_id, email, full_name, role, customer_id INTO v_inv;
 
   IF v_inv.id IS NULL THEN
     RETURN NULL;
@@ -253,10 +257,20 @@ BEGIN
   -- that would turn "invite an address you do not control" into account
   -- takeover.
 
-  INSERT INTO memberships (tenant_id, user_id, role, is_active, invited_at, accepted_at)
-  VALUES (v_inv.tenant_id, v_user_id, v_inv.role, true, now(), now())
+  -- POR-8. `customer_id` carries through from the invitation, so a portal
+  -- invitation produces a `customer` membership scoped to one customer and a
+  -- staff invitation produces one scoped to none. Both halves are load-bearing:
+  -- the role keeps a portal user out of the staff application, and the
+  -- customer_id is what withCustomerScope() sets so the RESTRICTIVE policies
+  -- narrow every query to that customer's rows.
+  INSERT INTO memberships (tenant_id, user_id, role, customer_id, is_active, invited_at, accepted_at)
+  VALUES (v_inv.tenant_id, v_user_id, v_inv.role, v_inv.customer_id, true, now(), now())
   ON CONFLICT (tenant_id, user_id)
-  DO UPDATE SET is_active = true, role = EXCLUDED.role, accepted_at = now(), updated_at = now();
+  DO UPDATE SET is_active = true,
+                role = EXCLUDED.role,
+                customer_id = EXCLUDED.customer_id,
+                accepted_at = now(),
+                updated_at = now();
 
   RETURN v_user_id;
 END;
