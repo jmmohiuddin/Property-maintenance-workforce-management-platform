@@ -23,7 +23,9 @@ const NAV = [
   { href: "/customers", label: "Customers", permission: "customers:read" },
   { href: "/invoices", label: "Invoices", permission: "invoices:read" },
   { href: "/technicians", label: "Technicians", permission: "technicians:read" },
+  { href: "/workforce", label: "Workforce", permission: "workforce:read" },
   { href: "/admin/users", label: "Users", permission: "users:manage" },
+  { href: "/admin/company", label: "Company", permission: "settings:write" },
 ] as const;
 
 export function AppShell({

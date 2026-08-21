@@ -236,6 +236,37 @@ async function main(): Promise<void> {
     const stillOne = await blockedTechnicians(tx);
     check("an expired driving licence adds no new block", stillOne.length, before.length + 1);
 
+    // ── Two lapsed documents must not become two blocked people ───────────
+    //
+    // The regression this section exists for. `blockedTechnicians` selected one
+    // row per expired document, so somebody with two lapses appeared twice: two
+    // cards on the board, two entries in the assign dialog, and a `deployable`
+    // count that under-reported the available workforce. A dispatcher planning
+    // a week off that number plans around people who do not exist.
+    console.log("\n— a second lapsed document must not double-count —");
+
+    await tx.execute(sql`
+      insert into employee_documents (tenant_id, employee_id, kind, expires_at, blocking, note)
+      values (${tenantId}::uuid, ${employee.id}::uuid, 'residence_visa', current_date - 40, true, ${TAG})
+    `);
+
+    const twice = await blockedTechnicians(tx);
+    check("still exactly one more blocked than the baseline", twice.length, before.length + 1);
+
+    const entry = twice.find((b) => b.technicianId === doomed.id);
+    check("the person appears once", twice.filter((b) => b.technicianId === doomed.id).length, 1);
+    check("and the card says there is another", entry?.otherExpiredCount, 1);
+    // The longest-overdue document leads: it is the most urgent and reads worst.
+    checkTrue("leading with the longest-overdue document", entry?.detail.includes("Residence visa") === true);
+
+    const summaryTwice = await workforceSummary(tx);
+    check("deployable is not under-reported", summaryTwice.deployable, summaryBefore.deployable - 1);
+
+    await tx.execute(sql`
+      delete from employee_documents
+       where employee_id = ${employee.id}::uuid and kind = 'residence_visa'
+    `);
+
     // ── Cleanup ────────────────────────────────────────────────────────────
     // Rolled back rather than deleted would be cleaner, but withTenant commits
     // and the assignment gate needs a real transaction to run in.
