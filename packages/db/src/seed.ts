@@ -17,7 +17,7 @@ import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { hash } from "@node-rs/argon2";
 import * as schema from "./schema";
-import { computeSlaDeadlines, type JobPriority } from "@meridian/core";
+import { computeSlaDeadlines, company, type JobPriority } from "@meridian/core";
 
 // The db package loads the root .env on first connect; do the same here so
 // `npm run db:seed` works without the caller sourcing it by hand.
@@ -103,9 +103,14 @@ async function main(): Promise<void> {
   await db.insert(schema.tenants).values([
     {
       id: T1,
-      slug: "meridian",
-      legalName: "Meridian Facilities Management LLC",
-      brandName: "Meridian Facilities",
+      // The operating company's identity comes from configuration (`ADM-9`),
+      // so the seeded tenant row matches what the site and the documents show.
+      // A tenant row saying one thing while the footer says another is the
+      // small inconsistency that becomes "which name is the real one?" on an
+      // invoice.
+      slug: process.env["PUBLIC_TENANT_SLUG"] ?? "meridian",
+      legalName: company.legalName,
+      brandName: company.brandName,
       countryCode: "AE",
       defaultCurrency: "AED",
       timezone: "Asia/Dubai",

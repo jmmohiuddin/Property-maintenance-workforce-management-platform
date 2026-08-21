@@ -23,6 +23,7 @@ const NAV = [
   { href: "/customers", label: "Customers", permission: "customers:read" },
   { href: "/invoices", label: "Invoices", permission: "invoices:read" },
   { href: "/technicians", label: "Technicians", permission: "technicians:read" },
+  { href: "/admin/users", label: "Users", permission: "users:manage" },
 ] as const;
 
 export function AppShell({
@@ -47,7 +48,7 @@ export function AppShell({
                 className="grid h-7 w-7 place-items-center rounded-sm font-mono text-[13px] font-bold"
                 style={{ backgroundColor: "var(--accent)", color: "var(--accent-contrast)" }}
               >
-                M
+                {session.tenant.brandName.trim().charAt(0).toUpperCase() || "?"}
               </span>
               <span className="text-[14px] font-semibold tracking-tight">{session.tenant.brandName}</span>
             </Link>
