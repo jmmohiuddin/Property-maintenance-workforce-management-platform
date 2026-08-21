@@ -5,3 +5,5 @@ export * from "./workforce";
 export * from "./operations";
 export * from "./commerce";
 export * from "./audit";
+export * from "./compliance";
+export * from "./ops";

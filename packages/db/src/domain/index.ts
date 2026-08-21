@@ -6,3 +6,6 @@ export * from "./portal";
 export * from "./workforce";
 export * from "./customers";
 export * from "./ratelimit";
+export * from "./compliance";
+export * from "./staff";
+export * from "./cron";
