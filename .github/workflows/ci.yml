@@ -1,0 +1,198 @@
+# Continuous integration.
+#
+# `CI-1` / `CI-2`. Both the PRD and the TRD name this as the highest-leverage
+# item in the whole backlog, and the reason is arithmetic: the repository
+# already contains 12 test suites, a 12-check adversarial row-level-security
+# harness, a 36-pair WCAG contrast gate and typechecking across six workspaces.
+# None of it ran automatically. Every regression risk in the system was
+# human-shaped — it depended on somebody remembering.
+#
+# The RLS harness is the one that matters most. `verify-rls.sql` proves the
+# tenant boundary holds by trying to cross it twelve different ways. A schema
+# change that quietly drops a policy produces no error, no failing feature and
+# no visible symptom; it produces one tenant able to read another's data. This
+# workflow is what turns that from a thing somebody might check into a thing
+# that cannot merge.
+#
+# `CI-2` — hermetic tests. The suites previously required a live, seeded
+# database and hand-set environment variables. The service container below plus
+# a deterministic apply-and-seed step removes that: a clean checkout on a clean
+# machine runs everything.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # A new push supersedes an in-flight run on the same ref. Nobody reads the
+  # result of a run against code that has already been replaced.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: typecheck · tests · RLS proof · contrast · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        # Pinned major. The schema uses generated columns and policy features
+        # that behave differently across majors, and "whatever latest is today"
+        # is not a reproducible test environment.
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci_only_not_a_secret
+          POSTGRES_DB: meridian_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # The migrator/superuser connection. Migrations and the seed use this.
+      DATABASE_ADMIN_URL: postgres://postgres:ci_only_not_a_secret@localhost:5432/meridian_ci
+      # The application connection. `meridian_app` is created by rls.sql with
+      # NOBYPASSRLS, and it is what every test that matters connects as — a
+      # suite run as the superuser would pass while proving nothing, because a
+      # superuser ignores every policy silently.
+      DATABASE_URL: postgres://meridian_app:ci_only_not_a_secret@localhost:5432/meridian_ci
+      DATABASE_POOL_MAX: "5"
+      PUBLIC_TENANT_SLUG: meridian
+      NEXT_PUBLIC_SITE_URL: http://localhost:3000
+      # Set so the cron routes compile and the guard is exercised rather than
+      # short-circuiting on an unset secret. Not a real secret; CI has no data.
+      CRON_SECRET: ci_only_not_a_secret
+      NODE_ENV: test
+      # CI has no real company identity and is testing that the build works,
+      # not shipping it. Without this the placeholder guard fails the build —
+      # which is correct on a deploy and unhelpful here.
+      ALLOW_PLACEHOLDER_IDENTITY: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # ── 1. Typecheck ─────────────────────────────────────────────────────
+      # First, because it is the fastest way to fail and it fails on the widest
+      # range of mistakes.
+      - name: Typecheck all workspaces
+        run: npm run typecheck
+
+      # ── 2. Schema, security, and the proof it worked ─────────────────────
+      # Order is load-bearing and mirrors the deployment runbook exactly:
+      # migrations define the tables, then rls.sql applies policies to every
+      # table carrying a tenant_id via a generic loop, then the function files
+      # add the narrow SECURITY DEFINER surface the bootstrap paths need.
+      #
+      # Running them in this order in CI is also how OPS-1 gets tested: if the
+      # deploy would fail, this fails first.
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h localhost -U postgres && exit 0
+            sleep 1
+          done
+          echo "Postgres did not become ready" >&2
+          exit 1
+        env:
+          PGPASSWORD: ci_only_not_a_secret
+
+      - name: Apply migrations
+        env:
+          PGPASSWORD: ci_only_not_a_secret
+        run: |
+          set -euo pipefail
+          for f in packages/db/drizzle/*.sql; do
+            echo "── $f"
+            psql -h localhost -U postgres -d meridian_ci -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Apply security SQL
+        env:
+          PGPASSWORD: ci_only_not_a_secret
+        run: |
+          set -euo pipefail
+          # Order is load-bearing, and not only for readability. rls.sql ends
+          # with a blanket GRANT ... ON ALL TABLES, so any REVOKE a later file
+          # depends on must come after it. public-functions.sql revoking direct
+          # access to rate_limits is exactly that case: applying rls.sql on its
+          # own leaves the rate limiter bypassable by the application role.
+          # ratelimit.test.ts catches it, which is how it was found.
+          for f in rls.sql auth-functions.sql public-functions.sql customer-scope.sql reference.sql mfa-functions.sql cron-functions.sql reset-functions.sql; do
+            echo "── $f"
+            psql -h localhost -U postgres -d meridian_ci -v ON_ERROR_STOP=1 -f "packages/db/sql/$f"
+          done
+
+      - name: Give the application role a password
+        env:
+          PGPASSWORD: ci_only_not_a_secret
+        run: |
+          psql -h localhost -U postgres -d meridian_ci -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE meridian_app WITH PASSWORD 'ci_only_not_a_secret';"
+
+      # THE GATE THAT MATTERS MOST. Twelve adversarial checks that try to cross
+      # the tenant boundary. Exits non-zero if any of them succeeds in doing so.
+      - name: Prove tenant isolation (verify-rls.sql)
+        env:
+          PGPASSWORD: ci_only_not_a_secret
+        run: |
+          psql -h localhost -U postgres -d meridian_ci -v ON_ERROR_STOP=1 \
+            -f packages/db/sql/verify-rls.sql
+
+      - name: Seed
+        run: npm run db:seed
+
+      # ── 3. Test suites ───────────────────────────────────────────────────
+      # `--workspaces --if-present` runs core, db, auth and notify. The db and
+      # auth suites are integration tests against the real Postgres above,
+      # connecting as the NOBYPASSRLS application role.
+      - name: Run all suites
+        run: npm run test
+
+      # ── 4. Accessibility ─────────────────────────────────────────────────
+      # 36 foreground/background pairings against WCAG AA. A design system with
+      # a test is rare; this one has one and it should not be allowed to decay,
+      # so every new token pair joins it in the commit that introduces it.
+      - name: Contrast gate
+        run: npm run check:contrast --workspace=@meridian/web
+
+      # ── 5. Build smoke ───────────────────────────────────────────────────
+      # Catches what typechecking cannot: a static page that throws during
+      # prerender, a server-only import pulled into a client component, a route
+      # that cannot be generated. NEXT_PUBLIC_SITE_URL is read at build time and
+      # baked into every canonical URL, the sitemap and all JSON-LD, so it is
+      # set above rather than left to default.
+      - name: Build
+        run: npm run build
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+
+      # `SEC-10`. Fails on a known critical advisory only. Failing on `high`
+      # would mean the build breaks on a transitive advisory in a dev-only tool
+      # on a random Tuesday, and a red build nobody can act on is a red build
+      # people learn to ignore — which costs more than it saves.
+      - name: Audit dependencies
+        run: npm audit --audit-level=critical
