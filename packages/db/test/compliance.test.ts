@@ -31,6 +31,7 @@
 
 import { sql } from "drizzle-orm";
 import { withTenant, closeConnection, db } from "../src/index";
+import { testTenantId } from "./_tenant";
 import {
   blockedTechnicians,
   blockForTechnician,
@@ -54,11 +55,11 @@ function checkTrue(label: string, got: boolean): void {
 const TAG = "COMPLIANCE-TEST";
 
 async function main(): Promise<void> {
-  const tenantRows = (await db.execute<{ id: string }>(
-    sql`select app_cron_active_tenants() as id`,
-  )) as unknown as { id: string }[];
-  const tenantId = tenantRows[0]?.id;
-  if (!tenantId) throw new Error("No tenant. Run `npm run db:seed` first.");
+  // Resolved by slug, not by taking whichever tenant sorts first. See
+  // ./_tenant.ts — three tests made that mistake and all three eventually
+  // failed against correct code, because the tenant that sorts first is the
+  // deliberately-empty one used to prove RLS isolation.
+  const tenantId = await testTenantId();
 
   await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
     // ── Fixtures ───────────────────────────────────────────────────────────

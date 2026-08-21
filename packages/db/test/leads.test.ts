@@ -25,6 +25,7 @@ import postgres from "postgres";
 import { sql } from "drizzle-orm";
 import { db, withTenant, closeConnection } from "../src/index";
 import { createLeadFromEnquiry, enquiryRecipients } from "../src/domain";
+import { testTenantId } from "./_tenant";
 
 let fail = 0;
 function check(label: string, got: unknown, expected: unknown): void {
@@ -59,11 +60,9 @@ async function cleanup(): Promise<void> {
 async function main(): Promise<void> {
   await cleanup();
 
-  const tenantRows = (await db.execute<{ id: string }>(
-    sql`select app_cron_active_tenants() as id`,
-  )) as unknown as { id: string }[];
-  const tenantId = tenantRows[0]?.id;
-  if (!tenantId) throw new Error("No tenant. Run `npm run db:seed` first.");
+  // Resolved by slug rather than by ordering. See ./_tenant.ts.
+  const slug = process.env["PUBLIC_TENANT_SLUG"] ?? "meridian";
+  const tenantId = await testTenantId(slug);
 
   console.log("\n— routing (LEAD-3) —");
 
@@ -72,6 +71,15 @@ async function main(): Promise<void> {
     await enquiryRecipients(tx, true),
   ]);
 
+  if ((routine?.length ?? 0) === 0) {
+    // A tenant with nobody to route to is a valid state — a fresh deployment
+    // looks exactly like this — so say what is missing rather than reporting it
+    // as a failure of the code under test.
+    throw new Error(
+      `Tenant "${slug}" has no active operations manager or dispatcher, so there is nothing to ` +
+        `route an enquiry to. Seed the database, or invite one from /admin/users.`,
+    );
+  }
   checkTrue("a routine enquiry has somebody to go to", (routine?.length ?? 0) > 0);
   // LEAD-3: the difference between "somebody will pick this up" and "somebody
   // must pick this up now" has to exist in who is woken, not only in a flag.

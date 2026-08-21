@@ -99,16 +99,39 @@ const REPLACEMENT = "ReplacementPassword2026";
 async function cleanup(): Promise<void> {
   await admin`delete from user_invitations where lower(email) like ${`${TAG}%`}`;
   await admin`delete from users where lower(email) like ${`${TAG}%`}`;
+  // The per-IP throttle buckets this run created.
+  //
+  // Without this the file passes on its own and fails inside the full suite,
+  // which is the most confusing shape a test failure can take. The IP limit is
+  // 10 per 15 minutes and this file makes several requests per address, so two
+  // runs inside the window exhaust it and `requestPasswordReset` starts
+  // returning null — correctly. The throttle is not the bug; leaving state
+  // behind is. Test addresses are from the RFC 5737 documentation ranges, so
+  // nothing real is being cleared.
+  await admin`delete from rate_limits where bucket like 'reset:203.0.113.%' or bucket like 'reset:198.51.100.%'`;
 }
 
 async function main(): Promise<void> {
   await cleanup();
 
-  const tenantRows = (await db.execute<{ id: string }>(
-    sql`select app_cron_active_tenants() as id`,
-  )) as unknown as { id: string }[];
-  const tenantId = tenantRows[0]?.id;
-  if (!tenantId) throw new Error("No tenant. Run `npm run db:seed` first.");
+  /*
+   * Resolved by slug, not by taking whichever tenant sorts first.
+   *
+   * `app_cron_active_tenants()` orders by created_at, and the tenant that sorts
+   * first is currently the deliberately-empty second one the seed creates to
+   * prove RLS isolation. Three tests made this mistake and all three eventually
+   * failed against code that was working correctly. packages/db/test/_tenant.ts
+   * has the shared version; this package cannot import from there, so the same
+   * resolution is inline.
+   */
+  const slug = process.env["PUBLIC_TENANT_SLUG"] ?? "meridian";
+  const tenantRows = (await db.execute<{ app_public_resolve_tenant: string | null }>(
+    sql`select app_public_resolve_tenant(${slug})`,
+  )) as unknown as { app_public_resolve_tenant: string | null }[];
+  const tenantId = tenantRows[0]?.app_public_resolve_tenant;
+  if (!tenantId) {
+    throw new Error(`No active tenant with slug "${slug}". Run \`npm run db:seed\` first.`);
+  }
 
   // ── Fixture: a real staff account, created the way ADM-1 creates one ───────
   //
