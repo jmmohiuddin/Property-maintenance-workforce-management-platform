@@ -43,11 +43,19 @@
 -- ── Look up a user by email, with their memberships ─────────────────────────
 -- Returns one row per membership, or one row with NULL membership columns when
 -- the user exists but belongs to no tenant. Zero rows means no such user.
+--
+-- DROP before CREATE: the return type changed in migration 0004 (the failure
+-- counter became an integer and `locked_until` was added), and CREATE OR
+-- REPLACE cannot change a function's output columns. Without the DROP this file
+-- fails to re-apply against a database that already has the old signature.
+DROP FUNCTION IF EXISTS app_auth_lookup(text);
+
 CREATE OR REPLACE FUNCTION app_auth_lookup(p_email text)
 RETURNS TABLE (
   user_id uuid,
   password_hash text,
-  failed_login_count text,
+  failed_login_count integer,
+  locked_until timestamptz,
   mfa_enabled boolean,
   tenant_id uuid,
   role text,
@@ -62,6 +70,7 @@ AS $$
     u.id,
     u.password_hash,
     u.failed_login_count,
+    u.locked_until,
     (u.mfa_enabled_at IS NOT NULL),
     m.tenant_id,
     m.role::text,
@@ -75,16 +84,39 @@ AS $$
 $$;
 
 -- ── Record the outcome of an attempt ────────────────────────────────────────
-CREATE OR REPLACE FUNCTION app_auth_record_failure(p_user_id uuid)
-RETURNS void
+--
+-- SEC-4. Lockout was previously permanent: the counter crossed a threshold and
+-- nothing except a database client could clear it, while the sign-in screen
+-- said "temporarily locked". Two things follow from that being wrong.
+--
+-- First, the lock now expires. The caller passes the backoff it has computed
+-- (packages/auth/src/lockout.ts owns the curve, so the policy is testable
+-- without a database and is stated in exactly one place). Zero or NULL means
+-- "count this failure but do not lock yet".
+--
+-- Second, the *later* of the existing and the new expiry wins. Otherwise a
+-- burst of attempts arriving while a lock is already in force would each
+-- recompute a shorter window from a stale count and shorten the lockout.
+DROP FUNCTION IF EXISTS app_auth_record_failure(uuid);
+
+CREATE OR REPLACE FUNCTION app_auth_record_failure(p_user_id uuid, p_lock_seconds integer DEFAULT 0)
+RETURNS TABLE (failed_login_count integer, locked_until timestamptz)
 LANGUAGE sql
 SECURITY DEFINER
 SET search_path = public
 AS $$
   UPDATE users
-     SET failed_login_count = (COALESCE(NULLIF(failed_login_count, '')::int, 0) + 1)::text,
+     SET failed_login_count = failed_login_count + 1,
+         locked_until = CASE
+           WHEN COALESCE(p_lock_seconds, 0) <= 0 THEN locked_until
+           ELSE GREATEST(
+             COALESCE(locked_until, now()),
+             now() + make_interval(secs => p_lock_seconds)
+           )
+         END,
          updated_at = now()
-   WHERE id = p_user_id;
+   WHERE id = p_user_id
+  RETURNING failed_login_count, locked_until;
 $$;
 
 CREATE OR REPLACE FUNCTION app_auth_record_success(p_user_id uuid)
@@ -94,8 +126,26 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
   UPDATE users
-     SET failed_login_count = '0',
+     SET failed_login_count = 0,
+         locked_until = NULL,
          last_login_at = now(),
+         updated_at = now()
+   WHERE id = p_user_id;
+$$;
+
+-- Administrator unlock (ADM-1, ADM-3). The one action that previously required
+-- someone to open a database client during an incident. Authorisation is the
+-- caller's job — this function only performs the clear, and the audit row is
+-- written by the server action so it carries the acting administrator.
+CREATE OR REPLACE FUNCTION app_auth_unlock(p_user_id uuid)
+RETURNS void
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  UPDATE users
+     SET failed_login_count = 0,
+         locked_until = NULL,
          updated_at = now()
    WHERE id = p_user_id;
 $$;
@@ -209,8 +259,9 @@ DECLARE fn text;
 BEGIN
   FOREACH fn IN ARRAY ARRAY[
     'app_auth_lookup(text)',
-    'app_auth_record_failure(uuid)',
+    'app_auth_record_failure(uuid, integer)',
     'app_auth_record_success(uuid)',
+    'app_auth_unlock(uuid)',
     'app_auth_create_session(uuid,uuid,text,text,text,timestamptz)',
     'app_auth_resolve_session(text)',
     'app_auth_revoke_session(text)',

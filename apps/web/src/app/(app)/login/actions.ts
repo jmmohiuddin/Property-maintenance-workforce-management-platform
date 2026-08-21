@@ -43,8 +43,14 @@ export async function signIn(_prev: LoginState, formData: FormData): Promise<Log
     }
 
     // The message is deliberately the same for unknown-email and wrong-password.
-    // See packages/auth/src/login.ts.
-    return { error: messageForFailure(result.reason) };
+    // See packages/auth/src/login.ts. Lockout is the one exception: it names the
+    // real wait, because the copy has to match the mechanism (SEC-4).
+    return {
+      error: messageForFailure(
+        result.reason,
+        result.reason === "locked" ? result.retryAfterSeconds : 0,
+      ),
+    };
   }
 
   await setSessionCookie(result.session.token, result.session.expiresAt);

@@ -39,11 +39,11 @@ const config: NextConfig = {
   serverExternalPackages: ["@node-rs/argon2", "postgres"],
   images: {
     formats: ["image/avif", "image/webp"],
-    remotePatterns: [
-      // Placeholder photography. Replace with the client's own asset host
-      // before launch: see docs/ops/03-launch-checklist.md.
-      { protocol: "https", hostname: "picsum.photos" },
-    ],
+    // No remote patterns. The picsum.photos placeholders are gone (WEB-3), and
+    // an empty allow-list is the correct default: a remote host added here is
+    // a host the site will fetch from on every page view, and it must also be
+    // added to `img-src` in src/middleware.ts or the browser will block it.
+    remotePatterns: [],
   },
   async headers() {
     return [
