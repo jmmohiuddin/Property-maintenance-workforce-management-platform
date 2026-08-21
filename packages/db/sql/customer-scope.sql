@@ -42,7 +42,12 @@ DECLARE
   t text;
   -- Every table with a `customer_id` column that a portal user can reach.
   owned text[] := ARRAY[
-    'properties', 'jobs', 'quotes', 'invoices', 'contracts', 'customer_contacts'
+    'properties', 'jobs', 'quotes', 'invoices', 'contracts', 'customer_contacts',
+    -- INV-7. A credit note carries the customer's name, address, TRN and the
+    -- amount of a dispute. It arrived with the tax-invoice work and would
+    -- otherwise be visible tenant-wide to any portal session, because the
+    -- generic loop in rls.sql grants tenant isolation and nothing narrower.
+    'credit_notes'
   ];
 BEGIN
   FOREACH t IN ARRAY owned LOOP
@@ -86,6 +91,16 @@ CREATE POLICY customer_scope ON public.invoice_lines
     OR EXISTS (SELECT 1 FROM public.invoices i
                 WHERE i.id = invoice_lines.invoice_id
                   AND i.customer_id = app_current_customer())
+  );
+
+DROP POLICY IF EXISTS customer_scope ON public.credit_note_lines;
+CREATE POLICY customer_scope ON public.credit_note_lines
+  AS RESTRICTIVE
+  USING (
+    app_current_customer() IS NULL
+    OR EXISTS (SELECT 1 FROM public.credit_notes n
+                WHERE n.id = credit_note_lines.credit_note_id
+                  AND n.customer_id = app_current_customer())
   );
 
 DROP POLICY IF EXISTS customer_scope ON public.payments;
