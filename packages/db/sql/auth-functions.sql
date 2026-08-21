@@ -151,32 +151,76 @@ AS $$
 $$;
 
 -- ── Sessions ────────────────────────────────────────────────────────────────
+--
+-- These live here, with the rest of the authentication surface, and NOWHERE
+-- else. They were briefly declared in reset-functions.sql as well, when sliding
+-- expiry was added, and two files declaring the same function produced two
+-- distinct failures that are worth recording because neither is obvious:
+--
+--   * `app_auth_resolve_session` gained a column, and CREATE OR REPLACE cannot
+--     change a function's return type. Re-applying the files in the documented
+--     order aborted partway through auth-functions.sql, so every statement
+--     after it — including the grants at the foot of this file — silently did
+--     not run.
+--
+--   * `app_auth_create_session` gained an argument, and a different argument
+--     list does not replace a function, it OVERLOADS it. Both versions existed
+--     in the database at once. The six-argument one writes a session with a
+--     NULL `absolute_expires_at`, and `app_auth_touch_session` COALESCEs a NULL
+--     ceiling to "now plus the slide" — so a session created through the older
+--     overload renews forever. That is exactly the "sliding degrades into never
+--     expires" failure the absolute cap was added to prevent, reintroduced by a
+--     duplicate declaration rather than by a change in logic.
+--
+-- Hence the explicit DROPs below. They are not decoration: without them this
+-- file cannot be re-applied, and the dead overload stays reachable.
+
+DROP FUNCTION IF EXISTS app_auth_create_session(uuid, uuid, text, text, text, timestamptz);
+DROP FUNCTION IF EXISTS app_auth_create_session(uuid, uuid, text, text, text, timestamptz, timestamptz);
+
 -- The raw token never reaches the database; only its SHA-256 hash does.
+--
+-- Two expiry clocks (SEC-11). `expires_at` slides forward on activity;
+-- `absolute_expires_at` never moves and is what stops a stolen token being
+-- renewed indefinitely.
 CREATE OR REPLACE FUNCTION app_auth_create_session(
   p_user_id uuid,
   p_tenant_id uuid,
   p_token_hash text,
   p_user_agent text,
   p_ip_address text,
-  p_expires_at timestamptz
+  p_expires_at timestamptz,
+  p_absolute_expires_at timestamptz
 )
 RETURNS uuid
 LANGUAGE sql
 SECURITY DEFINER
 SET search_path = public
 AS $$
-  INSERT INTO sessions (user_id, tenant_id, token_hash, user_agent, ip_address, expires_at)
-  VALUES (p_user_id, p_tenant_id, p_token_hash, p_user_agent, p_ip_address, p_expires_at)
+  INSERT INTO sessions (
+    user_id, tenant_id, token_hash, user_agent, ip_address,
+    expires_at, absolute_expires_at, last_seen_at
+  )
+  VALUES (
+    p_user_id, p_tenant_id, p_token_hash, p_user_agent, p_ip_address,
+    p_expires_at, p_absolute_expires_at, now()
+  )
   RETURNING id;
 $$;
 
 -- Resolves a token to everything the application needs to build a principal.
--- Deliberately enforces the liveness conditions in SQL (not revoked, not
--- expired, membership active, tenant active) so a caller cannot forget one.
+-- Deliberately enforces the liveness conditions in SQL (not revoked, neither
+-- clock elapsed, membership active, tenant active) so a caller cannot forget
+-- one. The absolute cap is checked on READ as well as on renewal: a session
+-- whose sliding expiry is still ahead but whose ceiling has passed must not
+-- resolve.
+DROP FUNCTION IF EXISTS app_auth_resolve_session(text);
+
 CREATE OR REPLACE FUNCTION app_auth_resolve_session(p_token_hash text)
 RETURNS TABLE (
   session_id uuid,
   expires_at timestamptz,
+  absolute_expires_at timestamptz,
   user_id uuid,
   full_name text,
   email text,
@@ -194,6 +238,7 @@ AS $$
   SELECT
     s.id,
     s.expires_at,
+    s.absolute_expires_at,
     u.id,
     u.full_name::text,
     u.email::text,
@@ -214,10 +259,36 @@ AS $$
   WHERE s.token_hash = p_token_hash
     AND s.revoked_at IS NULL
     AND s.expires_at > now()
+    AND (s.absolute_expires_at IS NULL OR s.absolute_expires_at > now())
     AND m.is_active
     AND t.is_active
     AND u.deleted_at IS NULL
   LIMIT 1;
+$$;
+
+-- Extend a live session on activity, bounded by its ceiling.
+--
+-- LEAST(..., absolute_expires_at) is the whole safety property: the sliding
+-- window can never push past the hard ceiling set when the session was created.
+-- Only live rows are touched, so a revoked or expired session is not
+-- resurrected by activity on it.
+CREATE OR REPLACE FUNCTION app_auth_touch_session(p_token_hash text, p_slide_seconds integer)
+RETURNS timestamptz
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  UPDATE sessions
+     SET expires_at = LEAST(
+           now() + make_interval(secs => p_slide_seconds),
+           COALESCE(absolute_expires_at, now() + make_interval(secs => p_slide_seconds))
+         ),
+         last_seen_at = now()
+   WHERE token_hash = p_token_hash
+     AND revoked_at IS NULL
+     AND expires_at > now()
+     AND (absolute_expires_at IS NULL OR absolute_expires_at > now())
+  RETURNING expires_at;
 $$;
 
 CREATE OR REPLACE FUNCTION app_auth_revoke_session(p_token_hash text)
@@ -262,7 +333,8 @@ BEGIN
     'app_auth_record_failure(uuid, integer)',
     'app_auth_record_success(uuid)',
     'app_auth_unlock(uuid)',
-    'app_auth_create_session(uuid,uuid,text,text,text,timestamptz)',
+    'app_auth_create_session(uuid,uuid,text,text,text,timestamptz,timestamptz)',
+    'app_auth_touch_session(text, integer)',
     'app_auth_resolve_session(text)',
     'app_auth_revoke_session(text)',
     'app_auth_revoke_all_sessions(uuid, uuid)'

@@ -276,118 +276,6 @@ BEGIN
 END;
 $$;
 
--- ── SEC-11: sliding sessions ────────────────────────────────────────────────
---
--- Extend a live session's expiry, bounded by its absolute cap.
---
--- `LEAST(..., absolute_expires_at)` is the whole safety property: the sliding
--- window can never push a session past the hard ceiling set when it was
--- created, so "sliding" cannot degrade into "never expires".
---
--- Only touches rows that are still live. A revoked or expired session is not
--- resurrected by activity on it.
-CREATE OR REPLACE FUNCTION app_auth_touch_session(p_token_hash text, p_slide_seconds integer)
-RETURNS timestamptz
-LANGUAGE sql
-SECURITY DEFINER
-SET search_path = public
-AS $$
-  UPDATE sessions
-     SET expires_at = LEAST(
-           now() + make_interval(secs => p_slide_seconds),
-           COALESCE(absolute_expires_at, now() + make_interval(secs => p_slide_seconds))
-         ),
-         last_seen_at = now()
-   WHERE token_hash = p_token_hash
-     AND revoked_at IS NULL
-     AND expires_at > now()
-     AND (absolute_expires_at IS NULL OR absolute_expires_at > now())
-  RETURNING expires_at;
-$$;
-
--- `app_auth_create_session` gains the absolute cap. DROP first: the argument
--- list changed, and CREATE OR REPLACE cannot do that.
-DROP FUNCTION IF EXISTS app_auth_create_session(uuid, uuid, text, text, text, timestamptz);
-
-CREATE OR REPLACE FUNCTION app_auth_create_session(
-  p_user_id uuid,
-  p_tenant_id uuid,
-  p_token_hash text,
-  p_user_agent text,
-  p_ip_address text,
-  p_expires_at timestamptz,
-  p_absolute_expires_at timestamptz
-)
-RETURNS uuid
-LANGUAGE sql
-SECURITY DEFINER
-SET search_path = public
-AS $$
-  INSERT INTO sessions (
-    user_id, tenant_id, token_hash, user_agent, ip_address, expires_at, absolute_expires_at, last_seen_at
-  )
-  VALUES (
-    p_user_id, p_tenant_id, p_token_hash, p_user_agent, p_ip_address,
-    p_expires_at, p_absolute_expires_at, now()
-  )
-  RETURNING id;
-$$;
-
--- The absolute cap has to be enforced on READ as well as on renewal. A session
--- whose sliding expiry is still in the future but whose absolute cap has passed
--- must not resolve.
-DROP FUNCTION IF EXISTS app_auth_resolve_session(text);
-
-CREATE OR REPLACE FUNCTION app_auth_resolve_session(p_token_hash text)
-RETURNS TABLE (
-  session_id uuid,
-  expires_at timestamptz,
-  absolute_expires_at timestamptz,
-  user_id uuid,
-  full_name text,
-  email text,
-  tenant_id uuid,
-  brand_name text,
-  role text,
-  overrides jsonb,
-  customer_id uuid,
-  technician_id uuid
-)
-LANGUAGE sql
-SECURITY DEFINER
-SET search_path = public
-AS $$
-  SELECT
-    s.id,
-    s.expires_at,
-    s.absolute_expires_at,
-    u.id,
-    u.full_name::text,
-    u.email::text,
-    t.id,
-    t.brand_name::text,
-    m.role::text,
-    m.permission_overrides,
-    m.customer_id,
-    tech.id
-  FROM sessions s
-  JOIN users u       ON u.id = s.user_id
-  JOIN tenants t     ON t.id = s.tenant_id
-  JOIN memberships m ON m.user_id = s.user_id AND m.tenant_id = s.tenant_id
-  LEFT JOIN technicians tech
-         ON tech.tenant_id = s.tenant_id
-        AND tech.user_id = s.user_id
-        AND tech.is_active
-  WHERE s.token_hash = p_token_hash
-    AND s.revoked_at IS NULL
-    AND s.expires_at > now()
-    AND (s.absolute_expires_at IS NULL OR s.absolute_expires_at > now())
-    AND m.is_active
-    AND t.is_active
-    AND u.deleted_at IS NULL
-  LIMIT 1;
-$$;
-
 -- ── Grants ──────────────────────────────────────────────────────────────────
 DO $$
 DECLARE fn text;
@@ -400,10 +288,7 @@ BEGIN
     'app_reset_consume(text, text)',
     'app_reset_sweep(integer)',
     'app_invite_peek(text)',
-    'app_invite_accept(text, text)',
-    'app_auth_touch_session(text, integer)',
-    'app_auth_create_session(uuid,uuid,text,text,text,timestamptz,timestamptz)',
-    'app_auth_resolve_session(text)'
+    'app_invite_accept(text, text)'
   ] LOOP
     EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', fn);
     EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO meridian_app', fn);
