@@ -22,6 +22,46 @@
  * anything else the browser will execute — those are text formats with no
  * reliable magic bytes anyway, so they fall out of the allowlist by
  * construction rather than by a rule somebody could later relax.
+ *
+ * ── THE OFFICE FORMATS, AND WHY THEY ARE HERE NOW ───────────────────────────
+ *
+ * `ATS-9` names `.doc`, `.docx`, `.rtf` and `.txt` as CV formats. The first
+ * three are on the list; `.txt` is not, and the difference is not arbitrary:
+ *
+ *  * **`.rtf`** opens with the literal ASCII `{\rtf`. A real signature.
+ *  * **`.doc`** is an OLE compound file — an eight-byte header that has not
+ *    changed since 1993 — and Word's own `WordDocument` stream name is in the
+ *    directory, which is what separates it from the `.xls` and `.msg` files
+ *    that share the container.
+ *  * **`.docx`** is a ZIP. The container is sniffable and the *contents* are
+ *    then inspected: an OPC package with `[Content_Types].xml` and
+ *    `word/document.xml` in its central directory is a Word document and a
+ *    `.xlsx`, a `.jar` or a plain archive is not.
+ *  * **`.txt` cannot be sniffed at all.** There is no header. Accepting it
+ *    would mean believing a client-declared type, which is the one thing this
+ *    module exists to refuse, and it would mean the allowlist could no longer
+ *    say "nothing outside this list can be written" — because "plain text" is
+ *    a shape, and an HTML page, an SVG and a shell script are all that shape.
+ *    A candidate with a `.txt` CV is asked for a PDF. That is a worse form and
+ *    a better system.
+ *
+ * ── WHAT MAKES THIS SAFE TO ADD, AND WHAT WOULD MAKE IT UNSAFE ──────────────
+ *
+ * All three formats can carry macros or embedded OLE objects, and a recruiter
+ * opening one in Word is the attack. Three things stand between the two, and
+ * the first is new: `ATS-9`'s virus scan is now a real ClamAV sweep rather than
+ * an unimplemented column, so an uploaded document is `pending` until something
+ * has actually looked at it. Second, nothing is ever rendered — every download
+ * is `Content-Disposition: attachment` with `nosniff` and a sandbox CSP.
+ * Third, the type is read from the bytes, so a `.exe` renamed `.docx` never
+ * reaches the store.
+ *
+ * The condition worth stating plainly: on a deployment with **no** scanner
+ * configured these files are stored `skipped` and are downloadable, and the
+ * only thing left between a macro-bearing `.doc` and a recruiter is the fact
+ * that it must be opened deliberately. That is the same position the system was
+ * already in for PDFs, and it is why `/api/cron/scan` says loudly, on every
+ * run, that no scanner is configured.
  */
 
 /** The complete set of types this system will store. Nothing else is written. */
@@ -31,6 +71,12 @@ export const ALLOWED_CONTENT_TYPES = [
   "image/jpeg",
   "image/webp",
   "image/heic",
+  "application/rtf",
+  "application/msword",
+  // 71 characters, which matters: `candidate_documents.content_type` is
+  // varchar(80), and a longer literal would fail at runtime on every upload of
+  // this type with nothing catching it at compile time.
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 ] as const;
 
 export type AllowedContentType = (typeof ALLOWED_CONTENT_TYPES)[number];
@@ -42,6 +88,9 @@ export const EXTENSION_FOR: Readonly<Record<AllowedContentType, string>> = {
   "image/jpeg": "jpg",
   "image/webp": "webp",
   "image/heic": "heic",
+  "application/rtf": "rtf",
+  "application/msword": "doc",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
 };
 
 function startsWith(bytes: Uint8Array, signature: readonly number[], offset = 0): boolean {
@@ -97,7 +146,108 @@ export function sniffContentType(bytes: Uint8Array): AllowedContentType | null {
     }
   }
 
+  // "{\rtf". RTF's own header, and the reason `.rtf` is sniffable when `.txt`
+  // is not: it is a text format that is required to identify itself.
+  if (startsWith(bytes, [0x7b, 0x5c, 0x72, 0x74, 0x66])) return "application/rtf";
+
+  // OLE compound file. `.doc` shares this container with `.xls`, `.ppt` and
+  // `.msg`, so the header alone is not an answer — the stream name is.
+  if (startsWith(bytes, [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])) {
+    return containsUtf16(bytes, "WordDocument") ? "application/msword" : null;
+  }
+
+  // ZIP local file header. Same situation as the compound file, one layer up:
+  // the container says nothing, the directory says everything.
+  if (startsWith(bytes, [0x50, 0x4b, 0x03, 0x04])) {
+    const names = zipEntryNames(bytes);
+    if (
+      names &&
+      names.includes("[Content_Types].xml") &&
+      names.some((name) => name === "word/document.xml")
+    ) {
+      return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    }
+    return null;
+  }
+
   return null;
+}
+
+/**
+ * Is this UTF-16LE string in these bytes?
+ *
+ * A compound file's directory can sit in any sector, so there is no fixed
+ * offset to look at — the honest options are to implement the FAT walk or to
+ * scan. The scan is bounded by the object size limit (25 MB) and runs once per
+ * upload, which is nothing next to the hash that runs on the same bytes.
+ */
+function containsUtf16(bytes: Uint8Array, needle: string): boolean {
+  const pattern = new Uint8Array(needle.length * 2);
+  for (let i = 0; i < needle.length; i++) {
+    pattern[i * 2] = needle.charCodeAt(i) & 0xff;
+    pattern[i * 2 + 1] = 0;
+  }
+
+  outer: for (let at = 0; at + pattern.length <= bytes.length; at++) {
+    for (let i = 0; i < pattern.length; i++) {
+      if (bytes[at + i] !== pattern[i]) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * The names in a ZIP's central directory, or `null` if this is not a plain ZIP.
+ *
+ * Reads the directory rather than walking local headers, because a local header
+ * may declare its sizes in a trailing data descriptor — leaving a walker with
+ * no way to find the next entry, and inviting the kind of guess that ends in an
+ * unbounded loop over attacker-controlled bytes. Every read below is
+ * bounds-checked and the entry count is capped; a Zip64 archive returns `null`
+ * rather than being half-understood.
+ */
+function zipEntryNames(bytes: Uint8Array): string[] | null {
+  const EOCD = 0x06054b50;
+  const ENTRY = 0x02014b50;
+
+  if (bytes.length < 22) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+  // The comment may be up to 65535 bytes, so the record starts at most that far
+  // plus its own 22 bytes from the end.
+  const floor = Math.max(0, bytes.length - 22 - 65535);
+  let eocd = -1;
+  for (let at = bytes.length - 22; at >= floor; at--) {
+    if (view.getUint32(at, true) === EOCD) {
+      eocd = at;
+      break;
+    }
+  }
+  if (eocd < 0) return null;
+
+  const total = view.getUint16(eocd + 10, true);
+  const directoryAt = view.getUint32(eocd + 16, true);
+  // Zip64 sentinels. A CV is not 4 GB; refusing is the right answer.
+  if (total === 0xffff || directoryAt === 0xffffffff) return null;
+
+  const names: string[] = [];
+  let at = directoryAt;
+
+  for (let i = 0; i < total && i < 4096; i++) {
+    if (at + 46 > bytes.length) return null;
+    if (view.getUint32(at, true) !== ENTRY) return null;
+
+    const nameLength = view.getUint16(at + 28, true);
+    const extraLength = view.getUint16(at + 30, true);
+    const commentLength = view.getUint16(at + 32, true);
+    if (at + 46 + nameLength > bytes.length) return null;
+
+    names.push(asciiAt(bytes, at + 46, nameLength));
+    at += 46 + nameLength + extraLength + commentLength;
+  }
+
+  return names;
 }
 
 /**

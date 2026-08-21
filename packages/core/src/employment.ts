@@ -34,6 +34,7 @@
 
 import { dubaiDateKey, isRamadan, toDubai, fromDubai, DEFAULT_CALENDAR, checkStatutoryHours } from "./calendar";
 import type { WorkingCalendar, HoursCheck } from "./calendar";
+import { EMIRATISATION_SKILLED_THRESHOLD } from "./reporting";
 
 // ── Calendar-day arithmetic ─────────────────────────────────────────────────
 
@@ -1681,4 +1682,640 @@ export function checkHealthInsurance(input: {
   }
 
   return { compliant: problems.length === 0, requiredPlan, problems };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HR-13 — End-of-service gratuity
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * ── THE TWO WAGE BASES IN THIS FILE, AND WHY THEY MUST NOT BE SHARED ────────
+ *
+ * Gratuity accrues on **basic salary only**. Housing, transport, utilities and
+ * furniture allowances are excluded from it, without exception.
+ *
+ * Sick pay, forty lines above, is computed on the **whole wage** — basic plus
+ * every allowance — because Article 31 stages *the wage* and Article 1 defines
+ * wage as basic plus allowances. `sickLeavePayMinor` takes `monthlyWageMinor`;
+ * `gratuityAccrual` below takes `basicMonthlyMinor`. They are different
+ * parameters with different names because they are different numbers, and the
+ * single most likely defect in this module is one helper serving both.
+ *
+ * The error is silent in both directions and expensive in both:
+ *
+ *   * gratuity on basic + allowances over-pays every leaver by the whole
+ *     allowance stack multiplied by their years of service, and nobody
+ *     complains about being over-paid;
+ *   * sick pay on basic alone under-pays every sick day by exactly the housing
+ *     and transport allowance, for everybody, forever.
+ *
+ * There is one place the two bases meet, and it is deliberate: the **cap**.
+ * Article 51 limits the total gratuity to two years' *wage*, and "wage" there
+ * carries its Article 1 meaning. So the accrual is measured on basic and the
+ * ceiling on total — which is why `gratuityAccrual` needs both numbers and
+ * refuses to infer one from the other.
+ */
+
+/** Below one year of continuous service, nothing accrues at all. */
+export const GRATUITY_MIN_SERVICE_YEARS = 1;
+
+/** 21 days' basic pay per year, for the first five years. */
+export const GRATUITY_DAYS_PER_YEAR_FIRST_FIVE = 21;
+
+/** 30 days' basic pay per year, for every year after the fifth. */
+export const GRATUITY_DAYS_PER_YEAR_THEREAFTER = 30;
+
+/** Where the 21-day rate becomes the 30-day one. Five completed years. */
+export const GRATUITY_TIER_BOUNDARY_YEARS = 5;
+
+/** Two years' total wages. Article 51's ceiling on the whole entitlement. */
+export const GRATUITY_CAP_MONTHS_OF_WAGE = 24;
+
+/**
+ * All end-of-service dues are payable within 14 days of termination.
+ *
+ * §11.3. Not "promptly", not "with the next payroll run" — fourteen days from
+ * the day the relationship ends, which for somebody terminated on the 20th is
+ * well before the wage cycle that would otherwise have carried it.
+ */
+export const GRATUITY_SETTLEMENT_DAYS = 14;
+
+/**
+ * Length of service, decomposed so nothing has to be approximated.
+ *
+ * `completedYears` counts **anniversaries**, not `days / 365`. The two disagree
+ * across a leap year, and they disagree at exactly the boundary that matters:
+ * somebody who started on 1 March 2020 has completed five years on 1 March
+ * 2025, which is 1,826 days rather than 1,825. Dividing by 365 would move them
+ * into the 30-day tier a day early; dividing by 366 would hold them in the
+ * 21-day tier a day late. Anniversaries have no such error because they are
+ * what the statute actually counts.
+ *
+ * The remainder is then a fraction of the year it falls in — `remainderDays`
+ * out of `remainderYearDays` — so a part-year is pro-rated against a real
+ * 365- or 366-day year rather than against an assumed one.
+ */
+export interface ServiceLength {
+  /** Whole days from the first day of service to `asOf`. */
+  readonly days: number;
+  readonly completedYears: number;
+  /** Days since the most recent service anniversary. */
+  readonly remainderDays: number;
+  /** Days in the service year the remainder sits in. 365 or 366. */
+  readonly remainderYearDays: number;
+}
+
+export function serviceLength(serviceStart: CalendarDay, asOf: CalendarDay = today()): ServiceLength {
+  const days = daysBetween(serviceStart, asOf);
+  if (days <= 0) {
+    return { days: 0, completedYears: 0, remainderDays: 0, remainderYearDays: 365 };
+  }
+
+  // String comparison on `YYYY-MM-DD` is date comparison — that is the whole
+  // reason the format is used here rather than a `Date`. `addMonths` clamps, so
+  // a 29 February start has its anniversary on 28 February in common years
+  // rather than slipping to 1 March and gaining a day of service every four.
+  let completedYears = 0;
+  while (addMonths(serviceStart, (completedYears + 1) * 12) <= asOf) completedYears++;
+
+  const lastAnniversary = addMonths(serviceStart, completedYears * 12);
+  const nextAnniversary = addMonths(serviceStart, (completedYears + 1) * 12);
+
+  return {
+    days,
+    completedYears,
+    remainderDays: daysBetween(lastAnniversary, asOf),
+    remainderYearDays: daysBetween(lastAnniversary, nextAnniversary),
+  };
+}
+
+export interface GratuityAccrual {
+  /** One year of continuous service, minimum. Below it the figure is zero. */
+  readonly eligible: boolean;
+  readonly service: ServiceLength;
+  /**
+   * Days of basic pay earned. Fractional where a part-year is pro-rated.
+   *
+   * **Display only.** No money below is derived from this number — it is
+   * rounded for a screen, and the amounts are computed from the integer parts
+   * of the service length directly.
+   */
+  readonly entitlementDays: number;
+  /** Monthly basic ÷ 30, rounded once. The rate a leaver checks by hand. */
+  readonly dailyBasicMinor: number;
+  /** What the formula produces before Article 51's ceiling. */
+  readonly uncappedMinor: number;
+  /** Two years' **total** wages — basic plus allowances. */
+  readonly capMinor: number;
+  readonly capApplied: boolean;
+  /** What is actually owed. */
+  readonly amountMinor: number;
+  readonly explanation: string;
+}
+
+/**
+ * What an employee's end-of-service gratuity is worth today (`HR-13`).
+ *
+ * 21 days' basic pay for each of the first five years, 30 days for each year
+ * after that, on basic salary only, capped at two years' total wages, and
+ * nothing at all below one year of continuous service.
+ *
+ * ── THE ROUNDING, WHICH IS A DELIBERATE CHOICE AND NOT AN OVERSIGHT ─────────
+ *
+ * The daily rate is rounded **once**, from monthly basic ÷ 30, and everything
+ * else is built from that integer. The whole-year part is then an exact integer
+ * product with no rounding at all, and only the pro-rated tail rounds a second
+ * time.
+ *
+ * The alternative — carrying the full precision and rounding once at the very
+ * end — is arithmetically tidier and would be wrong here for a practical
+ * reason: every UAE gratuity calculator, and every leaver checking the figure
+ * on their phone, computes `basic ÷ 30` first and multiplies. A settlement that
+ * differs from that by a few fils is a settlement somebody argues about, and
+ * being provably right by a fil is worth less than being obviously right.
+ *
+ * ── THE PART-YEAR ──────────────────────────────────────────────────────────
+ *
+ * Pro-rated, and at **the tier the service has reached**. Five years and a
+ * hundred days accrues 105 days for the first five years plus 100/365ths of 30
+ * days for the tail — not 100/365ths of 21. The switch is at the fifth
+ * anniversary and applies to everything after it.
+ */
+export function gratuityAccrual(input: {
+  serviceStart: CalendarDay;
+  /** Termination day, or today for an accrued-liability figure. */
+  asOf?: CalendarDay;
+  /** Monthly **basic** salary in minor units. Never basic plus allowances. */
+  basicMonthlyMinor: number;
+  /**
+   * Monthly **total** wage in minor units — basic plus every allowance.
+   *
+   * Used for the Article 51 cap and for nothing else. Omit it and the cap is
+   * measured against basic alone, which is the conservative direction but is
+   * not what the statute says; the domain layer always passes both.
+   */
+  totalMonthlyWageMinor?: number;
+  daysPerMonth?: number;
+}): GratuityAccrual {
+  const asOf = input.asOf ?? today();
+  const daysPerMonth = input.daysPerMonth ?? PAYROLL_DAYS_PER_MONTH;
+  const service = serviceLength(input.serviceStart, asOf);
+
+  const basic = Math.max(0, Math.round(input.basicMonthlyMinor));
+  const totalWage = Math.max(basic, Math.round(input.totalMonthlyWageMinor ?? basic));
+  const capMinor = totalWage * GRATUITY_CAP_MONTHS_OF_WAGE;
+  const dailyBasicMinor = daysPerMonth > 0 ? Math.round(basic / daysPerMonth) : 0;
+
+  // `>=`, not `>`. One year of service qualifies; the statute says minimum one
+  // year, so the anniversary itself is inside the entitlement. A `>` here would
+  // deny a settlement to somebody terminated on the day they earned it.
+  const eligible = service.completedYears >= GRATUITY_MIN_SERVICE_YEARS;
+
+  if (!eligible) {
+    return {
+      eligible: false,
+      service,
+      entitlementDays: 0,
+      dailyBasicMinor,
+      uncappedMinor: 0,
+      capMinor,
+      capApplied: false,
+      amountMinor: 0,
+      explanation:
+        `${service.days} day${service.days === 1 ? "" : "s"} of service. Gratuity requires ` +
+        `${GRATUITY_MIN_SERVICE_YEARS} year of continuous service, so none has accrued yet — ` +
+        `it starts accruing on ${formatDay(addMonths(input.serviceStart, 12))}.`,
+    };
+  }
+
+  const firstTierYears = Math.min(service.completedYears, GRATUITY_TIER_BOUNDARY_YEARS);
+  const laterTierYears = Math.max(0, service.completedYears - GRATUITY_TIER_BOUNDARY_YEARS);
+  const wholeDays =
+    firstTierYears * GRATUITY_DAYS_PER_YEAR_FIRST_FIVE + laterTierYears * GRATUITY_DAYS_PER_YEAR_THEREAFTER;
+
+  // The rate the part-year accrues at is decided by where the service already
+  // stands, not by where it started. Completed years 0–4 are still inside the
+  // first five; from the fifth anniversary on, everything is at 30.
+  const partialRate =
+    service.completedYears < GRATUITY_TIER_BOUNDARY_YEARS
+      ? GRATUITY_DAYS_PER_YEAR_FIRST_FIVE
+      : GRATUITY_DAYS_PER_YEAR_THEREAFTER;
+
+  const partialMinor =
+    service.remainderDays === 0 || service.remainderYearDays <= 0
+      ? 0
+      : Math.round((dailyBasicMinor * partialRate * service.remainderDays) / service.remainderYearDays);
+
+  const uncappedMinor = dailyBasicMinor * wholeDays + partialMinor;
+  const capApplied = uncappedMinor > capMinor;
+  const amountMinor = capApplied ? capMinor : uncappedMinor;
+
+  const entitlementDays =
+    Math.round((wholeDays + (partialRate * service.remainderDays) / (service.remainderYearDays || 1)) * 100) / 100;
+
+  const tail =
+    service.remainderDays > 0
+      ? ` plus ${service.remainderDays} day${service.remainderDays === 1 ? "" : "s"} pro-rated at the ${partialRate}-day rate`
+      : "";
+
+  return {
+    eligible: true,
+    service,
+    entitlementDays,
+    dailyBasicMinor,
+    uncappedMinor,
+    capMinor,
+    capApplied,
+    amountMinor,
+    explanation:
+      `${service.completedYears} completed year${service.completedYears === 1 ? "" : "s"}${tail} — ` +
+      `${entitlementDays} days of basic pay. Basic salary only; allowances are excluded.` +
+      (capApplied
+        ? ` Capped at two years' total wages, which is ${GRATUITY_CAP_MONTHS_OF_WAGE} months of the full wage and less than the ${entitlementDays}-day figure.`
+        : ""),
+  };
+}
+
+export interface GratuityDeadline {
+  readonly terminatedOn: CalendarDay;
+  /** Fourteen days after termination. */
+  readonly dueOn: CalendarDay;
+  /** Negative once the deadline has passed. */
+  readonly daysRemaining: number;
+  readonly overdue: boolean;
+  readonly headline: string;
+}
+
+/**
+ * When the final settlement has to have been paid (`HR-13`, §11.3).
+ *
+ * All end-of-service dues — gratuity, accrued leave, the final month's wages —
+ * within 14 days of termination. Returned as a day and a countdown rather than
+ * a boolean, because the whole value of the rule is knowing about it on day 3.
+ */
+export function gratuitySettlementDeadline(
+  terminatedOn: CalendarDay,
+  now: CalendarDay = today(),
+): GratuityDeadline {
+  const dueOn = addDays(terminatedOn, GRATUITY_SETTLEMENT_DAYS);
+  const daysRemaining = daysBetween(now, dueOn);
+  // Due *on* the 14th day, so the 14th day itself is not late. `< 0`, not `<= 0`.
+  const overdue = daysRemaining < 0;
+
+  return {
+    terminatedOn,
+    dueOn,
+    daysRemaining,
+    overdue,
+    headline: overdue
+      ? `End-of-service dues were payable by ${formatDay(dueOn)} — ${Math.abs(daysRemaining)} day${Math.abs(daysRemaining) === 1 ? "" : "s"} ago.`
+      : daysRemaining === 0
+        ? `End-of-service dues are payable today, ${formatDay(dueOn)}.`
+        : `End-of-service dues are payable by ${formatDay(dueOn)} — ${daysRemaining} day${daysRemaining === 1 ? "" : "s"} from now.`,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HR-18 — Emiratisation, and the denominator everybody gets wrong
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * ── WHY THIS IS THREE FACTS AND NOT A HEADCOUNT ─────────────────────────────
+ *
+ * Emiratisation targets apply to establishments with 50 or more **skilled**
+ * employees, and "skilled" is a conjunction of three independent tests:
+ *
+ *   1. ISCO occupational major group 1–5;
+ *   2. a post-secondary certificate;
+ *   3. a salary of at least AED 4,000 a month.
+ *
+ * All three, for the same person. A contractor with 60 tradesmen and 6 office
+ * staff is measured against the 6, not the 66 — so reporting total headcount
+ * against a 50-skilled threshold does not merely lose precision, it points the
+ * wrong way by an order of magnitude, and it points that way in the direction
+ * that causes a business to act on a threshold it is nowhere near.
+ *
+ * ── THE NAMED EXCLUSIONS, AND WHY THERE IS NO FOURTH TEST ───────────────────
+ *
+ * The requirement names manual and craft workers, drivers, security and
+ * cleaners as excluded. Three of those fall out of the ISCO leg on their own:
+ * craft and related trades are major group 7, drivers and plant operators are
+ * 8, cleaners and labourers are 9. Security guards are the awkward one — ISCO
+ * puts protective services in major group 5, which the first leg admits.
+ *
+ * They are excluded anyway, by the other two legs: a guard without a
+ * post-secondary certificate fails test 2, and one under AED 4,000 fails test
+ * 3. That is the conjunction doing its job, and it is the reason this module
+ * does **not** add a fourth "job title" test on top of the statute. A
+ * title-matching rule would be a guess layered over a legal definition, it
+ * would be applied by whoever typed the title, and where it disagreed with the
+ * three-part test it would be the guess that won.
+ *
+ * ── WHAT IS DELIBERATELY NOT HERE: THE NUMERATOR ────────────────────────────
+ *
+ * The Emiratisation *ratio* needs a count of UAE nationals, and there is no
+ * nationality field on `employees` — deliberately. `ATS-6` prohibits capturing
+ * nationality, and the requirement this file implements asks for the skilled
+ * headcount and an alert as it approaches 50, not for the ratio. Adding a
+ * nationality column that nothing in the specification asks for, to compute a
+ * figure nothing in the specification asks for, is how a protected
+ * characteristic ends up in a database. The Emirati count is reported to MOHRE
+ * from MOHRE's own register; if it is ever needed here it should arrive as a
+ * deliberate decision with a lawful basis written down, not as a side effect of
+ * this function.
+ */
+
+/** ISCO-08 major groups. The skilled test admits 1–5 and excludes 6–9. */
+export const ISCO_MAJOR_GROUPS = {
+  1: "Managers",
+  2: "Professionals",
+  3: "Technicians and associate professionals",
+  4: "Clerical support workers",
+  5: "Services and sales workers",
+  6: "Skilled agricultural, forestry and fishery workers",
+  7: "Craft and related trades workers",
+  8: "Plant and machine operators, and assemblers",
+  9: "Elementary occupations",
+} as const;
+
+export type IscoMajorGroup = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
+
+/** Groups 1 through 5. The comparison is `<=`, and it is tested on both sides. */
+export const ISCO_SKILLED_MAX_MAJOR_GROUP = 5;
+
+/**
+ * AED 4,000 a month, in fils. The third leg of the skilled test.
+ *
+ * ── WHY THIS IS NOT `ESSENTIAL_BENEFITS_WAGE_CEILING_MINOR` ─────────────────
+ *
+ * That constant holds the same number today and means something else: below it,
+ * `HR-6` requires an Essential Benefits health plan. Two statutes happening to
+ * pick the same figure is not a reason to alias them — the day MOHRE moves one
+ * and the DHA does not, an alias silently moves both.
+ *
+ * The **operators are opposite**, which is the other reason they must not
+ * share. The health rule is "under AED 4,000 requires an EBP" — strictly less
+ * than. This one is "a salary of **at least** AED 4,000" — greater than or
+ * equal. A worker on exactly AED 4,000 is outside the EBP requirement and
+ * inside the skilled denominator, and both of those are correct.
+ */
+export const EMIRATISATION_SKILLED_WAGE_FLOOR_MINOR = 400_000;
+
+/**
+ * How close to 50 is close enough to say so.
+ *
+ * `HR-18`: "the failure mode is discovering the threshold was crossed a quarter
+ * ago". Five skilled employees is a hire or two, which is the horizon on which
+ * somebody can still plan.
+ */
+export const EMIRATISATION_APPROACH_WINDOW = 5;
+
+/**
+ * The lower edge of the 20–49 band that `OPEN-4` is about.
+ *
+ * A separate rule applies to establishments of 20–49 employees in certain
+ * designated sectors. Whether technical services is one of those sectors is
+ * unresolved (`OPEN-4`); the PRD's instruction is to assume in scope until told
+ * otherwise, so this module reports the band and says plainly that the
+ * underlying question is open rather than answering it.
+ */
+export const EMIRATISATION_SMALL_ESTABLISHMENT_FLOOR = 20;
+
+/**
+ * `unknown` is a first-class answer, and it is the important one.
+ *
+ * An employee whose ISCO group or certificate has never been recorded is not
+ * unskilled — nobody has said. Counting them as unskilled understates the
+ * denominator, which is the reassuring direction and therefore the dangerous
+ * one: it is precisely how a company discovers it crossed 50 a quarter ago.
+ */
+export type SkilledClassification = "skilled" | "excluded" | "unknown";
+
+export interface SkilledTest {
+  readonly classification: SkilledClassification;
+  /** Null where the underlying fact has not been recorded. */
+  readonly iscoSkilled: boolean | null;
+  readonly certificateHeld: boolean | null;
+  readonly wageAtOrAboveFloor: boolean | null;
+  /** Why, in the operator's words. Empty for a plainly skilled employee. */
+  readonly reasons: readonly string[];
+}
+
+/**
+ * Apply the three-part skilled test to one employee (`HR-18`).
+ *
+ * A definite failure on any leg excludes, whatever the other legs say or fail
+ * to say — an ISCO group 7 craftsman is out of the denominator whether or not
+ * anybody recorded a certificate for them. Only where no leg fails and at least
+ * one is unrecorded is the answer `unknown`, which keeps that bucket to the
+ * employees whose classification genuinely turns on a missing fact.
+ *
+ * ── DO NOT "SIMPLIFY" `unknown` INTO `excluded` ─────────────────────────────
+ *
+ * This is the change somebody will propose, and it will look like tidying up:
+ * three states collapse to a boolean, `assessEmiratisation` loses its range,
+ * and every screen gets a single confident number instead of "48–51". Every
+ * test in `test/employment.test.ts` would still pass except the ones written
+ * against this specific behaviour, because the collapsed version is not wrong
+ * about anybody whose facts are recorded.
+ *
+ * It is wrong in the one direction that costs money. An employee whose ISCO
+ * group was never recorded is **not unskilled — nobody has said.** Counting
+ * them as excluded shrinks the denominator, which reads as reassuring, which
+ * is precisely `HR-18`'s named failure mode: "the failure mode is discovering
+ * the threshold was crossed a quarter ago", at roughly AED 9,000 a month per
+ * unfilled post. The cost of the honest version is being told to go and record
+ * two ISCO codes.
+ *
+ * That direction is a rule this codebase already follows everywhere a fact is
+ * missing rather than false: `HR-9` hard-blocks an expired permit instead of
+ * warning, the owner dashboard renders an unsourceable metric as "not
+ * measured" rather than as zero, and `wageFileGaps` reports the employee with
+ * no salary on file *because* leaving them out of the total is what makes a
+ * broken payroll read as 100% compliant. A missing fact must push toward
+ * investigation, never toward comfort.
+ *
+ * If the three states genuinely need to become two somewhere, do it at the
+ * point of display and round `unknown` **towards skilled**, which is what
+ * `assessEmiratisation`'s `upperBound` already does. Never here.
+ */
+export function classifySkilledEmployee(input: {
+  iscoMajorGroup: number | null;
+  postSecondaryCertificate: boolean | null;
+  /** Total monthly wage — basic plus allowances — in minor units. */
+  monthlyWageMinor: number | null;
+}): SkilledTest {
+  const iscoSkilled =
+    input.iscoMajorGroup === null || !Number.isFinite(input.iscoMajorGroup)
+      ? null
+      : input.iscoMajorGroup >= 1 && input.iscoMajorGroup <= ISCO_SKILLED_MAX_MAJOR_GROUP;
+  const certificateHeld = input.postSecondaryCertificate;
+  const wageAtOrAboveFloor =
+    input.monthlyWageMinor === null ? null : input.monthlyWageMinor >= EMIRATISATION_SKILLED_WAGE_FLOOR_MINOR;
+
+  const reasons: string[] = [];
+  if (iscoSkilled === false) {
+    reasons.push(
+      `ISCO major group ${input.iscoMajorGroup} — ${ISCO_MAJOR_GROUPS[input.iscoMajorGroup as IscoMajorGroup] ?? "outside 1–5"}. The test admits groups 1 to ${ISCO_SKILLED_MAX_MAJOR_GROUP}.`,
+    );
+  }
+  if (certificateHeld === false) {
+    reasons.push("No post-secondary certificate.");
+  }
+  if (wageAtOrAboveFloor === false) {
+    reasons.push(
+      `Wage is below AED ${EMIRATISATION_SKILLED_WAGE_FLOOR_MINOR / 100}/month, which is the floor the test sets.`,
+    );
+  }
+  if (reasons.length > 0) {
+    return { classification: "excluded", iscoSkilled, certificateHeld, wageAtOrAboveFloor, reasons };
+  }
+
+  const missing: string[] = [];
+  if (iscoSkilled === null) missing.push("no ISCO occupational group recorded");
+  if (certificateHeld === null) missing.push("no post-secondary certificate answer recorded");
+  if (wageAtOrAboveFloor === null) missing.push("no wage recorded");
+  if (missing.length > 0) {
+    return {
+      classification: "unknown",
+      iscoSkilled,
+      certificateHeld,
+      wageAtOrAboveFloor,
+      reasons: [
+        `Cannot be classified: ${missing.join(", ")}. Counted as neither skilled nor excluded, because guessing either way moves the threshold.`,
+      ],
+    };
+  }
+
+  return { classification: "skilled", iscoSkilled, certificateHeld, wageAtOrAboveFloor, reasons: [] };
+}
+
+/**
+ * `outside_targets` is both ends of the range, and that is not a modelling
+ * slip.
+ *
+ * The 50-employee threshold is counted on **skilled** employees; the 20–49 rule
+ * is counted on **total** employees. So an establishment can fall outside both:
+ * the PRD's own example — 60 tradesmen and 6 office staff — has 66 employees,
+ * which is past the top of the 20–49 band, and 6 skilled ones, which is nowhere
+ * near 50. It is in neither regime, and a band vocabulary that could not say so
+ * would have to put it in one of them.
+ */
+export type EmiratisationBand = "outside_targets" | "small_establishment_band" | "at_or_above_threshold";
+
+export interface EmiratisationPosition {
+  /** Employees who pass all three legs. */
+  readonly skilled: number;
+  /** Employees who definitely fail at least one leg. */
+  readonly excluded: number;
+  /** Employees a missing fact makes unclassifiable. */
+  readonly unknown: number;
+  /** Everybody, skilled or not. Not the denominator — reported for contrast. */
+  readonly headcount: number;
+  /** `skilled`. The most the denominator could be is `upperBound`. */
+  readonly lowerBound: number;
+  readonly upperBound: number;
+  readonly threshold: number;
+  readonly band: EmiratisationBand;
+  /** True where the 50-skilled targets apply, or may already. */
+  readonly inScope: boolean;
+  /** Within the approach window, or already there. */
+  readonly approaching: boolean;
+  /** True where the missing facts alone decide whether the threshold is crossed. */
+  readonly undecidedByMissingFacts: boolean;
+  readonly headline: string;
+  /** The uncertainty, stated. Null only when there is genuinely none. */
+  readonly caveat: string | null;
+}
+
+/**
+ * Where the establishment stands against the 50-skilled threshold (`HR-18`).
+ *
+ * ── MEASURED ON THE UPPER BOUND ────────────────────────────────────────────
+ *
+ * The band is decided by `skilled + unknown`, not by `skilled`. Where the
+ * missing facts could put the establishment over 50, this reports that it may
+ * already be over — because the penalty for being over and not knowing is about
+ * AED 9,000 a month per unfilled post, and the cost of being told to go and
+ * record two ISCO codes is ten minutes. `undecidedByMissingFacts` distinguishes
+ * "you are over" from "nobody can tell", so the screen never presents the
+ * second as the first.
+ *
+ * ── THE OPERATORS, BOTH OF WHICH ARE TESTED ON BOTH SIDES ──────────────────
+ *
+ * Targets apply at "50 **or more**", so the comparison is `>=` — 49 is outside,
+ * 50 is inside. The `OPEN-4` band is "20–49", so it is `>= 20` and `< 50`. A
+ * `>` in the first of those would let an establishment of exactly 50 report
+ * itself out of scope, which is the failure this whole requirement exists to
+ * prevent.
+ */
+export function assessEmiratisation(input: {
+  skilled: number;
+  excluded: number;
+  unknown: number;
+  headcount?: number;
+}): EmiratisationPosition {
+  const skilled = Math.max(0, Math.trunc(input.skilled));
+  const excluded = Math.max(0, Math.trunc(input.excluded));
+  const unknown = Math.max(0, Math.trunc(input.unknown));
+  const headcount = input.headcount ?? skilled + excluded + unknown;
+
+  const lowerBound = skilled;
+  const upperBound = skilled + unknown;
+  const threshold = EMIRATISATION_SKILLED_THRESHOLD;
+
+  // The second test is `>= 20 AND < 50` on **headcount**, not on the skilled
+  // count. Dropping the upper half of it would put a 66-employee contractor
+  // with 6 skilled staff into a band that stops at 49.
+  const band: EmiratisationBand =
+    upperBound >= threshold
+      ? "at_or_above_threshold"
+      : headcount >= EMIRATISATION_SMALL_ESTABLISHMENT_FLOOR && headcount < threshold
+        ? "small_establishment_band"
+        : "outside_targets";
+
+  const undecidedByMissingFacts = lowerBound < threshold && upperBound >= threshold;
+  const approaching = upperBound >= threshold - EMIRATISATION_APPROACH_WINDOW;
+
+  const range = unknown > 0 ? `${lowerBound}–${upperBound}` : `${lowerBound}`;
+  const headline = undecidedByMissingFacts
+    ? `Skilled headcount is somewhere between ${lowerBound} and ${upperBound}. The ${threshold}-employee threshold sits inside that range, so nothing here can say whether it has been crossed.`
+    : band === "at_or_above_threshold"
+      ? `${range} skilled employees against a threshold of ${threshold}. Emiratisation targets apply.`
+      : approaching
+        ? `${range} skilled employees, ${threshold - upperBound} short of the ${threshold} at which Emiratisation targets begin.`
+        : `${range} skilled employees against a threshold of ${threshold}. Well below it.`;
+
+  const caveats: string[] = [];
+  if (unknown > 0) {
+    caveats.push(
+      `${unknown} employee${unknown === 1 ? " is" : "s are"} unclassifiable — the ISCO occupational group, the post-secondary certificate answer or the wage has not been recorded. They are counted as neither skilled nor excluded; the true figure is between ${lowerBound} and ${upperBound}.`,
+    );
+  }
+  if (band === "small_establishment_band") {
+    caveats.push(
+      `Headcount is ${headcount}, inside the ${EMIRATISATION_SMALL_ESTABLISHMENT_FLOOR}–${threshold - 1} band where a separate rule applies to certain designated sectors. Whether technical services is one of them is OPEN-4 and unresolved — assume in scope until MOHRE says otherwise.`,
+    );
+  }
+  if (headcount !== skilled + excluded + unknown) {
+    caveats.push(
+      `Headcount (${headcount}) and the classified total (${skilled + excluded + unknown}) disagree, so some employees were not put through the test at all.`,
+    );
+  }
+
+  return {
+    skilled,
+    excluded,
+    unknown,
+    headcount,
+    lowerBound,
+    upperBound,
+    threshold,
+    band,
+    inScope: band === "at_or_above_threshold",
+    approaching,
+    undecidedByMissingFacts,
+    headline,
+    caveat: caveats.length > 0 ? caveats.join(" ") : null,
+  };
 }

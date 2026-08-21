@@ -2,6 +2,7 @@ import { and, asc, eq, sql } from "drizzle-orm";
 import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
 import { transitionJob } from "./jobs";
+import { assertJobCardComplete } from "./jobcard";
 import { UserFacingError, type JobStatus } from "@meridian/core";
 import { FAULT_CODE_KINDS, type FaultCodeKind } from "./reference";
 
@@ -35,6 +36,16 @@ import { FAULT_CODE_KINDS, type FaultCodeKind } from "./reference";
  * complete with no outcome — which is the state `JOB-15` exists to forbid, and
  * the state that is unfixable afterwards because nobody can remember in March
  * what happened on a Tuesday in January.
+ *
+ * ── AND WHY THE OTHER THREE CONDITIONS ARE CHECKED HERE TOO (JOB-15) ────────
+ *
+ * The outcome is one of four things `JOB-15` names, and for a while it was the
+ * only one anybody enforced: a job could reach `work_complete` carrying no
+ * photograph, no parts and no time. `assertJobCardComplete` in `./jobcard`
+ * holds the other three, and it is called from inside this transaction — the
+ * one that would otherwise perform the transition — so a refusal writes
+ * nothing at all. See that module for what "labour time" keys off and why a
+ * check in the completion form would have protected nothing.
  */
 
 // ── Fault coding (JOB-14) ───────────────────────────────────────────────────
@@ -251,6 +262,15 @@ export async function recordJobOutcome(
     }
   }
 
+  // JOB-15, before anything is written. The transaction would roll back either
+  // way, but checking here means the refusal names what the job card is
+  // missing rather than arriving after a partial write, and it means a
+  // *correction* to an already-complete job is never blocked by it: the gate
+  // applies to the move into `work_complete`, not to editing what is recorded
+  // about a job that already made the move.
+  const willComplete = (input.completeWork ?? true) && status === "on_site";
+  if (willComplete) await assertJobCardComplete(tx, input.jobId);
+
   await tx
     .update(schema.jobs)
     .set({ outcomeCode: outcome.code, updatedAt: new Date() })
@@ -285,7 +305,7 @@ export async function recordJobOutcome(
   }
 
   let transitioned = false;
-  if ((input.completeWork ?? true) && status === "on_site") {
+  if (willComplete) {
     await transitionJob(tx, ctx, {
       jobId: input.jobId,
       to: "work_complete",

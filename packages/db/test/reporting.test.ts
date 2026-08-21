@@ -43,10 +43,14 @@ import {
   auditTrail,
   auditActors,
   recordHistory,
+  corporateTaxPack,
+  accountingExport,
   PRODUCT_EVENT_NAMES,
   DASHBOARD_GAPS,
   AUDITED_TABLES,
 } from "../src/domain/reporting";
+// The AR control total the export's receivables schedule has to reconcile to.
+import { arAgeing, recordPayment } from "../src/domain/commerce";
 // Read-only, from the contracts stream. The dashboard calls this same function,
 // so the assertion below compares the headline against its own source.
 import { ppmCompliance } from "../src/domain/contracts";
@@ -55,11 +59,23 @@ import { ppmCompliance } from "../src/domain/contracts";
 import { dispatchBoardCounts, dispatchBoardCountsByPriority } from "../src/domain/jobs";
 import {
   smallBusinessReliefPosition,
+  taxPeriodPositions,
   gradeGoal,
   ppmCompletion,
   slaState,
+  csvField,
+  csvAmount,
+  toCsv,
+  documentJournalLines,
+  paymentJournalLines,
+  journalTotals,
   DASHBOARD_GOALS,
   SMALL_BUSINESS_RELIEF_THRESHOLD_MINOR,
+  SMALL_BUSINESS_RELIEF_FINAL_PERIOD_END,
+  PROJECTION_MINIMUM_ELAPSED_DAYS,
+  today,
+  type TaxPeriodRevenue,
+  type ExportTable,
 } from "@meridian/core";
 
 let fail = 0;
@@ -70,6 +86,63 @@ function check(label: string, got: unknown, expected: unknown): void {
 }
 function checkTrue(label: string, got: boolean): void {
   check(label, got, true);
+}
+
+/**
+ * Read a CSV back into rows.
+ *
+ * ── WHY THE TEST PARSES THE FILE INSTEAD OF READING THE OBJECT ──────────────
+ *
+ * Because the object is not what the accountant receives. A writer that quotes
+ * a comma wrongly, doubles a quote wrongly, or emits a header that does not
+ * line up with its rows produces an in-memory structure that passes every
+ * assertion and a file that imports as garbage. So every export assertion below
+ * goes through here, and this parser is deliberately independent of the writer
+ * — it knows RFC 4180 and nothing about `csvField`.
+ *
+ * The trailing comment line the writer appends (`# payments: 501 rows`) is
+ * dropped here along with the blank line before it, so `rows` is the data.
+ */
+function parseCsv(text: string): { header: string[]; rows: string[][] } {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let quoted = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+
+    if (quoted) {
+      if (c === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else quoted = false;
+      } else field += c;
+      continue;
+    }
+
+    if (c === '"' && field === "") quoted = true;
+    else if (c === ",") {
+      row.push(field);
+      field = "";
+    } else if (c === "\r" && text[i + 1] === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+      i++;
+    } else field += c;
+  }
+  if (field !== "" || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+
+  const header = rows.shift() ?? [];
+  // The blank separator and the row-count trailer are not data.
+  const data = rows.filter((r) => !(r.length === 1 && (r[0] === "" || r[0]!.startsWith("#"))));
+  return { header, rows: data };
 }
 
 const TAG = "REPORTING-TEST";
@@ -1187,6 +1260,584 @@ async function main(): Promise<void> {
 
   await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
     await tx.execute(sql`delete from customers where name = ${historyName}`);
+  });
+
+  // ── 6b. INV-16 accounting export, INV-17 corporate tax pack ───────────────
+  //
+  // ── WHAT THESE CHECKS ARE DEFENDING ─────────────────────────────────────
+  //
+  //  1. **Silent truncation.** This repository has shipped a capped list read
+  //     as a complete one five times in two days. An accounting export is the
+  //     worst place for the sixth: 200 tidy rows handed to an accountant is a
+  //     well-formed file and a wrong set of books. So the export's own row
+  //     count is asserted against `count(*)` over the same predicate, and the
+  //     batching loop is driven past its batch boundary with real rows.
+  //  2. **A tax-period boundary computed in the wrong timezone.** Revenue in
+  //     the wrong period misstates a threshold whose breach permanently ends
+  //     Small Business Relief. The pack's boundaries are asserted to be
+  //     calendar-year and its current-period figure is asserted **equal** to
+  //     the dashboard's, so the two screens cannot disagree.
+  //  3. **A credit note that stops subtracting.** Asserted as a delta, to the
+  //     fil, on both the pack and the export's journal.
+  console.log("\n— INV-17: revenue by tax period —");
+
+  /*
+   * The permanence rule, which is the whole of INV-17 and is not testable
+   * against the database because it is about periods that have already closed.
+   *
+   * A business at AED 3.1m in 2026 and AED 1m in 2027 has no relief in 2027.
+   * The dashboard's single-period meter reads that 2027 as "clear" — correctly,
+   * for the question it asks — which is exactly why this fold exists.
+   */
+  const periodFixture = (period: string, revenueMinor: number): TaxPeriodRevenue => ({
+    period,
+    startsOn: `${period}-01-01`,
+    endsOn: `${period}-12-31`,
+    invoicedMinor: revenueMinor,
+    creditedMinor: 0,
+    revenueMinor,
+    invoices: 1,
+    creditNotes: 0,
+    complete: true,
+    elapsedDays: 365,
+    totalDays: 365,
+  });
+
+  const carried = taxPeriodPositions([
+    periodFixture("2026", SMALL_BUSINESS_RELIEF_THRESHOLD_MINOR + 100),
+    periodFixture("2027", 100_000_00),
+  ]);
+  check("the period that crosses the line reads as breached", carried[0]?.standing, "breached");
+  check(
+    "and a later period well under the line is disqualified, not clear",
+    carried[1]?.standing,
+    "disqualified",
+  );
+  check(
+    "the disqualifying period is named, so the reader can go and look at it",
+    carried[1]?.disqualifyingPeriod,
+    "2026",
+  );
+  checkTrue(
+    "the later period's own arithmetic still says it is under the line",
+    carried[1]?.relief.state === "clear",
+  );
+
+  // Order is not trusted. A query that returned 2027 first would otherwise
+  // report the relief intact, and nothing in the output would show it.
+  const reversed = taxPeriodPositions([
+    periodFixture("2027", 100_000_00),
+    periodFixture("2026", SMALL_BUSINESS_RELIEF_THRESHOLD_MINOR + 100),
+  ]);
+  check("input order cannot change the verdict", reversed[1]?.standing, "disqualified");
+
+  const afterScheme = taxPeriodPositions([periodFixture("2030", 100_000_00)]);
+  check(
+    "a period ending after 31 December 2029 is outside the scheme entirely",
+    afterScheme[0]?.standing,
+    "unavailable",
+  );
+  check(
+    "and the scheme's last day is the one the PRD names",
+    SMALL_BUSINESS_RELIEF_FINAL_PERIOD_END,
+    "2029-12-31",
+  );
+
+  const runRate = taxPeriodPositions([
+    {
+      ...periodFixture("2026", 150_000_00),
+      complete: false,
+      elapsedDays: 180,
+      totalDays: 360,
+    },
+  ]);
+  check(
+    "a half-elapsed period at AED 1.5m projects to AED 3.0m",
+    runRate[0]?.projectedRevenueMinor,
+    300_000_00,
+  );
+
+  const tooEarly = taxPeriodPositions([
+    {
+      ...periodFixture("2026", 150_000_00),
+      complete: false,
+      elapsedDays: PROJECTION_MINIMUM_ELAPSED_DAYS - 1,
+      totalDays: 365,
+    },
+  ]);
+  check(
+    "and three weeks of January projects nothing at all, rather than AED 25m",
+    tooEarly[0]?.projectedRevenueMinor,
+    null,
+  );
+  check(
+    "a finished period has an actual, so it carries no projection beside it",
+    carried[0]?.projectedRevenueMinor,
+    null,
+  );
+
+  // ── The CSV writer ────────────────────────────────────────────────────────
+  console.log("\n— INV-16: the CSV writer —");
+
+  check("a comma forces quoting", csvField("Al Barsha, Dubai"), '"Al Barsha, Dubai"');
+  check('a quote is doubled', csvField('The "Palm" tower'), '"The ""Palm"" tower"');
+  check("a newline forces quoting", csvField("line one\nline two"), '"line one\nline two"');
+  check("trailing space is preserved by quoting", csvField("Serai "), '"Serai "');
+  check("a plain value is not quoted", csvField("SERAI"), "SERAI");
+  check("null is an empty cell, not the word null", csvField(null), "");
+
+  /*
+   * CSV injection. Customer names in this system arrive from a public lead form
+   * and from operators typing, and the file goes to somebody outside the
+   * business. A name beginning `=` is a formula in every spreadsheet there is.
+   */
+  check(
+    "a leading = is neutralised before it reaches a spreadsheet",
+    csvField('=HYPERLINK("http://evil","Click")'),
+    `"'=HYPERLINK(""http://evil"",""Click"")"`,
+  );
+  check("and a leading @", csvField("@SUM(A1:A9)"), "'@SUM(A1:A9)");
+
+  /*
+   * The reason amounts have their own type. A credit rendered as text would be
+   * caught by the guard above and arrive as `'-1000.00`, which imports as a
+   * label rather than a number — a whole column of them and the ledger is out.
+   */
+  check("a negative amount survives the formula guard intact", csvField(csvAmount(-100_000)), "-1000.00");
+  check("and minor units become a decimal exactly once", csvField(csvAmount(123_456)), "1234.56");
+
+  const trailerTable: ExportTable = {
+    name: "sample",
+    title: "Sample",
+    columns: ["reference", "total_incl_vat"],
+    rows: [["INV-1", csvAmount(105_000)]],
+    rowCount: 1,
+  };
+  checkTrue(
+    "the file states its own row count, so a short file is visibly short",
+    toCsv(trailerTable).includes("# sample: 1 rows"),
+  );
+  checkTrue("and it ends its lines with CRLF", toCsv(trailerTable).includes("\r\n"));
+
+  // ── The journal ───────────────────────────────────────────────────────────
+  console.log("\n— INV-16: the general journal —");
+
+  const sampleInvoice = {
+    reference: "INV-2026-00001",
+    date: "2026-03-01",
+    contact: "Serai Tower Owners Association",
+    currency: "AED",
+    taxCode: "S",
+    taxableMinor: 100_000,
+    taxMinor: 5_000,
+    totalMinor: 105_000,
+  };
+
+  const invoicePostings = documentJournalLines(sampleInvoice, "invoice");
+  check("an invoice posts three lines", invoicePostings.length, 3);
+  checkTrue("and it balances", journalTotals(invoicePostings).balanced);
+  check(
+    "receivables is debited with the VAT-INCLUSIVE total",
+    invoicePostings.find((l) => l.accountCode === "1100")?.debitMinor,
+    105_000,
+  );
+  check(
+    "revenue is credited with the VAT-EXCLUSIVE amount, never the gross",
+    invoicePostings.find((l) => l.accountCode === "4000")?.creditMinor,
+    100_000,
+  );
+  check(
+    "and the VAT is a liability rather than income",
+    invoicePostings.find((l) => l.accountCode === "2100")?.creditMinor,
+    5_000,
+  );
+
+  const creditPostings = documentJournalLines({ ...sampleInvoice, reference: "CRN-1" }, "credit_note");
+  checkTrue("a credit note balances too", journalTotals(creditPostings).balanced);
+  check(
+    "and it reverses every side — receivables is credited",
+    creditPostings.find((l) => l.accountCode === "1100")?.creditMinor,
+    105_000,
+  );
+  check(
+    "with revenue debited back off",
+    creditPostings.find((l) => l.accountCode === "4000")?.debitMinor,
+    100_000,
+  );
+
+  const bothWays = journalTotals([...invoicePostings, ...creditPostings]);
+  check("an invoice and its full credit note net to nothing", bothWays.debitMinor, bothWays.creditMinor);
+
+  // A document whose stored total disagrees with taxable + tax gets a visible
+  // rounding line rather than an unbalanced journal the import will reject.
+  const wonky = documentJournalLines({ ...sampleInvoice, totalMinor: 105_001 }, "invoice");
+  check("a one-fil discrepancy produces a fourth, named line", wonky.length, 4);
+  checkTrue("and the journal still balances", journalTotals(wonky).balanced);
+  check(
+    "on an account whose name says what it is",
+    wonky.find((l) => l.accountCode === "9999")?.accountName,
+    "Rounding difference",
+  );
+
+  const receipt = paymentJournalLines({
+    reference: "TT-9931",
+    date: "2026-03-20",
+    contact: "Serai Tower Owners Association",
+    currency: "AED",
+    amountMinor: 105_000,
+    method: "bank_transfer",
+    invoiceReference: "INV-2026-00001",
+  });
+  checkTrue("a receipt balances", journalTotals(receipt).balanced);
+  check("it debits the bank", receipt.find((l) => l.debitMinor > 0)?.accountCode, "1010");
+  check("and credits receivables", receipt.find((l) => l.creditMinor > 0)?.accountCode, "1100");
+  checkTrue(
+    "and posts no VAT — the output tax was accounted for when the invoice was issued",
+    receipt.every((l) => l.accountCode !== "2100"),
+  );
+
+  const offset = paymentJournalLines({
+    reference: "OFFSET",
+    date: "2026-03-20",
+    contact: "Serai Tower Owners Association",
+    currency: "AED",
+    amountMinor: 1_000,
+    method: "credit_note",
+    invoiceReference: "INV-2026-00001",
+  });
+  check(
+    "a settlement recorded as a credit note does not claim cash arrived",
+    offset.find((l) => l.debitMinor > 0)?.accountCode,
+    "1150",
+  );
+
+  // ── Against the database ──────────────────────────────────────────────────
+  console.log("\n— INV-16/17 against the database —");
+
+  // Unique to this run. Nine suites can be running at once against one
+  // database, and a cleanup anchored to a shared prefix takes another run's
+  // fixtures with it.
+  const runTag = `EXP-${Date.now().toString(36)}`;
+  const invoiceRef = `${runTag}-I1`;
+  const creditRef = `${runTag}-C1`;
+
+  await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
+    const [customer] = (await tx.execute<{ id: string }>(sql`
+      select id from customers where deleted_at is null order by created_at limit 1
+    `)) as unknown as { id: string }[];
+
+    if (!customer) {
+      console.log("skip  no customer to invoice — seed the database for the export checks");
+      return;
+    }
+
+    const packBefore = await corporateTaxPack(tx);
+    const revenueBefore = packBefore.current?.period.revenueMinor ?? 0;
+
+    await tx.execute(sql`
+      insert into invoices (tenant_id, reference, customer_id, status, issued_on, due_on, supply_date,
+                            supplier_name, recipient_name,
+                            subtotal, taxable_amount, tax_amount, total, amount_paid, notes)
+      values (${tenantId}::uuid, ${invoiceRef}, ${customer.id}::uuid, 'issued', now(), now() + interval '30 days',
+              current_date, ${`${runTag} supplier`}, ${`${runTag} recipient`},
+              1000.00, 1000.00, 50.00, 1050.00, 0.00, ${runTag})
+    `);
+
+    const packAfter = await corporateTaxPack(tx);
+    check(
+      "issuing AED 1,000 ex-VAT moves this tax period by exactly 100000 fils",
+      (packAfter.current?.period.revenueMinor ?? 0) - revenueBefore,
+      100_000,
+    );
+    check(
+      "and the invoice count moves with it, so a round figure can be checked",
+      (packAfter.current?.period.invoices ?? 0) - (packBefore.current?.period.invoices ?? 0),
+      1,
+    );
+
+    /*
+     * The assertion this whole requirement turns on.
+     *
+     * The owner dashboard's meter and the tax pack both measure revenue against
+     * AED 3,000,000. If they ever disagreed, the business would believe
+     * whichever screen it read first, and one breach is permanent. They share a
+     * SQL fragment rather than resembling each other, and this is what proves
+     * the sharing has not been undone.
+     */
+    const dashboard = await ownerDashboard(tx);
+    check(
+      "the tax pack and the dashboard report the same revenue, to the fil",
+      packAfter.current?.period.revenueMinor,
+      dashboard.revenue.yearToDateMinor,
+    );
+
+    const current = packAfter.current;
+    checkTrue("the current period is resolved, not left null", current !== null);
+    checkTrue(
+      "its boundaries are a calendar year in Asia/Dubai, computed in SQL",
+      current?.period.startsOn.endsWith("-01-01") === true &&
+        current?.period.endsOn.endsWith("-12-31") === true,
+    );
+    check(
+      "and the period is labelled with its own year",
+      current?.period.period,
+      current?.period.startsOn.slice(0, 4),
+    );
+    checkTrue(
+      "a period in progress is not reported as complete",
+      current?.period.complete === false,
+    );
+    checkTrue(
+      "and no more of it has elapsed than it contains",
+      (current?.period.elapsedDays ?? 0) <= (current?.period.totalDays ?? 0),
+    );
+
+    await tx.execute(sql`
+      insert into credit_notes (tenant_id, reference, invoice_id, customer_id, reason,
+                                issued_on, subtotal, taxable_amount, tax_amount, total, reason_detail)
+      select ${tenantId}::uuid, ${creditRef}, i.id, i.customer_id, 'correction',
+             now(), 400.00, 400.00, 20.00, 420.00, ${runTag}
+        from invoices i where i.reference = ${invoiceRef}
+    `);
+
+    const packCredited = await corporateTaxPack(tx);
+    check(
+      "a AED 400 credit note comes straight back off the period's revenue",
+      (packCredited.current?.period.revenueMinor ?? 0) - revenueBefore,
+      60_000,
+    );
+    check(
+      "and the gross invoiced figure is still reported beside it, not folded away",
+      (packCredited.current?.period.invoicedMinor ?? 0) -
+        (packBefore.current?.period.invoicedMinor ?? 0),
+      100_000,
+    );
+
+    /*
+     * Through `recordPayment` rather than an INSERT, and that is the point of
+     * the assertion it feeds. The export's `balance_incl_vat` is computed from
+     * `invoices.amount_paid`, which is a denormalisation that only the domain
+     * function maintains — a raw INSERT leaves it at zero and the exported
+     * balance is then wrong by the whole payment. Exercising the real path is
+     * what makes the balance check below mean something.
+     */
+    const [invoiceRow] = (await tx.execute<{ id: string }>(
+      sql`select id from invoices where reference = ${invoiceRef}`,
+    )) as unknown as { id: string }[];
+    await recordPayment(tx, { tenantId }, {
+      invoiceId: invoiceRow!.id,
+      amount: "630.00",
+      method: "bank_transfer",
+      reference: runTag,
+    });
+
+    // ── The export ──────────────────────────────────────────────────────────
+    //
+    // Everything below reads the PARSED CSV, not the object the export
+    // returned. A writer that quotes wrongly, drops a column or emits a header
+    // that does not line up with its rows is invisible to an assertion on the
+    // in-memory structure and obvious to one that reads the file back.
+    /*
+     * DUBAI'S DAY, NOT UTC'S.
+     *
+     * This read `new Date().toISOString().slice(0, 10)` and it was wrong for
+     * two hours out of every twenty-four. The export filters on
+     * `issued_on at time zone 'Asia/Dubai'`; an invoice issued at `now()`
+     * between midnight and 02:00 Dubai therefore belongs to a day that UTC has
+     * not reached yet, so a range ending on UTC's day excluded it — and with it
+     * every row the eight assertions below look for.
+     *
+     * The bug is invisible for twenty-two hours a day, which is why it survived
+     * the run that wrote it and failed the one that gated the wave. Deriving
+     * the fixture's day from the same clock the query reads is what makes the
+     * assertions mean anything.
+     */
+    const todayDubai = today();
+    const exported = await accountingExport(tx, { from: `${todayDubai.slice(0, 4)}-01-01`, to: todayDubai });
+
+    const parsed = (table: ExportTable) => parseCsv(toCsv(table));
+
+    const invoiceCsv = parsed(exported.tables.invoices);
+    const header = invoiceCsv.header;
+    const mine = invoiceCsv.rows.find((r) => r[header.indexOf("invoice_reference")] === invoiceRef);
+    checkTrue("the invoice is in the exported file", mine !== undefined);
+    check(
+      "its taxable amount is exported VAT-EXCLUSIVE, to the fil",
+      mine?.[header.indexOf("taxable_amount_excl_vat")],
+      "1000.00",
+    );
+    check(
+      "its total is exported VAT-INCLUSIVE, under a heading that says so",
+      mine?.[header.indexOf("total_incl_vat")],
+      "1050.00",
+    );
+    check("the VAT rate is a percentage, not basis points", mine?.[header.indexOf("vat_rate_percent")], "5");
+    check(
+      "the balance is net of both the payment and the credit note",
+      mine?.[header.indexOf("balance_incl_vat")],
+      "0.00",
+    );
+    checkTrue(
+      "every money column says whether it is VAT-inclusive or VAT-exclusive",
+      header
+        .filter((c) => /amount|total|balance|subtotal|discount|credited|paid/.test(c))
+        .every((c) => c.endsWith("_excl_vat") || c.endsWith("_incl_vat") || c === "vat_amount"),
+    );
+
+    const creditCsv = parsed(exported.tables.credit_notes);
+    const creditRow = creditCsv.rows.find(
+      (r) => r[creditCsv.header.indexOf("credit_note_reference")] === creditRef,
+    );
+    checkTrue("the credit note is exported too", creditRow !== undefined);
+    check(
+      "keyed to the invoice it credits, which Article 60 requires",
+      creditRow?.[creditCsv.header.indexOf("original_invoice_reference")],
+      invoiceRef,
+    );
+
+    /*
+     * The control total. The receivables schedule an accountant reconciles and
+     * the outstanding figure the dashboard shows are one calculation folded two
+     * ways — `arAgeing` is a fold over `openReceivables` — and this is what
+     * proves the fold has not been replaced by a second query.
+     */
+    const ageing = await arAgeing(tx);
+    const receivableCsv = parsed(exported.tables.receivables);
+    const outstandingColumn = receivableCsv.header.indexOf("outstanding_incl_vat");
+    const scheduleTotal = receivableCsv.rows.reduce(
+      (sum, r) => sum + Math.round(Number(r[outstandingColumn]) * 100),
+      0,
+    );
+    check(
+      "the AR schedule sums to the AR control total, to the fil",
+      scheduleTotal,
+      ageing.totalOutstandingMinor,
+    );
+
+    const journalCsv = parsed(exported.tables.journal);
+    const debitColumn = journalCsv.header.indexOf("debit");
+    const creditColumn = journalCsv.header.indexOf("credit");
+    const debits = journalCsv.rows.reduce((s, r) => s + Math.round(Number(r[debitColumn]) * 100), 0);
+    const credits = journalCsv.rows.reduce((s, r) => s + Math.round(Number(r[creditColumn]) * 100), 0);
+    check("the exported journal balances — an unbalanced one is rejected on import", debits, credits);
+    check("and the in-memory total agrees with the parsed file", debits, exported.journalBalance.debitMinor);
+    checkTrue("which the export reports as balanced", exported.journalBalance.balanced);
+
+    const revenueLines = journalCsv.rows.filter(
+      (r) => r[journalCsv.header.indexOf("account_code")] === "4000",
+    );
+    const revenueNet = revenueLines.reduce(
+      (s, r) => s + Math.round(Number(r[creditColumn]) * 100) - Math.round(Number(r[debitColumn]) * 100),
+      0,
+    );
+    checkTrue(
+      "the credit note debits revenue back off in the journal, as it does in the pack",
+      revenueNet < debits,
+    );
+
+    // ── Truncation ──────────────────────────────────────────────────────────
+    //
+    // The export's row count is asserted against `count(*)` over the same
+    // predicate, inside the same transaction so the two see one snapshot while
+    // eight other suites write to the same database.
+    const [invoiceCount] = (await tx.execute<{ n: string }>(sql`
+      select count(*)::text as n
+        from invoices
+       where deleted_at is null
+         and status <> 'draft'
+         and issued_on is not null
+         and (issued_on at time zone 'Asia/Dubai') >= ${`${todayDubai.slice(0, 4)}-01-01`}::date
+         and (issued_on at time zone 'Asia/Dubai') < ${todayDubai}::date + interval '1 day'
+    `)) as unknown as { n: string }[];
+
+    check(
+      "the export holds every invoice in the range, not a page of them",
+      exported.tables.invoices.rowCount,
+      Number(invoiceCount?.n ?? -1),
+    );
+    check(
+      "and the stated count is the number of rows actually written",
+      exported.tables.invoices.rowCount,
+      invoiceCsv.rows.length,
+    );
+
+    /*
+     * Now drive the batching loop past its boundary with real rows.
+     *
+     * The internal batch is 500. A loop that stopped after one round trip would
+     * be invisible to every assertion above, because a seeded database has
+     * fewer than 500 of anything. 501 payments is the smallest fixture that
+     * proves the second round trip happens and that the keyset carries across
+     * it — and because `now()` is transaction-stable, all 501 share one
+     * timestamp, so the boundary is crossed on the id tiebreak alone, which is
+     * the harder half.
+     */
+    const paymentsBefore = exported.tables.payments.rowCount;
+    await tx.execute(sql`
+      insert into payments (tenant_id, invoice_id, amount, method, reference, received_at)
+      select ${tenantId}::uuid, i.id, 0.01, 'cash', ${`${runTag}-BULK`}, now()
+        from invoices i, generate_series(1, 501)
+       where i.reference = ${invoiceRef}
+    `);
+
+    const bulk = await accountingExport(tx, { from: `${todayDubai.slice(0, 4)}-01-01`, to: todayDubai });
+    check(
+      "501 more payments appear in the export, every one of them",
+      bulk.tables.payments.rowCount - paymentsBefore,
+      501,
+    );
+    const bulkCsv = parseCsv(toCsv(bulk.tables.payments));
+    check("and every one of them is written to the file", bulkCsv.rows.length, bulk.tables.payments.rowCount);
+    check(
+      "the file's own trailer states the same number",
+      toCsv(bulk.tables.payments).includes(`# payments: ${bulk.tables.payments.rowCount} rows`),
+      true,
+    );
+    const bulkIds = new Set(bulkCsv.rows.map((r) => r[bulkCsv.header.indexOf("payment_id")]));
+    check("with no row repeated across the batch boundary", bulkIds.size, bulkCsv.rows.length);
+    checkTrue("and the journal still balances at 501 more receipts", bulk.journalBalance.balanced);
+
+    // A range that ends before it starts is refused rather than silently
+    // returning an empty, importable, wrong file.
+    let badRangeRefused = false;
+    try {
+      await accountingExport(tx, { from: "2026-12-31", to: "2026-01-01" });
+    } catch {
+      badRangeRefused = true;
+    }
+    checkTrue("a backwards date range is refused, not exported empty", badRangeRefused);
+
+    /*
+     * The tenant boundary, on the one file that contains every customer's
+     * ledger.
+     *
+     * `withTenant` scopes the queries, and this is what proves it rather than
+     * assuming it. An export that crossed tenants would hand one company's
+     * customers, prices and TRNs to another company's accountant — and unlike a
+     * screen, the file leaves the building.
+     */
+    const foreign = await withTenant({ tenantId: foreignTenantId, actorKind: "system" }, (t2) =>
+      accountingExport(t2, { from: `${todayDubai.slice(0, 4)}-01-01`, to: todayDubai }),
+    );
+    const foreignCsv = parseCsv(toCsv(foreign.tables.invoices));
+    checkTrue(
+      "another tenant's accounting export contains none of this tenant's invoices",
+      !foreignCsv.rows.some(
+        (r) => r[foreignCsv.header.indexOf("invoice_reference")] === invoiceRef,
+      ),
+    );
+    const foreignJournal = parseCsv(toCsv(foreign.tables.journal));
+    checkTrue(
+      "nor does its journal",
+      !foreignJournal.rows.some(
+        (r) => r[foreignJournal.header.indexOf("document_reference")] === invoiceRef,
+      ),
+    );
+
+    // ── Cleanup, anchored to this run's tag ─────────────────────────────────
+    await tx.execute(sql`delete from payments where reference in (${runTag}, ${`${runTag}-BULK`})`);
+    await tx.execute(sql`delete from credit_notes where reason_detail = ${runTag}`);
+    await tx.execute(sql`delete from invoices where notes = ${runTag}`);
   });
 
   // ── 7. Tenant isolation on the new table ──────────────────────────────────

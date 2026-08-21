@@ -1,9 +1,21 @@
 /**
- * Object storage.
+ * Object storage and the media pipeline.
  *
- * See `store.ts` for the interface and why it looks the way it does, `local.ts`
- * for the one driver that exists, and `sniff.ts` for why a caller's declared
- * content type is never believed.
+ * See `store.ts` for the storage interface and why it looks the way it does,
+ * `local.ts` for the one driver that exists, and `sniff.ts` for why a caller's
+ * declared content type is never believed.
+ *
+ * The pipeline TRD §8.6 describes is split across four more modules, each of
+ * which says in its own header why it is shaped the way it is:
+ *
+ *  * `chunks.ts` — resumable upload arithmetic, so a dropped connection costs
+ *    one chunk rather than a 12 MB photo.
+ *  * `exif.ts` — read the coordinates into columns, then take them out of the
+ *    file. Dependency-free, because it holds a security property.
+ *  * `images.ts` — resize, re-encode and HEIC conversion, which need a native
+ *    library and therefore report honestly when they cannot run.
+ *  * `scan.ts` / `clamav.ts` — the `ATS-9` virus scan, as an interface with a
+ *    real driver and an explicit "no scanner configured" state.
  */
 
 import { resolve } from "node:path";
@@ -13,6 +25,11 @@ import type { ObjectStore } from "./store";
 export * from "./sniff";
 export * from "./store";
 export * from "./download";
+export * from "./scan";
+export * from "./clamav";
+export * from "./exif";
+export * from "./images";
+export * from "./chunks";
 export { LocalFileStore, sha256Hex } from "./local";
 
 let _store: ObjectStore | undefined;

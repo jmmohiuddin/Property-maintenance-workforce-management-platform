@@ -7,3 +7,4 @@ export * from "./enrolment";
 export * from "./lockout";
 export * from "./login";
 export * from "./reset";
+export * from "./device";

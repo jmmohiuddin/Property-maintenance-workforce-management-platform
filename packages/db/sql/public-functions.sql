@@ -911,3 +911,25 @@ $$;
 
 REVOKE ALL ON FUNCTION app_public_request_interview_reschedule(text, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app_public_request_interview_reschedule(text, text) TO meridian_app;
+
+-- ── app_product_event: closed to PUBLIC ─────────────────────────────────────
+--
+-- Created by migration 0017 and extended by 0018, without a REVOKE. Migrations
+-- define structure; this file set owns the boundary, so the grant belongs here
+-- rather than there -- which is exactly why it was missed.
+--
+-- It is SECURITY DEFINER and takes the tenant as a PARAMETER, so any role that
+-- can connect could write product_events attributed to any tenant. Not a read
+-- of anybody's data, but the analytics stream is what KPI-2 reports the business
+-- on, and a figure anyone can inflate is not a measurement.
+--
+-- Safe for the six trigger emitters that call it: they are themselves SECURITY
+-- DEFINER and owned by the same role, so they execute it by ownership, not by
+-- the PUBLIC grant. Verified by re-running the suites after this landed.
+--
+-- Found by verify-rls.sql check 14, added the same evening after a mid-file
+-- abort in auth-functions.sql left a whole authentication surface executable by
+-- PUBLIC with nothing reporting it. This was the second thing that check found,
+-- and it had been open since 0017.
+REVOKE ALL ON FUNCTION app_product_event(uuid, text, text, uuid, jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app_product_event(uuid, text, text, uuid, jsonb) TO meridian_app;

@@ -19,9 +19,11 @@
  * Requires the schema, RLS and `npm run db:seed`. Cleans up after itself.
  */
 
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, ne, inArray } from "drizzle-orm";
 import {
   withTenant,
+  withCustomerScope,
+  createPortalRequest,
   listAssetCategories,
   addAssetCategory,
   setAssetCategoryActive,
@@ -31,6 +33,7 @@ import {
   listPropertyAssets,
   getAssetRecord,
   getPropertyRecord,
+  listAssetChoices,
   listLinkableJobs,
   linkJobToAsset,
   STANDARD_ASSET_CATEGORIES,
@@ -74,6 +77,7 @@ async function main(): Promise<void> {
 
   const createdAssets: string[] = [];
   const createdJobs: string[] = [];
+  const createdProperties: string[] = [];
   const createdCategories: string[] = [];
 
   // ── The vocabulary exists ────────────────────────────────────────────────
@@ -430,7 +434,7 @@ async function main(): Promise<void> {
     await refusal(() =>
       withTenant(ctx, (tx) => linkJobToAsset(tx, ctx, { assetId: asset.id, jobId: elsewhere.id })),
     ),
-    "That job was raised at a different property.",
+    "That asset and that job are at different properties.",
   );
 
   checkTrue(
@@ -440,6 +444,156 @@ async function main(): Promise<void> {
         withTenant(ctx, (tx) => linkJobToAsset(tx, ctx, { assetId: expired.id, jobId: here.id })),
       )
     ).includes("already attached to another asset"),
+  );
+
+  // ── CON-13 at intake, not after the fact ─────────────────────────────────
+  //
+  // Everything above attaches history from the asset side, which is the
+  // correction path. This is the point-of-work path: the customer reporting the
+  // fault names the equipment, and the job arrives already carrying it.
+  //
+  // A second building ON THE SAME ACCOUNT, so that "wrong property" is proven
+  // by the property rule rather than by customer scope refusing to see the row
+  // at all — two different refusals that would otherwise look identical.
+  const [annex] = await withTenant(ctx, (tx) =>
+    tx
+      .insert(schema.properties)
+      .values({
+        tenantId,
+        customerId: site.customerId,
+        name: `__TEST annex ${RUN}`,
+        type: "other" as const,
+        addressLine: "__TEST annex address",
+        city: "Dubai",
+      })
+      .returning({ id: schema.properties.id }),
+  );
+  if (!annex) throw new Error("failed to create the second property");
+  createdProperties.push(annex.id);
+
+  const annexAsset = await withTenant(ctx, (tx) =>
+    registerAsset(tx, ctx, {
+      propertyId: annex.id,
+      categoryId: chiller.id,
+      tag: `ZZ-ANNEX-${RUN}`,
+      name: "__TEST annex chiller",
+    }),
+  );
+  createdAssets.push(annexAsset.id);
+
+  const portalCtx = { tenantId, customerId: site.customerId, actorKind: "customer" as const };
+
+  const choices = await withCustomerScope(portalCtx, (tx) => listAssetChoices(tx, [site.id]));
+  checkTrue(
+    "the intake picker offers the plant registered at that property",
+    choices.some((c) => c.id === asset.id),
+  );
+  checkTrue(
+    "and not plant in the other building on the same account",
+    !choices.some((c) => c.id === annexAsset.id),
+  );
+  check(
+    "asking for no properties asks the database nothing",
+    (await withCustomerScope(portalCtx, (tx) => listAssetChoices(tx, []))).length,
+    0,
+  );
+
+  // The `assets` policy added to sql/customer-scope.sql. Until the intake
+  // picker existed, no portal query touched the table and it carried tenant
+  // isolation only — which is "every machine in every building in the tenant"
+  // to a portal session, not "nothing", for the reason that file sets out at
+  // length about `job_visits`.
+  const [stranger] = await withTenant(ctx, (tx) =>
+    tx
+      .select({ id: schema.customers.id })
+      .from(schema.customers)
+      .where(ne(schema.customers.id, site.customerId))
+      .limit(1),
+  );
+  if (stranger) {
+    check(
+      "another customer in the same tenant sees none of this plant",
+      (
+        await withCustomerScope(
+          { tenantId, customerId: stranger.id, actorKind: "customer" as const },
+          (tx) => listAssetChoices(tx, [site.id]),
+        )
+      ).length,
+      0,
+    );
+  } else {
+    console.log("skip  customer scope not proven — this tenant has only one customer");
+  }
+
+  const raised = await withCustomerScope(portalCtx, (tx) =>
+    createPortalRequest(
+      tx,
+      { tenantId, customerId: site.customerId },
+      {
+        propertyId: site.id,
+        serviceSlug: "hvac-installation-maintenance",
+        title: `__TEST the chiller is short cycling ${RUN}`,
+        requestedPriority: "p3_standard",
+        assetId: asset.id,
+      },
+    ),
+  );
+  createdJobs.push(raised.jobId);
+  check("intake names the equipment it attached", raised.assetName, "__TEST chiller");
+
+  const afterIntake = await withTenant(ctx, (tx) => getAssetRecord(tx, asset.id));
+  checkTrue(
+    "CON-13: a request raised in the portal arrives already on the asset's history",
+    (afterIntake?.history ?? []).some((h) => h.jobId === raised.jobId),
+  );
+  check("and the register's count agrees", afterIntake?.asset.jobCount, 2);
+
+  // The regression that matters. `last_serviced_at` is recomputed from
+  // max(completed_at) of the linked jobs, not from now() — so attaching an
+  // OPEN job must not reset the PPM clock to today and hide an overdue service.
+  check(
+    "attaching an open job does not move the last-serviced date",
+    afterIntake?.asset.lastServicedAt?.toISOString(),
+    completedAt.toISOString(),
+  );
+  checkTrue(
+    "and the next service still falls due one interval after the work that was actually done",
+    Math.round(
+      ((afterIntake?.asset.nextServiceDueAt?.getTime() ?? 0) - completedAt.getTime()) / DAY_MS,
+    ) === chiller.defaultPpmIntervalDays,
+  );
+
+  const wrongBuilding = `__TEST wrong building ${RUN}`;
+  check(
+    "a request cannot name plant from a different building",
+    await refusal(() =>
+      withCustomerScope(portalCtx, (tx) =>
+        createPortalRequest(
+          tx,
+          { tenantId, customerId: site.customerId },
+          {
+            propertyId: site.id,
+            serviceSlug: "hvac-installation-maintenance",
+            title: wrongBuilding,
+            requestedPriority: "p3_standard",
+            assetId: annexAsset.id,
+          },
+        ),
+      ),
+    ),
+    "That asset and that job are at different properties.",
+  );
+  check(
+    "and the refusal takes the job with it rather than leaving one badly linked",
+    (
+      await withTenant(ctx, (tx) =>
+        tx
+          .select({ id: schema.jobs.id })
+          .from(schema.jobs)
+          .where(eq(schema.jobs.title, wrongBuilding)),
+      )
+    ).length,
+    0,
   );
 
   // ── The tenant boundary ──────────────────────────────────────────────────
@@ -479,6 +633,10 @@ async function main(): Promise<void> {
       await tx
         .delete(schema.assetCategories)
         .where(inArray(schema.assetCategories.id, createdCategories));
+    }
+    // Last: the jobs and the assets above both point at it.
+    if (createdProperties.length > 0) {
+      await tx.delete(schema.properties).where(inArray(schema.properties.id, createdProperties));
     }
   });
 

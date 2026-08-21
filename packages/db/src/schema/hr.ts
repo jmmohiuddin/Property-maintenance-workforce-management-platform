@@ -388,3 +388,288 @@ export const salaryDeductions = pgTable(
     index("salary_deductions_cycle_idx").on(t.tenantId, t.wageCycleId),
   ],
 );
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HR-13 — The end-of-service settlement
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * What was actually paid when an employment ended, and whether it was on time.
+ *
+ * ── WHY THERE IS NO ACCRUAL TABLE ───────────────────────────────────────────
+ *
+ * The obvious design stores a running gratuity balance per employee and updates
+ * it monthly. It is the same design `leave_balances` refuses, for the same
+ * reason and with a bigger number attached: an accrual is a **derivation** from
+ * the service start date and the basic salary, both of which already exist, and
+ * a stored derivation drifts. A salary corrected retroactively, a start date
+ * fixed after an onboarding error, a row updated by hand — and the stored
+ * balance and the formula disagree, with the stored one being what somebody
+ * gets paid.
+ *
+ * So the liability is computed, every time, by `gratuityAccrual` in
+ * `packages/core`. `HR-13` asks for it to be "accrued and visible as a
+ * liability", and visible is what it says: the HR board reads the figure live
+ * rather than reading a cache of it.
+ *
+ * ── WHY THIS TABLE EXISTS ANYWAY ────────────────────────────────────────────
+ *
+ * A settlement is not a derivation. It is a payment, on a date, of an amount
+ * somebody authorised, against a statutory deadline of 14 days from
+ * termination — and every input to it moves afterwards. The employee's basic
+ * salary column will be edited, their contract terms superseded, and the whole
+ * employee record purged two years after termination by `HR-15`. A settlement
+ * that could only be recomputed from rows that no longer exist is not evidence
+ * of anything, which is why the service dates and both wage figures are frozen
+ * onto the row rather than joined to.
+ *
+ * Payroll is a tax record. Seven-year floor in `domain/retention.ts`, and the
+ * two-year `HR-15` employee clock must never delete it first.
+ */
+export const gratuitySettlements = pgTable(
+  "gratuity_settlements",
+  {
+    id: idCol(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    employeeId: uuid("employee_id")
+      .notNull()
+      .references(() => employees.id, { onDelete: "cascade" }),
+    /** The day the relationship ended. The 14-day clock starts here. */
+    terminatedOn: date("terminated_on").notNull(),
+    /** Frozen. `employees.contract_start` is editable and this must not be. */
+    serviceStart: date("service_start").notNull(),
+    serviceDays: integer("service_days").notNull(),
+    completedYears: integer("completed_years").notNull(),
+    /**
+     * Monthly **basic** at settlement. The accrual base, and only ever basic —
+     * housing, transport, utilities and furniture are excluded by Article 51.
+     */
+    basicMonthly: money("basic_monthly").notNull(),
+    /**
+     * Monthly **total** wage at settlement: basic plus every allowance.
+     *
+     * A different number from the one above, on the same row, on purpose. It is
+     * the base for the two-years cap and for nothing else. Storing only one
+     * figure would make it impossible to say afterwards which of the two rules
+     * the settlement was computed under.
+     */
+    totalMonthlyWage: money("total_monthly_wage").notNull(),
+    /** Before the cap. Kept so the cap can be seen to have been applied. */
+    uncappedAmount: money("uncapped_amount").notNull(),
+    /** Two years' total wages. */
+    capAmount: money("cap_amount").notNull(),
+    /** What is owed: the lesser of the two above. */
+    gratuityAmount: money("gratuity_amount").notNull(),
+    /**
+     * Terminated + 14 days. Stored rather than derived for the same reason
+     * `wage_cycles.due_on` is: a statutory deadline that moved once can move
+     * again, and history must not move with it.
+     */
+    settlementDueOn: date("settlement_due_on").notNull(),
+    /** Null while unpaid — which is the state the alert is about. */
+    paidOn: date("paid_on"),
+    paymentReference: varchar("payment_reference", { length: 64 }),
+    recordedById: uuid("recorded_by_id").references(() => users.id, { onDelete: "set null" }),
+    note: text("note"),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex("gratuity_settlements_employee_key")
+      .on(t.tenantId, t.employeeId)
+      .where(sql`${t.deletedAt} is null`),
+    // The overdue sweep's exact predicate: unpaid settlements past their day.
+    index("gratuity_settlements_due_idx")
+      .on(t.tenantId, t.settlementDueOn)
+      .where(sql`${t.paidOn} is null and ${t.deletedAt} is null`),
+  ],
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HR-19 — Subcontractors and manpower suppliers
+// ═══════════════════════════════════════════════════════════════════════════
+
+export const SUBCONTRACTOR_KINDS = ["subcontractor", "manpower_supplier"] as const;
+export type SubcontractorKind = (typeof SUBCONTRACTOR_KINDS)[number];
+
+export const SUBCONTRACTOR_STATUSES = ["approved", "provisional", "suspended", "withdrawn"] as const;
+export type SubcontractorStatus = (typeof SUBCONTRACTOR_STATUSES)[number];
+
+/**
+ * An organisation that supplies labour or takes a scope of work (`HR-19`).
+ *
+ * The requirement's own justification is the design constraint: **responsibility
+ * for site compliance does not transfer with the work.** A subcontractor's
+ * worker on our site with an expired permit is our exposure under Article 60 —
+ * AED 100,000 to AED 1,000,000 — as surely as an employee would be. So the
+ * expiries here are watched by the same sweep that watches employee documents
+ * and company accreditations, rather than living on a spreadsheet somebody
+ * checks at renewal.
+ *
+ * ── WHY THREE NAMED EXPIRY COLUMNS AND NOT A GENERIC DOCUMENT TABLE ─────────
+ *
+ * Because there is exactly one of each. An organisation has one trade licence,
+ * one liability policy and one workmen's compensation cover; a table of
+ * arbitrary documents would model a cardinality that does not exist and would
+ * then need a `kind` vocabulary and a uniqueness constraint to put it back. The
+ * per-worker permits below genuinely are one-to-many, and they have a table.
+ *
+ * ── THE SEAM WITH `PRJ-9` ──────────────────────────────────────────────────
+ *
+ * `PRJ-9` describes the same organisation engaged against a project scope with
+ * its own payment terms. That is an *engagement*, and an engagement belongs to
+ * the projects module — it points at a row here rather than duplicating one.
+ * Nothing on this table knows about a project, deliberately: two registers that
+ * disagreed about whether a licence was current would be worse than one, and
+ * the way that happens is each module growing its own copy of the organisation.
+ * Dubai Law No. 7 of 2025 also requires **prior approval for subcontracting**,
+ * which is why `approval_reference` is here and not there — the approval is
+ * held against the subcontractor, not against one job it was used on.
+ */
+export const subcontractors = pgTable(
+  "subcontractors",
+  {
+    id: idCol(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    name: varchar("name", { length: 160 }).notNull(),
+    /** A supplier of bodies is not a supplier of a scope. Different exposure. */
+    kind: varchar("kind", { length: 24 }).notNull().default("subcontractor"),
+    tradeSlug: varchar("trade_slug", { length: 64 }),
+    contactName: varchar("contact_name", { length: 120 }),
+    contactPhone: varchar("contact_phone", { length: 32 }),
+    contactEmail: varchar("contact_email", { length: 160 }),
+    /** Commercial Register number. Its expiry stops them trading, not just us. */
+    tradeLicenceNo: varchar("trade_licence_no", { length: 64 }),
+    tradeLicenceExpiresOn: date("trade_licence_expires_on"),
+    liabilityInsurer: varchar("liability_insurer", { length: 120 }),
+    liabilityPolicyNo: varchar("liability_policy_no", { length: 64 }),
+    liabilityExpiresOn: date("liability_expires_on"),
+    workmenCompInsurer: varchar("workmen_comp_insurer", { length: 120 }),
+    workmenCompPolicyNo: varchar("workmen_comp_policy_no", { length: 64 }),
+    workmenCompExpiresOn: date("workmen_comp_expires_on"),
+    /** Dubai Law No. 7 of 2025: prior approval is required to subcontract. */
+    approvalReference: varchar("approval_reference", { length: 64 }),
+    /**
+     * The supplier's 15-digit TRN, where they are VAT-registered.
+     *
+     * Not decoration: their invoices to us carry it, and `INV-6` distinguishes
+     * a full tax invoice from a simplified one on exactly that basis. A
+     * supplier whose TRN we do not hold is one whose input tax we cannot
+     * evidence. Validated against `TRN_PATTERN` in `packages/core` — the same
+     * fifteen digits the tax-invoice renderer enforces. There is not a second
+     * pattern, because a second pattern is one edit away from disagreeing.
+     */
+    taxRegistrationNumber: varchar("tax_registration_number", { length: 15 }),
+    /**
+     * Third-party certifications the supplier holds:
+     * `[{ name, issuer, expiresOn }]`.
+     *
+     * ── WHY jsonb HERE AND A TABLE FOR OUR OWN (`HR-14`) ────────────────────
+     *
+     * `company_accreditations` is a table with a `kind` vocabulary because we
+     * control what we hold and we renew it: that register drives the tender
+     * pack and carries a renewal owner per row. A supplier's accreditations are
+     * neither. We do not control the issuing schemes, cannot enumerate them in
+     * advance, and have no renewal to own — so a `kind` vocabulary would either
+     * reject a real certificate or grow an `other` bucket that swallowed most
+     * of them, which is free text with extra steps.
+     *
+     * The three licence and insurance columns above stay columns for the
+     * opposite reason: there is exactly one of each, and each has a statutory
+     * consequence attached. This is the open-ended tail, and it is shaped as
+     * one.
+     *
+     * `expiresOn` inside the JSON is a `YYYY-MM-DD` string, like every other
+     * day-valued field in this module, and it IS swept —
+     * `findExpiringSubcontractorObligations` expands this array into the same
+     * union as the three columns above. A free-form tail with its own expiry
+     * clock that nothing sweeps is how one clock silently stops being checked.
+     */
+    accreditations: jsonb("accreditations").notNull().default([]),
+    status: varchar("status", { length: 16 }).notNull().default("provisional"),
+    note: text("note"),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex("subcontractors_name_key")
+      .on(t.tenantId, t.name)
+      .where(sql`${t.deletedAt} is null`),
+    // Three expiries, one index each, all with the same predicate as
+    // employee_documents_blocking_expiry_idx — same question, different subject.
+    index("subcontractors_licence_expiry_idx")
+      .on(t.tenantId, t.tradeLicenceExpiresOn)
+      .where(sql`${t.deletedAt} is null`),
+    index("subcontractors_liability_expiry_idx")
+      .on(t.tenantId, t.liabilityExpiresOn)
+      .where(sql`${t.deletedAt} is null`),
+    index("subcontractors_workmen_expiry_idx")
+      .on(t.tenantId, t.workmenCompExpiresOn)
+      .where(sql`${t.deletedAt} is null`),
+  ],
+);
+
+/**
+ * One worker supplied by one subcontractor, and whether we checked their permit.
+ *
+ * ── WHY THESE ARE NOT `employees`, AND NOT `technicians` ────────────────────
+ *
+ * `employees` is the employment record, and recording a supplied worker as one
+ * would put them in the payroll, in the WPS wage file, in the gratuity
+ * liability and in the Emiratisation denominator — four places they do not
+ * belong. `schema/compliance.ts` says so at the top of the file: a model that
+ * forces every worker to be an employee makes the distinction unrepresentable,
+ * "at which point somebody records a subcontractor as an employee and the
+ * payroll numbers stop meaning anything".
+ *
+ * ── WHY THIS IS NOT A FOURTH DISPATCH BLOCK ────────────────────────────────
+ *
+ * `HR-9` hard-blocks assignment on an expired permit, and it reads
+ * `employee_documents`. Nothing here changes that, because nothing here is
+ * assignable: a supplied worker has no `technicians` row and so cannot be put
+ * on a job by this system at all. Where a supplied worker IS also carried as a
+ * technician — which happens, and is what `employment_type` on that table is
+ * for — they go through `HR-9` like anybody else, from their employee record.
+ * What this register adds is the case the hard block cannot see: the worker who
+ * is on our site under somebody else's payroll, whose permit is still our
+ * exposure, and whose expiry nothing was watching.
+ */
+export const subcontractorWorkers = pgTable(
+  "subcontractor_workers",
+  {
+    id: idCol(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    subcontractorId: uuid("subcontractor_id")
+      .notNull()
+      .references(() => subcontractors.id, { onDelete: "cascade" }),
+    fullName: varchar("full_name", { length: 160 }).notNull(),
+    tradeSlug: varchar("trade_slug", { length: 64 }),
+    /** MOHRE work permit. Two-year standard validity, same as `HR-5`. */
+    workPermitNo: varchar("work_permit_no", { length: 64 }),
+    workPermitExpiresOn: date("work_permit_expires_on"),
+    /**
+     * Who checked the permit, and when they last saw it.
+     *
+     * A recorded expiry date is a claim by the supplier. A verification is a
+     * claim by us, with a name against it, and it is the second one an
+     * inspector asks for. Null means nobody has looked — which is the state the
+     * register exists to make visible rather than the state it hides.
+     */
+    verifiedById: uuid("verified_by_id").references(() => users.id, { onDelete: "set null" }),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }),
+    /** False once they leave the supplier or the site. Not deleted. */
+    isActive: boolean("is_active").notNull().default(true),
+    note: text("note"),
+    ...timestamps,
+  },
+  (t) => [
+    index("subcontractor_workers_supplier_idx").on(t.tenantId, t.subcontractorId),
+    index("subcontractor_workers_permit_expiry_idx")
+      .on(t.tenantId, t.workPermitExpiresOn)
+      .where(sql`${t.isActive} and ${t.deletedAt} is null`),
+  ],
+);

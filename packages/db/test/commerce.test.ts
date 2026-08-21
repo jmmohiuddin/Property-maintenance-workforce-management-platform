@@ -29,6 +29,7 @@ import {
   recordPayment,
   searchInvoices,
   arAgeing,
+  openReceivables,
   transitionJob,
   schema,
   closeConnection,
@@ -235,9 +236,46 @@ async function main(): Promise<void> {
   checkTrue("a negative payment is rejected", negativeRejected);
 
   // ── AR ageing ─────────────────────────────────────────────────────────────
-  const ageing = await withTenant(ctx, (tx) => arAgeing(tx));
+  //
+  // Read in ONE transaction, because eight other suites are writing to this
+  // database and a schedule fetched at one instant against a total fetched at
+  // another would disagree for a reason that has nothing to do with the code.
+  const { ageing, schedule } = await withTenant(ctx, async (tx) => ({
+    ageing: await arAgeing(tx),
+    schedule: await openReceivables(tx),
+  }));
   checkTrue("a fully paid invoice is excluded from ageing", ageing.totalOutstandingMinor >= 0);
   console.log(`      outstanding: ${formatMoney(ageing.totalOutstandingMinor)}`);
+
+  /*
+   * The detail must reconcile to the control total.
+   *
+   * `INV-16` puts this schedule in front of an accountant, who reconciles it
+   * against the summary the moment they receive both. `arAgeing` is a fold over
+   * `openReceivables` for exactly that reason — two independent queries would
+   * agree right up until one of them learned about a new invoice status and the
+   * other did not, and the first symptom would be a schedule short by one
+   * invoice. These four checks are what stop the fold being replaced by a
+   * second query at some later date.
+   */
+  const scheduleTotal = schedule.reduce((sum, r) => sum + r.outstandingMinor, 0);
+  check("the AR schedule sums to the AR control total", scheduleTotal, ageing.totalOutstandingMinor);
+
+  const bucketTotal = (bucket: string) =>
+    schedule.filter((r) => r.bucket === bucket).reduce((sum, r) => sum + r.outstandingMinor, 0);
+  check("and bucket by bucket — current", bucketTotal("current"), ageing.currentMinor);
+  check("1 to 30 days", bucketTotal("days_1_30"), ageing.days1to30Minor);
+  check("31 to 60 days", bucketTotal("days_31_60"), ageing.days31to60Minor);
+  check("61 days and over", bucketTotal("days_61_plus"), ageing.days61PlusMinor);
+
+  checkTrue(
+    "nothing settled is on the schedule — every row is money still owed",
+    schedule.every((r) => r.outstandingMinor > 0),
+  );
+  checkTrue(
+    "and the paid invoice raised above is not one of them",
+    !schedule.some((r) => r.invoiceId === invoice.invoiceId),
+  );
 
   // ── Customer scoping ──────────────────────────────────────────────────────
   // The decisive test: a portal session scoped to a DIFFERENT customer must not

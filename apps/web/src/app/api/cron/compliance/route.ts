@@ -21,6 +21,7 @@ import {
   healthInsuranceGaps,
   workingHoursExceptions,
   hoursSourceWarning,
+  findExpiringSubcontractorObligations,
 } from "@meridian/db/domain";
 import { ISSUANCE_WINDOW_DAYS, LATE_ISSUANCE_PENALTY } from "@meridian/core";
 import {
@@ -75,15 +76,22 @@ import { runCron } from "@/lib/cron";
  *    the requirement says people get wrong.
  *  * `HR-6`, `HR-7`, `HR-8` — health insurance gaps, probation and renewal
  *    windows, and working-time breaches, as one weekly-shaped digest.
+ *  * `HR-19` subcontractor obligations — trade licences, liability and workmen's
+ *    compensation cover, individual work permits, and the subcontractor's own
+ *    accreditations, all on the subcontractor register. "Responsibility for
+ *    site compliance does not transfer with the work", so an expired
+ *    subcontractor licence is our exposure, not only theirs, and it rides in
+ *    the same digest HR and the owner already read.
  *
  * ── FOUR LADDERS, ONE ROUTE, THREE MESSAGES ─────────────────────────────────
  *
- * Documents, accreditations and certifications share one digest because they
- * share a recipient (HR and the owner) and an action (renew a piece of paper).
- * The issuance clock is its own message to the accountant. Renewals are their
- * own message again, one per contract, because a renewal is a conversation with
- * one named customer that gets forwarded to their account manager — and a
- * digest of six contracts cannot be forwarded to anybody.
+ * Documents, accreditations, certifications and subcontractor obligations
+ * share one digest because they share a recipient (HR and the owner) and an
+ * action (renew a piece of paper). The issuance clock is its own message to
+ * the accountant. Renewals are their own message again, one per contract,
+ * because a renewal is a conversation with one named customer that gets
+ * forwarded to their account manager — and a digest of six contracts cannot be
+ * forwarded to anybody.
  */
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -109,6 +117,7 @@ export async function GET(request: Request) {
     let documentsExpired = 0;
     let accreditationsExpiring = 0;
     let certificationsExpiring = 0;
+    let subcontractorsExpiring = 0;
     let notified = 0;
     let suppliesApproaching = 0;
     let suppliesBreached = 0;
@@ -128,16 +137,23 @@ export async function GET(request: Request) {
 
     for (const tenantId of tenants) {
       await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
-        const blocked = await blockedTechnicians(tx);
-        const documents = await findExpiringEmployeeDocuments(tx, ALERT_WINDOW_DAYS);
-        const accreditations = await findExpiringAccreditations(tx, ALERT_WINDOW_DAYS);
-        const certifications = await findExpiringCertifications(tx, ALERT_WINDOW_DAYS);
+        // Computed once per tenant, in Dubai, and threaded through every
+        // expiry sweep below rather than left to each one's own `today()`
+        // default — so a single run reads one "today", not four calls that
+        // could in principle straddle a midnight rollover between them.
+        const now = today();
+        const blocked = await blockedTechnicians(tx, now);
+        const documents = await findExpiringEmployeeDocuments(tx, ALERT_WINDOW_DAYS, now);
+        const accreditations = await findExpiringAccreditations(tx, ALERT_WINDOW_DAYS, now);
+        const certifications = await findExpiringCertifications(tx, ALERT_WINDOW_DAYS, now);
+        const subcontractors = await findExpiringSubcontractorObligations(tx, ALERT_WINDOW_DAYS, now);
 
         blockedNow += blocked.length;
         documentsExpiring += documents.length;
         documentsExpired += documents.filter((d) => d.daysRemaining < 0).length;
         accreditationsExpiring += accreditations.length;
         certificationsExpiring += certifications.length;
+        subcontractorsExpiring += subcontractors.length;
 
         // Reported every run while the condition holds, not once when it starts.
         // A technician who cannot legally be sent to work is a standing problem,
@@ -157,11 +173,26 @@ export async function GET(request: Request) {
           );
         }
 
+        // HR-19: responsibility for site compliance does not transfer with the
+        // work, so a lapsed subcontractor licence is our exposure and gets the
+        // same standing-problem treatment as the blocked-technician warning
+        // above — reported every run while it holds.
+        const expiredSubcontractors = subcontractors.filter((s) => s.daysRemaining < 0);
+        if (expiredSubcontractors.length > 0) {
+          warnings.push(
+            `${expiredSubcontractors.length} subcontractor obligation(s) have EXPIRED: ` +
+              expiredSubcontractors
+                .map((s) => `${s.subcontractorName} — ${s.label}`)
+                .join("; "),
+          );
+        }
+
         const nothingToSay =
           blocked.length === 0 &&
           documents.length === 0 &&
           accreditations.length === 0 &&
-          certifications.length === 0;
+          certifications.length === 0 &&
+          subcontractors.length === 0;
 
         if (!nothingToSay) {
           // HR and the owner both. HR acts on it; the owner carries the
@@ -212,6 +243,12 @@ export async function GET(request: Request) {
                   name: c.technicianName,
                   certification: c.certification,
                   daysRemaining: c.daysRemaining,
+                })),
+                subcontractors: subcontractors.map((s) => ({
+                  subcontractorName: s.subcontractorName,
+                  label: s.label,
+                  subject: s.subject,
+                  daysRemaining: s.daysRemaining,
                 })),
               },
             });
@@ -434,7 +471,8 @@ export async function GET(request: Request) {
         // consequence in force today, and a warning on the onboarding screen
         // when permit issuance is actually suspended. `assessWpsCycle` carries
         // the full argument.
-        const now = today();
+        //
+        // `now` was already computed once, above, when the expiry sweeps ran.
         const wages = await currentWageCycle(tx, { tenantId }, now);
         const unsettled = await unsettledWageCycles(tx, now);
         wpsUnsettled += unsettled.length;
@@ -655,6 +693,7 @@ export async function GET(request: Request) {
         documentsExpiring +
         accreditationsExpiring +
         certificationsExpiring +
+        subcontractorsExpiring +
         suppliesApproaching +
         suppliesBreached +
         renewalsDue +
@@ -669,6 +708,7 @@ export async function GET(request: Request) {
         documentsExpired,
         accreditationsExpiring,
         certificationsExpiring,
+        subcontractorsExpiring,
         suppliesApproaching,
         suppliesBreached,
         renewalsDue,

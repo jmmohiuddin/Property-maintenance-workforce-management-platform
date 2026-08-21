@@ -49,7 +49,8 @@ export default async function DashboardPage() {
     }),
   );
 
-  const { cash, revenue, pipeline, work, contracts, compliance, hiring, billing } = dashboard;
+  const { cash, revenue, pipeline, work, contracts, compliance, hiring, billing, emiratisation } =
+    dashboard;
   const critical = dashboard.attention.filter((a) => a.severity === "critical");
 
   const asOf = dashboard.generatedAt.toLocaleString("en-GB", {
@@ -148,8 +149,9 @@ export default async function DashboardPage() {
           {/* ── 3. Revenue and the relief line ───────────────────────────── */}
           <Card
             title="Revenue"
-            href="/invoices"
+            href="/reports/tax"
             tone={
+              dashboard.tax.current?.standing === "disqualified" ||
               revenue.relief.state === "breached"
                 ? "critical"
                 : revenue.relief.state === "approaching"
@@ -185,6 +187,26 @@ export default async function DashboardPage() {
                 useful moment to know is before, which is the only reason this is
                 on a weekly screen rather than in an annual return.
               */}
+              {/*
+                The meter above measures THIS period, and the relief is lost
+                permanently by a breach in ANY period — so a business that
+                crossed the line two years ago would otherwise read a
+                comfortable green bar here every January. The disqualification
+                outranks the bar rather than sitting under it.
+              */}
+              {dashboard.tax.current?.standing === "disqualified" ? (
+                <p className="prose-body mt-3 text-[13px]">
+                  <strong style={{ color: "var(--status-critical-text)" }}>
+                    The relief was lost in {dashboard.tax.current.disqualifyingPeriod}.
+                  </strong>{" "}
+                  This period is under the line and that does not bring it back — one breach
+                  disqualifies every later period.{" "}
+                  <Link href="/reports/tax" style={{ color: "var(--accent-text)" }}>
+                    Every period
+                  </Link>
+                  .
+                </p>
+              ) : (
               <p className="prose-body mt-3 text-[13px]">
                 {revenue.relief.state === "breached" ? (
                   <>
@@ -202,6 +224,7 @@ export default async function DashboardPage() {
                   </>
                 )}
               </p>
+              )}
               {revenue.relief.registrationRequired ? (
                 <p className="mt-2 text-[12px]" style={{ color: "var(--status-warning-text)" }}>
                   Turnover has passed AED 1,000,000, so corporate tax registration is due by 31
@@ -450,6 +473,46 @@ export default async function DashboardPage() {
                   : `${compliance.nextExpiry.daysRemaining} days`}
               </p>
             ) : null}
+
+            {/*
+              HR-18. A range, not a number — `lowerBound`–`upperBound` from
+              `assessEmiratisation`, because an employee with no ISCO group or
+              certificate answer recorded is not unskilled, nobody has said. The
+              establishment is banded on the upper bound, so a missing fact
+              reads as "the threshold may already have been crossed" rather
+              than as a reassuring low figure. Collapsing this to one number
+              would reintroduce exactly the misleading figure this card used to
+              omit as a named gap.
+            */}
+            <div className="my-2 border-t" />
+            <p
+              className="text-[12px] font-semibold uppercase tracking-wide"
+              style={{ color: "var(--text-secondary)" }}
+            >
+              Emiratisation (HR-18)
+            </p>
+            <Metric
+              label="Skilled headcount"
+              value={
+                emiratisation.unknown > 0
+                  ? `${emiratisation.lowerBound}–${emiratisation.upperBound}`
+                  : `${emiratisation.lowerBound}`
+              }
+              note={`Threshold ${emiratisation.threshold}${emiratisation.unknown > 0 ? ` · ${emiratisation.unknown} employee${emiratisation.unknown === 1 ? "" : "s"} unclassifiable` : ""}`}
+            />
+            <p className="prose-body mt-1 text-[12px]">{emiratisation.headline}</p>
+            {emiratisation.caveat ? (
+              <p
+                className="mt-1 text-[12px]"
+                style={{
+                  color: emiratisation.undecidedByMissingFacts
+                    ? "var(--status-warning-text)"
+                    : "var(--text-muted)",
+                }}
+              >
+                {emiratisation.caveat}
+              </p>
+            ) : null}
           </Card>
 
           {/* ── 8. Billing risk ──────────────────────────────────────────── */}
@@ -624,6 +687,21 @@ export default async function DashboardPage() {
               </div>
             </Card>
           </div>
+        </div>
+
+        {/*
+          The two screens this dashboard summarises rather than replaces. Both
+          are read at a different moment — the tax page when a return is being
+          prepared, the export when the accountant asks — so neither belongs in
+          the weekly card stack, and both belong within one click of it.
+        */}
+        <div className="mt-8 flex flex-wrap gap-x-6 gap-y-2 text-[13px]">
+          <Link href="/reports/tax" style={{ color: "var(--accent-text)" }}>
+            Corporate tax &mdash; every period against the AED 3m line &rarr;
+          </Link>
+          <Link href="/reports/export" style={{ color: "var(--accent-text)" }}>
+            Accounting export &mdash; invoices, credit notes, payments, AR &rarr;
+          </Link>
         </div>
       </div>
     </AppShell>

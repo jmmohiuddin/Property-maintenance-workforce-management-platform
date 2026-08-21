@@ -9,14 +9,17 @@ import {
   addDisposition,
   addFault,
   addOutcome,
+  addPhotoExemption,
   addRate,
   installAssetKinds,
   installOutcomes,
+  installPhotoExemptions,
   stopRate,
   toggleAssetKind,
   toggleDisposition,
   toggleFault,
   toggleOutcome,
+  togglePhotoExemption,
 } from "./taxonomy-actions";
 
 const INITIAL: ReferenceState = {};
@@ -56,7 +59,7 @@ export function RetireButton({
   label,
   isActive,
 }: {
-  kind: "disposition" | "fault" | "outcome" | "assetKind";
+  kind: "disposition" | "fault" | "outcome" | "assetKind" | "photoExemption";
   id: string;
   label: string;
   isActive: boolean;
@@ -68,7 +71,9 @@ export function RetireButton({
         ? toggleFault
         : kind === "assetKind"
           ? toggleAssetKind
-          : toggleOutcome;
+          : kind === "photoExemption"
+            ? togglePhotoExemption
+            : toggleOutcome;
   const [state, formAction, pending] = useActionState(action, INITIAL);
 
   return (
@@ -508,6 +513,67 @@ export function StopRateButton({
         {pending ? "Saving…" : "Stop charging"}
       </button>
       {state.error ? <span className="text-[12px]">{state.error}</span> : null}
+    </form>
+  );
+}
+
+// ── Photo exemption reasons (JOB-15) ────────────────────────────────────────
+
+export function InstallPhotoExemptionsButton({ label }: { label: string }) {
+  const [state, formAction, pending] = useActionState(installPhotoExemptions, INITIAL);
+
+  return (
+    <form action={formAction} className="space-y-3">
+      <Feedback state={state} />
+      <SubmitButton pending={pending} pendingLabel="Adding…" className="btn btn-primary disabled:opacity-60">
+        {label}
+      </SubmitButton>
+    </form>
+  );
+}
+
+/**
+ * Add a reason an "after" photograph is missing.
+ *
+ * No free-text alternative anywhere on this screen, and none in the job card
+ * either. `JOB-15` says "an explicit reason-coded exemption", and the whole
+ * value of the clause is being able to ask later whether photographs are
+ * missing because some work is genuinely unphotographable or because one crew
+ * learnt that typing anything gets them past the gate. A text box answers
+ * neither question.
+ */
+export function AddPhotoExemptionForm() {
+  const [state, formAction, pending] = useActionState(addPhotoExemption, INITIAL);
+
+  return (
+    <form action={formAction} className="space-y-4">
+      <Feedback state={state} />
+      <div className="grid gap-4 sm:grid-cols-3">
+        <Field label="Reason" description="How a technician would say it on the phone.">
+          {({ id }) => <TextInput id={id} name="label" required autoComplete="off" />}
+        </Field>
+        <Field
+          label="Description"
+          description="When this applies, so two reasons do not overlap."
+        >
+          {({ id }) => <TextInput id={id} name="description" autoComplete="off" />}
+        </Field>
+        <Field label="Order">
+          {({ id }) => (
+            <TextInput
+              id={id}
+              name="sortOrder"
+              type="number"
+              inputMode="numeric"
+              defaultValue="100"
+              step={10}
+            />
+          )}
+        </Field>
+      </div>
+      <SubmitButton pending={pending} pendingLabel="Adding…" className="btn btn-primary disabled:opacity-60">
+        Add reason
+      </SubmitButton>
     </form>
   );
 }

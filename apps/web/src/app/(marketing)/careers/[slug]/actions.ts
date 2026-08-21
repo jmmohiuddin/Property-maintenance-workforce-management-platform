@@ -14,7 +14,7 @@ import {
   attachCandidateDocument,
   submitApplication,
 } from "@meridian/db/domain";
-import { MAX_OBJECT_BYTES, objectStore, sniffContentType } from "@meridian/files";
+import { MAX_OBJECT_BYTES, objectStore, sniffContentType, virusScanner } from "@meridian/files";
 
 /**
  * The public application (`ATS-3`).
@@ -130,11 +130,12 @@ function certificatesFrom(formData: FormData): {
  * tradespeople do not have one.
  *
  * The type is sniffed from the bytes by `packages/files`, never taken from the
- * browser, and that allowlist deliberately excludes SVG and HTML. It also
- * excludes `.doc`, `.docx`, `.rtf` and `.txt`, which `ATS-9` names — those
- * formats have no reliable magic bytes and adding them would mean weakening the
- * sniffer, which is not a trade worth making for a field that is optional
- * anyway. The form says "PDF or a photo", which is what this workforce sends.
+ * browser, and that allowlist deliberately excludes SVG and HTML. It now
+ * includes three of the four formats `ATS-9` names — `.doc`, `.docx` and
+ * `.rtf`, each with a real signature the sniffer checks — and still excludes
+ * `.txt`, which has no header at all: accepting it would mean believing the
+ * browser's declared type, which is the one thing that allowlist exists to
+ * refuse. The form says so rather than silently dropping the file.
  */
 async function storeCv(
   tenantId: string,
@@ -179,16 +180,24 @@ async function storeCv(
           sha256: stored.sha256,
           /*
            * `ATS-9` requires asynchronous virus scanning and gates downloads on
-           * the result. No scanner is contracted for this deployment (the TRD
-           * lists it as an external dependency), so the honest value is
-           * `skipped` — "nobody scanned this" — rather than `pending`, which
-           * would claim a scan is in flight that will never complete and would
-           * leave every CV permanently undownloadable with no explanation.
+           * the result. Which of the two honest values this is depends entirely
+           * on the deployment, and asking rather than hardcoding is the whole
+           * change:
            *
-           * The recruitment screens label every `skipped` file as not scanned,
-           * and no flagged file is ever attached to outbound staff email.
+           *  * A scanner is configured → `pending`. `/api/cron/scan` claims the
+           *    row within ten minutes and moves it to `clean` or `infected`.
+           *    Until it does, the download route refuses the file, which is
+           *    correct: nobody has looked at it yet.
+           *  * No scanner is configured → `skipped`, meaning "nobody scanned
+           *    this", which the recruitment screens say in those words.
+           *    `pending` here would claim a scan is in flight that will never
+           *    complete and would leave every CV permanently undownloadable
+           *    with no explanation.
+           *
+           * No flagged file is ever attached to outbound staff email under any
+           * status.
            */
-          scanStatus: "skipped",
+          scanStatus: virusScanner().configured ? "pending" : "skipped",
         },
       ),
     );

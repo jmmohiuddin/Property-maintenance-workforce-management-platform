@@ -64,6 +64,24 @@ import {
   weeklyMinutesFor,
   hoursSourceWarning,
   activeTenantIds,
+  // HR-13
+  gratuityRegister,
+  gratuityLiability,
+  recordGratuitySettlement,
+  listGratuitySettlements,
+  overdueGratuitySettlements,
+  markGratuitySettlementPaid,
+  // HR-18
+  skilledWorkforce,
+  emiratisationPosition,
+  saveOccupationClassification,
+  // HR-19
+  recordSubcontractor,
+  subcontractorRegister,
+  recordSubcontractorWorker,
+  listSubcontractorWorkers,
+  verifySubcontractorWorker,
+  findExpiringSubcontractorObligations,
   // HR-6
   saveHealthInsurance,
   healthInsuranceFor,
@@ -79,6 +97,7 @@ import {
   today,
   fromDubai,
   SICK_LEAVE_TOTAL_DAYS,
+  GRATUITY_SETTLEMENT_DAYS,
 } from "@meridian/core";
 
 let fail = 0;
@@ -193,6 +212,16 @@ async function purge(): Promise<void> {
           select id from employees where full_name like ${like}
         )
       `);
+      await tx.execute(sql`
+        delete from gratuity_settlements where employee_id in (
+          select id from employees where full_name like ${like}
+        )
+      `);
+      // `subcontractor_workers` is ON DELETE cascade from its supplier, so the
+      // supplier is the only row that has to be named. Anchored to the tag, as
+      // everything here is — a structural predicate would eventually match a
+      // real subcontractor somebody entered.
+      await tx.execute(sql`delete from subcontractors where name like ${like}`);
       await tx.execute(sql`delete from employees where full_name like ${like}`);
       await tx.execute(sql`delete from technicians where full_name like ${like}`);
     });
@@ -895,6 +924,396 @@ async function main(): Promise<void> {
       recruitmentMessage = error instanceof Error ? error.message : "";
     }
     checkTrue("a visa-cost deduction is refused too (HR-16)", recruitmentMessage.includes("Article 6"));
+
+    // ═══════════════════════════════════════════════════════════════════════
+    console.log("\n— HR-13: gratuity, on basic salary only —");
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // The arithmetic itself is proved to the fil in
+    // `packages/core/test/employment.test.ts`, on the exact boundaries: 364
+    // days against one year, five years against five years and a day, the
+    // two-years cap biting and not biting. What is proved HERE is everything
+    // that only a database can get wrong — which service date the register
+    // reads, that a settlement freezes its inputs rather than joining to them,
+    // and that every day-valued column comes back as a `YYYY-MM-DD` string.
+
+    // A twin of E1: same service start, same basic, four times the allowance.
+    // It exists for one assertion — the gratuity must be identical and the cap
+    // must not be, which is the whole of `HR-13`'s "basic salary only" in two
+    // numbers.
+    const twinRows = (await tx.execute<{ id: string }>(sql`
+      insert into employees (tenant_id, employee_no, full_name, basic_salary_minor,
+                             allowances, wps_iban, contract_start, status)
+      values (${tenantId}::uuid, ${`${TAG}-E4`}, ${`${TAG} Allowance Twin`}, ${BASIC_MINOR},
+              '{"housing": "4000.00"}'::jsonb, 'AE070331234567890123458',
+              (${NOW}::date - 400), 'active')
+      returning id
+    `)) as unknown as { id: string }[];
+    const twinId = twinRows[0]!.id;
+
+    const register = await gratuityRegister(tx, NOW);
+    const mineE1 = register.find((r) => r.employeeId === employeeId);
+    const mineTwin = register.find((r) => r.employeeId === twinId);
+    const mineNoStart = register.find((r) => r.employeeId === unpayableId);
+
+    checkTrue("the register carries the payable employee", mineE1 !== undefined);
+    // The trap this module tests for by name: a `date` column read back as a
+    // space-separated timestamp string, or worse as a `Date` that moved a day.
+    checkTrue(
+      "the service start comes back as a YYYY-MM-DD string",
+      /^\d{4}-\d{2}-\d{2}$/.test(mineE1?.serviceStart ?? ""),
+    );
+    check("read from contract_start, 400 days ago", mineE1?.serviceStart, addDays(NOW, -400));
+    check("400 days is one completed year", mineE1?.accrual?.service.completedYears, 1);
+    checkTrue("so gratuity has started accruing", mineE1?.accrual?.eligible === true);
+    // 21 days at AED 200/day is AED 4,200, plus a pro-rated tail for the 35
+    // days past the anniversary. More than the flat year, less than two.
+    checkTrue("more than the flat 21 days", (mineE1?.accrual?.amountMinor ?? 0) > 21 * 20_000);
+    checkTrue("and less than two years' worth", (mineE1?.accrual?.amountMinor ?? 0) < 42 * 20_000);
+
+    // ── The requirement, in two assertions ────────────────────────────────
+    check(
+      "an AED 4,000 housing allowance changes the gratuity by nothing",
+      mineTwin?.accrual?.amountMinor,
+      mineE1?.accrual?.amountMinor,
+    );
+    checkTrue(
+      "but it does change the two-years cap, which is measured on the whole wage",
+      (mineTwin?.accrual?.capMinor ?? 0) > (mineE1?.accrual?.capMinor ?? 0),
+    );
+    check("E1's cap is 24 × (basic + AED 1,500)", mineE1?.accrual?.capMinor, (BASIC_MINOR + 150_000) * 24);
+    check("the twin's is 24 × (basic + AED 4,000)", mineTwin?.accrual?.capMinor, (BASIC_MINOR + 400_000) * 24);
+    check("neither cap bites at one year", mineTwin?.accrual?.capApplied, false);
+
+    // ── The employee nobody can compute ──────────────────────────────────
+    check("an employee with no service start has no accrual", mineNoStart?.accrual, null);
+    checkTrue(
+      "and says so rather than reporting zero",
+      (mineNoStart?.problem ?? "").includes("no service start date"),
+    );
+
+    const liability = await gratuityLiability(tx, NOW);
+    checkTrue("the liability is a positive number", liability.totalMinor > 0);
+    checkTrue("and counts the employees it could not compute", liability.uncomputableCount >= 1);
+    check(
+      "the total is exactly the sum of the register, and nothing else",
+      liability.totalMinor,
+      register.reduce((n, r) => n + (r.accrual?.eligible ? r.accrual.amountMinor : 0), 0),
+    );
+
+    // ── The settlement, and the 14-day deadline ──────────────────────────
+    const settlement = await recordGratuitySettlement(tx, { tenantId }, {
+      employeeId: twinId,
+      terminatedOn: NOW,
+    });
+    check("dues are payable 14 days after termination", settlement.dueOn, addDays(NOW, GRATUITY_SETTLEMENT_DAYS));
+    check("at the accrued figure, not one somebody typed", settlement.amountMinor, mineTwin?.accrual?.amountMinor);
+
+    const settlements = await listGratuitySettlements(tx, NOW);
+    const mySettlement = settlements.find((s) => s.id === settlement.id);
+    checkTrue("the settlement is on file", mySettlement !== undefined);
+    checkTrue(
+      "with its dates as YYYY-MM-DD strings",
+      /^\d{4}-\d{2}-\d{2}$/.test(mySettlement?.dueOn ?? "") &&
+        /^\d{4}-\d{2}-\d{2}$/.test(mySettlement?.terminatedOn ?? "") &&
+        /^\d{4}-\d{2}-\d{2}$/.test(mySettlement?.serviceStart ?? ""),
+    );
+    check("the cap did not bite", mySettlement?.capApplied, false);
+    check("so the amount equals the uncapped figure", mySettlement?.amountMinor, mySettlement?.uncappedMinor);
+    check("not overdue on the day of termination", mySettlement?.overdue, false);
+
+    // A second settlement for the same termination is how somebody gets paid
+    // twice, so it is refused rather than merged.
+    let doubleSettlement = "";
+    try {
+      await recordGratuitySettlement(tx, { tenantId }, { employeeId: twinId, terminatedOn: NOW });
+    } catch (error) {
+      doubleSettlement = error instanceof Error ? error.message : "";
+    }
+    checkTrue("a second settlement for the same employee is refused", doubleSettlement.includes("already has"));
+
+    // And an employee whose figure cannot be computed cannot be settled at all,
+    // rather than being settled at zero.
+    let uncomputableSettlement = "";
+    try {
+      await recordGratuitySettlement(tx, { tenantId }, { employeeId: unpayableId, terminatedOn: NOW });
+    } catch (error) {
+      uncomputableSettlement = error instanceof Error ? error.message : "";
+    }
+    checkTrue(
+      "and one with no service dates is refused rather than settled at zero",
+      uncomputableSettlement.includes("Cannot settle"),
+    );
+
+    check("nothing is overdue today", (await overdueGratuitySettlements(tx, NOW)).length, 0);
+    const overdueLater = await overdueGratuitySettlements(tx, addDays(NOW, GRATUITY_SETTLEMENT_DAYS + 1));
+    checkTrue(
+      "but it is on the 15th day",
+      overdueLater.some((s) => s.id === settlement.id),
+    );
+
+    // "Paid" with nothing behind it is an assertion, and the limitation period
+    // for a labour claim is two years.
+    let unreferenced = "";
+    try {
+      await markGratuitySettlementPaid(tx, { settlementId: settlement.id, paidOn: NOW, reference: "  " });
+    } catch (error) {
+      unreferenced = error instanceof Error ? error.message : "";
+    }
+    checkTrue("marking it paid with no reference is refused", unreferenced.includes("reference"));
+
+    await markGratuitySettlementPaid(tx, {
+      settlementId: settlement.id,
+      paidOn: addDays(NOW, 3),
+      reference: `${TAG}-WPS-1`,
+    });
+    const afterPaid = await overdueGratuitySettlements(tx, addDays(NOW, GRATUITY_SETTLEMENT_DAYS + 1));
+    check(
+      "a paid settlement stops being overdue, whenever it was paid",
+      afterPaid.filter((s) => s.id === settlement.id).length,
+      0,
+    );
+
+    // ── Frozen inputs ────────────────────────────────────────────────────
+    //
+    // Every input to a settlement moves afterwards — the salary gets corrected,
+    // the contract terms get superseded, and the employee record is purged two
+    // years after termination by HR-15. A settlement that could only be
+    // recomputed from rows that no longer exist is not evidence of anything.
+    await tx.execute(sql`
+      update employees set basic_salary_minor = 999999 where id = ${twinId}::uuid
+    `);
+    const frozen = (await listGratuitySettlements(tx, NOW)).find((s) => s.id === settlement.id);
+    check("the settlement keeps the salary it was computed on", frozen?.basicMonthlyMinor, BASIC_MINOR);
+    check("and the amount does not move with it", frozen?.amountMinor, settlement.amountMinor);
+    await tx.execute(sql`
+      update employees set basic_salary_minor = ${BASIC_MINOR} where id = ${twinId}::uuid
+    `);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    console.log("\n— HR-18: Emiratisation, and the skilled denominator —");
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const before = await emiratisationPosition(tx);
+
+    // E1: ISCO 3, certificate held, AED 7,500 total. All three legs pass.
+    await saveOccupationClassification(tx, {
+      employeeId,
+      iscoMajorGroup: 3,
+      postSecondaryCertificate: true,
+    });
+    // The twin: ISCO 7, craft and related trades. Excluded on the first leg
+    // whatever the other two say, which is the case the requirement is about.
+    await saveOccupationClassification(tx, {
+      employeeId: twinId,
+      iscoMajorGroup: 7,
+      postSecondaryCertificate: true,
+    });
+    // E2 is left entirely unrecorded: no group, no certificate answer, no wage.
+
+    const workforce = await skilledWorkforce(tx);
+    const wE1 = workforce.find((w) => w.employeeId === employeeId);
+    const wTwin = workforce.find((w) => w.employeeId === twinId);
+    const wUnknown = workforce.find((w) => w.employeeId === unpayableId);
+
+    check("ISCO 3 + certificate + AED 7,500 is skilled", wE1?.test.classification, "skilled");
+    check("and the group is labelled rather than left as a number", wE1?.iscoLabel, "Technicians and associate professionals");
+    check("ISCO 7 is excluded on the first leg", wTwin?.test.classification, "excluded");
+    checkTrue("and it names the group in the reason", (wTwin?.test.reasons[0] ?? "").includes("group 7"));
+    check("an employee with nothing recorded is unknown, not unskilled", wUnknown?.test.classification, "unknown");
+
+    const after = await emiratisationPosition(tx);
+    check("one more skilled employee than before", after.skilled, before.skilled + 1);
+    check("and one more excluded", after.excluded, before.excluded + 1);
+    check(
+      "the upper bound is skilled plus the unclassifiable",
+      after.upperBound,
+      after.skilled + after.unknown,
+    );
+    check(
+      "and every active employee lands in exactly one bucket",
+      after.skilled + after.excluded + after.unknown,
+      after.headcount,
+    );
+    checkTrue("the unknowns are stated rather than hidden", (after.caveat ?? "").includes("unclassifiable"));
+    // The point of the whole requirement: headcount is NOT the denominator.
+    checkTrue("headcount is larger than the skilled count", after.headcount > after.skilled);
+
+    let badGroup = "";
+    try {
+      await saveOccupationClassification(tx, {
+        employeeId,
+        iscoMajorGroup: 12,
+        postSecondaryCertificate: true,
+      });
+    } catch (error) {
+      badGroup = error instanceof Error ? error.message : "";
+    }
+    checkTrue("an ISCO group outside 1–9 is refused", badGroup.includes("1 to 9"));
+
+    // ═══════════════════════════════════════════════════════════════════════
+    console.log("\n— HR-19: the subcontractor register —");
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const supplier = await recordSubcontractor(tx, { tenantId }, {
+      name: `${TAG} Manpower LLC`,
+      kind: "manpower_supplier",
+      tradeSlug: "electrical",
+      // Lapsed. Responsibility for site compliance does not transfer with the
+      // work, so this is our exposure and not only theirs.
+      tradeLicenceNo: "CR-99887",
+      tradeLicenceExpiresOn: addDays(NOW, -41),
+      liabilityInsurer: "Oman Insurance",
+      liabilityPolicyNo: "TPL-2026-1",
+      liabilityExpiresOn: addDays(NOW, 20),
+      workmenCompInsurer: "Daman",
+      workmenCompPolicyNo: "WC-2026-1",
+      // Well outside the 90-day horizon, so it must NOT appear in the sweep.
+      workmenCompExpiresOn: addDays(NOW, 200),
+      approvalReference: "DM-SUBAPP-1",
+      // Fifteen digits. Anything else is refused — asserted below.
+      taxRegistrationNumber: "100123456700003",
+      // The free-form tail. One lapsed and one live, so the sweep is proved to
+      // reach INTO the jsonb rather than only across the three columns.
+      accreditations: [
+        { name: `${TAG} IRATA Level 3`, issuer: "IRATA International", expiresOn: addDays(NOW, -12) },
+        { name: `${TAG} ISO 45001`, issuer: "EIAC", expiresOn: addDays(NOW, 400) },
+      ],
+      status: "approved",
+    });
+
+    await recordSubcontractorWorker(tx, { tenantId }, {
+      subcontractorId: supplier.id,
+      fullName: `${TAG} Supplied Current`,
+      tradeSlug: "electrical",
+      workPermitNo: "WP-1",
+      workPermitExpiresOn: addDays(NOW, 30),
+    });
+    const lapsedWorker = await recordSubcontractorWorker(tx, { tenantId }, {
+      subcontractorId: supplier.id,
+      fullName: `${TAG} Supplied Lapsed`,
+      workPermitNo: "WP-2",
+      workPermitExpiresOn: addDays(NOW, -5),
+      verified: false,
+    });
+
+    const suppliers = await subcontractorRegister(tx, NOW);
+    const mySupplier = suppliers.find((s) => s.id === supplier.id);
+    checkTrue("the supplier is on the register", mySupplier !== undefined);
+    check("labelled as a manpower supplier, not a subcontractor", mySupplier?.kindLabel, "Manpower supplier");
+    checkTrue(
+      "expiry dates come back as YYYY-MM-DD strings",
+      /^\d{4}-\d{2}-\d{2}$/.test(mySupplier?.tradeLicenceExpiresOn ?? ""),
+    );
+    check("two supplied workers", mySupplier?.workerCount, 2);
+    check("one of them with a lapsed permit", mySupplier?.expiredPermitCount, 1);
+    checkTrue(
+      "the lapsed trade licence is a stated problem",
+      (mySupplier?.problems ?? []).some((p) => p.startsWith("Trade licence expired")),
+    );
+    checkTrue(
+      "and the lapsed permit names the Article 60 exposure",
+      (mySupplier?.problems ?? []).some((p) => p.includes("AED 100,000")),
+    );
+    check("the supplier TRN is on file", mySupplier?.taxRegistrationNumber, "100123456700003");
+    check("both accreditations are read back", mySupplier?.accreditations.length, 2);
+    check("one of them has lapsed", mySupplier?.lapsedAccreditations.length, 1);
+    check("named", mySupplier?.lapsedAccreditations[0]?.name, `${TAG} IRATA Level 3`);
+    check("with its issuer", mySupplier?.accreditations[0]?.issuer, "IRATA International");
+    checkTrue(
+      "and the lapse is a stated problem, not only a count",
+      (mySupplier?.problems ?? []).some((p) => p.includes("accreditation") && p.includes("expired")),
+    );
+
+    // The TRN is the same fifteen digits a tax invoice enforces, and it is one
+    // rule rather than two: a supplier TRN that does not match their invoice is
+    // input tax nobody can evidence.
+    let badTrn = "";
+    try {
+      await recordSubcontractor(tx, { tenantId }, {
+        name: `${TAG} Bad TRN LLC`,
+        kind: "subcontractor",
+        taxRegistrationNumber: "1234",
+      });
+    } catch (error) {
+      badTrn = error instanceof Error ? error.message : "";
+    }
+    checkTrue("a TRN that is not fifteen digits is refused", badTrn.includes("fifteen digits"));
+    check(
+      "cover that is in date is NOT a problem",
+      (mySupplier?.problems ?? []).filter((p) => p.startsWith("Workmen")).length,
+      0,
+    );
+
+    const workers = await listSubcontractorWorkers(tx, supplier.id, NOW);
+    check("both workers are listed", workers.length, 2);
+    const current = workers.find((w) => w.fullName === `${TAG} Supplied Current`);
+    const lapsed = workers.find((w) => w.id === lapsedWorker.id);
+    checkTrue("whoever recorded the current one is on the row as the verifier", current?.verifiedAt !== null);
+    check("30 days of permit left", current?.daysRemaining, 30);
+    check("and the lapsed one expired five days ago", lapsed?.daysRemaining, -5);
+    check("recorded without a verification, because nobody looked", lapsed?.verifiedAt, null);
+
+    // ── The sweep, which is the same one HR-5 and HR-14 already use ──────
+    const expiring = await findExpiringSubcontractorObligations(tx, 90, NOW);
+    const mineExpiring = expiring.filter((e) => e.subcontractorId === supplier.id);
+    // Seven obligations exist against this supplier: three organisation-level
+    // columns, two worker permits and two jsonb accreditations. Five are inside
+    // 90 days — the workmen's compensation cover at 200 days and the ISO 45001
+    // certificate at 400 are not.
+    check("five of the seven obligations are inside 90 days", mineExpiring.length, 5);
+    checkTrue(
+      "the lapsed trade licence, with a negative countdown",
+      mineExpiring.some((e) => e.kind === "trade_licence" && e.daysRemaining === -41),
+    );
+    checkTrue(
+      "the liability policy at 20 days",
+      mineExpiring.some((e) => e.kind === "liability_insurance" && e.daysRemaining === 20),
+    );
+    checkTrue(
+      "one worker permit, named",
+      mineExpiring.some((e) => e.kind === "work_permit" && e.subject === `${TAG} Supplied Lapsed`),
+    );
+    check(
+      "and NOT the workmen's compensation cover, which is 200 days out",
+      mineExpiring.filter((e) => e.kind === "workmen_comp").length,
+      0,
+    );
+    // The jsonb tail is swept by the SAME query, not by a second mechanism.
+    checkTrue(
+      "the lapsed accreditation inside the jsonb is swept, and named",
+      mineExpiring.some(
+        (e) => e.kind === "accreditation" && e.subject === `${TAG} IRATA Level 3` && e.daysRemaining === -12,
+      ),
+    );
+    check(
+      "and the one 400 days out is not",
+      mineExpiring.filter((e) => e.kind === "accreditation").length,
+      1,
+    );
+    check(
+      "both worker permits inside 90 days are swept",
+      mineExpiring.filter((e) => e.kind === "work_permit").length,
+      2,
+    );
+
+    // ── Re-verification ─────────────────────────────────────────────────
+    await verifySubcontractorWorker(tx, {}, {
+      workerId: lapsedWorker.id,
+      workPermitNo: "WP-2-RENEWED",
+      workPermitExpiresOn: addDays(NOW, 700),
+    });
+    const reverified = (await listSubcontractorWorkers(tx, supplier.id, NOW)).find(
+      (w) => w.id === lapsedWorker.id,
+    );
+    check("the renewed permit is on file", reverified?.workPermitNo, "WP-2-RENEWED");
+    checkTrue("with a verification stamped on it", reverified?.verifiedAt !== null);
+    const afterRenewal = await subcontractorRegister(tx, NOW);
+    check(
+      "and the supplier no longer has an expired permit against it",
+      afterRenewal.find((s) => s.id === supplier.id)?.expiredPermitCount,
+      0,
+    );
   });
 
   // ── The same refusal, with the domain layer bypassed ─────────────────────
@@ -984,6 +1403,46 @@ async function main(): Promise<void> {
   });
   checkTrue("a kind on the list is accepted", lawfulKindAccepted);
 
+  // ── The ISCO range, with the domain layer bypassed ──────────────────────
+  //
+  // Same shape and the same reason as the two above. The skilled test in
+  // `packages/core` reads major group 1-5 as skilled and 6-9 as excluded, and
+  // a group 12 is neither — `classifySkilledEmployee` would report it as
+  // excluded, because 12 is outside 1-5, and it would be reporting a typo as a
+  // legal classification. `saveOccupationClassification` refuses it, but that
+  // refusal is a code path somebody has to go through; the CHECK is what makes
+  // it true through `psql` as well.
+  console.log("\n— the ISCO range, with the domain layer bypassed —");
+  let rawIscoRefused = false;
+  let rawIscoConstraint = "";
+  try {
+    await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
+      await tx.execute(sql`
+        update employees set isco_major_group = 12 where id = ${employeeId}::uuid
+      `);
+    });
+  } catch (error) {
+    rawIscoRefused = true;
+    const cause = (error as { cause?: { constraint_name?: string; message?: string } }).cause;
+    rawIscoConstraint = cause?.constraint_name ?? cause?.message ?? "";
+  }
+  checkTrue("an ISCO group outside 1-9 is refused by Postgres", rawIscoRefused);
+  check("by the CHECK constraint specifically", rawIscoConstraint, "employees_isco_major_group_check");
+
+  // And the constraint is NOT 1-5. An employee in group 7 is a recorded fact
+  // that excludes them from the denominator; a constraint that only admitted
+  // skilled groups would make the exclusion unrepresentable and push every
+  // craft worker back into the unknown bucket, which is the reassuring
+  // direction and therefore the wrong one.
+  let group9Accepted = false;
+  await withTenant({ tenantId, actorKind: "system" }, async (tx) => {
+    await tx.execute(sql`
+      update employees set isco_major_group = 9 where id = ${employeeId}::uuid
+    `);
+    group9Accepted = true;
+  });
+  checkTrue("but an unskilled group is a fact, not an error", group9Accepted);
+
   // ── Tenant isolation ─────────────────────────────────────────────────────
   //
   // Every table added by 0015 carries `tenant_id` and is covered by the generic
@@ -1008,7 +1467,13 @@ async function main(): Promise<void> {
            (select count(*)::int from wage_payments p
               join employees e on e.id = p.employee_id where e.full_name like ${`${TAG}%`}) as payments,
            (select count(*)::int from leave_requests l
-              join technicians t on t.id = l.technician_id where t.full_name like ${`${TAG}%`}) as leave
+              join technicians t on t.id = l.technician_id where t.full_name like ${`${TAG}%`}) as leave,
+           (select count(*)::int from gratuity_settlements g
+              join employees e on e.id = g.employee_id where e.full_name like ${`${TAG}%`}) as settlements,
+           (select count(*)::int from subcontractors s where s.name like ${`${TAG}%`}) as suppliers,
+           (select count(*)::int from subcontractor_workers w
+              join subcontractors s on s.id = w.subcontractor_id
+             where s.name like ${`${TAG}%`}) as supplied_workers
   `;
   type Counts = {
     employees: number;
@@ -1017,6 +1482,9 @@ async function main(): Promise<void> {
     overtime: number;
     payments: number;
     leave: number;
+    settlements: number;
+    suppliers: number;
+    supplied_workers: number;
   };
 
   const mine = ((await withTenant({ tenantId, actorKind: "system" }, (tx) =>
@@ -1028,7 +1496,10 @@ async function main(): Promise<void> {
   checkTrue("its contract terms", mine.terms > 0);
   checkTrue("its overtime", mine.overtime > 0);
   checkTrue("its wage lines", mine.payments > 0);
-  checkTrue("and its sick leave", mine.leave > 0);
+  checkTrue("its sick leave", mine.leave > 0);
+  checkTrue("its gratuity settlement", mine.settlements > 0);
+  checkTrue("its subcontractor", mine.suppliers > 0);
+  checkTrue("and its supplied workers", mine.supplied_workers > 0);
 
   const theirs = ((await withTenant({ tenantId: otherId, actorKind: "system" }, (tx) =>
     tx.execute<Counts>(countMine),
@@ -1039,7 +1510,12 @@ async function main(): Promise<void> {
   check("none of the contract terms", theirs.terms, 0);
   check("none of the overtime", theirs.overtime, 0);
   check("none of the wage lines", theirs.payments, 0);
-  check("and none of the sick leave", theirs.leave, 0);
+  check("none of the sick leave", theirs.leave, 0);
+  // The three tables migration 0032 adds. Each carries `tenant_id`, so the
+  // generic loop in sql/rls.sql covers them — this is what proves the loop ran.
+  check("none of the gratuity settlements", theirs.settlements, 0);
+  check("none of the subcontractors", theirs.suppliers, 0);
+  check("and none of the supplied workers", theirs.supplied_workers, 0);
 
   await purge();
 

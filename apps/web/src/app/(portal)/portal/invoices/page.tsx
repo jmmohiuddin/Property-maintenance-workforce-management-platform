@@ -232,6 +232,15 @@ const KIND_LABEL: Readonly<Record<string, string>> = {
   invoice: "Invoice",
   credit_note: "Credit note",
   payment: "Payment",
+  // `0031`. A write-off is a real ledger event and reads as one: the row
+  // carries the invoice it forgave and reduces the running balance by what was
+  // still open on it, so the last row of this table now lands on the same
+  // number as the Balance card above. Before that column existed the write-off
+  // was subtracted from the card alone and the two disagreed.
+  //
+  // The wording is deliberately plain. `written_off_reason` is internal and the
+  // domain does not project it, so there is nothing to append here.
+  write_off: "Written off",
 };
 
 /**

@@ -7,6 +7,7 @@ import {
   type AccreditationKind,
   type EmployeeDocumentKind,
 } from "../schema/compliance";
+import { today, type CalendarDay } from "@meridian/core";
 
 /**
  * Workforce compliance: who may legally be sent to work, and who may not.
@@ -95,7 +96,10 @@ function penaltyFor(kind: string): string | null {
  * unusable on day one and get it switched off. `HR-19` puts subcontractor
  * verification on its own footing; conflating the two would hide both.
  */
-export async function blockedTechnicians(tx: TenantScopedTx): Promise<readonly DispatchBlock[]> {
+export async function blockedTechnicians(
+  tx: TenantScopedTx,
+  now: CalendarDay = today(),
+): Promise<readonly DispatchBlock[]> {
   /*
    * ONE ROW PER TECHNICIAN, not one per document.
    *
@@ -112,6 +116,13 @@ export async function blockedTechnicians(tx: TenantScopedTx): Promise<readonly D
    * DISTINCT ON keeps the longest-expired document, which is both the most
    * urgent and the one that reads worst — the right one to lead with. The rest
    * are counted so the card can say there are more without listing them.
+   *
+   * `now` is Dubai's day, not `current_date` — the Postgres session's, which
+   * runs wherever the cluster was initialised. `HR-9`'s block is the one
+   * check in this whole system a race against the clock is least affordable:
+   * this is the query the assign dialog and the second gate at the moment of
+   * assignment both read, and the wrong direction for the error is a lapsed
+   * permit reading as still valid for up to a few hours a day.
    */
   const rows = (await tx.execute<{
     technician_id: string;
@@ -126,13 +137,13 @@ export async function blockedTechnicians(tx: TenantScopedTx): Promise<readonly D
              t.full_name,
              d.kind,
              d.expires_at,
-             (current_date - d.expires_at)::int as days_expired
+             (${now}::date - d.expires_at)::int as days_expired
         from employee_documents d
         join employees e on e.id = d.employee_id
         join technicians t on t.id = e.technician_id
        where d.blocking
          and d.expires_at is not null
-         and d.expires_at < current_date
+         and d.expires_at < ${now}::date
          and d.deleted_at is null
          and e.deleted_at is null
          and e.status = 'active'
@@ -184,8 +195,9 @@ export async function blockedTechnicians(tx: TenantScopedTx): Promise<readonly D
 export async function blockForTechnician(
   tx: TenantScopedTx,
   technicianId: string,
+  now: CalendarDay = today(),
 ): Promise<DispatchBlock | null> {
-  const blocks = await blockedTechnicians(tx);
+  const blocks = await blockedTechnicians(tx, now);
   return blocks.find((b) => b.technicianId === technicianId) ?? null;
 }
 
@@ -208,10 +220,16 @@ export interface ExpiringDocument {
  * everything inside the outer window and lets the caller decide which band each
  * one falls in. Already-expired documents are always included, whatever the
  * window, because they are the urgent ones.
+ *
+ * `now` is Dubai's day, from `today()` — not `current_date`, which is the
+ * Postgres session's idea of today and not necessarily the same calendar day.
+ * See `findExpiringAccreditations` for the full reasoning; this is one of the
+ * queries it refers to as "the other two".
  */
 export async function findExpiringEmployeeDocuments(
   tx: TenantScopedTx,
   withinDays = 90,
+  now: CalendarDay = today(),
 ): Promise<readonly ExpiringDocument[]> {
   const rows = (await tx.execute<{
     employee_id: string;
@@ -227,12 +245,12 @@ export async function findExpiringEmployeeDocuments(
            e.full_name,
            d.kind,
            d.expires_at,
-           (d.expires_at - current_date)::int as days_remaining,
+           (d.expires_at - ${now}::date)::int as days_remaining,
            d.blocking
       from employee_documents d
       join employees e on e.id = d.employee_id
      where d.expires_at is not null
-       and d.expires_at <= current_date + (${withinDays})::int
+       and d.expires_at <= ${now}::date + (${withinDays})::int
        and d.deleted_at is null
        and e.deleted_at is null
        and e.status = 'active'
@@ -278,6 +296,7 @@ export interface ExpiringAccreditation {
 export async function findExpiringAccreditations(
   tx: TenantScopedTx,
   withinDays = 90,
+  now: CalendarDay = today(),
 ): Promise<readonly ExpiringAccreditation[]> {
   // Day counting happens in SQL, as `date - date`, not in JavaScript.
   //
@@ -286,6 +305,17 @@ export async function findExpiringAccreditations(
   // and "29 days" on an alert that should read "30" is the kind of quiet
   // wrongness nobody ever chases down. Postgres date arithmetic has no time
   // component to lose. The other two expiry queries do the same.
+  //
+  // ── BUT THE DAY IS `now`, NOT `current_date` ────────────────────────────
+  //
+  // `current_date` is the Postgres session's idea of today, and the session
+  // timezone is whatever the cluster was initialised with — not `Asia/Dubai`.
+  // For the hours where those two disagree, this query and Dubai's calendar
+  // are on different days, and the countdown is off by one in the direction
+  // that reports a lapsed accreditation — including the trade licence this
+  // function exists to watch — as still having a day left. `now` is `today()`,
+  // computed in Dubai, and the subtraction stays in SQL: only the day it
+  // subtracts changed.
   const rows = (await tx.execute<{
     id: string;
     kind: string;
@@ -295,10 +325,10 @@ export async function findExpiringAccreditations(
     days_remaining: number;
   }>(sql`
     select id, kind, name, reference_no, expires_at,
-           (expires_at - current_date)::int as days_remaining
+           (expires_at - ${now}::date)::int as days_remaining
       from company_accreditations
      where expires_at is not null
-       and expires_at <= current_date + (${withinDays})::int
+       and expires_at <= ${now}::date + (${withinDays})::int
        and deleted_at is null
      order by expires_at
   `)) as unknown as {
@@ -402,8 +432,15 @@ export interface EmployeeRegisterRow {
  * Ordered by exposure rather than by name: gaps first, then people, because the
  * list exists to be acted on and alphabetical order buries the only rows that
  * need anything doing to them.
+ *
+ * `now` is Dubai's day, not `current_date` — see `findExpiringAccreditations`.
+ * `blockingGaps` is what decides which rows sort first, so getting the day
+ * wrong here reorders the register, not just one figure on it.
  */
-export async function listEmployees(tx: TenantScopedTx): Promise<readonly EmployeeRegisterRow[]> {
+export async function listEmployees(
+  tx: TenantScopedTx,
+  now: CalendarDay = today(),
+): Promise<readonly EmployeeRegisterRow[]> {
   const rows = (await tx.execute<{
     id: string;
     employee_no: string | null;
@@ -431,7 +468,7 @@ export async function listEmployees(tx: TenantScopedTx): Promise<readonly Employ
                   and d.kind = k
                   and d.deleted_at is null
                   and d.expires_at is not null
-                  and d.expires_at >= current_date
+                  and d.expires_at >= ${now}::date
              )) as blocking_gaps
       from employees e
       left join technicians t on t.id = e.technician_id and t.deleted_at is null
@@ -538,10 +575,20 @@ export interface EmployeeRecord {
   readonly missingBlockingKinds: readonly EmployeeDocumentKind[];
 }
 
-/** One employee and every document on file. Null when the id is not this tenant's. */
+/**
+ * One employee and every document on file. Null when the id is not this
+ * tenant's.
+ *
+ * `now` is Dubai's day, not `current_date` — see `findExpiringAccreditations`.
+ * `missingBlockingKinds` below is derived from `daysRemaining >= 0` on each
+ * document, so the wrong day here does not just mislabel one row — it can
+ * move a document across the in-date/expired line and change which `HR-9`
+ * kinds this employee is reported as missing.
+ */
 export async function getEmployeeRecord(
   tx: TenantScopedTx,
   employeeId: string,
+  now: CalendarDay = today(),
 ): Promise<EmployeeRecord | null> {
   const headers = (await tx.execute<{
     id: string;
@@ -584,7 +631,7 @@ export async function getEmployeeRecord(
     days_remaining: number | null;
   }>(sql`
     select id, kind, reference_no, issued_at, expires_at, blocking, note,
-           (expires_at - current_date)::int as days_remaining
+           (expires_at - ${now}::date)::int as days_remaining
       from employee_documents
      where employee_id = ${employeeId} and deleted_at is null
      order by expires_at nulls last
@@ -748,8 +795,13 @@ export interface AccreditationRow {
  * the question that has been answered from memory until now. The previous build
  * published three ISO certificates the company does not hold; nothing is
  * publishable that is not a row here.
+ *
+ * `now` is Dubai's day, not `current_date` — see `findExpiringAccreditations`.
  */
-export async function listAccreditations(tx: TenantScopedTx): Promise<readonly AccreditationRow[]> {
+export async function listAccreditations(
+  tx: TenantScopedTx,
+  now: CalendarDay = today(),
+): Promise<readonly AccreditationRow[]> {
   const rows = (await tx.execute<{
     id: string;
     kind: string;
@@ -761,7 +813,7 @@ export async function listAccreditations(tx: TenantScopedTx): Promise<readonly A
     days_remaining: number | null;
   }>(sql`
     select id, kind, name, reference_no, issuing_body, grade, expires_at,
-           (expires_at - current_date)::int as days_remaining
+           (expires_at - ${now}::date)::int as days_remaining
       from company_accreditations
      where deleted_at is null
      order by expires_at nulls last

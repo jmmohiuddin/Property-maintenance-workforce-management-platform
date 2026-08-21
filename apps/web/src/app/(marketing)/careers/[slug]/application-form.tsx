@@ -301,12 +301,12 @@ export function ApplicationForm({
             id="cv-field"
             type="file"
             name="cv"
-            accept="application/pdf,image/png,image/jpeg,image/webp,image/heic"
+            accept="application/pdf,image/png,image/jpeg,image/webp,image/heic,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/rtf"
             className="text-[14px]"
           />
           <p className="text-[13px]" style={{ color: "var(--text-muted)" }}>
-            A PDF or a photo of your CV, up to 10 MB. No CV? That is fine — you have told us
-            enough.
+            A PDF, a Word document, or a photo of your CV, up to 10 MB. Plain text files
+            cannot be accepted. No CV? That is fine — you have told us enough.
           </p>
         </div>
 

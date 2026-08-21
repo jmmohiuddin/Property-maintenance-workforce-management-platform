@@ -115,6 +115,12 @@ export const RETENTION_PROTECTED_TABLES = [
   "salary_deductions",
   "overtime_records",
   "employment_contract_terms",
+  // The end-of-service payment (`HR-13`) — the largest single payment most
+  // employees ever receive, and a Corporate Tax deduction like every other
+  // payroll row above it. Added for the same reason: the employee it belongs
+  // to is deleted two years after termination, but the settlement is a tax
+  // record and the seven-year floor governs it, not the two-year clock.
+  "gratuity_settlements",
   // Append-only by construction; the application role has no DELETE on it.
   "audit_log",
 ] as const;

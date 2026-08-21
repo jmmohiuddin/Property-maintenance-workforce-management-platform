@@ -374,6 +374,18 @@ export const candidateDocuments = pgTable(
     sizeBytes: integer("size_bytes").notNull(),
     sha256: varchar("sha256", { length: 64 }).notNull(),
     scanStatus: varchar("scan_status", { length: 16 }).notNull().default("pending"),
+    /**
+     * When the asynchronous sweep took this row, and the reason two overlapping
+     * sweeps cannot both scan it. Claim and verdict happen in one transaction,
+     * so a run that dies mid-scan rolls this back and the next run picks the
+     * document up.
+     *
+     * Claimed *and* still `pending` is the third meaning, and it is deliberate:
+     * a document the sweep could not finish — the stored object was missing —
+     * stays undownloadable, stops being retried forever, and is counted
+     * separately by `/api/cron/scan` so a person can look at it.
+     */
+    scanClaimedAt: timestamp("scan_claimed_at", { withTimezone: true }),
     scannedAt: timestamp("scanned_at", { withTimezone: true }),
     scannerNote: varchar("scanner_note", { length: 200 }),
     /** `ATS-10`. Failure is ordinary; the original file is retained regardless. */
@@ -385,6 +397,7 @@ export const candidateDocuments = pgTable(
   (t) => [
     index("candidate_documents_candidate_idx").on(t.tenantId, t.candidateId),
     index("candidate_documents_scan_idx").on(t.tenantId, t.scanStatus),
+    index("candidate_documents_unclaimed_idx").on(t.tenantId, t.uploadedAt),
   ],
 );
 

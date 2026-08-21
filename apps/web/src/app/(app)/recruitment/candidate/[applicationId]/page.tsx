@@ -294,14 +294,17 @@ export default async function CandidatePage({
                         · {Math.round(document.sizeBytes / 1024)} KB
                       </p>
                       {/*
-                        `ATS-9`. Downloads are gated on scan status. No virus
-                        scanner is contracted for this deployment, so files are
-                        recorded as `skipped` — explicitly unscanned rather than
-                        stuck pending — and that is said here every time, next
-                        to a link that works. The warning is not a substitute
-                        for the link and the link is not a reason to drop the
-                        warning: a file somebody can open is exactly the file
-                        they need telling about.
+                        `ATS-9`. Downloads are gated on scan status, and all
+                        four states are now reachable: a deployment with a
+                        ClamAV daemon configured writes `pending` and the sweep
+                        moves it to `clean` or `infected`; one without writes
+                        `skipped`, meaning nobody scanned this.
+
+                        `skipped` files stay downloadable and the warning below
+                        appears next to a link that works. The warning is not a
+                        substitute for the link and the link is not a reason to
+                        drop the warning: a file somebody can open is exactly
+                        the file they need telling about.
                       */}
                       {document.scanStatus === "skipped" ? (
                         <p className="mt-2 text-[13px]" style={{ color: "var(--text-muted)" }}>
@@ -329,7 +332,18 @@ export default async function CandidatePage({
                           className="mt-2 text-[13px]"
                           style={{ color: "var(--status-critical-text)" }}
                         >
-                          Download blocked until the scan completes (SEC-8).
+                          {/*
+                            Two different refusals, said differently on purpose.
+                            "Blocked until the scan completes" is true of a
+                            pending file and false of an infected one — that
+                            scan is finished, it failed, and nothing about
+                            waiting will change it. Telling a recruiter to wait
+                            for something that has already happened is how a
+                            blocked file becomes a support ticket.
+                          */}
+                          {document.scanStatus === "infected"
+                            ? "Blocked: this file failed the virus scan. It will not become available, and it is never attached to outbound email."
+                            : "Download blocked until the scan completes. /api/cron/scan runs every ten minutes; if it stays here, no scanner is configured and nobody has looked at this file."}
                         </p>
                       )}
                     </li>

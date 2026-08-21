@@ -57,6 +57,18 @@ export const PERMISSIONS = [
   "recruitment:write",
   "contracts:read",
   "contracts:write",
+  // M5. Separate from `contracts:*` on purpose, and the distinction is not
+  // cosmetic. A maintenance contract is a commercial relationship — sales owns
+  // it, which is why `contracts:write` is held by owner, admin and sales alone
+  // and an operations manager reads it without writing it.
+  //
+  // A project is a piece of work: phases, milestones, variations, retention,
+  // permits, a snag list and a project manager. Borrowing the contract's
+  // permission to reach it would have meant granting `contracts:write` to the
+  // operations manager, which moves an existing boundary as a side effect of
+  // fixing an unrelated gap — and that is how a permission model rots.
+  "projects:read",
+  "projects:write",
   "reports:read",
   "audit:read",
   "users:manage",
@@ -110,6 +122,11 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
     "technicians:read",
     "technicians:write",
     "contracts:read",
+    // M5's primary actor. Reads the AMC term sheet without writing it, and
+    // owns projects outright — the module is the operational half of the
+    // business, not the commercial one.
+    "projects:read",
+    "projects:write",
     "reports:read",
   ],
 
@@ -148,6 +165,16 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
     "payments:record",
     "customers:read",
     "contracts:read",
+    // Read-only, and that pairing is load-bearing rather than generous.
+    // `PRJ-3` splits the milestone in two: a project manager certifies that a
+    // stage of work is done (`projects:write`), and an accountant allocates the
+    // sequential tax-invoice number against it (`invoices:create`). The
+    // accountant therefore has to be able to OPEN the project to raise its
+    // invoice — without this line they hold `invoices:create` for a screen they
+    // cannot reach, and the split becomes a dead end rather than a separation
+    // of duties. They still cannot move a phase, close a snag or approve a
+    // variation.
+    "projects:read",
     "reports:read",
   ],
 
@@ -162,6 +189,10 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
     "properties:write",
     "contracts:read",
     "contracts:write",
+    // A project usually begins as a tender or a quote, so the person who won
+    // it is the person who first needs to record it.
+    "projects:read",
+    "projects:write",
   ],
 
   /**

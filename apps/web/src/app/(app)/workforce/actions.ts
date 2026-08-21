@@ -11,8 +11,16 @@ import {
   EMPLOYEE_DOCUMENT_KINDS,
   EMPLOYEE_DOCUMENT_LABEL,
   ACCREDITATION_KINDS,
+  recordSubcontractor,
+  removeSubcontractor,
+  recordSubcontractorWorker,
+  verifySubcontractorWorker,
+  SUBCONTRACTOR_KINDS,
+  SUBCONTRACTOR_STATUSES,
   type EmployeeDocumentKind,
   type AccreditationKind,
+  type SubcontractorKind,
+  type SubcontractorStatus,
 } from "@meridian/db";
 import { requireSessionWith } from "@/lib/session";
 import { userMessage } from "@/lib/errors";
@@ -255,4 +263,211 @@ export async function withdrawAccreditation(
   revalidatePath("/workforce/accreditations");
   revalidatePath("/workforce");
   return { ok: "Accreditation withdrawn." };
+}
+
+// ── HR-19: subcontractors and manpower suppliers ────────────────────────────
+
+/**
+ * Add or amend a subcontractor (`HR-19`).
+ *
+ * Sits on the workforce board rather than on `/hr` because it answers the
+ * workforce board's question — "may this person legally be on our site today" —
+ * about the people this company does not employ. Responsibility for site
+ * compliance does not transfer with the work.
+ */
+export async function saveSubcontractor(
+  _prev: WorkforceFormState,
+  formData: FormData,
+): Promise<WorkforceFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const id = text(formData, "id");
+  const name = text(formData, "name");
+  const kind = text(formData, "kind");
+  const status = text(formData, "status");
+
+  if (name.length < 2) return { error: "Name the subcontractor." };
+  if (!(SUBCONTRACTOR_KINDS as readonly string[]).includes(kind)) {
+    return { error: "Choose whether this is a subcontractor or a manpower supplier." };
+  }
+  if (status && !(SUBCONTRACTOR_STATUSES as readonly string[]).includes(status)) {
+    return { error: "That is not one of the register's statuses." };
+  }
+
+  const tradeLicenceExpiresOn = calendarDate(formData.get("tradeLicenceExpiresOn"));
+  const liabilityExpiresOn = calendarDate(formData.get("liabilityExpiresOn"));
+  const workmenCompExpiresOn = calendarDate(formData.get("workmenCompExpiresOn"));
+  if (tradeLicenceExpiresOn === null) return { error: "The trade licence expiry is not a real date." };
+  if (liabilityExpiresOn === null) return { error: "The liability policy expiry is not a real date." };
+  if (workmenCompExpiresOn === null) return { error: "The workmen's compensation expiry is not a real date." };
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) =>
+        recordSubcontractor(
+          tx,
+          { tenantId: session.principal.tenantId },
+          {
+            ...(id ? { id } : {}),
+            name,
+            kind: kind as SubcontractorKind,
+            tradeSlug: text(formData, "tradeSlug") || null,
+            contactName: text(formData, "contactName") || null,
+            contactPhone: text(formData, "contactPhone") || null,
+            contactEmail: text(formData, "contactEmail") || null,
+            tradeLicenceNo: text(formData, "tradeLicenceNo") || null,
+            tradeLicenceExpiresOn: tradeLicenceExpiresOn ?? null,
+            liabilityInsurer: text(formData, "liabilityInsurer") || null,
+            liabilityPolicyNo: text(formData, "liabilityPolicyNo") || null,
+            liabilityExpiresOn: liabilityExpiresOn ?? null,
+            workmenCompInsurer: text(formData, "workmenCompInsurer") || null,
+            workmenCompPolicyNo: text(formData, "workmenCompPolicyNo") || null,
+            workmenCompExpiresOn: workmenCompExpiresOn ?? null,
+            approvalReference: text(formData, "approvalReference") || null,
+            taxRegistrationNumber: text(formData, "taxRegistrationNumber") || null,
+            // Three parallel field arrays, one row per accreditation. The
+            // domain layer drops anything with no name, so a blank spare row
+            // costs nothing and does not need trimming here.
+            accreditations: formData
+              .getAll("accreditationName")
+              .map((name, i) => ({
+                name: String(name ?? "").trim(),
+                issuer: String(formData.getAll("accreditationIssuer")[i] ?? "").trim() || null,
+                expiresOn: (() => {
+                  const raw = String(formData.getAll("accreditationExpiresOn")[i] ?? "").trim();
+                  return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : null;
+                })(),
+              }))
+              .filter((a) => a.name.length > 0),
+            status: (status || "provisional") as SubcontractorStatus,
+          },
+        ),
+    );
+
+    revalidatePath("/workforce/subcontractors");
+    revalidatePath("/hr");
+    return { ok: `${name} saved to the register.` };
+  } catch (error) {
+    return { error: userMessage(error, "Could not save the subcontractor.", "workforce") };
+  }
+}
+
+/** Withdraw a subcontractor from the register. Soft delete. */
+export async function withdrawSubcontractor(
+  _prev: WorkforceFormState,
+  formData: FormData,
+): Promise<WorkforceFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const id = text(formData, "id");
+  if (!id) return { error: "Missing subcontractor." };
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) => removeSubcontractor(tx, id),
+    );
+    revalidatePath("/workforce/subcontractors");
+    revalidatePath("/hr");
+    return { ok: "Withdrawn from the register." };
+  } catch (error) {
+    return { error: userMessage(error, "Could not withdraw that subcontractor.", "workforce") };
+  }
+}
+
+/**
+ * Record a supplied worker, and the verification of their permit (`HR-19`).
+ *
+ * One form, both facts. A separate "verify" step produces a register full of
+ * workers with a permit number, an expiry date and nobody's name against them —
+ * which is precisely the state that looks like compliance and is not. Whoever
+ * enters the row is the person who saw the card, so the checkbox defaults to
+ * checked and unticking it is the deliberate act.
+ */
+export async function saveSubcontractorWorker(
+  _prev: WorkforceFormState,
+  formData: FormData,
+): Promise<WorkforceFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const subcontractorId = text(formData, "subcontractorId");
+  const fullName = text(formData, "fullName");
+  if (!subcontractorId) return { error: "Missing subcontractor." };
+  if (fullName.length < 2) return { error: "Name the worker." };
+
+  const workPermitExpiresOn = calendarDate(formData.get("workPermitExpiresOn"));
+  if (workPermitExpiresOn === null) return { error: "The work permit expiry is not a real date." };
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) =>
+        recordSubcontractorWorker(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          {
+            subcontractorId,
+            fullName,
+            tradeSlug: text(formData, "tradeSlug") || null,
+            workPermitNo: text(formData, "workPermitNo") || null,
+            workPermitExpiresOn: workPermitExpiresOn ?? null,
+            verified: text(formData, "verified") === "on",
+          },
+        ),
+    );
+
+    revalidatePath("/workforce/subcontractors");
+    revalidatePath("/hr");
+    return workPermitExpiresOn
+      ? { ok: `${fullName} recorded, permit expiring ${readableDay(workPermitExpiresOn)}.` }
+      : {
+          ok:
+            `${fullName} recorded — but with no permit expiry, so nothing is counting down to it. ` +
+            `Deploying a worker without a valid permit carries AED 100,000 to AED 1,000,000 under Article 60, ` +
+            `and responsibility does not transfer with the work.`,
+        };
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the worker.", "workforce") };
+  }
+}
+
+/** Re-verify one supplied worker's permit, or stand them down (`HR-19`). */
+export async function reverifySubcontractorWorker(
+  _prev: WorkforceFormState,
+  formData: FormData,
+): Promise<WorkforceFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const workerId = text(formData, "workerId");
+  if (!workerId) return { error: "Missing worker." };
+
+  const standDown = text(formData, "standDown") === "on";
+  const workPermitExpiresOn = calendarDate(formData.get("workPermitExpiresOn"));
+  if (workPermitExpiresOn === null) return { error: "The work permit expiry is not a real date." };
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) =>
+        verifySubcontractorWorker(
+          tx,
+          { userId: session.principal.userId },
+          {
+            workerId,
+            ...(standDown ? { isActive: false } : {}),
+            ...(workPermitExpiresOn !== undefined ? { workPermitExpiresOn } : {}),
+            ...(text(formData, "workPermitNo") ? { workPermitNo: text(formData, "workPermitNo") } : {}),
+          },
+        ),
+    );
+
+    revalidatePath("/workforce/subcontractors");
+    revalidatePath("/hr");
+    return standDown
+      ? { ok: "Stood down. The permit is no longer counted against this supplier." }
+      : { ok: "Permit re-verified, with your name against it." };
+  } catch (error) {
+    return { error: userMessage(error, "Could not update that worker.", "workforce") };
+  }
 }

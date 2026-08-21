@@ -1,0 +1,24 @@
+{
+  "expo": {
+    "name": "Meridian Field",
+    "slug": "meridian-field",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "ae.meridian.field",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Photographs of the work you carry out are attached to the job sheet as evidence of what was done.",
+        "NSLocationWhenInUseUsageDescription": "Your position is recorded when you arrive, start, finish and photograph a job, to prove attendance. It is not recorded continuously and never outside working hours.",
+        "NSPhotoLibraryAddUsageDescription": "Not used. Photographs are taken in the app and are never read from or written to your camera roll."
+      }
+    },
+    "android": {
+      "package": "ae.meridian.field",
+      "permissions": ["CAMERA", "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION"]
+    },
+    "plugins": ["expo-camera", "expo-location", "expo-secure-store"]
+  }
+}

@@ -58,7 +58,22 @@ import {
   refuseDeduction,
   checkHealthInsurance,
   ESSENTIAL_BENEFITS_WAGE_CEILING_MINOR,
+  // HR-13
+  serviceLength,
+  gratuityAccrual,
+  gratuitySettlementDeadline,
+  GRATUITY_DAYS_PER_YEAR_FIRST_FIVE,
+  GRATUITY_DAYS_PER_YEAR_THEREAFTER,
+  GRATUITY_CAP_MONTHS_OF_WAGE,
+  GRATUITY_SETTLEMENT_DAYS,
+  // HR-18
+  classifySkilledEmployee,
+  assessEmiratisation,
+  ISCO_SKILLED_MAX_MAJOR_GROUP,
+  EMIRATISATION_SKILLED_WAGE_FLOOR_MINOR,
+  EMIRATISATION_SMALL_ESTABLISHMENT_FLOOR,
 } from "../src/employment";
+import { EMIRATISATION_SKILLED_THRESHOLD } from "../src/reporting";
 import { fromDubai, DEFAULT_CALENDAR, type WorkingCalendar } from "../src/calendar";
 
 let fail = 0;
@@ -636,6 +651,210 @@ const good = checkHealthInsurance({
   hasInDatePolicyDocument: true,
 });
 check("the right plan with a policy on file is compliant", good.compliant, true);
+
+console.log("\n— HR-13: end-of-service gratuity, on basic salary only —");
+
+/**
+ * One fixture, six boundaries.
+ *
+ * AED 6,000 basic gives a daily basic of exactly AED 200 — 600000 ÷ 30 — so
+ * every figure below can be checked by multiplication rather than trusted. The
+ * AED 2,000 housing allowance is there precisely because it must make no
+ * difference to the accrual and all the difference to the cap.
+ */
+const GRAT_BASIC = 600_000;
+const GRAT_TOTAL = 800_000; // basic + AED 2,000 housing
+const GRAT_START = "2020-01-01";
+const gratuity = (asOf: string, start = GRAT_START) =>
+  gratuityAccrual({
+    serviceStart: start,
+    asOf,
+    basicMonthlyMinor: GRAT_BASIC,
+    totalMonthlyWageMinor: GRAT_TOTAL,
+  });
+
+check("daily basic is monthly ÷ 30, to the fil", gratuity("2021-01-01").dailyBasicMinor, 20_000);
+
+// ── The minimum-service boundary: 364 days against exactly one year ─────────
+const day364 = gratuity(addDays(GRAT_START, 364));
+check("364 days of service is 364 days", daysBetween(GRAT_START, addDays(GRAT_START, 364)), 364);
+check("364 days accrues nothing", day364.amountMinor, 0);
+check("and is reported as ineligible rather than as zero", day364.eligible, false);
+check("no completed years at 364 days", day364.service.completedYears, 0);
+
+const year1 = gratuity("2021-01-01");
+checkTrue("exactly one year is eligible — the anniversary is inside the entitlement", year1.eligible);
+check("one completed year", year1.service.completedYears, 1);
+check("21 days of basic pay", year1.entitlementDays, GRATUITY_DAYS_PER_YEAR_FIRST_FIVE);
+check("which is AED 4,200 at AED 200/day", year1.amountMinor, 21 * 20_000);
+
+// ── The 21 → 30 switch: exactly five years against five years and a day ─────
+const year5 = gratuity("2025-01-01");
+check("five completed years", year5.service.completedYears, 5);
+check("21 × 5 = 105 days", year5.entitlementDays, 105);
+check("AED 21,000", year5.amountMinor, 105 * 20_000);
+check("no part-year at the anniversary", year5.service.remainderDays, 0);
+
+const year5day1 = gratuity("2025-01-02");
+check("five years and a day is still five completed years", year5day1.service.completedYears, 5);
+check("with one day of remainder", year5day1.service.remainderDays, 1);
+check("in a 365-day service year", year5day1.service.remainderYearDays, 365);
+// The extra day accrues at 30/365 of a day's basic, NOT 21/365. Math.round(20000 × 30 ÷ 365).
+check("the day after the fifth anniversary accrues at the 30-day rate", year5day1.amountMinor, 105 * 20_000 + 1_644);
+check("and 1644 fils is 20000 × 30 ÷ 365 rounded", Math.round((20_000 * GRATUITY_DAYS_PER_YEAR_THEREAFTER) / 365), 1_644);
+
+// The same one-day tail on the other side of the boundary, at the 21-day rate.
+// 2024 is a leap year, so the service year 2024-01-01 → 2025-01-01 is 366 days.
+const year4day1 = gratuity("2024-01-02");
+check("four years and a day is four completed years", year4day1.service.completedYears, 4);
+check("in a 366-day service year", year4day1.service.remainderYearDays, 366);
+check("and its tail accrues at the 21-day rate", year4day1.amountMinor, 84 * 20_000 + 1_148);
+check("21 ≠ 30: the tails differ", year4day1.amountMinor - 84 * 20_000 === year5day1.amountMinor - 105 * 20_000, false);
+
+// ── The cap, on both sides of where it bites ───────────────────────────────
+check("the cap is two years' TOTAL wages", gratuity("2021-01-01").capMinor, GRAT_TOTAL * GRATUITY_CAP_MONTHS_OF_WAGE);
+
+// 33 completed years: 21×5 + 30×28 = 945 days = AED 189,000, under the
+// AED 192,000 ceiling. This is also the assertion that the cap is measured on
+// the total wage and not on basic — at 24 months of basic the ceiling would be
+// AED 144,000 and this figure would be capped.
+const year33 = gratuity("2023-01-01", "1990-01-01");
+check("33 completed years", year33.service.completedYears, 33);
+check("945 days of basic pay", year33.entitlementDays, 945);
+check("the cap does NOT bite at AED 189,000", year33.capApplied, false);
+check("so the full accrual is owed", year33.amountMinor, 945 * 20_000);
+
+// 34 completed years: 21×5 + 30×29 = 975 days = AED 195,000, over the ceiling.
+const year34 = gratuity("2024-01-01", "1990-01-01");
+check("34 completed years", year34.service.completedYears, 34);
+check("975 days uncapped", year34.uncappedMinor, 975 * 20_000);
+checkTrue("the cap bites", year34.capApplied);
+check("and two years' total wages is what is owed", year34.amountMinor, GRAT_TOTAL * GRATUITY_CAP_MONTHS_OF_WAGE);
+check("which is AED 192,000", year34.amountMinor, 19_200_000);
+
+// ── Basic only. The whole requirement, in one assertion ───────────────────
+const withAllowances = gratuityAccrual({
+  serviceStart: GRAT_START,
+  asOf: "2025-01-01",
+  basicMonthlyMinor: GRAT_BASIC,
+  totalMonthlyWageMinor: 1_400_000, // AED 8,000 of allowances on top
+});
+const withoutAllowances = gratuityAccrual({
+  serviceStart: GRAT_START,
+  asOf: "2025-01-01",
+  basicMonthlyMinor: GRAT_BASIC,
+  totalMonthlyWageMinor: GRAT_BASIC,
+});
+check(
+  "allowances change the gratuity by nothing at all",
+  withAllowances.amountMinor,
+  withoutAllowances.amountMinor,
+);
+// The contrast that makes the point: sick pay on the same two wages is NOT the
+// same number, because sick pay is staged on the whole wage and gratuity is not.
+const oneSickDay = stageSickLeave({ days: 1 });
+check(
+  "sick pay on the same two wages IS different — different base, deliberately",
+  sickLeavePayMinor(1_400_000, oneSickDay) === sickLeavePayMinor(GRAT_BASIC, oneSickDay),
+  false,
+);
+// Stated as a number rather than only as an inequality, so the direction is on
+// the record: sick pay on basic alone under-pays by exactly the allowance.
+check("one sick day on the whole wage", sickLeavePayMinor(1_400_000, oneSickDay), Math.round(1_400_000 / 30));
+check("one sick day on basic alone", sickLeavePayMinor(GRAT_BASIC, oneSickDay), Math.round(GRAT_BASIC / 30));
+
+// ── Service length, on its own ─────────────────────────────────────────────
+check("a 29 February start has a 28 February anniversary", serviceLength("2020-02-29", "2021-02-28").completedYears, 1);
+check("and not one day earlier", serviceLength("2020-02-29", "2021-02-27").completedYears, 0);
+check("service before the start date is zero, not negative", serviceLength("2026-01-01", "2025-12-01").days, 0);
+
+// ── The 14-day settlement deadline ─────────────────────────────────────────
+const settled = gratuitySettlementDeadline("2026-08-01", "2026-08-15");
+check("dues are payable 14 days after termination", settled.dueOn, addDays("2026-08-01", GRATUITY_SETTLEMENT_DAYS));
+check("the 14th day itself is not late", settled.overdue, false);
+check("with zero days remaining", settled.daysRemaining, 0);
+const late = gratuitySettlementDeadline("2026-08-01", "2026-08-16");
+checkTrue("the 15th day is", late.overdue);
+check("by one day", late.daysRemaining, -1);
+
+console.log("\n— HR-18: Emiratisation, and the three-part skilled test —");
+
+const skilledInput = (over: Partial<Parameters<typeof classifySkilledEmployee>[0]> = {}) =>
+  classifySkilledEmployee({
+    iscoMajorGroup: 3,
+    postSecondaryCertificate: true,
+    monthlyWageMinor: 600_000,
+    ...over,
+  });
+
+check("all three legs pass", skilledInput().classification, "skilled");
+
+// ── Leg 1: the ISCO boundary, both sides ──────────────────────────────────
+check("ISCO major group 5 is inside the test", skilledInput({ iscoMajorGroup: 5 }).classification, "skilled");
+check("ISCO major group 6 is not", skilledInput({ iscoMajorGroup: 6 }).classification, "excluded");
+check("the boundary constant is 5", ISCO_SKILLED_MAX_MAJOR_GROUP, 5);
+check("craft trades — group 7 — are excluded", skilledInput({ iscoMajorGroup: 7 }).classification, "excluded");
+check("plant operators and drivers — group 8", skilledInput({ iscoMajorGroup: 8 }).classification, "excluded");
+check("cleaners and labourers — group 9", skilledInput({ iscoMajorGroup: 9 }).classification, "excluded");
+
+// ── Leg 3: the AED 4,000 boundary, both sides ─────────────────────────────
+check("AED 4,000 is AED 4,000 in fils", EMIRATISATION_SKILLED_WAGE_FLOOR_MINOR, 400_000);
+check("exactly AED 4,000 is at or above the floor", skilledInput({ monthlyWageMinor: 400_000 }).classification, "skilled");
+check("one fil below is not", skilledInput({ monthlyWageMinor: 399_999 }).classification, "excluded");
+// The opposite operator on the same number, forty lines apart in the source.
+check("and the SAME wage is outside the Essential Benefits requirement", requiredHealthPlan(400_000), "standard");
+check("while one fil below is inside it", requiredHealthPlan(399_999), "essential_benefits");
+
+// ── Leg 2, and the unknowns ───────────────────────────────────────────────
+check("no certificate excludes", skilledInput({ postSecondaryCertificate: false }).classification, "excluded");
+check("an unrecorded certificate is unknown, not unskilled", skilledInput({ postSecondaryCertificate: null }).classification, "unknown");
+check("an unrecorded ISCO group is unknown", skilledInput({ iscoMajorGroup: null }).classification, "unknown");
+check("an unrecorded wage is unknown", skilledInput({ monthlyWageMinor: null }).classification, "unknown");
+check(
+  "but a definite failure beats a missing fact",
+  skilledInput({ iscoMajorGroup: 7, postSecondaryCertificate: null, monthlyWageMinor: null }).classification,
+  "excluded",
+);
+checkTrue("and it says why", skilledInput({ iscoMajorGroup: 7 }).reasons.length > 0);
+
+// ── The establishment position, on both sides of 50 ───────────────────────
+const at49 = assessEmiratisation({ skilled: 49, excluded: 300, unknown: 0 });
+check("49 skilled is below the threshold", at49.inScope, false);
+checkTrue("but close enough to say so", at49.approaching);
+const at50 = assessEmiratisation({ skilled: 50, excluded: 300, unknown: 0 });
+checkTrue("50 skilled is 'or more' — the targets apply", at50.inScope);
+check("the threshold is 50", EMIRATISATION_SKILLED_THRESHOLD, 50);
+
+// The requirement's own example: 60 tradesmen and 6 office staff.
+const contractor = assessEmiratisation({ skilled: 6, excluded: 60, unknown: 0, headcount: 66 });
+check("60 tradesmen and 6 office staff is measured against the 6", contractor.lowerBound, 6);
+check("not the 66", contractor.headcount, 66);
+check("and is nowhere near the threshold", contractor.inScope, false);
+check("nor approaching it", contractor.approaching, false);
+
+// Missing facts must not resolve in the reassuring direction.
+const undecided = assessEmiratisation({ skilled: 48, excluded: 10, unknown: 3 });
+check("48 skilled with 3 unclassified has an upper bound of 51", undecided.upperBound, 51);
+checkTrue("so the threshold may already be crossed", undecided.inScope);
+checkTrue("and the screen is told it cannot tell", undecided.undecidedByMissingFacts);
+checkTrue("with the reason named", (undecided.caveat ?? "").includes("unclassifiable"));
+check("a fully classified establishment over the line is not 'undecided'", at50.undecidedByMissingFacts, false);
+
+// OPEN-4: the 20–49 band, on both sides.
+check("the small-establishment floor is 20", EMIRATISATION_SMALL_ESTABLISHMENT_FLOOR, 20);
+check(
+  "19 employees is below the OPEN-4 band",
+  assessEmiratisation({ skilled: 6, excluded: 13, unknown: 0 }).band,
+  "outside_targets",
+);
+const band20 = assessEmiratisation({ skilled: 6, excluded: 14, unknown: 0 });
+check("20 is inside it", band20.band, "small_establishment_band");
+checkTrue("and OPEN-4 is stated rather than answered", (band20.caveat ?? "").includes("OPEN-4"));
+// 66 employees is past the top of the 20-49 band and 6 skilled is nowhere near
+// 50. Neither regime applies, and the band says exactly that rather than
+// rounding the establishment into the nearer of the two.
+check("60 tradesmen and 6 office staff is in neither regime", contractor.band, "outside_targets");
+check("no caveat is invented where there is no uncertainty", contractor.caveat, null);
 
 console.log(fail === 0 ? "\nAll employment checks passed.\n" : `\n${fail} check(s) failed.\n`);
 process.exit(fail === 0 ? 0 : 1);

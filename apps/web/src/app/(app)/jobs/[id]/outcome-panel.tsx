@@ -33,6 +33,13 @@ export interface VisitOption {
   technicianName: string;
 }
 
+/** The same three gaps `assertJobCardComplete` names, in the operator's words. */
+const GAP_LABEL: Readonly<Record<string, string>> = {
+  after_photo: "no after photograph and no exemption",
+  materials: "no materials, and none declared",
+  labour: "no labour time",
+};
+
 export interface RecordedFault {
   kind: string;
   label: string;
@@ -75,6 +82,7 @@ export function OutcomePanel({
   recordedOutcome,
   recordedFaults,
   isComplete,
+  jobCardGaps,
 }: {
   jobId: string;
   outcomes: OutcomeOption[];
@@ -86,6 +94,11 @@ export function OutcomePanel({
   recordedFaults: RecordedFault[];
   /** True once the job is past `on_site`: recording is a correction, not a move. */
   isComplete: boolean;
+  /**
+   * Which of `JOB-15`'s conditions the job card still fails, as the server
+   * computes them. A hint, never the control — see below.
+   */
+  jobCardGaps: string[];
 }) {
   const [state, formAction, pending] = useActionState(recordOutcomeAction, INITIAL);
   const [selected, setSelected] = useState(recordedOutcome?.code ?? "");
@@ -238,6 +251,30 @@ export function OutcomePanel({
             style={fieldStyle}
           />
         </div>
+
+        {/*
+          ── JOB-15, said before the button rather than after it ────────────
+
+          The refusal itself lives in `assertJobCardComplete`, inside the
+          transaction that would otherwise move the job to `work_complete`, and
+          it applies to the field app (`M11`) as much as to this form. This
+          line is a courtesy so the operator is not surprised by it.
+
+          The button stays enabled. Disabling it would make the browser the
+          authority on a rule the server owns, and the two would eventually
+          disagree — at which point somebody is looking at a greyed-out button
+          with no explanation instead of a sentence naming what is missing.
+        */}
+        {!isComplete && jobCardGaps.length > 0 ? (
+          <p
+            className="flex items-start gap-1.5 text-[12px]"
+            style={{ color: "var(--status-warning-text)" }}
+          >
+            <Warning size={13} weight="fill" aria-hidden className="mt-0.5 shrink-0" />
+            The job card is not finished: {jobCardGaps.map((g) => GAP_LABEL[g] ?? g).join(", ")}.
+            The server will refuse the completion until it is.
+          </p>
+        ) : null}
 
         <button
           type="submit"

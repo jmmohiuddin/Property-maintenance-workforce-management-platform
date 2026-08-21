@@ -18,10 +18,22 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import { hash } from "@node-rs/argon2";
 import * as schema from "./schema";
 import { STANDARD_JOB_OUTCOMES } from "./domain/reference";
+import { STANDARD_PHOTO_EXEMPTION_REASONS } from "./domain/jobcard";
 // M3 (`CON-13`). Same reasoning as the HR import below: a separate statement,
 // because several streams are editing this file at once.
 import { and, eq } from "drizzle-orm";
 import { STANDARD_ASSET_CATEGORIES } from "./domain/assets";
+// M3 (`CON-11`). A separate import statement for the same reason the one above
+// is: these vocabularies belong to the tender module and importing them through
+// the package barrel would drag the whole domain layer into the seed.
+import {
+  STANDARD_TENDER_SOURCES,
+  STANDARD_TENDER_OUTCOME_REASONS,
+} from "./domain/tenders";
+// M5 (`PRJ-6`, `PRJ-7`). A separate import statement for the same reason the
+// M3 and M10 ones above are separate: several streams are editing this file,
+// and a whole added line merges where an edited line inside a list does not.
+import { STANDARD_PERMIT_AUTHORITIES, STANDARD_SNAG_TRADES } from "@meridian/core";
 import { dubaiDateKey } from "@meridian/core";
 import {
   computeSlaDeadlines,
@@ -89,6 +101,29 @@ async function main(): Promise<void> {
     // references this seed writes, which is harmless but makes the seeded
     // data confusing to read.
     schema.referenceCounters,
+    // M5. Before `invoices`, and that ordering is load-bearing rather than
+    // tidy: `project_retention.invoice_id` is ON DELETE RESTRICT, so deleting
+    // an invoice with retention held against it fails outright. It is restrict
+    // on purpose — retention is a claim on a specific document, and a claim
+    // whose document has vanished is a balance nobody can evidence.
+    //
+    // Also before `customers`, which `projects.customer_id` restricts against,
+    // and before `subcontractors`, which `project_subcontracts` restricts
+    // against. Everything else here cascades from `projects` or from `tenants`
+    // and is named anyway, because this file's rule is that anything it writes
+    // is listed — `credit_notes` is the precedent for what happens otherwise.
+    schema.projectCosts,
+    schema.projectRetention,
+    schema.projectSubcontracts,
+    schema.projectSnags,
+    schema.snagTrades,
+    schema.projectPermits,
+    schema.permitAuthorities,
+    schema.projectMilestones,
+    schema.projectPhaseJobs,
+    schema.projectPhases,
+    schema.projects,
+    schema.labourCostRates,
     // Credit notes before invoices, because a credit note references the
     // invoice it corrects (Article 60) and that reference is the whole point of
     // the document. Omitting these two made `db:seed` fail on a foreign key for
@@ -101,6 +136,17 @@ async function main(): Promise<void> {
     schema.invoices,
     schema.quoteLines,
     schema.quotes,
+    // M3 (`CON-11`, `CON-12`). Children before parents: a pack references the
+    // tender it was assembled for, and the tender references both vocabularies
+    // with ON DELETE restrict — which does not cascade at all, so leaving the
+    // vocabularies out of this list would fail the clear-down on a foreign key
+    // the moment anybody had recorded a tender. `credit_notes` is the precedent
+    // and it is why this file names everything it writes.
+    schema.tenderPacks,
+    schema.tenderProperties,
+    schema.tenders,
+    schema.tenderOutcomeReasons,
+    schema.tenderOpportunitySources,
     // M3. Children of `contracts` before it. They all cascade, so deleting the
     // parent alone would work — but this file's own rule is that anything
     // referencing a seeded row is listed, and relying on a cascade here would
@@ -120,6 +166,10 @@ async function main(): Promise<void> {
     // referencing a seeded row is named, and its reference to `fault_codes` is
     // ON DELETE restrict, which does not cascade at all.
     schema.jobFaultCodes,
+    // JOB-15. Before the jobs and visits it hangs off, and before the reason
+    // vocabulary it cites — that reference is ON DELETE restrict, which does
+    // not cascade at all, so leaving it out would fail the clear-down here.
+    schema.jobCardDeclarations,
     schema.jobEvents,
     schema.jobVisits,
     schema.jobReports,
@@ -127,6 +177,10 @@ async function main(): Promise<void> {
     schema.jobAttachments,
     schema.jobSignoffs,
     schema.jobs,
+    // After `job_card_declarations`, which references it. It cascades from
+    // `tenants` and would be cleared anyway; it is named because this file's
+    // rule is that everything it writes is listed.
+    schema.jobPhotoExemptionReasons,
     // M10, children first. Every one of these cascades from `tenants`, which is
     // last in this list — so the clear-down would work without them. They are
     // named anyway, because this file's rule is that anything it writes is
@@ -139,6 +193,12 @@ async function main(): Promise<void> {
     schema.overtimeRecords,
     schema.leaveBalances,
     schema.employmentContractTerms,
+    // HR-13/HR-19, before the `employees` rows they hang off.
+    // `subcontractor_workers` cascades from its supplier, and is named anyway
+    // because this file's rule is that everything it writes is listed.
+    schema.gratuitySettlements,
+    schema.subcontractorWorkers,
+    schema.subcontractors,
     schema.employeeDocuments,
     // Before `technicians`: `employees.technician_id` is ON DELETE SET NULL, so
     // deleting technicians first would leave employment records behind with a
@@ -566,6 +626,83 @@ async function main(): Promise<void> {
   }
   console.log(`  ${STANDARD_JOB_OUTCOMES.length} standard job outcomes per tenant`);
 
+  // ── Why an "after" photo may be missing (JOB-15) ──────────────────────────
+  //
+  // Seeded for the same reason the outcomes above are, and with more at stake:
+  // this list is the alternative to a required photograph, so a tenant whose
+  // picker is empty on day one has a completion gate with no legitimate way
+  // past it. The technician then either cannot close a job with nothing to
+  // photograph, or somebody widens the gate — and a gate widened once stays
+  // widened. `on conflict do nothing`, so re-seeding leaves an edited label be.
+  for (const tenantId of [T1, T2]) {
+    await db
+      .insert(schema.jobPhotoExemptionReasons)
+      .values(
+        STANDARD_PHOTO_EXEMPTION_REASONS.map((r) => ({
+          tenantId,
+          code: r.code,
+          label: r.label,
+          description: r.description,
+          sortOrder: r.sortOrder,
+        })),
+      )
+      .onConflictDoNothing();
+  }
+  console.log(
+    `  ${STANDARD_PHOTO_EXEMPTION_REASONS.length} photo exemption reasons per tenant`,
+  );
+
+  // ── The project vocabularies (PRJ-6, PRJ-7) ──────────────────────────────
+  //
+  // Seeded for the same reason the job outcomes above are. A permit authority
+  // typed by hand gives "DM", "Dubai Municipality" and "Dubai Muncipality" for
+  // one body, and "which authority is holding this project up" stops having an
+  // answer — permanently, because by the time anyone asks it the history is
+  // already written. The snag trades carry a catalogue slug wherever the trade
+  // is one this business sells, so "who has the most open snags" and "who do we
+  // send" are the same answer.
+  //
+  // `on conflict do nothing`, so re-seeding leaves an operator's edits alone.
+  //
+  // `labour_cost_rates` (PRJ-8) is deliberately NOT seeded, and the omission is
+  // a decision rather than an oversight — the same one this file already makes
+  // for the rate card and the fault codes. A fully-loaded hourly cost is
+  // genuinely per-business, and a plausible-looking invented figure is worse
+  // than an empty table: a project margin computed from somebody else's wage
+  // assumptions is a number that gets believed. `recordCost` accepts an hourly
+  // cost directly, so an empty rate card blocks nothing.
+  for (const tenantId of [T1, T2]) {
+    await db
+      .insert(schema.permitAuthorities)
+      .values(
+        STANDARD_PERMIT_AUTHORITIES.map((a) => ({
+          tenantId,
+          code: a.code,
+          label: a.label,
+          description: a.description,
+          sortOrder: a.sortOrder,
+        })),
+      )
+      .onConflictDoNothing();
+
+    await db
+      .insert(schema.snagTrades)
+      .values(
+        STANDARD_SNAG_TRADES.map((t) => ({
+          tenantId,
+          code: t.code,
+          label: t.label,
+          serviceSlug: t.serviceSlug,
+          sortOrder: t.sortOrder,
+        })),
+      )
+      .onConflictDoNothing();
+  }
+  console.log(
+    `  ${STANDARD_PERMIT_AUTHORITIES.length} permit authorities and ` +
+      `${STANDARD_SNAG_TRADES.length} snag trades per tenant`,
+  );
+
   // ── The asset register (CON-13) ───────────────────────────────────────────
   //
   // The kinds are seeded for the same reason the job outcomes above are: the
@@ -589,6 +726,51 @@ async function main(): Promise<void> {
       )
       .onConflictDoNothing();
   }
+
+  // ── The tender vocabularies (CON-11) ──────────────────────────────────────
+  //
+  // Seeded for the same reason the asset kinds above are: the four channels are
+  // written into the requirement rather than chosen per business, and a picker
+  // that is empty on day one is a picker whose first entry everybody chooses.
+  // The outcome reasons matter for a second reason — "why did we lose" answered
+  // in free text is a question with no answer at the end of the year, and two
+  // of the reasons on the list ("incomplete submission", "missing
+  // accreditation") are the ones CON-12's pack exists to drive to zero, so they
+  // have to be countable.
+  //
+  // `on conflict do nothing`, so re-seeding leaves an operator's edits alone.
+  for (const tenantId of [T1, T2]) {
+    await db
+      .insert(schema.tenderOpportunitySources)
+      .values(
+        STANDARD_TENDER_SOURCES.map((v) => ({
+          tenantId,
+          code: v.code,
+          label: v.label,
+          description: v.description,
+          sortOrder: v.sortOrder,
+        })),
+      )
+      .onConflictDoNothing();
+
+    await db
+      .insert(schema.tenderOutcomeReasons)
+      .values(
+        STANDARD_TENDER_OUTCOME_REASONS.map((v) => ({
+          tenantId,
+          code: v.code,
+          label: v.label,
+          description: v.description,
+          appliesTo: v.appliesTo,
+          sortOrder: v.sortOrder,
+        })),
+      )
+      .onConflictDoNothing();
+  }
+  console.log(
+    `  ${STANDARD_TENDER_SOURCES.length} tender opportunity sources and ` +
+      `${STANDARD_TENDER_OUTCOME_REASONS.length} outcome reasons per tenant`,
+  );
 
   const categoryIds = new Map<string, string>();
   for (const row of await db
@@ -1152,6 +1334,11 @@ async function main(): Promise<void> {
         // a breach on a fresh install is a false alarm.
         overtimeMinutes: 90,
         carriedOverLeaveDays: 5,
+        // HR-18, leg one and leg two. A charge hand on AED 9,200 with a
+        // technical diploma passes all three legs of the skilled test, so this
+        // is the tenant's entire Emiratisation denominator: one.
+        iscoMajorGroup: 3,
+        postSecondaryCertificate: true,
       },
       {
         no: "E-002",
@@ -1184,6 +1371,12 @@ async function main(): Promise<void> {
         },
         overtimeMinutes: 0,
         carriedOverLeaveDays: 0,
+        // Craft and related trades, no post-secondary certificate, AED 3,700 a
+        // month. Outside the denominator on all three legs at once, which is
+        // the ordinary case in this business and the reason total headcount is
+        // not the number Emiratisation is measured against.
+        iscoMajorGroup: 7,
+        postSecondaryCertificate: false,
       },
       {
         no: "E-003",
@@ -1211,6 +1404,14 @@ async function main(): Promise<void> {
         },
         overtimeMinutes: 0,
         carriedOverLeaveDays: 0,
+        // Deliberately unrecorded, both of them. `classifySkilledEmployee`
+        // returns `unknown` rather than guessing, and `assessEmiratisation`
+        // counts the unknowns into the UPPER bound of the skilled range — so a
+        // fresh install opens showing "1-2 skilled" and a named reason, which
+        // is the honest answer and is what the screen exists to say. Seeding
+        // this as a definite value would demonstrate the wrong behaviour.
+        iscoMajorGroup: null,
+        postSecondaryCertificate: null,
       },
     ];
 
@@ -1243,6 +1444,8 @@ async function main(): Promise<void> {
           noticePeriodDays: 30,
           basicSalaryMinor: e.basicMinor,
           allowances: e.allowances,
+          iscoMajorGroup: e.iscoMajorGroup,
+          postSecondaryCertificate: e.postSecondaryCertificate,
           mohrePersonCode: `MOHRE-${e.no}`,
           // Without an IBAN a wage line cannot be transferred, and
           // `wageFileGaps` reports that as the failure that looks like
@@ -1459,9 +1662,85 @@ async function main(): Promise<void> {
       })),
     );
 
+    // ── HR-19: one manpower supplier, with its paperwork ─────────────────
+    //
+    // Same rule as the employee documents above: seeded in the band BEFORE a
+    // problem, not inside one. The liability policy at 75 days puts a row in
+    // the 90-day sweep so the section is populated on a fresh install; nothing
+    // is expired, because a seed that opens in breach trains everybody to
+    // ignore the colour.
+    //
+    // The workers are here rather than as `technicians` deliberately. A
+    // supplied worker is not an employee and must not be one — that would put
+    // them in the payroll, the WPS wage file, the gratuity liability and the
+    // Emiratisation denominator, four places they do not belong.
+    const [supplier] = await db
+      .insert(schema.subcontractors)
+      .values({
+        tenantId: T1,
+        name: "Gulf Skilled Manpower LLC",
+        kind: "manpower_supplier",
+        tradeSlug: "electrical",
+        contactName: "Rakesh Menon",
+        contactPhone: "+971 4 555 0198",
+        contactEmail: "ops@gulfskilled.example",
+        tradeLicenceNo: "CR-742118",
+        tradeLicenceExpiresOn: day(310),
+        liabilityInsurer: "Oman Insurance",
+        liabilityPolicyNo: "TPL-2026-88431",
+        liabilityExpiresOn: day(75),
+        workmenCompInsurer: "Daman",
+        workmenCompPolicyNo: "WC-2026-11902",
+        workmenCompExpiresOn: day(240),
+        // Dubai Law No. 7 of 2025 requires prior approval to subcontract.
+        approvalReference: "DM-SUB-2026-0417",
+        // Fifteen digits, the same TRN_PATTERN a tax invoice enforces. Their
+        // invoices to us carry it, and INV-6 decides full-versus-simplified on
+        // exactly that basis.
+        taxRegistrationNumber: "100482913600003",
+        // The free-form tail: third-party certifications we neither issue nor
+        // renew. Both in date, and the nearer one at 130 days is deliberately
+        // OUTSIDE the 90-day sweep — a fresh install should not open with an
+        // amber row it cannot act on.
+        accreditations: [
+          { name: "IRATA rope access — Level 3 supervisor", issuer: "IRATA International", expiresOn: day(130) },
+          { name: "ISO 45001 occupational health and safety", issuer: "EIAC", expiresOn: day(500) },
+        ],
+        status: "approved",
+        note: "Two electricians on the Bay Tower riser upgrade.",
+      })
+      .returning({ id: schema.subcontractors.id });
+    if (!supplier) throw new Error("failed to insert the manpower supplier");
+
+    await db.insert(schema.subcontractorWorkers).values([
+      {
+        tenantId: T1,
+        subcontractorId: supplier.id,
+        fullName: "Sanjay Raut",
+        tradeSlug: "electrical",
+        workPermitNo: "WP-4471182",
+        workPermitExpiresOn: day(410),
+        verifiedById: userIds.get("rania@meridianfm.example") ?? null,
+        verifiedAt: ago(11 * DAY),
+      },
+      {
+        tenantId: T1,
+        subcontractorId: supplier.id,
+        fullName: "Imran Sheikh",
+        tradeSlug: "electrical",
+        workPermitNo: "WP-4471183",
+        // Inside the 90-day sweep. A permit is not a warning at 88 days; it is
+        // the point at which a renewal is still cheap and unhurried.
+        workPermitExpiresOn: day(88),
+        verifiedById: userIds.get("rania@meridianfm.example") ?? null,
+        verifiedAt: ago(11 * DAY),
+      },
+    ]);
+
     console.log(
       `  ${employeeSpecs.length} employment records, ${employeeSpecs.length * 5} statutory documents, ` +
-        `2 wage cycles (live one transferred on time), 1 document expiring inside 30 days`,
+        `2 wage cycles (live one transferred on time), 1 document expiring inside 30 days, ` +
+        `1 manpower supplier with 2 permit-verified workers`,
     );
   }
 

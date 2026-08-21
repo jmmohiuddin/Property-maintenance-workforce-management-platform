@@ -152,9 +152,10 @@ export default async function AssetPage({
 
           {history.length === 0 ? (
             <p className="prose-body mt-4 text-[14px]">
-              No work has been attached to this asset yet. Jobs raised at this property are not
-              linked to plant automatically — the job screens do not ask which asset the work is
-              for — so the history starts when somebody attaches the first one below.
+              No work has been attached to this asset yet. A request raised in the customer portal
+              can name the equipment it is about, and arrives here already attached; anything raised
+              before this asset was registered, or raised without naming it, is attached by hand
+              below.
             </p>
           ) : (
             <ul className="mt-5 divide-y rounded border">

@@ -11,6 +11,7 @@ import {
   SICK_LEAVE_HALF_PAY_DAYS,
   SICK_LEAVE_TOTAL_DAYS,
   ESSENTIAL_BENEFITS_WAGE_CEILING_MINOR,
+  GRATUITY_SETTLEMENT_DAYS,
 } from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
@@ -45,6 +46,10 @@ export default async function HrPage() {
 
   const { wages, unsettled, permitWarning, contracts, leave, hoursExceptions, hoursWarning } = summary;
   const { sickLeave, weeklyBreaches } = summary;
+  const { gratuity, gratuityOverdue, emiratisation, subcontractorExpiries } = summary;
+  // Already lapsed, as opposed to lapsing. The card leads with the count that
+  // has a consequence attached today rather than with the horizon total.
+  const subcontractorLapsed = subcontractorExpiries.filter((e) => e.daysRemaining < 0).length;
   // Anyone who has used more than the full-pay stage. Everybody else's sick
   // leave is on their own record; what belongs on a board is the position that
   // has a consequence attached — the next day of illness is paid at half.
@@ -551,10 +556,123 @@ export default async function HrPage() {
           )}
         </section>
 
+        {/* ── 6. Gratuity, Emiratisation and the subcontractor register ──
+            Three summaries rather than three sections, each linking to the
+            board that owns it. They are last for the same reason the WPS
+            banner is first: nothing here moves inside a week. The gratuity
+            liability changes by a day's accrual a day, the skilled headcount
+            by a hire, and a subcontractor's licence on a schedule somebody
+            else set. Putting any of them above a payroll that is eleven days
+            late would be sorting the page by interest rather than by
+            consequence. */}
+        <section aria-labelledby="standing-heading" className="mt-10">
+          <div id="standing-heading">
+            <SectionHeading tone="success" title="Standing positions">
+              slower-moving obligations, each with its own board
+            </SectionHeading>
+          </div>
+
+          <div className="mt-4 grid gap-4 md:grid-cols-3">
+            {/* HR-13 */}
+            <Link
+              href="/hr/gratuity"
+              className="rounded border p-4 transition-colors hover:border-current"
+              style={{ backgroundColor: "var(--surface-raised)" }}
+            >
+              <p className="text-[12px] uppercase tracking-wide" style={{ color: "var(--text-muted)" }}>
+                End-of-service gratuity
+              </p>
+              <p className="tnum mt-1 text-xl font-semibold">{formatMoney(gratuity.totalMinor)}</p>
+              <p className="prose-body mt-1 text-[12px]">{gratuity.headline}</p>
+              {gratuityOverdue.length > 0 ? (
+                <p className="mt-2 text-[12px] font-semibold" style={{ color: "var(--status-critical-text)" }}>
+                  {gratuityOverdue.length} settlement
+                  {gratuityOverdue.length === 1 ? " is" : "s are"} past the{" "}
+                  {GRATUITY_SETTLEMENT_DAYS}-day deadline and unpaid.
+                </p>
+              ) : null}
+              {gratuity.uncomputableCount > 0 ? (
+                <p className="mt-2 text-[12px]" style={{ color: "var(--status-warning-text)" }}>
+                  {gratuity.uncomputableCount} record
+                  {gratuity.uncomputableCount === 1 ? "" : "s"} missing a service date or a basic
+                  salary, so this figure is understated.
+                </p>
+              ) : null}
+            </Link>
+
+            {/* HR-18 */}
+            <Link
+              href="/hr/emiratisation"
+              className="rounded border p-4 transition-colors hover:border-current"
+              style={{ backgroundColor: "var(--surface-raised)" }}
+            >
+              <p className="text-[12px] uppercase tracking-wide" style={{ color: "var(--text-muted)" }}>
+                Emiratisation &mdash; skilled headcount
+              </p>
+              <p className="tnum mt-1 text-xl font-semibold">
+                {emiratisation.unknown > 0
+                  ? `${emiratisation.lowerBound}–${emiratisation.upperBound}`
+                  : emiratisation.lowerBound}
+                <span className="text-[13px] font-normal" style={{ color: "var(--text-muted)" }}>
+                  {" "}
+                  / {emiratisation.threshold}
+                </span>
+              </p>
+              {/* The whole point of HR-18 in one line: this is NOT headcount. */}
+              <p className="prose-body mt-1 text-[12px]">
+                {emiratisation.headcount} employed in total, which is not the number the threshold
+                is measured against.
+              </p>
+              {emiratisation.undecidedByMissingFacts || emiratisation.approaching ? (
+                <p className="mt-2 text-[12px] font-semibold" style={{ color: "var(--status-warning-text)" }}>
+                  {emiratisation.headline}
+                </p>
+              ) : null}
+              {/* OPEN-4 travels with the figure, not only on the page that
+                  explains it. A count this precise, against a threshold that
+                  may not apply to technical services at all, is exactly the
+                  number somebody acts on with false confidence — and the
+                  summary card is where they would see it without the
+                  explanation. Shown only in the 20–49 band, because that is
+                  the only band the open question affects: at 50+ skilled the
+                  rule applies whatever the sector. */}
+              {emiratisation.band === "small_establishment_band" ? (
+                <p className="mt-2 text-[12px]" style={{ color: "var(--text-muted)" }}>
+                  OPEN-4: whether technical services is a designated sector for the 20&ndash;49
+                  employee rule is unconfirmed. Assumed in scope.
+                </p>
+              ) : null}
+            </Link>
+
+            {/* HR-19 */}
+            <Link
+              href="/workforce/subcontractors"
+              className="rounded border p-4 transition-colors hover:border-current"
+              style={{ backgroundColor: "var(--surface-raised)" }}
+            >
+              <p className="text-[12px] uppercase tracking-wide" style={{ color: "var(--text-muted)" }}>
+                Subcontractors and manpower suppliers
+              </p>
+              <p className="tnum mt-1 text-xl font-semibold">{subcontractorExpiries.length}</p>
+              <p className="prose-body mt-1 text-[12px]">
+                {subcontractorExpiries.length === 0
+                  ? "Nothing in the supplier register expires within 90 days."
+                  : "licence, insurance and work-permit expiries within 90 days"}
+              </p>
+              {subcontractorLapsed > 0 ? (
+                <p className="mt-2 text-[12px] font-semibold" style={{ color: "var(--status-critical-text)" }}>
+                  {subcontractorLapsed} of them {subcontractorLapsed === 1 ? "has" : "have"} already
+                  lapsed. Responsibility for site compliance does not transfer with the work.
+                </p>
+              ) : null}
+            </Link>
+          </div>
+        </section>
+
         <p className="mt-10 text-[12px]" style={{ color: "var(--text-muted)" }}>
-          End-of-service gratuity (`HR-13`), the work-injury register (`HR-11`) and Emiratisation
-          monitoring (`HR-18`) are specified but not built. Nothing on this page reports on them, and
-          nothing on this page implies they are fine.
+          The work-injury register (`HR-11`) is specified but not built &mdash; the 48-hour MOHRE
+          reporting clock and the salary-continuation obligation have no home yet. Nothing on this
+          page reports on it, and nothing on this page implies it is fine.
         </p>
       </div>
     </AppShell>

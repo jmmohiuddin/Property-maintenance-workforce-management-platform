@@ -232,7 +232,12 @@ DECLARE
   audited text[] := ARRAY[
     'jobs', 'job_visits', 'job_signoffs', 'quotes', 'quote_lines',
     'contracts', 'contract_visits', 'invoices', 'invoice_lines', 'payments',
-    'customers', 'properties', 'assets', 'technicians', 'memberships', 'leave_requests'
+    'customers', 'properties', 'assets', 'technicians', 'memberships', 'leave_requests',
+    -- CON-11. The tender row stores its own outcome, reason and who decided it,
+    -- so the FACT is recorded. What was not recorded is the change: who moved a
+    -- bid from won to lost, and when. On a deadline-driven pipeline that is the
+    -- history somebody asks for after the fact.
+    'tenders'
   ];
 BEGIN
   FOREACH t IN ARRAY audited LOOP

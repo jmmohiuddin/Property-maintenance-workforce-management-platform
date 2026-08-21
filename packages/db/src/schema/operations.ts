@@ -353,3 +353,105 @@ export const jobFaultCodes = pgTable(
     index("job_fault_codes_code_idx").on(t.tenantId, t.faultCodeId, t.createdAt),
   ],
 );
+
+/**
+ * Why an "after" photo is missing, from a controlled list (`JOB-15`).
+ *
+ * ── WHY A TABLE AND NOT A TEXT FIELD ────────────────────────────────────────
+ *
+ * `JOB-15` says "an explicit reason-coded exemption", and the wording is the
+ * requirement. A free-text box collects "n/a", "-", "camera", "phone died" and
+ * "no photo needed" for the same situation, and nobody can then answer the only
+ * question worth asking of this data: are photos missing because the work is
+ * genuinely unphotographable, or because one crew has learnt that typing
+ * anything gets them past the gate? A code groups; a sentence does not.
+ *
+ * ── WHY IT LIVES HERE AND NOT IN `reference.ts` ─────────────────────────────
+ *
+ * The vocabularies in `reference.ts` are the ones an administrator maintains on
+ * a screen — holidays, rate cards, disposition reasons, fault codes. This list
+ * is read by exactly one thing, the completion gate below, and it sits beside
+ * the tables that gate reads.
+ */
+export const jobPhotoExemptionReasons = pgTable(
+  "job_photo_exemption_reasons",
+  {
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    id: idCol(),
+    /** Stable machine key. Reports group on this, so labels can be reworded. */
+    code: varchar("code", { length: 48 }).notNull(),
+    label: varchar("label", { length: 120 }).notNull(),
+    description: varchar("description", { length: 400 }),
+    sortOrder: integer("sort_order").notNull().default(100),
+    /** Retirement, never deletion — completed jobs still cite this row. */
+    isActive: boolean("is_active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("job_photo_exemption_reasons_code_key").on(t.tenantId, t.code),
+    index("job_photo_exemption_reasons_pick_idx").on(t.tenantId, t.isActive, t.sortOrder),
+  ],
+);
+
+/**
+ * The assertions a job card carries that are absences rather than records
+ * (`JOB-15`).
+ *
+ * ── THE DISTINCTION THIS TABLE EXISTS FOR ───────────────────────────────────
+ *
+ * `JOB-15` asks for "materials recorded or explicitly none". An empty
+ * `job_materials` cannot tell those apart: no rows means either no parts were
+ * fitted or nobody filled the section in, and those two have opposite meanings
+ * for job costing, for stock reordering and for a warranty argument six months
+ * later. So "none were used" is written down as a fact somebody asserted, with
+ * their name and the time on it, and the gate reads the assertion rather than
+ * inferring from silence.
+ *
+ * The photo exemption is the same shape — a technician saying "there is nothing
+ * to photograph, and here is the reason from the list" — so it is the same
+ * table with a `kind` discriminator, the way `job_fault_codes` carries symptom,
+ * cause and remedy in one table rather than three.
+ */
+export const jobCardDeclarations = pgTable(
+  "job_card_declarations",
+  {
+    id: idCol(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    jobId: uuid("job_id")
+      .notNull()
+      .references(() => jobs.id, { onDelete: "cascade" }),
+    visitId: uuid("visit_id").references(() => jobVisits.id, { onDelete: "set null" }),
+    /** `materials_none` | `photo_exempt`. */
+    kind: varchar("kind", { length: 16 }).notNull(),
+    /**
+     * From `job_photo_exemption_reasons.code`, and only on a `photo_exempt`
+     * row. A `materials_none` declaration has no reason to give: "no parts were
+     * used" is the whole of it.
+     */
+    reasonCode: varchar("reason_code", { length: 48 }),
+    /** What the code does not say. Beside it, never instead of it. */
+    note: text("note"),
+    declaredById: uuid("declared_by_id").references(() => users.id, { onDelete: "set null" }),
+    // Written out rather than the shared `timestamps` spread, for the reason
+    // `job_fault_codes` gives: this table has no soft delete and should not
+    // gain one. A withdrawn declaration is deleted, because a soft-deleted one
+    // would keep satisfying any gate that forgot to filter — which is the one
+    // query this table exists to answer correctly.
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("job_card_declarations_job_idx").on(t.tenantId, t.jobId),
+    // `job_card_declarations_one_per_kind` — one declaration of each kind per
+    // job, per visit — is a unique index over an expression and so lives in
+    // `0025_job_card.sql` only, the way `job_fault_codes_one_per_kind` does.
+    // Without it a form submitted twice records that no materials were used
+    // twice, and a count of exempted jobs then depends on how many times
+    // somebody pressed save.
+  ],
+);

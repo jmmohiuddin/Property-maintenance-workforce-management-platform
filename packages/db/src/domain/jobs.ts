@@ -17,6 +17,7 @@ import {
 } from "@meridian/core";
 import { loadWorkingCalendar } from "./reference";
 import { writeAuditNote } from "./staff";
+import { assertJobCardComplete } from "./jobcard";
 // The cursor codec is imported rather than re-implemented, even though
 // `leads.ts` already imports `nextJobReference` from here and this makes the
 // pair mutually importing. Both sides only touch each other inside function
@@ -70,6 +71,27 @@ export async function transitionJob(
 
   const from = current.status as JobStatus;
   if (!canTransition(from, input.to)) throw new InvalidTransitionError(from, input.to);
+
+  // JOB-15 lives HERE, not only in `recordJobOutcome`.
+  //
+  // The requirement says a job cannot be completed without an outcome, an after
+  // photograph or a coded exemption, materials recorded or declared none, and
+  // labour time -- "enforced in the domain layer, not the UI". It was enforced
+  // in recordJobOutcome alone, which left this function as a second door into
+  // the same state: `on_site -> work_complete` is a legal transition, so any
+  // caller reaching for the status machine directly walked straight past the
+  // gate.
+  //
+  // That door was not hypothetical. The field sync API called this function to
+  // apply a device's status change, so a handset could have completed jobs with
+  // empty cards -- at scale, from the client hardest to observe. It closed its
+  // own side with an allow-list; this closes the door itself, for every caller
+  // that comes later and does not know the rule exists.
+  //
+  // recordJobOutcome still asserts before it writes anything, so the ordinary
+  // path fails early with nothing half-written. This is the backstop, and the
+  // duplicated read is worth what it buys.
+  if (input.to === "work_complete") await assertJobCardComplete(tx, input.jobId);
 
   const now = new Date();
   const patch: Record<string, unknown> = { status: input.to, updatedAt: now };

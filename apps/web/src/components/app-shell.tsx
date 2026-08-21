@@ -38,6 +38,13 @@ const NAV = [
   // route groups resolving to the same path is a Next build error, not a
   // precedence rule. AMC is what the business calls the thing anyway.
   { href: "/amc", label: "Contracts", permission: "contracts:read" },
+  // CON-11. Beside contracts because a tender is how one begins, and it
+  // shares contracts:read for the same reason.
+  { href: "/tenders", label: "Tenders", permission: "contracts:read" },
+  // M5. A project is a different commercial object from an AMC — it has
+  // phases, milestones, variations and retention — so it gets its own
+  // permission rather than borrowing the contract one.
+  { href: "/projects", label: "Projects", permission: "projects:read" },
   { href: "/technicians", label: "Technicians", permission: "technicians:read" },
   { href: "/workforce", label: "Workforce", permission: "workforce:read" },
   { href: "/recruitment", label: "Recruitment", permission: "recruitment:read" },
@@ -49,6 +56,10 @@ const NAV = [
   // balance under a lapsed work permit.
   { href: "/hr", label: "HR", permission: "workforce:read" },
   { href: "/admin/users", label: "Users", permission: "users:manage" },
+  // SEC-7. Beside Users and on the same permission, because revoking a lost
+  // handset is the same kind of act as unlocking an account or resetting a
+  // second factor: somebody reaching for a credential they are not holding.
+  { href: "/admin/devices", label: "Devices", permission: "users:manage" },
   { href: "/admin/company", label: "Company", permission: "settings:write" },
   // ADM-7. `audit:read`, which `readonly` also holds — this is the screen that
   // gives that role a reason to exist (and what ADM-8 builds on).

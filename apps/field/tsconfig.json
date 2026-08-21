@@ -1,0 +1,42 @@
+{
+  "extends": "../../tsconfig.base.json",
+  // ── WHY THIS PROJECT EXCLUDES HALF ITS OWN SOURCE ──────────────────────────
+  //
+  // The root gates run `npm run typecheck --workspaces`, so whatever this
+  // workspace's `typecheck` script compiles has to compile on a machine where
+  // nobody has installed Expo. The field app's React Native layer cannot: it
+  // imports `react-native`, `@nozbe/watermelondb` and half a dozen `expo-*`
+  // modules whose types only exist after an install nobody has run yet.
+  //
+  // So the workspace is split into two TypeScript projects rather than one:
+  //
+  //   tsconfig.json         the portable half - sync engine, outbox, clock,
+  //                         job-card rules, media policy, the WatermelonDB
+  //                         schema as plain data. No native imports at all.
+  //                         This is what the root sweep compiles, and it is
+  //                         also everything the unit tests exercise.
+  //
+  //   tsconfig.native.json  the React Native half - models, screens, adapters.
+  //                         Run with `npm run typecheck:native` AFTER
+  //                         `npm install`. It is deliberately NOT wired to the
+  //                         `typecheck` script, because a script that fails on
+  //                         a clean checkout would turn every other agent's
+  //                         green tree red for a reason that has nothing to do
+  //                         with their change.
+  //
+  // The split is not only defensive. Keeping the sync engine free of native
+  // imports is what makes it testable at all: `test/engine.test.ts` runs the
+  // real drain planner under plain `tsx`, with no simulator and no device.
+  "compilerOptions": {
+    "types": ["node"],
+    "jsx": "react-jsx"
+  },
+  "include": [
+    "src/domain/**/*.ts",
+    "src/sync/**/*.ts",
+    "src/media/**/*.ts",
+    "src/db/schema.ts",
+    "test/**/*.ts"
+  ],
+  "exclude": ["node_modules", "src/app/**", "src/db/models/**", "src/db/watermelon.ts"]
+}

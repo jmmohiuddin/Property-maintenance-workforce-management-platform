@@ -15,3 +15,5 @@ export * from "./recruitment";
 export * from "./employment";
 export * from "./reporting";
 export * from "./portal";
+export * from "./project";
+export * from "./tender";

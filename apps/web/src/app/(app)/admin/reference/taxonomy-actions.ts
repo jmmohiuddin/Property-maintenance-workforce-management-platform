@@ -7,14 +7,17 @@ import {
   addDispositionReason,
   addFaultCode,
   addJobOutcomeCode,
+  addPhotoExemptionReason,
   addRateVersion,
   endRate,
   installStandardAssetCategories,
   installStandardJobOutcomes,
+  installStandardPhotoExemptionReasons,
   setAssetCategoryActive,
   setDispositionReasonActive,
   setFaultCodeActive,
   setJobOutcomeActive,
+  setPhotoExemptionReasonActive,
   writeAuditNote,
   type DispositionScope,
   type FaultCodeKind,
@@ -591,5 +594,111 @@ export async function stopRate(_prev: ReferenceState, formData: FormData): Promi
   revalidatePath("/admin/reference/rate-card");
   return {
     success: `“${label}” stops applying on ${endsOn}. Quotations issued before then still show what they were priced from.`,
+  };
+}
+
+// ── Photo exemption reasons (JOB-15) ────────────────────────────────────────
+
+export async function installPhotoExemptions(
+  _prev: ReferenceState,
+  _formData: FormData,
+): Promise<ReferenceState> {
+  const { session, ctx } = await context();
+
+  let added = 0;
+  try {
+    await withTenant(ctx, async (tx) => {
+      added = await installStandardPhotoExemptionReasons(tx, ctx);
+      await writeAuditNote(tx, ctx, {
+        tableName: "job_photo_exemption_reasons",
+        // 13 characters. See the note at the top of this file.
+        action: "exempts_added",
+        detail: { added, changedBy: session.user.email },
+      });
+    });
+  } catch (error) {
+    console.error("[admin] install standard photo exemption reasons failed", error);
+    return fail("Could not add the standard reasons.");
+  }
+
+  revalidatePath("/admin/reference/photo-exemptions");
+  return {
+    success:
+      added === 0
+        ? "Every standard reason was already here. Nothing was changed or overwritten."
+        : `${added} standard ${added === 1 ? "reason" : "reasons"} added. Existing wording was left alone.`,
+  };
+}
+
+export async function addPhotoExemption(
+  _prev: ReferenceState,
+  formData: FormData,
+): Promise<ReferenceState> {
+  const { session, ctx } = await context();
+
+  const label = String(formData.get("label") ?? "").trim();
+  const rawCode = String(formData.get("code") ?? "").trim();
+  const description = String(formData.get("description") ?? "").trim() || null;
+  const sortOrder = Number(String(formData.get("sortOrder") ?? "100"));
+
+  if (!label) return fail("Name the reason as a technician would give it.");
+  const code = normaliseCode(rawCode || label);
+  if (!code) return fail("That name has no letters or numbers in it to build a code from.");
+
+  try {
+    await withTenant(ctx, async (tx) => {
+      await addPhotoExemptionReason(tx, ctx, {
+        code,
+        label,
+        description,
+        sortOrder: Number.isFinite(sortOrder) ? sortOrder : 100,
+      });
+      await writeAuditNote(tx, ctx, {
+        tableName: "job_photo_exemption_reasons",
+        // 10 characters.
+        action: "exempt_set",
+        detail: { code, label, changedBy: session.user.email },
+      });
+    });
+  } catch (error) {
+    console.error("[admin] add photo exemption reason failed", error);
+    return fail("Could not save that reason.");
+  }
+
+  revalidatePath("/admin/reference/photo-exemptions");
+  return { success: `“${label}” saved as ${code}.` };
+}
+
+export async function togglePhotoExemption(
+  _prev: ReferenceState,
+  formData: FormData,
+): Promise<ReferenceState> {
+  const { session, ctx } = await context();
+  const id = String(formData.get("id") ?? "");
+  const label = String(formData.get("label") ?? "that reason");
+  const activate = String(formData.get("activate") ?? "") === "true";
+  if (!id) return fail("No reason selected.");
+
+  try {
+    await withTenant(ctx, async (tx) => {
+      await setPhotoExemptionReasonActive(tx, id, activate);
+      await writeAuditNote(tx, ctx, {
+        tableName: "job_photo_exemption_reasons",
+        recordId: id,
+        // 15 and 14 characters.
+        action: activate ? "exempt_restored" : "exempt_retired",
+        detail: { reason: label, changedBy: session.user.email },
+      });
+    });
+  } catch (error) {
+    console.error("[admin] toggle photo exemption reason failed", error);
+    return fail("Could not change that reason.");
+  }
+
+  revalidatePath("/admin/reference/photo-exemptions");
+  return {
+    success: activate
+      ? `“${label}” is back in the picker.`
+      : `“${label}” is retired. Every job already exempted for it still shows it.`,
   };
 }

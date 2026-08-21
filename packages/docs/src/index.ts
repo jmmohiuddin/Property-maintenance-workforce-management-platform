@@ -8,8 +8,9 @@
  * financial document is rendered once and then kept.
  *
  * Still to build here, and deliberately not stubbed: the job sheet (`FLD-14`),
- * the statement of account (`INV-13`), the tender pack (`CON-12`) and the
- * Arabic bilingual layout variant (`INV-14`).
+ * the statement of account (`INV-13`) and the Arabic bilingual layout variant
+ * (`INV-14`). The tender pack (`CON-12`) is in `tender-pack.ts`, and it is the
+ * one document here assembled from several renders — see its header.
  */
 
 export * from "./tokens";
@@ -19,3 +20,4 @@ export * from "./blocks";
 export * from "./tax-document";
 export * from "./quote-document";
 export * from "./issue";
+export * from "./tender-pack";

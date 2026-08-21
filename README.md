@@ -54,6 +54,7 @@ Two deployment-specific notes worth keeping:
 | `packages/db` | Schema (81 tables), tenant + customer RLS, audit triggers, job/SLA/commerce/workforce/contracts/recruitment/HR/assets domain, seed | Built, verified against real Postgres |
 | `packages/auth` | Argon2id hashing, revocable sessions, 10-role RBAC, TOTP two-factor with recovery codes | Built, verified end to end |
 | `packages/notify` | Templates, transactional queue, retry with attempt limits, pluggable transport | Built, verified — console transport only |
+| `packages/files` | Object store (local driver only), magic-byte sniffing, resumable chunked upload, EXIF extraction and stripping, image compression, ClamAV virus scanning | Built — **no scanner and no S3 bucket configured on this deployment**, and both say so |
 | `docs/` | Architecture, ADRs, security model, AEO/GEO playbook, roadmap | Written |
 
 ## Quick start
@@ -74,7 +75,7 @@ for f in rls auth-functions public-functions customer-scope reference mfa-functi
   psql -d meridian_dev -v ON_ERROR_STOP=1 -f "packages/db/sql/$f.sql"; done
 ```
 
-That last file runs thirteen isolation checks and exits non-zero if any fail. It now runs in CI on
+That last file runs fourteen isolation checks and exits non-zero if any fail. It now runs in CI on
 every push (`.github/workflows/ci.yml`) — it is the gate that matters most in this repo.
 
 **The order of the `sql/` files is load-bearing, not stylistic.** `rls.sql` ends with a blanket
@@ -146,7 +147,7 @@ Many AI crawlers do not execute JavaScript. Anything an answer engine needs to r
 the HTML response, so structured data, FAQ answers and the per-page answer paragraph are all
 server-rendered. The FAQ uses native `<details>` rather than a JS accordion for the same reason.
 
-## Two traps that have each caught more than one person
+## Three traps that have each caught more than one person
 
 Both are silent, both compile, and neither is a mistake you make once and learn from — three
 different people hit the first independently before it was written down.
@@ -200,6 +201,23 @@ This one is invisible unless a fixture exercises the branch, so it survives exac
 tests do not reach. When you add raw SQL with a date in it, sweep for it rather than waiting for a
 failure.
 
+**3. A Postgres constraint name is on the error's `cause`, not its `message`.**
+
+Drizzle wraps a driver error in a `DrizzleQueryError` whose own `message` is only
+`Failed query: ...`. The constraint name — the entire reason Postgres refused — is on `.cause`.
+
+```ts
+// Silently matches nothing. The check fails while the database behaves perfectly.
+checkTrue("refused by the constraint", err.message.includes("leave_requests_kind_check"));
+```
+
+This matters because a test proving a CHECK constraint refuses bad data is one of the strongest
+assertions in this repo — several suites rely on exactly that shape — and this failure mode makes
+such a test fail for a reason unrelated to what it is testing. Walk the cause chain instead;
+`packages/db/test/jobcard.test.ts` has a `messageChain()` helper that does it.
+
+Same family as trap 2: the type system says one thing, the runtime hands you another.
+
 ## Documentation
 
 | Document | Read it when |
@@ -230,7 +248,7 @@ Claims in this README that have been executed rather than asserted:
   That is fewer than this file used to claim, and deliberately: `WEB-1` rebuilt the service pages
   one-to-one against the licensed activities and removed the rest, and `WEB-6` cut the area pages to
   the ones the company will genuinely travel to
-- Schema applied to PostgreSQL 16; all 13 RLS isolation checks pass
+- Schema applied to PostgreSQL 16; all 14 RLS isolation checks pass
 - JSON-LD parsed and validated across 10 blocks on 9 pages, 0 invalid
 - Quote form submitted end to end in a browser: success path and validation-failure path both confirmed
 - Full internal link crawl from `/`: 59 URLs, zero dead links

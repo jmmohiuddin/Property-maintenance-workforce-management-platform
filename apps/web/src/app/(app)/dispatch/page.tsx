@@ -1,6 +1,12 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { withTenant, listDispatchBoard, dispatchBoardCounts } from "@meridian/db";
+import {
+  withTenant,
+  listDispatchBoard,
+  dispatchBoardCounts,
+  countOpenFieldConflicts,
+  listFieldConflicts,
+} from "@meridian/db";
 import {
   getService,
   STATUS_LABEL,
@@ -34,11 +40,17 @@ export default async function DispatchPage() {
 
   // Every read goes through withTenant, so Postgres RLS is what actually
   // scopes these rows - not a WHERE clause we could forget to write.
-  const { rows, counts } = await withTenant(
+  const { rows, counts, openConflictCount, conflictRows } = await withTenant(
     { tenantId: session.principal.tenantId, userId: session.principal.userId },
     async (tx) => ({
       rows: await listDispatchBoard(tx, { now }),
       counts: await dispatchBoardCounts(tx, now),
+      // The headline figure comes from the count query, never from measuring
+      // the (deliberately short) list below it — a capped list under-reports
+      // the moment the queue outgrows its cap, and this is the number a
+      // dispatcher would use to decide whether the queue is under control.
+      openConflictCount: await countOpenFieldConflicts(tx),
+      conflictRows: await listFieldConflicts(tx, { unresolvedOnly: true, limit: 5 }),
     }),
   );
 
@@ -81,6 +93,86 @@ export default async function DispatchPage() {
             </div>
           ))}
         </dl>
+
+        {/*
+          The field conflict queue (§8.4, ADR 0004).
+
+          A conflict is raised when a technician completes a job offline while
+          a dispatcher cancels it online (or the reverse) — ADR 0004 treats
+          that as real work for a human, not something a merge rule can
+          settle. Somebody spent an afternoon on work the system does not
+          currently believe happened, so this sits on the board rather than
+          waiting to be found, but as a panel of its own: the table below is
+          ordered by SLA consequence, and folding an old conflict into that
+          ordering would let it displace a live emergency.
+        */}
+        <div className="mt-8">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-[15px] font-semibold">Field conflicts</h2>
+            {openConflictCount > 0 ? (
+              <Link
+                href="/dispatch/conflicts"
+                className="text-[13px] font-medium underline underline-offset-2"
+                style={{ color: "var(--accent-text)" }}
+              >
+                Resolve &rarr;
+              </Link>
+            ) : null}
+          </div>
+
+          {openConflictCount === 0 ? (
+            <div className="mt-3">
+              <EmptyState kind="good" title="No unresolved field conflicts.">
+                <p>
+                  Nothing is waiting on a decision between what a handset attempted and what the
+                  server holds. New conflicts appear here the moment a device sync disagrees with
+                  the server about a job&apos;s state.
+                </p>
+              </EmptyState>
+            </div>
+          ) : (
+            <div
+              className="mt-3 overflow-hidden rounded border"
+              style={{ borderColor: "var(--status-warning)", backgroundColor: "var(--status-warning-wash)" }}
+            >
+              <ul className="divide-y" style={{ borderColor: "var(--border-hairline)" }}>
+                {conflictRows.map((c) => (
+                  <li key={c.id} className="p-4">
+                    <p className="text-[14px] font-medium">
+                      <Link
+                        href={`/jobs/${c.jobId}`}
+                        className="underline underline-offset-2"
+                        style={{ color: "var(--accent-text)" }}
+                      >
+                        {c.jobReference}
+                      </Link>
+                      <span style={{ color: "var(--text-secondary)" }}>
+                        {" "}
+                        &middot; {c.technicianName} &middot; {c.deviceLabel}
+                      </span>
+                    </p>
+                    <p className="mt-1 text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                      {c.detail}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+              {openConflictCount > conflictRows.length ? (
+                <p
+                  className="px-4 py-3 text-[12px]"
+                  style={{ color: "var(--text-secondary)", backgroundColor: "var(--surface-raised)" }}
+                >
+                  Showing the {conflictRows.length} oldest-waiting of {openConflictCount} unresolved
+                  conflicts.{" "}
+                  <Link href="/dispatch/conflicts" style={{ color: "var(--accent-text)" }}>
+                    The full queue
+                  </Link>{" "}
+                  has the rest.
+                </p>
+              ) : null}
+            </div>
+          )}
+        </div>
 
         {rows.length === 0 ? (
           /*

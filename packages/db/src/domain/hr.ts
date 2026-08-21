@@ -32,6 +32,20 @@ import {
   MAX_OVERTIME_MINUTES_PER_DAY,
   type PayBand,
   type WeeklyHoursAssessment,
+  // HR-13
+  gratuityAccrual,
+  gratuitySettlementDeadline,
+  type GratuityAccrual,
+  type GratuityDeadline,
+  // HR-18
+  classifySkilledEmployee,
+  assessEmiratisation,
+  ISCO_MAJOR_GROUPS,
+  type IscoMajorGroup,
+  type SkilledTest,
+  type EmiratisationPosition,
+  // HR-19
+  TRN_PATTERN,
   // HR-6
   refuseDeduction,
   checkHealthInsurance,
@@ -52,6 +66,7 @@ import {
 import { toMinor, toDecimalString } from "@meridian/core";
 import type { TenantScopedTx } from "../index";
 import * as schema from "../schema";
+import type { SubcontractorKind, SubcontractorStatus } from "../schema/hr";
 
 /**
  * The employment lifecycle: wages, contracts, leave, hours, insurance.
@@ -2646,6 +2661,1170 @@ export async function listSalaryDeductions(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// HR-13 — End-of-service gratuity, accrued and visible as a liability
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface GratuityRow {
+  readonly employeeId: string;
+  readonly employeeNo: string | null;
+  readonly fullName: string;
+  readonly status: string;
+  /** Continuous service, from the first contract. Never the current term's. */
+  readonly serviceStart: CalendarDay | null;
+  readonly basicMonthlyMinor: number | null;
+  readonly allowancesMinor: number;
+  readonly totalMonthlyWageMinor: number | null;
+  readonly accrual: GratuityAccrual | null;
+  /** Null where no service start or basic salary is on file. */
+  readonly problem: string | null;
+  /** True once a settlement row exists for this employee. */
+  readonly settled: boolean;
+}
+
+type GratuityDbRow = {
+  employee_id: string;
+  employee_no: string | null;
+  full_name: string;
+  status: string;
+  contract_start: string | null;
+  basic_salary_minor: string | null;
+  allowances: unknown;
+  settled: boolean | null;
+};
+
+const GRATUITY_COLUMNS = sql`
+  e.id as employee_id, e.employee_no, e.full_name, e.status,
+  e.contract_start::text as contract_start,
+  e.basic_salary_minor::text as basic_salary_minor,
+  e.allowances,
+  exists (
+    select 1 from gratuity_settlements g
+     where g.employee_id = e.id and g.deleted_at is null
+  ) as settled
+`;
+
+/**
+ * One employee's accrued gratuity, or the reason it cannot be computed.
+ *
+ * ── THE SERVICE DATE IS `contract_start`, AND THAT IS DELIBERATE ────────────
+ *
+ * Gratuity runs on **continuous service**, so an auto-renewal must not restart
+ * the clock. `employees.contract_start` is the first contract's start and is
+ * never rewritten — renewals land as new rows in `employment_contract_terms`,
+ * which is exactly why that table exists. Reading the current term's
+ * `starts_on` instead would reset every long-serving employee's entitlement to
+ * zero on the day their contract renewed, which is both the largest possible
+ * error in this calculation and completely silent.
+ *
+ * ── AND THE WAGE IS TWO NUMBERS, NOT ONE ───────────────────────────────────
+ *
+ * `basic_salary_minor` is the accrual base — basic only, allowances excluded.
+ * `allowances` is summed separately and used only for the two-years cap, where
+ * "wage" carries its Article 1 meaning of basic plus allowances. The two are
+ * passed to `gratuityAccrual` as distinct parameters so neither can stand in
+ * for the other. See the header comment above `GRATUITY_MIN_SERVICE_YEARS` in
+ * `packages/core/src/employment.ts` for what happens when they do.
+ */
+function toGratuityRow(r: GratuityDbRow, now: CalendarDay): GratuityRow {
+  const basic = r.basic_salary_minor === null ? null : Number(r.basic_salary_minor);
+  const allowancesMinor = allowanceTotalMinor(r.allowances);
+  const totalMonthlyWageMinor = basic === null ? null : basic + allowancesMinor;
+
+  const problems: string[] = [];
+  if (!r.contract_start) problems.push("no service start date on file");
+  if (basic === null) problems.push("no basic salary on file");
+
+  return {
+    employeeId: r.employee_id,
+    employeeNo: r.employee_no,
+    fullName: r.full_name,
+    status: r.status,
+    serviceStart: r.contract_start,
+    basicMonthlyMinor: basic,
+    allowancesMinor,
+    totalMonthlyWageMinor,
+    accrual:
+      r.contract_start && basic !== null
+        ? gratuityAccrual({
+            serviceStart: r.contract_start,
+            asOf: now,
+            basicMonthlyMinor: basic,
+            totalMonthlyWageMinor: totalMonthlyWageMinor ?? basic,
+          })
+        : null,
+    problem:
+      problems.length === 0
+        ? null
+        : `Cannot compute gratuity: ${problems.join(" and ")}. The liability below is understated by whatever this person has earned.`,
+    settled: r.settled === true,
+  };
+}
+
+/**
+ * Everybody's accrued gratuity, today (`HR-13`).
+ *
+ * "Accrued and visible as a liability so it is never a surprise" is the
+ * requirement, and *visible* is the operative word: this is computed on every
+ * read from the service dates and the basic salary rather than cached, for the
+ * same reason `leave_balances` holds no `days_taken` column. A stored accrual
+ * drifts the first time a salary is corrected retroactively, and the stored one
+ * is what somebody gets paid.
+ */
+export async function gratuityRegister(
+  tx: TenantScopedTx,
+  now: CalendarDay = today(),
+): Promise<readonly GratuityRow[]> {
+  const rows = (await tx.execute<GratuityDbRow>(sql`
+    select ${GRATUITY_COLUMNS}
+      from employees e
+     where e.deleted_at is null and e.status = 'active'
+     order by e.contract_start nulls last, e.full_name
+  `)) as unknown as GratuityDbRow[];
+
+  return rows.map((r) => toGratuityRow(r, now));
+}
+
+export interface GratuityLiability {
+  /** What the business would owe if everybody left today. */
+  readonly totalMinor: number;
+  readonly employeeCount: number;
+  /** Employees past one year of service, so with something to lose. */
+  readonly accruingCount: number;
+  /** Under a year. They accrue nothing yet, and will. */
+  readonly notYetEligibleCount: number;
+  /** Employees whose figure could not be computed at all. */
+  readonly uncomputableCount: number;
+  /** The next employee to cross the one-year line, and when. */
+  readonly nextEligible: { readonly fullName: string; readonly on: CalendarDay } | null;
+  readonly headline: string;
+}
+
+/**
+ * The accrued gratuity liability of the whole establishment (`HR-13`).
+ *
+ * ── WHY THE UNCOMPUTABLE ONES ARE COUNTED RATHER THAN SKIPPED ──────────────
+ *
+ * An employee with no start date on file contributes nothing to the total, and
+ * a total that quietly excludes them is a total that reads lower than the real
+ * one — in the direction that says the business owes less than it does. So the
+ * count comes back beside the number, and the screen says so.
+ */
+export async function gratuityLiability(
+  tx: TenantScopedTx,
+  now: CalendarDay = today(),
+): Promise<GratuityLiability> {
+  const register = await gratuityRegister(tx, now);
+
+  let totalMinor = 0;
+  let accruingCount = 0;
+  let notYetEligibleCount = 0;
+  let uncomputableCount = 0;
+  let nextEligible: { fullName: string; on: CalendarDay } | null = null;
+
+  for (const row of register) {
+    if (!row.accrual) {
+      uncomputableCount++;
+      continue;
+    }
+    if (row.accrual.eligible) {
+      accruingCount++;
+      totalMinor += row.accrual.amountMinor;
+    } else {
+      notYetEligibleCount++;
+      const on = addMonths(row.serviceStart as CalendarDay, 12);
+      if (!nextEligible || on < nextEligible.on) nextEligible = { fullName: row.fullName, on };
+    }
+  }
+
+  return {
+    totalMinor,
+    employeeCount: register.length,
+    accruingCount,
+    notYetEligibleCount,
+    uncomputableCount,
+    nextEligible,
+    headline:
+      accruingCount === 0
+        ? "Nobody has completed a year of continuous service yet, so no gratuity has accrued."
+        : `${accruingCount} of ${register.length} employees have completed a year of continuous service. ` +
+          `On basic salary only, excluding allowances.`,
+  };
+}
+
+export interface GratuitySettlementRow {
+  readonly id: string;
+  readonly employeeId: string;
+  readonly fullName: string;
+  readonly terminatedOn: CalendarDay;
+  readonly serviceStart: CalendarDay;
+  readonly serviceDays: number;
+  readonly completedYears: number;
+  readonly basicMonthlyMinor: number;
+  readonly totalMonthlyWageMinor: number;
+  readonly uncappedMinor: number;
+  readonly capMinor: number;
+  readonly amountMinor: number;
+  readonly capApplied: boolean;
+  readonly dueOn: CalendarDay;
+  readonly paidOn: CalendarDay | null;
+  readonly paymentReference: string | null;
+  readonly deadline: GratuityDeadline;
+  /** Unpaid and past the 14th day. The only state with a penalty attached. */
+  readonly overdue: boolean;
+}
+
+type SettlementDbRow = {
+  id: string;
+  employee_id: string;
+  full_name: string;
+  terminated_on: string;
+  service_start: string;
+  service_days: number;
+  completed_years: number;
+  basic_monthly: string;
+  total_monthly_wage: string;
+  uncapped_amount: string;
+  cap_amount: string;
+  gratuity_amount: string;
+  settlement_due_on: string;
+  paid_on: string | null;
+  payment_reference: string | null;
+};
+
+function toSettlementRow(r: SettlementDbRow, now: CalendarDay): GratuitySettlementRow {
+  const deadline = gratuitySettlementDeadline(r.terminated_on, now);
+  return {
+    id: r.id,
+    employeeId: r.employee_id,
+    fullName: r.full_name,
+    terminatedOn: r.terminated_on,
+    serviceStart: r.service_start,
+    serviceDays: Number(r.service_days),
+    completedYears: Number(r.completed_years),
+    basicMonthlyMinor: minorOf(r.basic_monthly),
+    totalMonthlyWageMinor: minorOf(r.total_monthly_wage),
+    uncappedMinor: minorOf(r.uncapped_amount),
+    capMinor: minorOf(r.cap_amount),
+    amountMinor: minorOf(r.gratuity_amount),
+    capApplied: minorOf(r.gratuity_amount) < minorOf(r.uncapped_amount),
+    dueOn: r.settlement_due_on,
+    paidOn: r.paid_on,
+    paymentReference: r.payment_reference,
+    deadline,
+    // A settlement that was paid is not overdue, whenever it was paid. The
+    // lateness of a payment already made is a fact about the past; what this
+    // flag drives is an alert, and an alert about something already done is
+    // noise that gets the whole section ignored.
+    overdue: r.paid_on === null && deadline.overdue,
+  };
+}
+
+const SETTLEMENT_COLUMNS = sql`
+  g.id, g.employee_id, e.full_name,
+  g.terminated_on::text as terminated_on,
+  g.service_start::text as service_start,
+  g.service_days, g.completed_years,
+  g.basic_monthly, g.total_monthly_wage,
+  g.uncapped_amount, g.cap_amount, g.gratuity_amount,
+  g.settlement_due_on::text as settlement_due_on,
+  g.paid_on::text as paid_on,
+  g.payment_reference
+`;
+
+/** Every recorded end-of-service settlement, most recent termination first. */
+export async function listGratuitySettlements(
+  tx: TenantScopedTx,
+  now: CalendarDay = today(),
+): Promise<readonly GratuitySettlementRow[]> {
+  const rows = (await tx.execute<SettlementDbRow>(sql`
+    select ${SETTLEMENT_COLUMNS}
+      from gratuity_settlements g
+      join employees e on e.id = g.employee_id
+     where g.deleted_at is null
+     order by g.terminated_on desc
+  `)) as unknown as SettlementDbRow[];
+
+  return rows.map((r) => toSettlementRow(r, now));
+}
+
+/**
+ * Settlements past their 14-day deadline and still unpaid (`HR-13`, §11.3).
+ *
+ * The predicate is in SQL and matches `gratuity_settlements_due_idx` exactly,
+ * so the sweep is an index scan rather than a filter over every settlement ever
+ * recorded. `settlement_due_on` is compared against the day passed in rather
+ * than against `current_date`, for the reason `healthColumns` gives: the
+ * Postgres session's idea of today is not Dubai's, and a deadline that has
+ * passed in Dubai must not keep reading as met for the hours in between.
+ */
+export async function overdueGratuitySettlements(
+  tx: TenantScopedTx,
+  now: CalendarDay = today(),
+): Promise<readonly GratuitySettlementRow[]> {
+  const rows = (await tx.execute<SettlementDbRow>(sql`
+    select ${SETTLEMENT_COLUMNS}
+      from gratuity_settlements g
+      join employees e on e.id = g.employee_id
+     where g.deleted_at is null
+       and g.paid_on is null
+       and g.settlement_due_on < ${now}::date
+     order by g.settlement_due_on
+  `)) as unknown as SettlementDbRow[];
+
+  return rows.map((r) => toSettlementRow(r, now));
+}
+
+/**
+ * Record an end-of-service settlement (`HR-13`).
+ *
+ * The figures are computed here from the employee's own service dates and
+ * salary, not taken from the caller. A settlement whose amount arrived as a
+ * form field is a settlement somebody typed, and the whole reason this
+ * requirement exists is that the arithmetic is unforgiving and nobody does it
+ * the same way twice. What the caller supplies is the **termination date** —
+ * which is a fact only they know — and everything else follows from it.
+ */
+export async function recordGratuitySettlement(
+  tx: TenantScopedTx,
+  ctx: { tenantId: string; userId?: string | null },
+  input: {
+    employeeId: string;
+    terminatedOn: CalendarDay;
+    note?: string | null;
+  },
+): Promise<{ id: string; amountMinor: number; dueOn: CalendarDay }> {
+  const rows = (await tx.execute<GratuityDbRow>(sql`
+    select ${GRATUITY_COLUMNS}
+      from employees e
+     where e.id = ${input.employeeId} and e.deleted_at is null
+  `)) as unknown as GratuityDbRow[];
+
+  const employee = rows[0];
+  if (!employee) throw new UserFacingError("That employee record could not be found.");
+  if (employee.settled) {
+    throw new UserFacingError(
+      `${employee.full_name} already has an end-of-service settlement recorded. Correct that one rather than adding a second — two settlements for one termination is how somebody gets paid twice.`,
+    );
+  }
+
+  const row = toGratuityRow(employee, input.terminatedOn);
+  if (!row.accrual || !row.serviceStart || row.basicMonthlyMinor === null) {
+    throw new UserFacingError(
+      `Cannot settle ${employee.full_name}: ${row.problem ?? "the service dates or basic salary are missing."} Record those first — a settlement computed from a missing salary is a figure somebody will dispute.`,
+    );
+  }
+  if (input.terminatedOn < row.serviceStart) {
+    throw new UserFacingError("The termination date is before the start of service.");
+  }
+
+  const accrual = row.accrual;
+  const deadline = gratuitySettlementDeadline(input.terminatedOn);
+
+  const [created] = await tx
+    .insert(schema.gratuitySettlements)
+    .values({
+      tenantId: ctx.tenantId,
+      employeeId: input.employeeId,
+      terminatedOn: input.terminatedOn,
+      serviceStart: row.serviceStart,
+      serviceDays: accrual.service.days,
+      completedYears: accrual.service.completedYears,
+      basicMonthly: toDecimalString(row.basicMonthlyMinor),
+      totalMonthlyWage: toDecimalString(row.totalMonthlyWageMinor ?? row.basicMonthlyMinor),
+      uncappedAmount: toDecimalString(accrual.uncappedMinor),
+      capAmount: toDecimalString(accrual.capMinor),
+      gratuityAmount: toDecimalString(accrual.amountMinor),
+      settlementDueOn: deadline.dueOn,
+      recordedById: ctx.userId ?? null,
+      note: input.note?.trim() || accrual.explanation,
+    })
+    .returning({ id: schema.gratuitySettlements.id });
+
+  if (!created) throw new Error("Could not record the settlement.");
+  return { id: created.id, amountMinor: accrual.amountMinor, dueOn: deadline.dueOn };
+}
+
+/**
+ * Mark a settlement as paid (`HR-13`).
+ *
+ * Takes a reference, and requires one. "Paid" without a bank reference is an
+ * assertion, and it is the same assertion `wage_cycles.transfer_reference`
+ * refuses to accept on its own — a settlement is the second-largest payment
+ * this system records and the one most likely to be challenged two years later,
+ * which is exactly the limitation period for a labour claim.
+ */
+export async function markGratuitySettlementPaid(
+  tx: TenantScopedTx,
+  input: { settlementId: string; paidOn: CalendarDay; reference: string },
+): Promise<void> {
+  const reference = input.reference.trim();
+  if (!reference) {
+    throw new UserFacingError(
+      "Record the bank or WPS reference. A settlement marked paid with nothing behind it is worth nothing in a labour claim, and the limitation period is two years from termination.",
+    );
+  }
+
+  await tx
+    .update(schema.gratuitySettlements)
+    .set({ paidOn: input.paidOn, paymentReference: reference, updatedAt: new Date() })
+    .where(eq(schema.gratuitySettlements.id, input.settlementId));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HR-18 — Emiratisation, computed on the skilled denominator
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface SkilledEmployeeRow {
+  readonly employeeId: string;
+  readonly employeeNo: string | null;
+  readonly fullName: string;
+  readonly iscoMajorGroup: number | null;
+  readonly iscoLabel: string | null;
+  readonly postSecondaryCertificate: boolean | null;
+  readonly monthlyWageMinor: number | null;
+  readonly test: SkilledTest;
+}
+
+type SkilledDbRow = {
+  employee_id: string;
+  employee_no: string | null;
+  full_name: string;
+  isco_major_group: number | null;
+  post_secondary_certificate: boolean | null;
+  basic_salary_minor: string | null;
+  allowances: unknown;
+};
+
+/**
+ * Every active employee, put through the three-part skilled test (`HR-18`).
+ *
+ * ── WHY THE TEST IS NOT IN THE SQL ─────────────────────────────────────────
+ *
+ * It would fit — three predicates and a CASE. It lives in `packages/core`
+ * instead, with `classifySkilledEmployee`, because the AED 4,000 floor and the
+ * ISCO 1–5 range are statutory numbers and a statutory number written into a
+ * SQL string is a number that cannot be unit-tested and quietly differs from
+ * the one on the screen. There is a second reason specific to this rule: the
+ * three legs each have a **third** state — not recorded — and a CASE that
+ * collapsed those into "not skilled" would produce the exact reassuring
+ * understatement the requirement is written to prevent.
+ *
+ * The wage leg reads basic **plus allowances**, which is what the AED 4,000
+ * threshold is set against — what the worker is actually paid, not the basic
+ * component gratuity accrues on. Two of the three requirements in this module
+ * use the same number and the same base, and one of them uses the opposite
+ * comparison; see `EMIRATISATION_SKILLED_WAGE_FLOOR_MINOR`.
+ */
+export async function skilledWorkforce(tx: TenantScopedTx): Promise<readonly SkilledEmployeeRow[]> {
+  const rows = (await tx.execute<SkilledDbRow>(sql`
+    select e.id as employee_id, e.employee_no, e.full_name,
+           e.isco_major_group, e.post_secondary_certificate,
+           e.basic_salary_minor::text as basic_salary_minor,
+           e.allowances
+      from employees e
+     where e.deleted_at is null and e.status = 'active'
+     order by e.full_name
+  `)) as unknown as SkilledDbRow[];
+
+  return rows.map((r) => {
+    const basic = r.basic_salary_minor === null ? null : Number(r.basic_salary_minor);
+    const monthlyWageMinor = basic === null ? null : basic + allowanceTotalMinor(r.allowances);
+    const group = r.isco_major_group === null ? null : Number(r.isco_major_group);
+
+    return {
+      employeeId: r.employee_id,
+      employeeNo: r.employee_no,
+      fullName: r.full_name,
+      iscoMajorGroup: group,
+      iscoLabel: group === null ? null : (ISCO_MAJOR_GROUPS[group as IscoMajorGroup] ?? null),
+      postSecondaryCertificate: r.post_secondary_certificate,
+      monthlyWageMinor,
+      test: classifySkilledEmployee({
+        iscoMajorGroup: group,
+        postSecondaryCertificate: r.post_secondary_certificate,
+        monthlyWageMinor,
+      }),
+    };
+  });
+}
+
+/**
+ * Where the establishment stands against the 50-skilled threshold (`HR-18`).
+ *
+ * This is the figure `DASHBOARD_GAPS` in `domain/reporting.ts` currently
+ * withholds, and withholds correctly: reporting total headcount against a
+ * 50-**skilled** threshold would say the threshold was near when it is far. The
+ * three facts now exist per employee, so the number can be computed rather than
+ * approximated, and the gap entry can be closed by whoever owns the dashboard.
+ *
+ * The counts are done in TypeScript rather than as a SQL `count(*) filter`,
+ * because the classification is `classifySkilledEmployee`'s and one copy of a
+ * statutory test is the whole point. This runs over the active headcount of one
+ * establishment — tens of rows, not millions.
+ */
+export async function emiratisationPosition(tx: TenantScopedTx): Promise<EmiratisationPosition> {
+  const workforce = await skilledWorkforce(tx);
+
+  let skilled = 0;
+  let excluded = 0;
+  let unknown = 0;
+  for (const row of workforce) {
+    if (row.test.classification === "skilled") skilled++;
+    else if (row.test.classification === "excluded") excluded++;
+    else unknown++;
+  }
+
+  return assessEmiratisation({ skilled, excluded, unknown, headcount: workforce.length });
+}
+
+/**
+ * Record the two occupational facts the skilled test needs (`HR-18`).
+ *
+ * `null` is an accepted value for both and clears the field back to "not
+ * recorded". That is not a convenience: a wrong ISCO group is worse than a
+ * missing one, because a missing one shows up in the unknown count and pushes
+ * the establishment's upper bound towards the threshold, while a wrong one
+ * silently answers the question. Being able to un-answer it is what makes a
+ * correction possible.
+ */
+export async function saveOccupationClassification(
+  tx: TenantScopedTx,
+  input: {
+    employeeId: string;
+    iscoMajorGroup: number | null;
+    postSecondaryCertificate: boolean | null;
+  },
+): Promise<void> {
+  if (
+    input.iscoMajorGroup !== null &&
+    (!Number.isInteger(input.iscoMajorGroup) || input.iscoMajorGroup < 1 || input.iscoMajorGroup > 9)
+  ) {
+    throw new UserFacingError(
+      "The ISCO occupational major group is a number from 1 to 9. Groups 1 to 5 are inside the skilled test; 6 to 9 are outside it.",
+    );
+  }
+
+  await tx
+    .update(schema.employees)
+    .set({
+      iscoMajorGroup: input.iscoMajorGroup,
+      postSecondaryCertificate: input.postSecondaryCertificate,
+      updatedAt: new Date(),
+    })
+    .where(eq(schema.employees.id, input.employeeId));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HR-19 — Subcontractors and manpower suppliers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * One third-party certification a supplier claims to hold.
+ *
+ * Free-form on purpose: unlike `company_accreditations`, which has a `kind`
+ * vocabulary because we control what we hold and renew it, we control neither
+ * the issuing schemes nor the renewals here. See the column comment in
+ * `schema/hr.ts`.
+ */
+export interface SupplierAccreditation {
+  readonly name: string;
+  readonly issuer: string | null;
+  /** `YYYY-MM-DD`, or null where the supplier did not state one. */
+  readonly expiresOn: CalendarDay | null;
+}
+
+/**
+ * Read the jsonb column back into something the rest of the module can trust.
+ *
+ * ── WHY THIS PARSES RATHER THAN CASTS ──────────────────────────────────────
+ *
+ * `tx.execute<T>()`'s type parameter is an assertion, not a check, and this
+ * column is the one place in the module where the shape is not enforced by the
+ * schema — the CHECK constraint guarantees it is a JSON *array* and nothing
+ * more. A cast would compile and then throw at render time on the first row
+ * somebody wrote through `psql`. Anything unrecognisable is dropped rather
+ * than half-read: a certificate with no name is not a certificate.
+ */
+export function readSupplierAccreditations(value: unknown): readonly SupplierAccreditation[] {
+  if (!Array.isArray(value)) return [];
+
+  const out: SupplierAccreditation[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") continue;
+    const row = entry as Record<string, unknown>;
+    const name = typeof row.name === "string" ? row.name.trim() : "";
+    if (!name) continue;
+    const expiresOn =
+      typeof row.expiresOn === "string" && /^\d{4}-\d{2}-\d{2}$/.test(row.expiresOn)
+        ? row.expiresOn
+        : null;
+    out.push({
+      name,
+      issuer: typeof row.issuer === "string" && row.issuer.trim() ? row.issuer.trim() : null,
+      expiresOn,
+    });
+  }
+  return out;
+}
+
+/** Normalise on the way in, so the column only ever holds the shape above. */
+export function normaliseSupplierAccreditations(
+  input: readonly SupplierAccreditation[],
+): readonly SupplierAccreditation[] {
+  return readSupplierAccreditations(input);
+}
+
+/** One expiring obligation, whoever it belongs to. Shaped like `HR-14`'s. */
+export interface SubcontractorExpiry {
+  readonly subcontractorId: string;
+  readonly subcontractorName: string;
+  /**
+   * `trade_licence`, `liability_insurance`, `workmen_comp`, `work_permit` or
+   * `accreditation`.
+   */
+  readonly kind: string;
+  readonly label: string;
+  /**
+   * What the obligation is about, where that is not the organisation itself:
+   * the worker's name for a permit, the certificate's name for an
+   * accreditation. Null for the licence and the two insurances, which the
+   * organisation holds directly.
+   */
+  readonly subject: string | null;
+  readonly expiresOn: CalendarDay;
+  readonly daysRemaining: number;
+}
+
+const SUBCONTRACTOR_EXPIRY_LABEL: Readonly<Record<string, string>> = {
+  trade_licence: "Trade licence",
+  liability_insurance: "Third-party liability insurance",
+  workmen_comp: "Workmen's compensation cover",
+  work_permit: "MOHRE work permit",
+  accreditation: "Accreditation",
+};
+
+/**
+ * ── WHY THIS IS `SubcontractorRegisterRow` AND NOT `SubcontractorRow` ───────
+ *
+ * `domain/projects.ts` exports a `SubcontractorRow` of its own for `PRJ-9`,
+ * and it reads this same table — correctly, rather than growing a second one.
+ * Its row is the organisation plus an engagement count, for choosing who to put
+ * on a project. This one is the organisation plus its lapsed obligations, for
+ * deciding whether anybody should be on a site at all. Two names, because they
+ * answer two questions and a reader who found them sharing one would reasonably
+ * assume they were the same view.
+ */
+export interface SubcontractorRegisterRow {
+  readonly id: string;
+  readonly name: string;
+  readonly kind: string;
+  readonly kindLabel: string;
+  readonly tradeSlug: string | null;
+  readonly contactName: string | null;
+  readonly contactPhone: string | null;
+  readonly contactEmail: string | null;
+  readonly tradeLicenceNo: string | null;
+  readonly tradeLicenceExpiresOn: CalendarDay | null;
+  readonly liabilityInsurer: string | null;
+  readonly liabilityPolicyNo: string | null;
+  readonly liabilityExpiresOn: CalendarDay | null;
+  readonly workmenCompInsurer: string | null;
+  readonly workmenCompPolicyNo: string | null;
+  readonly workmenCompExpiresOn: CalendarDay | null;
+  readonly approvalReference: string | null;
+  readonly taxRegistrationNumber: string | null;
+  readonly accreditations: readonly SupplierAccreditation[];
+  /** Accreditations already lapsed. Reported, never swept — see below. */
+  readonly lapsedAccreditations: readonly SupplierAccreditation[];
+  readonly status: string;
+  readonly workerCount: number;
+  /** Active workers with no permit expiry recorded at all. */
+  readonly unverifiedWorkerCount: number;
+  /** Active workers whose permit has already lapsed. */
+  readonly expiredPermitCount: number;
+  /** Organisation-level obligations already lapsed. Never a dispatch block. */
+  readonly problems: readonly string[];
+}
+
+type SubcontractorDbRow = {
+  id: string;
+  name: string;
+  kind: string;
+  trade_slug: string | null;
+  contact_name: string | null;
+  contact_phone: string | null;
+  contact_email: string | null;
+  trade_licence_no: string | null;
+  trade_licence_expires_on: string | null;
+  liability_insurer: string | null;
+  liability_policy_no: string | null;
+  liability_expires_on: string | null;
+  workmen_comp_insurer: string | null;
+  workmen_comp_policy_no: string | null;
+  workmen_comp_expires_on: string | null;
+  approval_reference: string | null;
+  tax_registration_number: string | null;
+  accreditations: unknown;
+  status: string;
+  worker_count: string;
+  unverified_worker_count: string;
+  expired_permit_count: string;
+};
+
+const SUBCONTRACTOR_KIND_LABEL: Readonly<Record<string, string>> = {
+  subcontractor: "Subcontractor",
+  manpower_supplier: "Manpower supplier",
+};
+
+/**
+ * The subcontractor and manpower-supplier register (`HR-19`).
+ *
+ * ── WHY THE PROBLEMS ARE COMPUTED HERE AND NOT IN SQL ──────────────────────
+ *
+ * They are three lapsed dates and a sentence for each, and the sentence is the
+ * value. "Trade licence expired 41 days ago" is actionable; a boolean column
+ * called `compliant` is not, and it is also the column somebody would later
+ * join to and treat as a gate.
+ *
+ * ── WHAT THIS DELIBERATELY DOES NOT DO ─────────────────────────────────────
+ *
+ * It does not block anything. `HR-9`'s hard block reads `employee_documents`
+ * and stops an *assignment*; nothing here is assignable, because a supplied
+ * worker has no `technicians` row. Adding a fourth hard block on the strength
+ * of a supplier's paperwork would stop lawful work in this system to punish a
+ * lapse in somebody else's, and it would be routed around inside a day. What
+ * the register earns instead is visibility: responsibility for site compliance
+ * does not transfer with the work, so an expiry nobody was watching is the
+ * exposure, and Article 60 puts that at AED 100,000 to AED 1,000,000.
+ */
+export async function subcontractorRegister(
+  tx: TenantScopedTx,
+  now: CalendarDay = today(),
+): Promise<readonly SubcontractorRegisterRow[]> {
+  const rows = (await tx.execute<SubcontractorDbRow>(sql`
+    select s.id, s.name, s.kind, s.trade_slug,
+           s.contact_name, s.contact_phone, s.contact_email,
+           s.trade_licence_no, s.trade_licence_expires_on::text as trade_licence_expires_on,
+           s.liability_insurer, s.liability_policy_no, s.liability_expires_on::text as liability_expires_on,
+           s.workmen_comp_insurer, s.workmen_comp_policy_no,
+           s.workmen_comp_expires_on::text as workmen_comp_expires_on,
+           s.approval_reference, s.tax_registration_number, s.accreditations, s.status,
+           -- Counted here rather than in a second round trip, and cast to text
+           -- rather than to int: count() returns bigint, and the driver hands a
+           -- bigint back as a string whatever the cast says it is.
+           (select count(*) from subcontractor_workers w
+             where w.subcontractor_id = s.id and w.is_active and w.deleted_at is null)::text
+             as worker_count,
+           (select count(*) from subcontractor_workers w
+             where w.subcontractor_id = s.id and w.is_active and w.deleted_at is null
+               and w.work_permit_expires_on is null)::text
+             as unverified_worker_count,
+           (select count(*) from subcontractor_workers w
+             where w.subcontractor_id = s.id and w.is_active and w.deleted_at is null
+               and w.work_permit_expires_on < ${now}::date)::text
+             as expired_permit_count
+      from subcontractors s
+     where s.deleted_at is null
+     order by s.name
+  `)) as unknown as SubcontractorDbRow[];
+
+  return rows.map((r) => {
+    const accreditations = readSupplierAccreditations(r.accreditations);
+
+    const problems: string[] = [];
+    const lapsed = (day: string | null, label: string) => {
+      if (!day) {
+        problems.push(`No ${label.toLowerCase()} expiry recorded.`);
+        return;
+      }
+      // `<`, not `<=`. A licence expiring today is valid today.
+      if (day < now) {
+        problems.push(`${label} expired ${formatDay(day)} — ${Math.abs(daysBetween(now, day))} days ago.`);
+      }
+    };
+    lapsed(r.trade_licence_expires_on, "Trade licence");
+    lapsed(r.liability_expires_on, "Third-party liability insurance");
+    lapsed(r.workmen_comp_expires_on, "Workmen's compensation cover");
+
+    // Reported as a problem even though the sweep does not carry it, so a
+    // lapsed certificate is visible somewhere rather than nowhere.
+    const lapsedAccreditations = accreditations.filter(
+      (a) => a.expiresOn !== null && a.expiresOn < now,
+    );
+    if (lapsedAccreditations.length > 0) {
+      problems.push(
+        `${lapsedAccreditations.length} accreditation${lapsedAccreditations.length === 1 ? " has" : "s have"} expired: ${lapsedAccreditations.map((a) => a.name).join(", ")}.`,
+      );
+    }
+
+    const expiredPermitCount = Number(r.expired_permit_count);
+    if (expiredPermitCount > 0) {
+      problems.push(
+        `${expiredPermitCount} supplied worker${expiredPermitCount === 1 ? " has" : "s have"} an expired work permit. Article 60 penalties run from AED 100,000 to AED 1,000,000 per worker, and responsibility does not transfer with the work.`,
+      );
+    }
+
+    return {
+      id: r.id,
+      name: r.name,
+      kind: r.kind,
+      kindLabel: SUBCONTRACTOR_KIND_LABEL[r.kind] ?? r.kind,
+      tradeSlug: r.trade_slug,
+      contactName: r.contact_name,
+      contactPhone: r.contact_phone,
+      contactEmail: r.contact_email,
+      tradeLicenceNo: r.trade_licence_no,
+      tradeLicenceExpiresOn: r.trade_licence_expires_on,
+      liabilityInsurer: r.liability_insurer,
+      liabilityPolicyNo: r.liability_policy_no,
+      liabilityExpiresOn: r.liability_expires_on,
+      workmenCompInsurer: r.workmen_comp_insurer,
+      workmenCompPolicyNo: r.workmen_comp_policy_no,
+      workmenCompExpiresOn: r.workmen_comp_expires_on,
+      approvalReference: r.approval_reference,
+      taxRegistrationNumber: r.tax_registration_number,
+      accreditations,
+      lapsedAccreditations: accreditations.filter((a) => a.expiresOn !== null && a.expiresOn < now),
+      status: r.status,
+      workerCount: Number(r.worker_count),
+      unverifiedWorkerCount: Number(r.unverified_worker_count),
+      expiredPermitCount,
+      problems,
+    };
+  });
+}
+
+export interface SubcontractorWorkerRow {
+  readonly id: string;
+  readonly subcontractorId: string;
+  readonly fullName: string;
+  readonly tradeSlug: string | null;
+  readonly workPermitNo: string | null;
+  readonly workPermitExpiresOn: CalendarDay | null;
+  readonly daysRemaining: number | null;
+  readonly verifiedAt: Date | null;
+  readonly verifiedByName: string | null;
+  readonly isActive: boolean;
+}
+
+/** The workers one supplier has on our sites (`HR-19`). */
+export async function listSubcontractorWorkers(
+  tx: TenantScopedTx,
+  subcontractorId: string,
+  now: CalendarDay = today(),
+): Promise<readonly SubcontractorWorkerRow[]> {
+  const rows = (await tx.execute<{
+    id: string;
+    subcontractor_id: string;
+    full_name: string;
+    trade_slug: string | null;
+    work_permit_no: string | null;
+    work_permit_expires_on: string | null;
+    days_remaining: number | null;
+    verified_at: string | null;
+    verified_by_name: string | null;
+    is_active: boolean;
+  }>(sql`
+    select w.id, w.subcontractor_id, w.full_name, w.trade_slug,
+           w.work_permit_no, w.work_permit_expires_on::text as work_permit_expires_on,
+           (w.work_permit_expires_on - ${now}::date)::int as days_remaining,
+           w.verified_at, u.full_name as verified_by_name, w.is_active
+      from subcontractor_workers w
+      left join users u on u.id = w.verified_by_id
+     where w.subcontractor_id = ${subcontractorId} and w.deleted_at is null
+     order by w.is_active desc, w.work_permit_expires_on nulls first, w.full_name
+  `)) as unknown as {
+    id: string;
+    subcontractor_id: string;
+    full_name: string;
+    trade_slug: string | null;
+    work_permit_no: string | null;
+    work_permit_expires_on: string | null;
+    days_remaining: number | null;
+    verified_at: string | null;
+    verified_by_name: string | null;
+    is_active: boolean;
+  }[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    subcontractorId: r.subcontractor_id,
+    fullName: r.full_name,
+    tradeSlug: r.trade_slug,
+    workPermitNo: r.work_permit_no,
+    workPermitExpiresOn: r.work_permit_expires_on,
+    daysRemaining: r.days_remaining === null ? null : Number(r.days_remaining),
+    verifiedAt: r.verified_at === null ? null : new Date(r.verified_at),
+    verifiedByName: r.verified_by_name,
+    isActive: r.is_active,
+  }));
+}
+
+/**
+ * Everything in the subcontractor register at or near expiry (`HR-19`).
+ *
+ * One query, five obligations, because the alert is the same shape and the
+ * recipient is the same person — which is the argument `findExpiringCertifications`
+ * makes for its own union of urgencies. Day counting happens in SQL as
+ * `date - date` for the reason `findExpiringAccreditations` gives: subtracting
+ * a JavaScript midnight from `new Date()` and flooring reports 29 days for a
+ * document expiring in 30.
+ *
+ * ── BUT THE DAY IS PASSED IN, NOT `current_date` ───────────────────────────
+ *
+ * The two sweeps this one is modelled on both compare against `current_date`,
+ * which is the Postgres session's idea of today — and the session timezone is
+ * whatever the cluster was initialised with, not `Asia/Dubai`. For the hours
+ * where those disagree the two are different calendar days, and the countdown
+ * is off by one in the direction that reports a lapsed permit as still having a
+ * day left. `healthColumns` in this module already refuses `current_date` for
+ * exactly that reason, and this follows it: the subtraction stays in SQL, where
+ * there is no time component to lose, but the day it subtracts is Dubai's.
+ *
+ * This is the `HR-19` half of the same sweep `/api/cron/compliance` already
+ * runs over employee documents and company accreditations. It is deliberately
+ * not a second mechanism.
+ */
+export async function findExpiringSubcontractorObligations(
+  tx: TenantScopedTx,
+  withinDays = 90,
+  now: CalendarDay = today(),
+): Promise<readonly SubcontractorExpiry[]> {
+  const rows = (await tx.execute<{
+    subcontractor_id: string;
+    subcontractor_name: string;
+    kind: string;
+    subject: string | null;
+    expires_on: string;
+    days_remaining: number;
+  }>(sql`
+    select s.id as subcontractor_id, s.name as subcontractor_name,
+           v.kind, v.subject, v.expires_on::text as expires_on,
+           (v.expires_on - ${now}::date)::int as days_remaining
+      from subcontractors s
+      join lateral (
+        select 'trade_licence'::text as kind, null::text as subject,
+               s.trade_licence_expires_on as expires_on
+        union all
+        select 'liability_insurance', null::text, s.liability_expires_on
+        union all
+        select 'workmen_comp', null::text, s.workmen_comp_expires_on
+        union all
+        select 'work_permit', w.full_name::text, w.work_permit_expires_on
+          from subcontractor_workers w
+         where w.subcontractor_id = s.id and w.is_active and w.deleted_at is null
+        union all
+        -- The jsonb tail, expanded into the SAME sweep rather than left to a
+        -- second mechanism. An expiry clock nothing sweeps is one that silently
+        -- stops being checked, and a supplier's IRATA or EIAC certificate
+        -- lapsing is exactly the kind of thing nobody notices until an
+        -- inspection. The character class is [0-9] and not \d on purpose:
+        -- a backslash inside a template literal is one edit away from being
+        -- eaten by JavaScript before Postgres ever sees it, and a date filter
+        -- that silently matches nothing would make this branch return zero rows
+        -- forever without failing.
+        select 'accreditation', a.entry->>'name',
+               (a.entry->>'expiresOn')::date
+          from jsonb_array_elements(s.accreditations) as a(entry)
+         where jsonb_typeof(s.accreditations) = 'array'
+           and a.entry->>'name' is not null
+           and a.entry->>'expiresOn' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      ) v on true
+     where s.deleted_at is null
+       and s.status <> 'withdrawn'
+       and v.expires_on is not null
+       -- The cast on the parameter is required, not decorative: a bare
+       -- date + placeholder is ambiguous to the planner and it refuses to guess.
+       and v.expires_on <= ${now}::date + (${withinDays})::int
+     order by v.expires_on, s.name
+  `)) as unknown as {
+    subcontractor_id: string;
+    subcontractor_name: string;
+    kind: string;
+    subject: string | null;
+    expires_on: string;
+    days_remaining: number;
+  }[];
+
+  return rows.map((r) => ({
+    subcontractorId: r.subcontractor_id,
+    subcontractorName: r.subcontractor_name,
+    kind: r.kind,
+    label: SUBCONTRACTOR_EXPIRY_LABEL[r.kind] ?? r.kind,
+    subject: r.subject,
+    expiresOn: r.expires_on,
+    daysRemaining: Number(r.days_remaining),
+  }));
+}
+
+/** Add or amend a subcontractor (`HR-19`). */
+export async function recordSubcontractor(
+  tx: TenantScopedTx,
+  ctx: { tenantId: string },
+  input: {
+    id?: string;
+    name: string;
+    kind: SubcontractorKind;
+    tradeSlug?: string | null;
+    contactName?: string | null;
+    contactPhone?: string | null;
+    contactEmail?: string | null;
+    tradeLicenceNo?: string | null;
+    tradeLicenceExpiresOn?: CalendarDay | null;
+    liabilityInsurer?: string | null;
+    liabilityPolicyNo?: string | null;
+    liabilityExpiresOn?: CalendarDay | null;
+    workmenCompInsurer?: string | null;
+    workmenCompPolicyNo?: string | null;
+    workmenCompExpiresOn?: CalendarDay | null;
+    approvalReference?: string | null;
+    taxRegistrationNumber?: string | null;
+    accreditations?: readonly SupplierAccreditation[];
+    status?: SubcontractorStatus;
+    note?: string | null;
+  },
+): Promise<{ id: string }> {
+  const name = input.name.trim();
+  if (!name) throw new UserFacingError("Name the subcontractor.");
+
+  // The same fifteen digits `packages/core` enforces on a tax invoice, and the
+  // same pattern object — not a second copy of the rule. Refused rather than
+  // stored loosely, because a TRN with a space in it silently fails to match
+  // the supplier's invoice at the moment somebody reconciles input tax.
+  const trn = input.taxRegistrationNumber?.replace(/\s/g, "") || null;
+  if (trn !== null && !TRN_PATTERN.test(trn)) {
+    throw new UserFacingError(
+      `"${input.taxRegistrationNumber}" is not a TRN. A UAE tax registration number is exactly fifteen digits. Leave it blank if the supplier is not VAT-registered.`,
+    );
+  }
+
+  const values = {
+    name,
+    kind: input.kind,
+    tradeSlug: input.tradeSlug?.trim() || null,
+    contactName: input.contactName?.trim() || null,
+    contactPhone: input.contactPhone?.trim() || null,
+    contactEmail: input.contactEmail?.trim() || null,
+    tradeLicenceNo: input.tradeLicenceNo?.trim() || null,
+    tradeLicenceExpiresOn: input.tradeLicenceExpiresOn ?? null,
+    liabilityInsurer: input.liabilityInsurer?.trim() || null,
+    liabilityPolicyNo: input.liabilityPolicyNo?.trim() || null,
+    liabilityExpiresOn: input.liabilityExpiresOn ?? null,
+    workmenCompInsurer: input.workmenCompInsurer?.trim() || null,
+    workmenCompPolicyNo: input.workmenCompPolicyNo?.trim() || null,
+    workmenCompExpiresOn: input.workmenCompExpiresOn ?? null,
+    approvalReference: input.approvalReference?.trim() || null,
+    taxRegistrationNumber: trn,
+    ...(input.accreditations === undefined
+      ? {}
+      : { accreditations: normaliseSupplierAccreditations(input.accreditations) }),
+    status: input.status ?? "provisional",
+    note: input.note?.trim() || null,
+    updatedAt: new Date(),
+  };
+
+  if (input.id) {
+    await tx.update(schema.subcontractors).set(values).where(eq(schema.subcontractors.id, input.id));
+    return { id: input.id };
+  }
+
+  const [created] = await tx
+    .insert(schema.subcontractors)
+    .values({ tenantId: ctx.tenantId, ...values })
+    .returning({ id: schema.subcontractors.id });
+
+  if (!created) throw new Error("Could not record the subcontractor.");
+  return created;
+}
+
+/** Withdraw a subcontractor. Soft delete — the engagement history stays. */
+export async function removeSubcontractor(tx: TenantScopedTx, subcontractorId: string): Promise<void> {
+  await tx
+    .update(schema.subcontractors)
+    .set({ deletedAt: new Date(), updatedAt: new Date() })
+    .where(eq(schema.subcontractors.id, subcontractorId));
+}
+
+/**
+ * Record a supplied worker and, in the same call, who verified their permit.
+ *
+ * ── WHY VERIFICATION IS NOT A SEPARATE STEP ────────────────────────────────
+ *
+ * Because a two-step flow produces a register full of workers with a permit
+ * number, an expiry date and nobody's name against them — which is precisely
+ * the state that looks like compliance and is not. The expiry date is a claim
+ * by the supplier; the verification is a claim by us, and it is the second one
+ * an inspector asks for. Whoever adds the row is the person who saw the card,
+ * so they are the verifier, unless they say otherwise by passing `verified:
+ * false`.
+ */
+export async function recordSubcontractorWorker(
+  tx: TenantScopedTx,
+  ctx: { tenantId: string; userId?: string | null },
+  input: {
+    subcontractorId: string;
+    fullName: string;
+    tradeSlug?: string | null;
+    workPermitNo?: string | null;
+    workPermitExpiresOn?: CalendarDay | null;
+    verified?: boolean;
+    note?: string | null;
+  },
+): Promise<{ id: string }> {
+  const fullName = input.fullName.trim();
+  if (!fullName) throw new UserFacingError("Name the worker.");
+
+  const verified = input.verified !== false;
+
+  const [created] = await tx
+    .insert(schema.subcontractorWorkers)
+    .values({
+      tenantId: ctx.tenantId,
+      subcontractorId: input.subcontractorId,
+      fullName,
+      tradeSlug: input.tradeSlug?.trim() || null,
+      workPermitNo: input.workPermitNo?.trim() || null,
+      workPermitExpiresOn: input.workPermitExpiresOn ?? null,
+      verifiedById: verified ? (ctx.userId ?? null) : null,
+      verifiedAt: verified ? new Date() : null,
+      note: input.note?.trim() || null,
+    })
+    .returning({ id: schema.subcontractorWorkers.id });
+
+  if (!created) throw new Error("Could not record the worker.");
+  return created;
+}
+
+/** Re-verify one worker's permit, or stand them down (`HR-19`). */
+export async function verifySubcontractorWorker(
+  tx: TenantScopedTx,
+  ctx: { userId?: string | null },
+  input: {
+    workerId: string;
+    workPermitNo?: string | null;
+    workPermitExpiresOn?: CalendarDay | null;
+    isActive?: boolean;
+  },
+): Promise<void> {
+  const patch: Record<string, unknown> = { updatedAt: new Date() };
+  if (input.workPermitNo !== undefined) patch.workPermitNo = input.workPermitNo?.trim() || null;
+  if (input.workPermitExpiresOn !== undefined) patch.workPermitExpiresOn = input.workPermitExpiresOn ?? null;
+  if (input.isActive !== undefined) patch.isActive = input.isActive;
+  // Re-checking the card is the act being recorded. Standing somebody down is
+  // not, so it does not stamp a fresh verification onto a permit nobody looked
+  // at.
+  if (input.isActive !== false) {
+    patch.verifiedById = ctx.userId ?? null;
+    patch.verifiedAt = new Date();
+  }
+
+  await tx
+    .update(schema.subcontractorWorkers)
+    .set(patch)
+    .where(eq(schema.subcontractorWorkers.id, input.workerId));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // The board
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2662,6 +3841,14 @@ export interface HrLifecycleSummary {
   readonly hoursWarning: string | null;
   readonly insuranceGaps: readonly HealthInsuranceRow[];
   readonly wageGaps: readonly WageFileGap[];
+  /** `HR-13`. What the business owes if everybody left today. */
+  readonly gratuity: GratuityLiability;
+  /** `HR-13`. Settlements past the 14-day statutory deadline, unpaid. */
+  readonly gratuityOverdue: readonly GratuitySettlementRow[];
+  /** `HR-18`. The skilled denominator, with its unknowns stated. */
+  readonly emiratisation: EmiratisationPosition;
+  /** `HR-19`. Subcontractor obligations at or near expiry. */
+  readonly subcontractorExpiries: readonly SubcontractorExpiry[];
 }
 
 /**
@@ -2699,5 +3886,13 @@ export async function hrLifecycleSummary(
     hoursWarning: await hoursSourceWarning(tx),
     insuranceGaps: await healthInsuranceGaps(tx, now),
     wageGaps: await wageFileGaps(tx),
+    gratuity: await gratuityLiability(tx, now),
+    gratuityOverdue: await overdueGratuitySettlements(tx, now),
+    emiratisation: await emiratisationPosition(tx),
+    // 90 days, the same horizon `findExpiringAccreditations` and
+    // `findExpiringCertifications` use. A renewal is still cheap and unhurried
+    // at 90 days, and a board that only ever shows the urgent band trains
+    // people to act late.
+    subcontractorExpiries: await findExpiringSubcontractorObligations(tx, 90),
   };
 }

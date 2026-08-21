@@ -123,6 +123,25 @@ CREATE POLICY customer_scope ON public.job_events
                   AND j.customer_id = app_current_customer())
   );
 
+-- CON-13. The plant register, scoped through the building it is fixed to.
+--
+-- `assets` carries no customer_id — an asset belongs to a property and the
+-- property belongs to the customer — so without this a portal session reads
+-- every asset in the tenant. That was harmless only for as long as no portal
+-- query touched the table, which stopped being true when the request form
+-- began asking which piece of equipment a fault is about. Relying on the
+-- form's own join to `properties` to do the narrowing would be exactly the
+-- "one forgotten filter" this file exists to make impossible.
+DROP POLICY IF EXISTS customer_scope ON public.assets;
+CREATE POLICY customer_scope ON public.assets
+  AS RESTRICTIVE
+  USING (
+    app_current_customer() IS NULL
+    OR EXISTS (SELECT 1 FROM public.properties p
+                WHERE p.id = assets.property_id
+                  AND p.customer_id = app_current_customer())
+  );
+
 -- `job_visits` deliberately excluded: it carries technician identity and
 -- assignment scoring, which is internal. The portal reads technician *name*
 -- through a purpose-built query rather than by being granted the table.
@@ -172,10 +191,32 @@ DO $$
 DECLARE
   t text;
   -- Every table keyed by `job_id` that a portal session can name. `POR-3` and
-  -- `POR-9` put four of them on the request detail screen; `job_visits` is here
+  -- `POR-9` put five of them on the request detail screen; `job_visits` is here
   -- for the reason argued above.
+  --
+  -- `job_card_declarations` is the `POR-9` addition, and it is here because an
+  -- ABSENCE is evidence too. `JOB-15` records "no parts were used" and "there
+  -- is nothing to photograph, and here is the reason" as facts somebody
+  -- asserted, precisely because an empty `job_materials` cannot tell "none were
+  -- fitted" apart from "nobody filled the section in". Those two have opposite
+  -- meanings in a warranty argument. Left closed, the portal inherits exactly
+  -- the ambiguity the table was built to remove: it can only render an empty
+  -- section, which reads to a customer as "nothing happened".
+  --
+  -- What it exposes is a `kind`, a reason code and a note. The NOTE IS NOT
+  -- PROJECTED to the customer, and that is the same call made for
+  -- `job_events.note` at the top of `getPortalRequestDetail`: it is free text
+  -- written by a technician filling in an internal form, and there is no way to
+  -- sanitise a field written by somebody who believed it was internal. What the
+  -- customer is shown is the reason LABEL, from the controlled vocabulary
+  -- below — which is the entire argument for `JOB-15` making the reason a code
+  -- rather than a text box in the first place.
+  --
+  -- This policy only decides whose rows they are. The projection decides which
+  -- columns leave. Both are needed and neither substitutes for the other.
   via_job text[] := ARRAY[
-    'job_visits', 'job_reports', 'job_attachments', 'job_signoffs', 'job_materials'
+    'job_visits', 'job_reports', 'job_attachments', 'job_signoffs',
+    'job_materials', 'job_card_declarations'
   ];
 BEGIN
   FOREACH t IN ARRAY via_job LOOP
@@ -197,6 +238,53 @@ BEGIN
         )
     $p$, t);
   END LOOP;
+END
+$$;
+
+-- ── POR-9. The exemption vocabulary ─────────────────────────────────────────
+--
+-- `job_photo_exemption_reasons` is the controlled list `JOB-15` requires — the
+-- codes a technician picks from when there is nothing to photograph. It is a
+-- VOCABULARY, in the same family as `job_outcome_codes` and `fault_codes`: a
+-- tenant's own wording for a fixed set of situations, with no customer
+-- dimension anywhere in it. There is no such thing as "customer A's exemption
+-- reasons".
+--
+-- ── WHY THIS ONE POLICY SAYS `true` WHERE EVERY OTHER SAYS SOMETHING ────────
+--
+-- Every other policy in this file narrows rows to a customer. This one narrows
+-- nothing, and writing it any other way would be wrong rather than merely
+-- cautious. The portal reaches this table to turn a stored `reason_code` into
+-- the sentence a human reads — "the equipment is in a sealed riser" rather than
+-- `access_restricted`. Scope it to a customer and the join finds nothing, and
+-- the screen shows a bare machine code, or worse, silently drops the
+-- explanation and renders the empty section this whole change exists to
+-- remove.
+--
+-- The policy is still RESTRICTIVE and still present rather than omitted,
+-- because of the rule at the top of this file that the omission which was meant
+-- to withhold a table was publishing it. `USING (true)` is ANDed with
+-- `tenant_isolation` and therefore leaves the tenant boundary in force and adds
+-- nothing beyond it. The row is readable by a portal session in the same tenant
+-- and by nobody else, which is exactly the intent — stated, rather than
+-- inherited by accident.
+--
+-- The write check is NOT `true`. A portal session has no business writing a
+-- vocabulary, and `verify-rls` check 13 only forbids an unbounded write check
+-- on a table carrying `customer_id` — this table carries none, so nothing would
+-- catch `WITH CHECK (true)` here. Naming the staff test explicitly is the
+-- difference between "no code path does that today" and "the database refuses".
+DO $$
+BEGIN
+  -- Guarded, so this file stays runnable against a database part-way through
+  -- the migration set. `0025_job_card.sql` is where this table arrives.
+  IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'job_photo_exemption_reasons' AND relkind = 'r') THEN
+    DROP POLICY IF EXISTS customer_scope ON public.job_photo_exemption_reasons;
+    CREATE POLICY customer_scope ON public.job_photo_exemption_reasons
+      AS RESTRICTIVE
+      USING (true)
+      WITH CHECK (app_current_customer() IS NULL);
+  END IF;
 END
 $$;
 

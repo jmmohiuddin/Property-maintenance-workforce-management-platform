@@ -14,3 +14,7 @@ export * from "./portal";
 export * from "./analytics";
 export * from "./recruitment";
 export * from "./hr";
+export * from "./uploads";
+export * from "./field";
+export * from "./tenders";
+export * from "./projects";

@@ -36,6 +36,10 @@ import {
   listFaultCodes,
   recordJobOutcome,
   getJobOutcome,
+  getJobCard,
+  recordPhotoExemption,
+  declareNoMaterials,
+  recordVisitLabour,
   schema,
   closeConnection,
 } from "../src/index";
@@ -182,7 +186,29 @@ async function main(): Promise<void> {
       .returning({ id: schema.jobs.id });
 
     if (!assignable || !onSite) throw new Error("Could not create the job fixtures");
-    return { property, assignableJobId: assignable.id, onSiteJobId: onSite.id };
+
+    // A job on site has somebody on site. It used to have no visit at all,
+    // which was harmless until `JOB-15` — labour time is recorded against a
+    // visit, so a job with none has nowhere to put it and can never be
+    // completed. The fixture now looks like the state it is named after.
+    const [onSiteVisit] = await tx
+      .insert(schema.jobVisits)
+      .values({
+        tenantId: TENANT,
+        jobId: onSite.id,
+        technicianId: subject.id,
+        sequence: 1,
+        status: "arrived",
+      })
+      .returning({ id: schema.jobVisits.id });
+    if (!onSiteVisit) throw new Error("Could not create the on-site visit fixture");
+
+    return {
+      property,
+      assignableJobId: assignable.id,
+      onSiteJobId: onSite.id,
+      onSiteVisitId: onSiteVisit.id,
+    };
   });
 
   const property = { lat: fixture.property.lat, lng: fixture.property.lng, city: fixture.property.city };
@@ -415,6 +441,32 @@ async function main(): Promise<void> {
     "and points at the screen that maintains it",
     (bogus?.message ?? "").includes("Reference data"),
   );
+
+  // ── JOB-15, satisfied the way a no-access visit actually satisfies it ────
+  //
+  // The outcome is one of four things a job needs before it can be completed,
+  // and this fixture is the case the other three were written for: the
+  // technician never got through the door. So there is no photograph and there
+  // is a coded reason there is none; no parts were fitted and that is declared
+  // rather than left blank; and the time on the tools is zero, which is the
+  // honest figure rather than a made-up one. See `assertJobCardComplete`.
+  await withTenant(ctx, async (tx) => {
+    await recordPhotoExemption(tx, ctx, {
+      jobId: fixture.onSiteJobId,
+      reasonCode: "no_access_to_work",
+      note: `${TAG} never reached the plant room`,
+    });
+    await declareNoMaterials(tx, ctx, { jobId: fixture.onSiteJobId });
+    await recordVisitLabour(tx, ctx, {
+      jobId: fixture.onSiteJobId,
+      visitId: fixture.onSiteVisitId,
+      workMinutes: 0,
+      travelMinutes: 35,
+    });
+  });
+
+  const cardBefore = await withTenant(ctx, (tx) => getJobCard(tx, fixture.onSiteJobId));
+  check("JOB-15: the job card is complete before the outcome is recorded", cardBefore.gaps.length, 0);
 
   const completed = await withTenant(ctx, (tx) =>
     recordJobOutcome(tx, ctx, {

@@ -13,6 +13,9 @@ import {
   recordWorkedDay,
   saveHealthInsurance,
   recordSalaryDeduction,
+  recordGratuitySettlement,
+  markGratuitySettlementPaid,
+  saveOccupationClassification,
 } from "@meridian/db";
 import {
   toMinor,
@@ -605,4 +608,133 @@ export async function recordDeduction(
 
   revalidatePath(`/workforce/${employeeId}`);
   return { ok: `${formatMoney(amount)} recorded against the next wage cycle.` };
+}
+
+// ── HR-13: the end-of-service settlement ────────────────────────────────────
+
+/**
+ * Record an end-of-service settlement (`HR-13`).
+ *
+ * ── WHY THERE IS NO AMOUNT FIELD ON THIS FORM ───────────────────────────────
+ *
+ * Deliberately the opposite decision from `confirmTransfer` above, which asks
+ * for the amount because a partial WPS transfer is a real state that has to be
+ * measured against the 85% line. Nothing of the kind is true here. The gratuity
+ * figure is not an observation of what a bank did — it is the arithmetic in
+ * Article 51, and the whole reason `HR-13` exists is that the arithmetic is
+ * unforgiving and nobody does it the same way twice: 21 days for five years
+ * then 30, basic salary only, capped at two years' *total* wages.
+ *
+ * An amount field would make that computation optional, and the first person in
+ * a hurry would type the number from a spreadsheet. So the server computes it
+ * from the employee's own service dates and salary, and the only thing this
+ * form supplies is the termination date — a fact only a human knows.
+ */
+export async function settleGratuity(_prev: HrFormState, formData: FormData): Promise<HrFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const employeeId = text(formData, "employeeId");
+  const terminatedOn = calendarDate(formData.get("terminatedOn"));
+
+  if (!employeeId) return { error: "Missing employee." };
+  if (terminatedOn === null) return { error: "The termination date is not a real date." };
+  if (terminatedOn === undefined) return { error: "Enter the termination date. The 14-day clock runs from it." };
+
+  try {
+    const result = await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) =>
+        recordGratuitySettlement(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          { employeeId, terminatedOn },
+        ),
+    );
+
+    revalidatePath("/hr/gratuity");
+    revalidatePath("/hr");
+    return {
+      ok:
+        `Settlement recorded: ${formatMoney(result.amountMinor)}, payable with all other end-of-service ` +
+        `dues by ${formatDay(result.dueOn)} — 14 days from termination.`,
+    };
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the settlement.", "hr") };
+  }
+}
+
+/** Mark a settlement as paid, with the reference that makes it evidence. */
+export async function payGratuity(_prev: HrFormState, formData: FormData): Promise<HrFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const settlementId = text(formData, "settlementId");
+  const reference = text(formData, "reference");
+  const paidOn = calendarDate(formData.get("paidOn"));
+
+  if (!settlementId) return { error: "Missing settlement." };
+  if (paidOn === null) return { error: "The payment date is not a real date." };
+  if (paidOn === undefined) return { error: "Enter the date the payment was made." };
+  if (!reference) {
+    return {
+      error:
+        "Record the bank or WPS reference. A settlement marked paid with nothing behind it is worth nothing in a labour claim, and the limitation period is two years from termination.",
+    };
+  }
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) => markGratuitySettlementPaid(tx, { settlementId, paidOn, reference }),
+    );
+
+    revalidatePath("/hr/gratuity");
+    revalidatePath("/hr");
+    return { ok: `Settlement recorded as paid on ${formatDay(paidOn)}, reference ${reference}.` };
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the payment.", "hr") };
+  }
+}
+
+// ── HR-18: the two facts the skilled test needs ─────────────────────────────
+
+/**
+ * Record an employee's ISCO occupational group and certificate answer (`HR-18`).
+ *
+ * ── WHY BOTH FIELDS HAVE AN EXPLICIT "NOT RECORDED" OPTION ──────────────────
+ *
+ * Because the alternative is a select that defaults to something. A defaulted
+ * ISCO group is indistinguishable from one somebody chose, and it silently
+ * answers the question that decides whether an employee is in the Emiratisation
+ * denominator. Unanswered is a real state, it is visible in the skilled range
+ * as an upper bound above the lower one, and it is recoverable; a wrong answer
+ * is none of those things.
+ */
+export async function classifyOccupation(_prev: HrFormState, formData: FormData): Promise<HrFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const employeeId = text(formData, "employeeId");
+  const rawGroup = text(formData, "iscoMajorGroup");
+  const rawCertificate = text(formData, "postSecondaryCertificate");
+
+  if (!employeeId) return { error: "Missing employee." };
+
+  const iscoMajorGroup = rawGroup === "" ? null : Number(rawGroup);
+  if (iscoMajorGroup !== null && !Number.isInteger(iscoMajorGroup)) {
+    return { error: "The ISCO occupational major group is a whole number from 1 to 9." };
+  }
+  const postSecondaryCertificate =
+    rawCertificate === "yes" ? true : rawCertificate === "no" ? false : null;
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) => saveOccupationClassification(tx, { employeeId, iscoMajorGroup, postSecondaryCertificate }),
+    );
+
+    revalidatePath("/hr/emiratisation");
+    revalidatePath("/hr");
+    return { ok: "Occupational classification saved." };
+  } catch (error) {
+    return { error: userMessage(error, "Could not save the classification.", "hr") };
+  }
 }

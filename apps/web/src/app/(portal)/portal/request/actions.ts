@@ -28,6 +28,12 @@ export async function raiseRequest(_prev: RequestState, formData: FormData): Pro
   const title = String(formData.get("title") ?? "").trim();
   const description = String(formData.get("description") ?? "").trim();
   const urgency = String(formData.get("urgency") ?? "this-week");
+  // CON-13, optional by design: "I don't know which chiller" is an honest
+  // answer and the empty option is what it submits. Not validated as a uuid
+  // here — `linkJobToAsset` resolves it against this customer's own plant
+  // inside the transaction, and an id that resolves to nothing there refuses
+  // the whole request rather than raising a job with a bad link on it.
+  const assetId = String(formData.get("assetId") ?? "").trim();
 
   if (!propertyId) return { error: "Choose which property this is about." };
   if (!getService(serviceSlug)) return { error: "Choose what kind of work it is." };
@@ -55,7 +61,14 @@ export async function raiseRequest(_prev: RequestState, formData: FormData): Pro
             customerId: session.customerId,
             userId: session.principal.userId,
           },
-          { propertyId, serviceSlug, title, description: description || undefined, requestedPriority },
+          {
+            propertyId,
+            serviceSlug,
+            title,
+            description: description || undefined,
+            requestedPriority,
+            assetId: assetId || undefined,
+          },
         );
 
         // ── WHO HEARS ABOUT THIS, AND WHY IT IS NOT THE PERSON WHO ASKED ────

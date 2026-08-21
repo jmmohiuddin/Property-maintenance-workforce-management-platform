@@ -3191,6 +3191,247 @@ export async function getCandidateDocumentForDownload(
 }
 
 
+// ── ATS-9: the scan, and the sweep that actually runs it ────────────────────
+//
+// ── WHAT WAS HERE BEFORE, PLAINLY ──────────────────────────────────────────
+//
+// `scan_status` has been a CHECK-constrained column with four honest states
+// since migration 0014, and the download route re-derives its gate from the row
+// on every request. Both real. But the only writer was the public CV upload and
+// it wrote `skipped` unconditionally: nothing ever wrote `pending`, and no code
+// path anywhere moved a row out of it. The gate was real and there was nothing
+// behind it.
+//
+// The three functions below are the engine. They are shaped exactly like the
+// interview-reminder sweep next door, for the same reason and with the same
+// guarantee: claim first, act second, both inside one transaction.
+
+/** One document waiting to be looked at. */
+export interface PendingDocumentScan {
+  readonly documentId: string;
+  readonly candidateId: string;
+  readonly applicationId: string | null;
+  readonly kind: string;
+  readonly storageKey: string;
+  readonly filename: string | null;
+  readonly sizeBytes: number;
+  /** What it was before this claim — `pending`, or `skipped` on a re-scan pass. */
+  readonly previousStatus: ScanStatus;
+}
+
+/**
+ * Take the next document to scan, and hold it.
+ *
+ * ── HOW TWO OVERLAPPING SWEEPS ARE PREVENTED FROM BOTH SCANNING IT ─────────
+ *
+ * `for update skip locked` means a concurrent run never even sees a row this
+ * one is holding, and the conditional `scan_claimed_at is null` on the UPDATE
+ * means that if it somehow did, its update would match nothing and it would
+ * return null. The loser does no work rather than duplicate work.
+ *
+ * The claim and the verdict must be written in the same transaction — which is
+ * why this returns the storage key and the caller does the scanning between the
+ * two. A run that dies mid-scan rolls the claim back with everything else, and
+ * the next run picks the document up. At most once, at least once, never twice.
+ *
+ * ── WHY `skipped` IS RE-SCANNABLE ──────────────────────────────────────────
+ *
+ * `skipped` means "no scanner was configured when this arrived". The day one is
+ * configured, every one of those files is still unscanned, and nothing would
+ * ever go back for them. `includeSkipped` is that second pass. It is ordered
+ * behind the pending queue, because a file nobody has any opinion about matters
+ * less than one somebody is waiting to download.
+ */
+export async function claimNextDocumentScan(
+  tx: TenantScopedTx,
+  includeSkipped = false,
+): Promise<PendingDocumentScan | null> {
+  const candidates = (await tx.execute<{
+    id: string;
+    candidate_id: string;
+    application_id: string | null;
+    kind: string;
+    storage_key: string;
+    filename: string | null;
+    size_bytes: number;
+    scan_status: string;
+  }>(sql`
+    select id, candidate_id, application_id, kind, storage_key, filename, size_bytes, scan_status
+      from candidate_documents
+     where deleted_at is null
+       and scan_claimed_at is null
+       and (scan_status = 'pending' or (${includeSkipped}::boolean and scan_status = 'skipped'))
+     order by (scan_status <> 'pending'), uploaded_at
+     limit 1
+     for update skip locked
+  `)) as unknown as {
+    id: string;
+    candidate_id: string;
+    application_id: string | null;
+    kind: string;
+    storage_key: string;
+    filename: string | null;
+    size_bytes: number;
+    scan_status: string;
+  }[];
+
+  const row = candidates[0];
+  if (!row) return null;
+
+  const claimed = (await tx.execute<{ id: string }>(sql`
+    update candidate_documents
+       set scan_claimed_at = now(), updated_at = now()
+     where id = ${row.id}::uuid
+       and scan_claimed_at is null
+       and deleted_at is null
+    returning id
+  `)) as unknown as { id: string }[];
+
+  if (claimed.length === 0) return null;
+
+  return {
+    documentId: row.id,
+    candidateId: row.candidate_id,
+    applicationId: row.application_id,
+    kind: row.kind,
+    storageKey: row.storage_key,
+    filename: row.filename,
+    sizeBytes: Number(row.size_bytes),
+    previousStatus: row.scan_status as ScanStatus,
+  };
+}
+
+/**
+ * Write what the scanner concluded.
+ *
+ * `pending` is not accepted as a verdict. It is the absence of one, and a
+ * function that could write it would be a function that could quietly undo a
+ * scan.
+ */
+export async function recordScanVerdict(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    documentId: string;
+    applicationId?: string | null;
+    status: "clean" | "infected" | "skipped";
+    /** The scanner's name for what it found, or why nothing was found. varchar(200). */
+    note: string | null;
+  },
+): Promise<boolean> {
+  const rows = (await tx.execute<{ id: string }>(sql`
+    update candidate_documents
+       set scan_status = ${input.status},
+           scanned_at = now(),
+           scanner_note = ${input.note ? input.note.slice(0, 200) : null},
+           updated_at = now()
+     where id = ${input.documentId}::uuid
+       and deleted_at is null
+    returning id
+  `)) as unknown as { id: string }[];
+
+  if (rows.length === 0) return false;
+
+  if (input.applicationId) {
+    // On the application's own activity feed (ATS-11), not only in a log. A
+    // recruiter who cannot download a CV needs to be able to see why on the
+    // screen they are already looking at.
+    await tx.insert(schema.applicationEvents).values({
+      tenantId: ctx.tenantId,
+      applicationId: input.applicationId,
+      eventType: "document_scanned",
+      note: input.note ? input.note.slice(0, 200) : null,
+      payload: { documentId: input.documentId, scanStatus: input.status },
+      actorKind: "system",
+    });
+  }
+
+  return true;
+}
+
+/**
+ * The document the sweep claimed and could not finish.
+ *
+ * Leaves `scan_status` at `pending` — undownloadable, which is right, because
+ * nobody knows anything about this file — but keeps the claim, so the sweep
+ * stops picking the same broken row on every run and livelocking behind it.
+ * `/api/cron/scan` counts these separately and names them.
+ *
+ * Parking it in `skipped` was the alternative and would have been a lie:
+ * `skipped` is the statement "this deployment has no scanner", and this file's
+ * problem is its own.
+ */
+export async function parkDocumentScan(
+  tx: TenantScopedTx,
+  input: { documentId: string; note: string },
+): Promise<void> {
+  await tx.execute(sql`
+    update candidate_documents
+       set scanner_note = ${input.note.slice(0, 200)}, updated_at = now()
+     where id = ${input.documentId}::uuid
+       and deleted_at is null
+  `);
+}
+
+export interface ScanBacklog {
+  readonly pending: number;
+  /** Claimed and still pending: the sweep could not finish these. Needs a person. */
+  readonly stalled: number;
+  readonly clean: number;
+  readonly infected: number;
+  readonly skipped: number;
+  readonly oldestPendingMinutes: number;
+}
+
+/**
+ * What the scan gate is holding, right now.
+ *
+ * Reported by the scheduled route on every run rather than living on a screen.
+ * A backlog that only appears on a page is a backlog nobody sees until a
+ * recruiter phones to ask why a CV will not open.
+ */
+export async function scanBacklog(tx: TenantScopedTx): Promise<ScanBacklog> {
+  const rows = (await tx.execute<{
+    pending: number;
+    stalled: number;
+    clean: number;
+    infected: number;
+    skipped: number;
+    oldest_pending_minutes: number;
+  }>(sql`
+    select
+      count(*) filter (where scan_status = 'pending' and scan_claimed_at is null)::int as pending,
+      count(*) filter (where scan_status = 'pending' and scan_claimed_at is not null)::int as stalled,
+      count(*) filter (where scan_status = 'clean')::int as clean,
+      count(*) filter (where scan_status = 'infected')::int as infected,
+      count(*) filter (where scan_status = 'skipped')::int as skipped,
+      coalesce(
+        max(extract(epoch from (now() - uploaded_at)) / 60)
+          filter (where scan_status = 'pending'),
+        0
+      )::int as oldest_pending_minutes
+      from candidate_documents
+     where deleted_at is null
+  `)) as unknown as {
+    pending: number;
+    stalled: number;
+    clean: number;
+    infected: number;
+    skipped: number;
+    oldest_pending_minutes: number;
+  }[];
+
+  const row = rows[0];
+  return {
+    pending: Number(row?.pending ?? 0),
+    stalled: Number(row?.stalled ?? 0),
+    clean: Number(row?.clean ?? 0),
+    infected: Number(row?.infected ?? 0),
+    skipped: Number(row?.skipped ?? 0),
+    oldestPendingMinutes: Number(row?.oldest_pending_minutes ?? 0),
+  };
+}
+
 // ── ATS-14: interview logistics ─────────────────────────────────────────────
 //
 // The half of ATS-14 that is not blocked.

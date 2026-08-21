@@ -1,19 +1,30 @@
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 import type { TenantScopedTx } from "../index";
 import {
   DASHBOARD_GOALS,
   DASHBOARD_HIRING_WINDOW_DAYS,
   DASHBOARD_HORIZON_DAYS,
   DASHBOARD_WEEK_DAYS,
-  EMIRATISATION_SKILLED_THRESHOLD,
   gradeGoal,
   ppmCompletion,
   smallBusinessReliefPosition,
+  taxPeriodPositions,
+  csvAmount,
+  documentJournalLines,
+  paymentJournalLines,
+  journalTotals,
+  dubaiDateKey,
+  UserFacingError,
   type GoalVerdict,
   type ReliefPosition,
+  type CorporateTaxPack,
+  type TaxPeriodRevenue,
+  type ExportTable,
+  type CsvValue,
+  type JournalLine,
 } from "@meridian/core";
 import { requiredRowDate } from "./_rows";
-import { arAgeing, uninvoicedSignedOffJobs, invoiceSequenceGaps } from "./commerce";
+import { arAgeing, openReceivables, uninvoicedSignedOffJobs, invoiceSequenceGaps } from "./commerce";
 import {
   workforceSummary,
   blockedTechnicians,
@@ -23,6 +34,8 @@ import {
 import { dispatchBoardCounts, dispatchBoardCountsByPriority } from "./jobs";
 import { findExpiringCertifications } from "./cron";
 import { listRequisitions } from "./recruitment";
+import { emiratisationPosition } from "./hr";
+import type { EmiratisationPosition } from "@meridian/core";
 // Read, never written by this stream. The dashboard and the AMC screen have to
 // agree about PPM completion, and calling the same function is what guarantees it.
 import { ppmCompliance } from "./contracts";
@@ -572,6 +585,29 @@ export interface OwnerDashboard {
   readonly compliance: CompliancePosition;
   readonly hiring: HiringPosition;
   readonly billing: BillingRisk;
+  /**
+   * Skilled headcount against the 50-employee Emiratisation threshold
+   * (`KPI-3` / `HR-18`).
+   *
+   * Carries `lowerBound`/`upperBound`, not a single figure — see
+   * `emiratisationPosition` and `assessEmiratisation` in `packages/core`.
+   * An employee with a missing ISCO group or certificate answer is not
+   * counted as unskilled; they widen the range instead, because the
+   * establishment is banded on the upper bound. Render `headline` and
+   * `caveat` together, never `skilled` alone: a single confident number
+   * is exactly the misleading figure this used to be a `DASHBOARD_GAPS`
+   * entry to prevent.
+   */
+  readonly emiratisation: EmiratisationPosition;
+  /**
+   * Every tax period on record against the relief line (`INV-17`).
+   *
+   * On the dashboard for one reason: `revenue.relief` measures **this** period,
+   * and the relief is lost permanently by a breach in **any** period. Without
+   * this the meter reads green every January after the year it was crossed,
+   * which is precisely the failure `INV-17` was written about.
+   */
+  readonly tax: CorporateTaxPack;
   readonly attention: readonly Attention[];
   readonly gaps: readonly DashboardGap[];
 }
@@ -594,16 +630,18 @@ export async function ownerDashboard(
   const now = options?.now ?? new Date();
   const horizonDays = options?.horizonDays ?? DASHBOARD_HORIZON_DAYS;
 
-  const [ageing, revenue, pipeline, work, contracts, compliance, hiring, billing] =
+  const [ageing, revenue, pipeline, work, contracts, compliance, hiring, billing, tax, emiratisation] =
     await Promise.all([
       arAgeing(tx, now),
       revenuePosition(tx, now),
       pipelinePosition(tx, now),
       workPosition(tx, now),
       contractPosition(tx, now, horizonDays),
-      compliancePosition(tx, horizonDays),
+      compliancePosition(tx, horizonDays, now),
       hiringPosition(tx, now),
       billingRisk(tx, now),
+      corporateTaxPack(tx, { now }),
+      emiratisationPosition(tx),
     ]);
 
   const overdueMinor =
@@ -648,7 +686,9 @@ export async function ownerDashboard(
     compliance,
     hiring,
     billing,
-    attention: attentionItems({ cash, revenue, work, contracts, compliance, billing }),
+    tax,
+    emiratisation,
+    attention: attentionItems({ cash, revenue, work, contracts, compliance, billing, tax }),
     gaps: DASHBOARD_GAPS,
   };
 }
@@ -662,16 +702,6 @@ export async function ownerDashboard(
  * investigation.
  */
 export const DASHBOARD_GAPS: readonly DashboardGap[] = [
-  {
-    requirement: "KPI-3 / HR-18",
-    metric: "Skilled headcount against the Emiratisation threshold",
-    waitingOn:
-      `The HR stream. "Skilled" needs three facts per employee — ISCO occupational level 1–5, a ` +
-      `post-secondary certificate, and salary at or above AED 4,000/month — and \`employees\` carries ` +
-      `none of them. Total headcount is reported instead, and it is NOT the same number: a contractor ` +
-      `with 60 tradesmen and 6 office staff is measured against the 6, not the 66, so reporting ` +
-      `headcount against ${EMIRATISATION_SKILLED_THRESHOLD} would say the threshold was near when it is far.`,
-  },
   {
     requirement: "KPI-3 / HR-17",
     metric: "WPS payroll countdown",
@@ -714,6 +744,56 @@ export const DASHBOARD_GAPS: readonly DashboardGap[] = [
  * arithmetic in JavaScript against a database that does not run in Dubai puts
  * an invoice issued at 02:00 on the 1st into the previous month.
  */
+/**
+ * What "revenue" means, once, in SQL.
+ *
+ * ── WHY THIS IS A SHARED FRAGMENT AND NOT TWO SIMILAR QUERIES ───────────────
+ *
+ * Two figures in this system are measured against the AED 3,000,000 Small
+ * Business Relief line: the meter on the owner dashboard (`revenuePosition`)
+ * and the tax-period pack (`corporateTaxPack`, `INV-17`). If those two ever
+ * disagreed, the screen that says "you are fine" and the screen that says "you
+ * are not" would both be in the product, and the business would believe
+ * whichever it read first. Breaching AED 3m once ends the relief permanently,
+ * so the cost of believing the wrong one is not recoverable.
+ *
+ * The two queries therefore share this definition rather than resembling each
+ * other. Four decisions live in it:
+ *
+ *  * **Tax-exclusive.** `taxable_amount`, not `total`. VAT is collected on
+ *    behalf of the FTA and is not revenue; measuring the relief on the gross
+ *    would report a breach roughly AED 150,000 early every year.
+ *  * **Drafts are not revenue.** A draft is not a document.
+ *  * **Credit notes subtract.** `crn` is netted off wherever `inv` is summed,
+ *    never left to a caller to remember.
+ *  * **Dated in Asia/Dubai.** `issued_on` is a `timestamptz`; an invoice raised
+ *    at 02:00 Dubai on 1 January is 31 December in UTC and belongs to the wrong
+ *    tax period under the wrong timezone. That is a permanent misstatement of a
+ *    threshold, which is why every boundary here is computed in SQL against
+ *    this conversion and none of it is done in JavaScript.
+ *
+ * `issued_on is null` on a non-draft is a data fault: it is excluded rather
+ * than dated to today, because inventing an issue date puts revenue in a period
+ * it was never earned in.
+ */
+const REVENUE_SOURCE = sql`
+    inv as (
+      select (i.issued_on at time zone 'Asia/Dubai') as issued_local,
+             (i.taxable_amount * 100)::bigint        as taxable_minor,
+             i.currency
+        from invoices i
+       where i.deleted_at is null
+         and i.status <> 'draft'
+         and i.issued_on is not null
+    ),
+    crn as (
+      select (c.issued_on at time zone 'Asia/Dubai') as issued_local,
+             (c.taxable_amount * 100)::bigint        as taxable_minor
+        from credit_notes c
+       where c.deleted_at is null
+         and c.issued_on is not null
+    )`;
+
 async function revenuePosition(tx: TenantScopedTx, now: Date): Promise<RevenuePosition> {
   const rows = (await tx.execute<{
     this_month: string;
@@ -734,28 +814,7 @@ async function revenuePosition(tx: TenantScopedTx, now: Date): Promise<RevenuePo
              local_now                                          as local_now
         from anchor
     ),
-    -- Issued invoices, keyed on the local-time issue date. issued_on is null
-    -- on a draft, and the status filter already excludes drafts, so a null here
-    -- is an issued invoice with no issue date — which is a data fault worth
-    -- leaving out of a revenue figure rather than silently dating to today.
-    inv as (
-      select (i.issued_on at time zone 'Asia/Dubai') as issued_local,
-             (i.taxable_amount * 100)::bigint        as taxable_minor,
-             i.currency
-        from invoices i, bounds b
-       where i.deleted_at is null
-         and i.status <> 'draft'
-         and i.issued_on is not null
-         and (i.issued_on at time zone 'Asia/Dubai') >= b.year_start - interval '1 year'
-    ),
-    crn as (
-      select (c.issued_on at time zone 'Asia/Dubai') as issued_local,
-             (c.taxable_amount * 100)::bigint        as taxable_minor
-        from credit_notes c, bounds b
-       where c.deleted_at is null
-         and c.issued_on is not null
-         and (c.issued_on at time zone 'Asia/Dubai') >= b.year_start - interval '1 year'
-    )
+    ${REVENUE_SOURCE}
     select
       coalesce((select sum(taxable_minor) from inv, bounds b
                  where issued_local >= b.month_start and issued_local < b.local_now + interval '1 day'), 0)
@@ -1127,13 +1186,21 @@ async function contractPosition(
 async function compliancePosition(
   tx: TenantScopedTx,
   horizonDays: number,
+  now: Date,
 ): Promise<CompliancePosition> {
+  // The dashboard's own `now` is a `Date` (it drives revenue-period and
+  // other instant-valued arithmetic too); the expiry sweeps below want
+  // Dubai's calendar day, not `current_date`, so it is converted once here
+  // rather than letting each sweep fall back to its own `today()` default.
+  // `dubaiDateKey` is what `today()` itself calls — same conversion, already
+  // imported in this file.
+  const day = dubaiDateKey(now);
   const [summary, blocks, documents, accreditations, certifications] = await Promise.all([
     workforceSummary(tx),
-    blockedTechnicians(tx),
-    findExpiringEmployeeDocuments(tx, horizonDays),
-    findExpiringAccreditations(tx, horizonDays),
-    findExpiringCertifications(tx, horizonDays),
+    blockedTechnicians(tx, day),
+    findExpiringEmployeeDocuments(tx, horizonDays, day),
+    findExpiringAccreditations(tx, horizonDays, day),
+    findExpiringCertifications(tx, horizonDays, day),
   ]);
 
   const candidates: { label: string; daysRemaining: number }[] = [
@@ -1367,9 +1434,10 @@ function attentionItems(input: {
   contracts: ContractPosition;
   compliance: CompliancePosition;
   billing: BillingRisk;
+  tax: CorporateTaxPack;
 }): readonly Attention[] {
   const items: Attention[] = [];
-  const { cash, revenue, work, contracts, compliance, billing } = input;
+  const { cash, revenue, work, contracts, compliance, billing, tax } = input;
 
   if (compliance.blocked > 0) {
     items.push({
@@ -1413,14 +1481,33 @@ function attentionItems(input: {
     });
   }
 
-  if (revenue.relief.state === "breached") {
+  /*
+   * Three states, and the order matters.
+   *
+   * `disqualified` goes first because it is the one this period's own figure
+   * cannot show. A business that crossed AED 3m in a previous period is under
+   * the line this year, sees a green meter, and elects a relief it lost for
+   * good — so the disqualification has to outrank a reassuring current number
+   * rather than sit behind it.
+   */
+  if (tax.current?.standing === "disqualified") {
+    items.push({
+      severity: "critical",
+      headline: `Small Business Relief was permanently lost in ${tax.current.disqualifyingPeriod}`,
+      detail:
+        "This period's revenue is under AED 3,000,000, and it does not restore the relief — one " +
+        "breach disqualifies every later period. Do not elect it in the return without confirming " +
+        "the earlier period with your accountant.",
+      href: "/reports/tax",
+    });
+  } else if (revenue.relief.state === "breached") {
     items.push({
       severity: "critical",
       headline: "Revenue has passed the AED 3,000,000 Small Business Relief line",
       detail:
         "The relief is lost for this period and permanently for every later one. Confirm the figure " +
         "with the accountant before acting on it — it is computed from issued invoices net of credit notes.",
-      href: "/invoices",
+      href: "/reports/tax",
     });
   } else if (revenue.relief.state === "approaching") {
     items.push({
@@ -1429,7 +1516,7 @@ function attentionItems(input: {
       detail:
         "Crossing it once permanently ends the relief for all later periods. There is still time to " +
         "decide deliberately rather than discover it in the return.",
-      href: "/invoices",
+      href: "/reports/tax",
     });
   }
 
@@ -1786,3 +1873,842 @@ export async function recordHistory(
 
   return rows.map(toAuditEntry);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INV-17 — the corporate tax support pack
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Revenue by tax period, against the AED 3,000,000 Small Business Relief line.
+ *
+ * ── WHY THIS IS NOT THE DASHBOARD METER AGAIN ───────────────────────────────
+ *
+ * The owner dashboard already measures this year's revenue against AED 3m. It
+ * is the right thing on that screen and it is not `INV-17`, for one reason: the
+ * relief is lost **permanently** by a single breach, and a single-period view
+ * cannot see a breach that happened in a previous period. A business that
+ * crossed the line in 2026 sees a green meter every January afterwards, files a
+ * return electing relief it is not entitled to, and finds out from the FTA.
+ *
+ * So the pack reads every period on record, in order, and carries the breach
+ * forward — `taxPeriodPositions` in `@meridian/core` does the carrying. That is
+ * the whole requirement: the number was never the hard part.
+ *
+ * ── THE PERIOD ──────────────────────────────────────────────────────────────
+ *
+ * The Gregorian calendar year, in `Asia/Dubai`, which is the default corporate
+ * tax period and the one this business uses. A financial year ending on any
+ * other date is a real possibility for a UAE company and is **not** supported
+ * here: it would need a configured year-end, and configuring one that nobody
+ * has been asked for would put a wrong period boundary in front of the reader
+ * with no way to tell. `startsOn` and `endsOn` travel on every row so the
+ * assumption is visible in the output rather than buried in this comment.
+ *
+ * Every boundary below — the period start, the period end, whether the period
+ * is complete, how much of it has elapsed — is computed in SQL against
+ * `at time zone 'Asia/Dubai'`. None of it is done in JavaScript. An invoice
+ * issued at 02:00 Dubai on 1 January is dated 31 December in UTC, and a
+ * period boundary computed on the server's clock would put that revenue in the
+ * previous period — misstating a threshold whose breach cannot be undone.
+ */
+export async function corporateTaxPack(
+  tx: TenantScopedTx,
+  options?: { now?: Date },
+): Promise<CorporateTaxPack> {
+  const now = options?.now ?? new Date();
+
+  type Row = {
+    period: string;
+    starts_on: string;
+    ends_on: string;
+    invoiced_minor: string;
+    credited_minor: string;
+    revenue_minor: string;
+    invoices: string;
+    credit_notes: string;
+    complete: string;
+    elapsed_days: string;
+    total_days: string;
+    is_current: string;
+    currency: string | null;
+  };
+
+  const rows = (await tx.execute<Row>(sql`
+    with ${REVENUE_SOURCE},
+    anchor as (
+      select (${now.toISOString()}::timestamptz at time zone 'Asia/Dubai') as local_now
+    ),
+    current_period as (
+      select date_trunc('year', local_now) as current_start from anchor
+    ),
+    -- One row per document, tagged with the period it falls in. A union rather
+    -- than two joined aggregates: a full outer join between invoices-by-year
+    -- and credits-by-year drops a year that has credits and no invoices, which
+    -- is exactly the year somebody would want an explanation for.
+    movements as (
+      select date_trunc('year', issued_local) as period_start,
+             taxable_minor                    as invoiced_minor,
+             0::bigint                        as credited_minor,
+             1                                as invoice_count,
+             0                                as credit_count
+        from inv
+      union all
+      select date_trunc('year', issued_local),
+             0::bigint,
+             taxable_minor,
+             0,
+             1
+        from crn
+    ),
+    span as (
+      select min(period_start) as first_start, max(period_start) as last_start from movements
+    ),
+    -- Generated rather than taken from the movements, so a period with no
+    -- documents at all still appears with a revenue of zero. A missing row
+    -- reads as "no data" and a zero row reads as "no revenue", and for a
+    -- threshold report those are different statements.
+    period_list as (
+      select generate_series(
+               least(
+                 coalesce((select first_start from span), (select current_start from current_period)),
+                 (select current_start from current_period)
+               ),
+               greatest(
+                 coalesce((select last_start from span), (select current_start from current_period)),
+                 (select current_start from current_period)
+               ),
+               interval '1 year'
+             ) as period_start
+    )
+    select
+      to_char(p.period_start, 'YYYY')                                                as period,
+      to_char(p.period_start, 'YYYY-MM-DD')                                          as starts_on,
+      to_char(p.period_start + interval '1 year' - interval '1 day', 'YYYY-MM-DD')   as ends_on,
+      coalesce(sum(m.invoiced_minor), 0)::text                                       as invoiced_minor,
+      coalesce(sum(m.credited_minor), 0)::text                                       as credited_minor,
+      (coalesce(sum(m.invoiced_minor), 0) - coalesce(sum(m.credited_minor), 0))::text as revenue_minor,
+      coalesce(sum(m.invoice_count), 0)::text                                        as invoices,
+      coalesce(sum(m.credit_count), 0)::text                                         as credit_notes,
+      ((select local_now from anchor) >= p.period_start + interval '1 year')::text   as complete,
+      greatest(0, least(
+        extract(day from ((select local_now from anchor) - p.period_start))::int + 1,
+        extract(day from ((p.period_start + interval '1 year') - p.period_start))::int
+      ))::text                                                                       as elapsed_days,
+      extract(day from ((p.period_start + interval '1 year') - p.period_start))::int::text as total_days,
+      -- Which period "now" falls in, decided in SQL against the same
+      -- Asia/Dubai conversion as every other boundary here. Resolving it in
+      -- JavaScript would reintroduce exactly the timezone offset the rest of
+      -- this query exists to avoid, on the one row the reader acts on.
+      (p.period_start = (select current_start from current_period))::text             as is_current,
+      (select currency from inv limit 1)                                              as currency
+      from period_list p
+      left join movements m on m.period_start = p.period_start
+     group by p.period_start
+     order by p.period_start
+  `)) as unknown as Row[];
+
+  const periods: TaxPeriodRevenue[] = rows.map((r) => ({
+    period: r.period,
+    startsOn: r.starts_on,
+    endsOn: r.ends_on,
+    // Number(), never ::int in SQL. A year's taxable amount in fils is a
+    // nine-figure number and a business that has been running a decade would
+    // overflow int4 in the sum, mid-query, for no reason.
+    invoicedMinor: Number(r.invoiced_minor),
+    creditedMinor: Number(r.credited_minor),
+    revenueMinor: Number(r.revenue_minor),
+    invoices: Number(r.invoices),
+    creditNotes: Number(r.credit_notes),
+    complete: r.complete === "true",
+    elapsedDays: Number(r.elapsed_days),
+    totalDays: Number(r.total_days),
+  }));
+
+  const positions = taxPeriodPositions(periods);
+
+  // The current period is the one SQL flagged, never the last element of the
+  // list: a future-dated invoice puts a later period on the end, and `at(-1)`
+  // would then report next year's figure as this year's.
+  const currentPeriodLabel = rows.find((r) => r.is_current === "true")?.period ?? null;
+  const current = positions.find((p) => p.period.period === currentPeriodLabel) ?? null;
+
+  return {
+    periods: positions,
+    current,
+    reliefPermanentlyLost: positions.some((p) => p.relief.state === "breached"),
+    currency: rows[0]?.currency ?? "AED",
+    measuredAt: now,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INV-16 — the accounting export
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * How many rows one round trip to the database fetches.
+ *
+ * Not a page size. Nothing outside this file sees it, no caller can change it,
+ * and the loop that uses it does not stop until the query returns a short
+ * batch. It exists so a ten-year export does not build one enormous result set
+ * in the driver, and for no other reason.
+ */
+const EXPORT_BATCH = 500;
+
+/**
+ * The point at which a batching loop is assumed to be broken.
+ *
+ * One million rows. A maintenance contractor does not issue a million invoices
+ * a decade, so reaching this means the cursor stopped advancing — and the right
+ * response to that is to fail loudly. **Never** to return what has been
+ * collected so far: a partial accounting export that looks complete is the
+ * exact failure this whole module is written to prevent, and a thrown error is
+ * the only outcome an operator cannot mistake for a quiet month.
+ */
+const EXPORT_MAX_BATCHES = 2_000;
+
+/** A keyset position: the last row's sort value and id. */
+interface ExportCursor {
+  readonly sort: string;
+  readonly id: string;
+}
+
+/**
+ * Every row a query matches, fetched in batches.
+ *
+ * ── WHY THIS IS NOT `.limit(500)` ───────────────────────────────────────────
+ *
+ * Because five separate places in this repository have shipped a capped list
+ * being read as a complete one, and an accounting export is the worst place for
+ * the sixth. The loop below has no row limit: it asks for `EXPORT_BATCH + 0`
+ * rows, and it stops when the database returns fewer than it asked for, which
+ * is the only condition that means "there are no more". Every caller counts
+ * what it received and the count is written into the file, so a file that is
+ * short is visibly short.
+ *
+ * Keyset rather than `offset`, on `(sort, id)` where `id` is unique — so the
+ * comparison is strict, progress is guaranteed, and a row inserted by another
+ * session mid-export cannot cause a row to be skipped or repeated the way a
+ * shifting `offset` does.
+ */
+async function* exportRows<T extends { cursor_sort: string; cursor_id: string }>(
+  tx: TenantScopedTx,
+  build: (after: ExportCursor | null, limit: number) => SQL,
+): AsyncGenerator<T> {
+  let after: ExportCursor | null = null;
+
+  for (let batch = 0; ; batch++) {
+    if (batch >= EXPORT_MAX_BATCHES) {
+      throw new Error(
+        `Accounting export did not terminate after ${EXPORT_MAX_BATCHES} batches. ` +
+          `Refusing to return a partial set of books.`,
+      );
+    }
+
+    const rows = (await tx.execute<T>(build(after, EXPORT_BATCH))) as unknown as T[];
+    for (const row of rows) yield row;
+    if (rows.length < EXPORT_BATCH) return;
+
+    const last = rows[rows.length - 1]!;
+    after = { sort: last.cursor_sort, id: last.cursor_id };
+  }
+}
+
+/** The keyset predicate, or nothing on the first batch. */
+function afterCursor(after: ExportCursor | null, sortExpression: SQL): SQL {
+  if (!after) return sql``;
+  return sql`and (${sortExpression}, cursor_source.id) > (${after.sort}::timestamp, ${after.id}::uuid)`;
+}
+
+/** A VAT rate in basis points, as a percentage string. Integer arithmetic. */
+function vatRatePercent(basisPoints: number): string {
+  const whole = Math.floor(basisPoints / 100);
+  const fraction = basisPoints % 100;
+  return fraction === 0 ? String(whole) : `${whole}.${String(fraction).padStart(2, "0")}`;
+}
+
+export const ACCOUNTING_EXPORT_DATASETS = [
+  "invoices",
+  "credit_notes",
+  "payments",
+  "receivables",
+  "journal",
+] as const;
+
+export type AccountingDataset = (typeof ACCOUNTING_EXPORT_DATASETS)[number];
+
+export function isAccountingDataset(value: string): value is AccountingDataset {
+  return (ACCOUNTING_EXPORT_DATASETS as readonly string[]).includes(value);
+}
+
+export interface AccountingExport {
+  /** Inclusive, `YYYY-MM-DD`, Asia/Dubai. */
+  readonly from: string;
+  readonly to: string;
+  readonly generatedAt: Date;
+  readonly currency: string;
+  readonly tables: Readonly<Record<AccountingDataset, ExportTable>>;
+  /**
+   * Debits against credits over the whole journal. An accounting package
+   * rejects an unbalanced journal outright, so this is checked here rather than
+   * discovered on import.
+   */
+  readonly journalBalance: ReturnType<typeof journalTotals>;
+}
+
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * The accounting export (`INV-16`, closing `MB-017`).
+ *
+ * Five tables: the invoices issued in the range, the credit notes issued in it,
+ * the payments received in it, the receivables outstanding **now**, and a
+ * double-entry general journal covering the first three.
+ *
+ * ── "IN CSV AND IN A FORMAT THE ACCOUNTANT CAN IMPORT" ──────────────────────
+ *
+ * Both are CSV, and they are not the same thing. The first four tables are
+ * listings — one row per document, every field the document carries, which is
+ * what somebody checks a figure against. The journal is the import: one row per
+ * posting, account code and name, debit and credit in separate columns, which
+ * is the shape Xero, QuickBooks Online, Zoho Books and Tally all accept. A
+ * listing cannot be imported into a ledger and a journal cannot be reconciled
+ * against a document, so the requirement asks for both and this produces both.
+ *
+ * ── WHAT THIS DELIBERATELY DOES NOT DO ──────────────────────────────────────
+ *
+ * PRD §6.2: *this system feeds an accountant; it does not replace one.* There
+ * is no trial balance, no P&L, no expense side and no bank reconciliation — the
+ * journal covers sales, VAT and receipts, because those are the transactions
+ * this system is the system of record for. Everything else belongs to the
+ * accountant, and exporting a half-populated trial balance would invite it to
+ * be trusted as a complete one.
+ *
+ * ── THE RANGE, AND THE ONE TABLE IT DOES NOT APPLY TO ───────────────────────
+ *
+ * `receivables` is the position **as at now**, not as at `to`. Reconstructing
+ * an as-at-a-past-date AR balance would need the payment history replayed
+ * against each invoice, and while `payments` carries the dates to do it, the
+ * write-off and credited statuses do not — so the honest answer is today's
+ * balance, labelled today's balance. The table's title carries the date.
+ */
+export async function accountingExport(
+  tx: TenantScopedTx,
+  options: { from: string; to: string; now?: Date },
+): Promise<AccountingExport> {
+  const now = options.now ?? new Date();
+  const { from, to } = options;
+
+  if (!ISO_DATE.test(from) || !ISO_DATE.test(to)) {
+    throw new UserFacingError("Give the export range as two dates, each YYYY-MM-DD.");
+  }
+  if (from > to) {
+    throw new UserFacingError("The export range starts after it ends.");
+  }
+
+  const journal: JournalLine[] = [];
+
+  // ── Invoices ──────────────────────────────────────────────────────────────
+
+  type InvoiceRowOut = {
+    cursor_sort: string;
+    cursor_id: string;
+    reference: string;
+    document_type: string;
+    status: string;
+    issue_date: string;
+    supply_date: string | null;
+    due_date: string | null;
+    customer_code: string | null;
+    customer_name: string;
+    customer_trn: string | null;
+    currency: string;
+    subtotal_minor: string;
+    discount_minor: string;
+    taxable_minor: string;
+    tax_rate_basis_points: string;
+    tax_minor: string;
+    total_minor: string;
+    paid_minor: string;
+    credited_minor: string;
+    tax_category_code: string;
+    buyer_reference: string | null;
+    purchase_order_reference: string | null;
+    job_reference: string | null;
+    contract_reference: string | null;
+  };
+
+  const invoiceSort = sql`(cursor_source.issued_on at time zone 'Asia/Dubai')`;
+
+  const invoiceRows: (readonly CsvValue[])[] = [];
+  for await (const r of exportRows<InvoiceRowOut>(tx, (after, limit) => sql`
+    select
+      to_char(cursor_source.issued_on at time zone 'Asia/Dubai', 'YYYY-MM-DD HH24:MI:SS.US') as cursor_sort,
+      cursor_source.id::text                                       as cursor_id,
+      cursor_source.reference,
+      cursor_source.document_type,
+      cursor_source.status::text                                   as status,
+      to_char(cursor_source.issued_on at time zone 'Asia/Dubai', 'YYYY-MM-DD') as issue_date,
+      to_char(cursor_source.supply_date, 'YYYY-MM-DD')             as supply_date,
+      to_char(cursor_source.due_on at time zone 'Asia/Dubai', 'YYYY-MM-DD')    as due_date,
+      cu.code                                                      as customer_code,
+      cu.name                                                      as customer_name,
+      cu.trn                                                       as customer_trn,
+      cursor_source.currency,
+      (cursor_source.subtotal * 100)::bigint::text                 as subtotal_minor,
+      (cursor_source.discount_amount * 100)::bigint::text          as discount_minor,
+      (cursor_source.taxable_amount * 100)::bigint::text           as taxable_minor,
+      cursor_source.tax_rate_basis_points::text                    as tax_rate_basis_points,
+      (cursor_source.tax_amount * 100)::bigint::text               as tax_minor,
+      (cursor_source.total * 100)::bigint::text                    as total_minor,
+      (cursor_source.amount_paid * 100)::bigint::text              as paid_minor,
+      coalesce(cn.credited, 0)::text                               as credited_minor,
+      cursor_source.tax_category_code,
+      cursor_source.buyer_reference,
+      cursor_source.purchase_order_reference,
+      j.reference                                                  as job_reference,
+      ct.reference                                                 as contract_reference
+      from invoices cursor_source
+      join customers cu on cu.id = cursor_source.customer_id
+      left join jobs j on j.id = cursor_source.job_id
+      left join contracts ct on ct.id = cursor_source.contract_id
+      left join lateral (
+        select sum((n.total * 100)::bigint) as credited
+          from credit_notes n
+         where n.invoice_id = cursor_source.id and n.deleted_at is null
+      ) cn on true
+     where cursor_source.deleted_at is null
+       -- A draft is not a document. Exporting one would put a number in an
+       -- accountant's ledger that the customer has never been shown.
+       and cursor_source.status <> 'draft'
+       and cursor_source.issued_on is not null
+       and (cursor_source.issued_on at time zone 'Asia/Dubai') >= ${from}::date
+       and (cursor_source.issued_on at time zone 'Asia/Dubai') < ${to}::date + interval '1 day'
+       ${afterCursor(after, invoiceSort)}
+     order by ${invoiceSort}, cursor_source.id
+     limit ${limit}
+  `)) {
+    const taxableMinor = Number(r.taxable_minor);
+    const taxMinor = Number(r.tax_minor);
+    const totalMinor = Number(r.total_minor);
+    const paidMinor = Number(r.paid_minor);
+    const creditedMinor = Number(r.credited_minor);
+
+    invoiceRows.push([
+      r.reference,
+      r.document_type,
+      r.status,
+      r.issue_date,
+      r.supply_date,
+      r.due_date,
+      r.customer_code,
+      r.customer_name,
+      r.customer_trn,
+      r.currency,
+      csvAmount(Number(r.subtotal_minor)),
+      csvAmount(Number(r.discount_minor)),
+      csvAmount(taxableMinor),
+      vatRatePercent(Number(r.tax_rate_basis_points)),
+      csvAmount(taxMinor),
+      csvAmount(totalMinor),
+      csvAmount(paidMinor),
+      csvAmount(creditedMinor),
+      csvAmount(totalMinor - paidMinor - creditedMinor),
+      r.tax_category_code,
+      r.buyer_reference,
+      r.purchase_order_reference,
+      r.job_reference,
+      r.contract_reference,
+      r.cursor_id,
+    ]);
+
+    journal.push(
+      ...documentJournalLines(
+        {
+          reference: r.reference,
+          date: r.issue_date,
+          contact: r.customer_name,
+          currency: r.currency,
+          taxCode: r.tax_category_code,
+          taxableMinor,
+          taxMinor,
+          totalMinor,
+        },
+        "invoice",
+      ),
+    );
+  }
+
+  // ── Credit notes ──────────────────────────────────────────────────────────
+
+  type CreditRowOut = {
+    cursor_sort: string;
+    cursor_id: string;
+    reference: string;
+    document_type: string;
+    status: string;
+    issue_date: string;
+    supply_date: string | null;
+    invoice_reference: string;
+    customer_code: string | null;
+    customer_name: string;
+    customer_trn: string | null;
+    reason: string;
+    reason_detail: string | null;
+    currency: string;
+    subtotal_minor: string;
+    discount_minor: string;
+    taxable_minor: string;
+    tax_rate_basis_points: string;
+    tax_minor: string;
+    total_minor: string;
+    tax_category_code: string;
+  };
+
+  const creditSort = sql`(cursor_source.issued_on at time zone 'Asia/Dubai')`;
+
+  const creditRows: (readonly CsvValue[])[] = [];
+  for await (const r of exportRows<CreditRowOut>(tx, (after, limit) => sql`
+    select
+      to_char(cursor_source.issued_on at time zone 'Asia/Dubai', 'YYYY-MM-DD HH24:MI:SS.US') as cursor_sort,
+      cursor_source.id::text                                       as cursor_id,
+      cursor_source.reference,
+      cursor_source.document_type,
+      cursor_source.status,
+      to_char(cursor_source.issued_on at time zone 'Asia/Dubai', 'YYYY-MM-DD') as issue_date,
+      to_char(cursor_source.supply_date, 'YYYY-MM-DD')             as supply_date,
+      i.reference                                                  as invoice_reference,
+      cu.code                                                      as customer_code,
+      cu.name                                                      as customer_name,
+      cu.trn                                                       as customer_trn,
+      cursor_source.reason,
+      cursor_source.reason_detail,
+      cursor_source.currency,
+      (cursor_source.subtotal * 100)::bigint::text                 as subtotal_minor,
+      (cursor_source.discount_amount * 100)::bigint::text          as discount_minor,
+      (cursor_source.taxable_amount * 100)::bigint::text           as taxable_minor,
+      cursor_source.tax_rate_basis_points::text                    as tax_rate_basis_points,
+      (cursor_source.tax_amount * 100)::bigint::text               as tax_minor,
+      (cursor_source.total * 100)::bigint::text                    as total_minor,
+      cursor_source.tax_category_code
+      from credit_notes cursor_source
+      join invoices i on i.id = cursor_source.invoice_id
+      join customers cu on cu.id = cursor_source.customer_id
+     where cursor_source.deleted_at is null
+       and cursor_source.issued_on is not null
+       and (cursor_source.issued_on at time zone 'Asia/Dubai') >= ${from}::date
+       and (cursor_source.issued_on at time zone 'Asia/Dubai') < ${to}::date + interval '1 day'
+       ${afterCursor(after, creditSort)}
+     order by ${creditSort}, cursor_source.id
+     limit ${limit}
+  `)) {
+    const taxableMinor = Number(r.taxable_minor);
+    const taxMinor = Number(r.tax_minor);
+    const totalMinor = Number(r.total_minor);
+
+    creditRows.push([
+      r.reference,
+      r.document_type,
+      r.status,
+      r.issue_date,
+      r.supply_date,
+      r.invoice_reference,
+      r.customer_code,
+      r.customer_name,
+      r.customer_trn,
+      r.reason,
+      r.reason_detail,
+      r.currency,
+      csvAmount(Number(r.subtotal_minor)),
+      csvAmount(Number(r.discount_minor)),
+      csvAmount(taxableMinor),
+      vatRatePercent(Number(r.tax_rate_basis_points)),
+      csvAmount(taxMinor),
+      csvAmount(totalMinor),
+      r.tax_category_code,
+      r.cursor_id,
+    ]);
+
+    journal.push(
+      ...documentJournalLines(
+        {
+          reference: r.reference,
+          date: r.issue_date,
+          contact: r.customer_name,
+          currency: r.currency,
+          taxCode: r.tax_category_code,
+          taxableMinor,
+          taxMinor,
+          totalMinor,
+        },
+        "credit_note",
+      ),
+    );
+  }
+
+  // ── Payments ──────────────────────────────────────────────────────────────
+
+  type PaymentRowOut = {
+    cursor_sort: string;
+    cursor_id: string;
+    received_date: string;
+    invoice_reference: string;
+    customer_code: string | null;
+    customer_name: string;
+    method: string;
+    reference: string | null;
+    gateway_provider: string | null;
+    currency: string;
+    amount_minor: string;
+    reconciled_date: string | null;
+  };
+
+  const paymentSort = sql`(cursor_source.received_at at time zone 'Asia/Dubai')`;
+
+  const paymentRows: (readonly CsvValue[])[] = [];
+  for await (const r of exportRows<PaymentRowOut>(tx, (after, limit) => sql`
+    select
+      to_char(cursor_source.received_at at time zone 'Asia/Dubai', 'YYYY-MM-DD HH24:MI:SS.US') as cursor_sort,
+      cursor_source.id::text                                       as cursor_id,
+      to_char(cursor_source.received_at at time zone 'Asia/Dubai', 'YYYY-MM-DD') as received_date,
+      i.reference                                                  as invoice_reference,
+      cu.code                                                      as customer_code,
+      cu.name                                                      as customer_name,
+      cursor_source.method::text                                   as method,
+      cursor_source.reference,
+      cursor_source.gateway_provider,
+      cursor_source.currency,
+      (cursor_source.amount * 100)::bigint::text                   as amount_minor,
+      to_char(cursor_source.reconciled_at at time zone 'Asia/Dubai', 'YYYY-MM-DD') as reconciled_date
+      from payments cursor_source
+      join invoices i on i.id = cursor_source.invoice_id
+      join customers cu on cu.id = i.customer_id
+     where cursor_source.deleted_at is null
+       and (cursor_source.received_at at time zone 'Asia/Dubai') >= ${from}::date
+       and (cursor_source.received_at at time zone 'Asia/Dubai') < ${to}::date + interval '1 day'
+       ${afterCursor(after, paymentSort)}
+     order by ${paymentSort}, cursor_source.id
+     limit ${limit}
+  `)) {
+    const amountMinor = Number(r.amount_minor);
+
+    paymentRows.push([
+      r.received_date,
+      r.invoice_reference,
+      r.customer_code,
+      r.customer_name,
+      r.method,
+      r.reference,
+      r.gateway_provider,
+      r.currency,
+      csvAmount(amountMinor),
+      r.reconciled_date,
+      r.cursor_id,
+    ]);
+
+    journal.push(
+      ...paymentJournalLines({
+        reference: r.reference ?? r.invoice_reference,
+        date: r.received_date,
+        contact: r.customer_name,
+        currency: r.currency,
+        amountMinor,
+        method: r.method,
+        invoiceReference: r.invoice_reference,
+      }),
+    );
+  }
+
+  // ── Receivables, as at now ────────────────────────────────────────────────
+  //
+  // From `openReceivables`, which `arAgeing` also folds over. The schedule an
+  // accountant receives and the control total the dashboard shows are the same
+  // arithmetic run once, so reconciling them is a formality rather than a
+  // discovery.
+
+  const receivables = await openReceivables(tx, now);
+  const asOf = dubaiDateKey(now);
+
+  const receivableRows: (readonly CsvValue[])[] = receivables.map((r) => [
+    r.reference,
+    r.customerCode,
+    r.customerName,
+    r.customerTrn,
+    r.status,
+    r.issuedOn ? dubaiDateKey(r.issuedOn) : null,
+    r.dueOn ? dubaiDateKey(r.dueOn) : null,
+    r.overdueDays,
+    r.bucket,
+    r.currency,
+    csvAmount(r.totalMinor),
+    csvAmount(r.paidMinor),
+    csvAmount(r.creditedMinor),
+    csvAmount(r.outstandingMinor),
+    r.invoiceId,
+  ]);
+
+  // ── The journal ───────────────────────────────────────────────────────────
+
+  const journalRows: (readonly CsvValue[])[] = journal.map((l) => [
+    l.date,
+    l.reference,
+    l.documentType,
+    l.accountCode,
+    l.accountName,
+    l.contact,
+    l.description,
+    csvAmount(l.debitMinor),
+    csvAmount(l.creditMinor),
+    l.taxCode,
+    l.currency,
+  ]);
+
+  const table = (
+    name: AccountingDataset,
+    title: string,
+    columns: readonly string[],
+    rows: (readonly CsvValue[])[],
+  ): ExportTable => ({ name, title, columns, rows, rowCount: rows.length });
+
+  const range = `${from} to ${to}`;
+
+  return {
+    from,
+    to,
+    generatedAt: now,
+    currency: receivables[0]?.currency ?? "AED",
+    journalBalance: journalTotals(journal),
+    tables: {
+      invoices: table("invoices", `Invoices issued, ${range}`, INVOICE_EXPORT_COLUMNS, invoiceRows),
+      credit_notes: table(
+        "credit_notes",
+        `Credit notes issued, ${range}`,
+        CREDIT_NOTE_EXPORT_COLUMNS,
+        creditRows,
+      ),
+      payments: table("payments", `Payments received, ${range}`, PAYMENT_EXPORT_COLUMNS, paymentRows),
+      receivables: table(
+        "receivables",
+        `Accounts receivable as at ${asOf}`,
+        RECEIVABLE_EXPORT_COLUMNS,
+        receivableRows,
+      ),
+      journal: table(
+        "journal",
+        `General journal, ${range}`,
+        JOURNAL_EXPORT_COLUMNS,
+        journalRows,
+      ),
+    },
+  };
+}
+
+/*
+ * ── THE COLUMN HEADINGS ─────────────────────────────────────────────────────
+ *
+ * Every money column says `_excl_vat` or `_incl_vat`, without exception, and
+ * that is the single most important thing about these lists.
+ *
+ * An accountant importing a column called `total` has to decide whether it is
+ * gross or net, and the decision is invisible once it is made: a VAT-inclusive
+ * figure booked as revenue overstates revenue by 5% and understates the VAT
+ * liability by the same amount, in a business that is measured against a
+ * AED 3,000,000 threshold on revenue. The suffix costs nine characters.
+ */
+
+const INVOICE_EXPORT_COLUMNS = [
+  "invoice_reference",
+  "document_type",
+  "status",
+  "issue_date",
+  "supply_date",
+  "due_date",
+  "customer_code",
+  "customer_name",
+  "customer_trn",
+  "currency",
+  "subtotal_excl_vat",
+  "discount_excl_vat",
+  "taxable_amount_excl_vat",
+  "vat_rate_percent",
+  "vat_amount",
+  "total_incl_vat",
+  "amount_paid_incl_vat",
+  "credited_incl_vat",
+  "balance_incl_vat",
+  "tax_category_code",
+  "buyer_reference",
+  "purchase_order_reference",
+  "job_reference",
+  "contract_reference",
+  "invoice_id",
+] as const;
+
+const CREDIT_NOTE_EXPORT_COLUMNS = [
+  "credit_note_reference",
+  "document_type",
+  "status",
+  "issue_date",
+  "supply_date",
+  "original_invoice_reference",
+  "customer_code",
+  "customer_name",
+  "customer_trn",
+  "reason",
+  "reason_detail",
+  "currency",
+  "subtotal_excl_vat",
+  "discount_excl_vat",
+  "taxable_amount_excl_vat",
+  "vat_rate_percent",
+  "vat_amount",
+  "total_incl_vat",
+  "tax_category_code",
+  "credit_note_id",
+] as const;
+
+const PAYMENT_EXPORT_COLUMNS = [
+  "received_date",
+  "invoice_reference",
+  "customer_code",
+  "customer_name",
+  "method",
+  "payment_reference",
+  "gateway_provider",
+  "currency",
+  "amount_received_incl_vat",
+  "reconciled_date",
+  "payment_id",
+] as const;
+
+const RECEIVABLE_EXPORT_COLUMNS = [
+  "invoice_reference",
+  "customer_code",
+  "customer_name",
+  "customer_trn",
+  "status",
+  "issue_date",
+  "due_date",
+  "days_overdue",
+  "ageing_bucket",
+  "currency",
+  "total_incl_vat",
+  "amount_paid_incl_vat",
+  "credited_incl_vat",
+  "outstanding_incl_vat",
+  "invoice_id",
+] as const;
+
+const JOURNAL_EXPORT_COLUMNS = [
+  "date",
+  "document_reference",
+  "document_type",
+  "account_code",
+  "account_name",
+  "contact",
+  "description",
+  "debit",
+  "credit",
+  "tax_code",
+  "currency",
+] as const;

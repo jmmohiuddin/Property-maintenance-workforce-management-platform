@@ -1,5 +1,6 @@
 "use server";
 
+import { randomUUID } from "node:crypto";
 import { revalidatePath } from "next/cache";
 import {
   withTenant,
@@ -16,13 +17,28 @@ import {
   jobContractScope,
   quoteOutOfScopeWork,
   ASSIGNMENT_WARNING_LABEL,
+  recordJobAttachment,
+  recordJobMaterial,
+  declareNoMaterials,
+  recordPhotoExemption,
+  recordVisitLabour,
+  recordJobSignature,
   type AssignmentWarningType,
   type DraftLine,
 } from "@meridian/db";
 import { enqueue, dispatchPending } from "@meridian/notify";
 import { sendCustomerNotification } from "@/lib/customer-notifications";
 import { materialiseInvoiceDocument, materialiseQuoteDocument } from "@meridian/docs";
-import { InvalidTransitionError, absoluteUrl, formatMoney, fromDubai, type JobStatus } from "@meridian/core";
+import { MAX_OBJECT_BYTES, objectStore, sniffContentType } from "@meridian/files";
+import {
+  InvalidTransitionError,
+  absoluteUrl,
+  formatDuration,
+  formatMoney,
+  fromDubai,
+  toMinor,
+  type JobStatus,
+} from "@meridian/core";
 import { requirePermission } from "@meridian/auth";
 import { requireSession } from "@/lib/session";
 import { userMessage } from "@/lib/errors";
@@ -767,4 +783,349 @@ export async function raiseInvoiceAction(
       : `${reference} raised and emailed to the customer.`;
 
   return { ok: documentProblem ? `${raised} ${documentProblem}` : raised };
+}
+
+// ── The job card (JOB-15) ───────────────────────────────────────────────────
+
+/**
+ * Capture, so the gate can be satisfied by somebody who is not in a plant room.
+ *
+ * `JOB-15`'s four conditions are enforced in `assertJobCardComplete`, which is
+ * in the domain layer where the field app (`M11`) will reach it. These actions
+ * are the web half: without them the gate would be a wall, because nothing in
+ * this application has ever written `job_attachments`, `job_materials`,
+ * `job_signoffs` or `job_visits.work_minutes`.
+ *
+ * Every one follows the shape the file already uses — `FormData` read by hand
+ * rather than through zod, matching `recordOutcomeAction` above rather than
+ * introducing a second convention for one action.
+ */
+
+/** A minutes field, read from a text input. Null when it is not a number. */
+function wholeMinutes(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (!/^\d{1,4}$/.test(trimmed)) return null;
+  return Number(trimmed);
+}
+
+/**
+ * Store an uploaded image and file it against the job.
+ *
+ * The bytes go to `packages/files` first and the row afterwards, the same order
+ * the careers page uses. A failure between the two leaves an object with no
+ * row, which the retention sweep already looks for; the other order would leave
+ * a row pointing at bytes that are not there, and that is the failure that
+ * shows an operator a broken photograph on a signed job card.
+ */
+async function storeJobImage(
+  jobId: string,
+  prefix: string,
+  file: File | null,
+): Promise<{ key: string; contentType: string; sizeBytes: number } | { error: string }> {
+  if (!file || file.size === 0) return { error: "Choose a photograph to upload." };
+  if (file.size > MAX_OBJECT_BYTES) {
+    return { error: "That image is larger than 25 MB. Send a smaller one." };
+  }
+
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const contentType = sniffContentType(bytes);
+  if (!contentType || !contentType.startsWith("image/")) {
+    // Sniffed from the bytes, never taken from the browser's word. A file the
+    // sniffer does not recognise is refused rather than stored as "probably a
+    // photo" — see the note at the top of `packages/files/src/sniff.ts`.
+    return { error: "That file is not an image this system can store. Send a PNG, JPEG or HEIC." };
+  }
+
+  const key = `jobs/${jobId}/${prefix}-${randomUUID()}.${contentType.split("/")[1]}`;
+  const stored = await objectStore().put({ key, body: bytes, declaredContentType: contentType });
+  return { key: stored.key, contentType: stored.contentType, sizeBytes: stored.sizeBytes };
+}
+
+export async function uploadJobPhotoAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const session = await requireSession();
+  const jobId = String(formData.get("jobId") ?? "");
+  const visitId = String(formData.get("visitId") ?? "").trim();
+  const caption = String(formData.get("caption") ?? "").trim();
+  const kindRaw = String(formData.get("kind") ?? "photo_after").trim();
+
+  try {
+    requirePermission(session.principal, "jobs:update");
+  } catch {
+    return { error: "Your role cannot add photographs to a job." };
+  }
+
+  if (kindRaw !== "photo_after" && kindRaw !== "photo_before") {
+    return { error: "A job photograph is either a before or an after shot." };
+  }
+  const kind: "photo_after" | "photo_before" = kindRaw;
+
+  const file = formData.get("photo");
+  const stored = await storeJobImage(
+    jobId,
+    kind === "photo_after" ? "after" : "before",
+    file instanceof File ? file : null,
+  );
+  if ("error" in stored) return { error: stored.error };
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
+      (tx) =>
+        recordJobAttachment(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          {
+            jobId,
+            visitId: visitId || null,
+            kind,
+            storageKey: stored.key,
+            mimeType: stored.contentType,
+            sizeBytes: stored.sizeBytes,
+            caption: caption || null,
+          },
+        ),
+    );
+  } catch (error) {
+    return { error: userMessage(error, "Could not attach that photograph.", "jobs") };
+  }
+
+  revalidatePath(`/jobs/${jobId}`);
+  return { ok: kind === "photo_after" ? "After photograph attached." : "Before photograph attached." };
+}
+
+export async function exemptAfterPhotoAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const session = await requireSession();
+  const jobId = String(formData.get("jobId") ?? "");
+  const reasonCode = String(formData.get("reasonCode") ?? "").trim();
+  const note = String(formData.get("note") ?? "").trim();
+
+  try {
+    requirePermission(session.principal, "jobs:update");
+  } catch {
+    return { error: "Your role cannot exempt a job from the photograph requirement." };
+  }
+
+  if (!reasonCode) return { error: "Choose the reason there is no photograph." };
+
+  let label = "";
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
+      async (tx) => {
+        const result = await recordPhotoExemption(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          { jobId, reasonCode, note: note || null },
+        );
+        label = result.reasonLabel;
+      },
+    );
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the exemption.", "jobs") };
+  }
+
+  revalidatePath(`/jobs/${jobId}`);
+  return { ok: `Recorded: no after photograph — ${label}.` };
+}
+
+export async function addJobMaterialAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const session = await requireSession();
+  const jobId = String(formData.get("jobId") ?? "");
+  const visitId = String(formData.get("visitId") ?? "").trim();
+  const sku = String(formData.get("sku") ?? "").trim();
+  const description = String(formData.get("description") ?? "").trim();
+  const quantity = String(formData.get("quantity") ?? "").trim();
+  const unit = String(formData.get("unit") ?? "").trim();
+  const unitCost = String(formData.get("unitCost") ?? "").trim();
+  const isBillable = String(formData.get("isBillable") ?? "") === "on";
+
+  try {
+    requirePermission(session.principal, "jobs:update");
+  } catch {
+    return { error: "Your role cannot record materials." };
+  }
+
+  if (!description) return { error: "Name the part or consumable." };
+  if (!/^\d+(\.\d{1,3})?$/.test(quantity)) {
+    return { error: "Quantity is a number, to at most three decimal places." };
+  }
+  if (unitCost && !/^\d+(\.\d{1,2})?$/.test(unitCost)) {
+    return { error: "Unit cost is an amount in AED, to at most two decimal places." };
+  }
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
+      (tx) =>
+        recordJobMaterial(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          {
+            jobId,
+            visitId: visitId || null,
+            sku: sku || null,
+            description,
+            quantity,
+            unit: unit || "ea",
+            // Minor units all the way down. The form collects AED because that
+            // is what a person reads off a delivery note.
+            unitCostMinor: unitCost ? toMinor(unitCost) : null,
+            isBillable,
+          },
+        ),
+    );
+  } catch (error) {
+    return { error: userMessage(error, "Could not record that material.", "jobs") };
+  }
+
+  revalidatePath(`/jobs/${jobId}`);
+  return { ok: `Recorded ${quantity} ${unit || "ea"} of ${description}.` };
+}
+
+export async function declareNoMaterialsAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const session = await requireSession();
+  const jobId = String(formData.get("jobId") ?? "");
+  const note = String(formData.get("note") ?? "").trim();
+
+  try {
+    requirePermission(session.principal, "jobs:update");
+  } catch {
+    return { error: "Your role cannot record materials." };
+  }
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
+      (tx) =>
+        declareNoMaterials(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          { jobId, note: note || null },
+        ),
+    );
+  } catch (error) {
+    return { error: userMessage(error, "Could not record that no materials were used.", "jobs") };
+  }
+
+  revalidatePath(`/jobs/${jobId}`);
+  return { ok: "Recorded: no parts or consumables were used." };
+}
+
+export async function recordLabourAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const session = await requireSession();
+  const jobId = String(formData.get("jobId") ?? "");
+  const visitId = String(formData.get("visitId") ?? "").trim();
+  const workMinutes = wholeMinutes(String(formData.get("workMinutes") ?? ""));
+  const travelMinutes = wholeMinutes(String(formData.get("travelMinutes") ?? ""));
+
+  try {
+    requirePermission(session.principal, "jobs:update");
+  } catch {
+    return { error: "Your role cannot record labour time." };
+  }
+
+  if (!visitId) return { error: "Labour time is recorded against a visit." };
+  if (workMinutes === null) {
+    // Zero is accepted deliberately: a visit that never reached the work spent
+    // no time on the tools, and demanding a positive number would collect a
+    // made-up one. Empty is what is refused.
+    return { error: "Enter the time on the tools, in whole minutes. Zero is a valid answer." };
+  }
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
+      (tx) =>
+        recordVisitLabour(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          { jobId, visitId, workMinutes, travelMinutes },
+        ),
+    );
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the labour time.", "jobs") };
+  }
+
+  revalidatePath(`/jobs/${jobId}`);
+  return { ok: `Recorded ${formatDuration(workMinutes)} on the tools.` };
+}
+
+/**
+ * The customer's signature (`OPS-6`).
+ *
+ * Not one of `JOB-15`'s four conditions and deliberately not gated on — see the
+ * note on `recordJobSignature`. It is here because `job_signoffs` has carried a
+ * comment about its legal weight since `0000` with nothing reading or writing
+ * it, and a signature nobody can capture is not evidence of anything.
+ */
+export async function captureSignatureAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const session = await requireSession();
+  const jobId = String(formData.get("jobId") ?? "");
+  const visitId = String(formData.get("visitId") ?? "").trim();
+  const signedByName = String(formData.get("signedByName") ?? "").trim();
+  const signedByRole = String(formData.get("signedByRole") ?? "").trim();
+  const comments = String(formData.get("comments") ?? "").trim();
+  const ratingRaw = String(formData.get("satisfactionRating") ?? "").trim();
+
+  try {
+    requirePermission(session.principal, "jobs:update");
+  } catch {
+    return { error: "Your role cannot capture a sign-off." };
+  }
+
+  if (!signedByName) return { error: "Record the name of the person signing." };
+  const satisfactionRating = ratingRaw ? Number(ratingRaw) : null;
+  if (satisfactionRating !== null && !Number.isInteger(satisfactionRating)) {
+    return { error: "A satisfaction rating is a whole number from one to five." };
+  }
+
+  const file = formData.get("signature");
+  const stored = await storeJobImage(jobId, "signature", file instanceof File ? file : null);
+  if ("error" in stored) {
+    return { error: "Attach the signature image — a name alone is not a signature." };
+  }
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
+      (tx) =>
+        recordJobSignature(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          {
+            jobId,
+            visitId: visitId || null,
+            signedByName,
+            signedByRole: signedByRole || null,
+            signatureStorageKey: stored.key,
+            satisfactionRating,
+            comments: comments || null,
+          },
+        ),
+    );
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the sign-off.", "jobs") };
+  }
+
+  revalidatePath(`/jobs/${jobId}`);
+  return { ok: `Signed by ${signedByName}.` };
 }

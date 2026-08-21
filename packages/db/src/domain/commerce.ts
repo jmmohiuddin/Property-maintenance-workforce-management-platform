@@ -1,5 +1,5 @@
 import { randomBytes, createHash } from "node:crypto";
-import { and, eq, desc, sql, inArray, isNull } from "drizzle-orm";
+import { and, count, eq, desc, sql, inArray, isNull } from "drizzle-orm";
 import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
 import { decodeCursor, encodeCursor, type Page } from "./leads";
@@ -70,6 +70,16 @@ export const QUOTE_STATUS_LABEL: Readonly<Record<QuoteStatus, string>> = {
   expired: "Expired",
   superseded: "Superseded",
 };
+
+/**
+ * The two statuses that mean the ball is in the customer's court.
+ *
+ * Named here rather than written as a literal at each call site, because it is
+ * a fact about the vocabulary above and not about any one screen: `draft` is
+ * ours and unfinished, `expired` and `superseded` are past, `approved` and
+ * `rejected` are decided. Only `sent` and `viewed` are waiting on somebody.
+ */
+export const QUOTE_AWAITING_DECISION: readonly QuoteStatus[] = ["sent", "viewed"];
 
 export interface DraftLine {
   readonly description: string;
@@ -301,7 +311,7 @@ export interface QuoteRow {
 
 export async function listQuotes(
   tx: TenantScopedTx,
-  options?: { jobId?: string; limit?: number },
+  options?: { jobId?: string; limit?: number; statuses?: readonly QuoteStatus[] },
 ): Promise<readonly QuoteRow[]> {
   const rows = await tx
     .select({
@@ -318,15 +328,51 @@ export async function listQuotes(
     })
     .from(schema.quotes)
     .innerJoin(schema.customers, eq(schema.customers.id, schema.quotes.customerId))
-    .where(
-      options?.jobId
-        ? and(isNull(schema.quotes.deletedAt), eq(schema.quotes.jobId, options.jobId))
-        : isNull(schema.quotes.deletedAt),
-    )
+    .where(quotePredicate(options))
     .orderBy(desc(schema.quotes.createdAt))
     .limit(options?.limit ?? 100);
 
   return rows.map((r) => ({ ...r, status: r.status as QuoteStatus }));
+}
+
+/**
+ * How many quotes match, independently of any page.
+ *
+ * ── WHY FILTERING THE LIST IS NOT THE SAME ANSWER ───────────────────────────
+ *
+ * `listQuotes` is capped and ordered newest-first across every status, so a
+ * caller that reads a page and counts the `sent` and `viewed` rows in it is
+ * answering "how many are awaiting a decision among the most recent N", which
+ * is a different question and a smaller number. It goes wrong long before the
+ * cap is reached: a customer with a run of recent approved and rejected quotes
+ * has the waiting ones pushed off the page, and the count reads zero while two
+ * are genuinely sitting with them.
+ *
+ * Same shape as `countJobs` in domain/jobs.ts, for the same `LEAD-8` reason: a
+ * headline figure is counted over every matching row, never measured off a
+ * page, and the two are separate queries so neither can quietly become the
+ * other.
+ */
+export async function countQuotes(
+  tx: TenantScopedTx,
+  options?: { jobId?: string; statuses?: readonly QuoteStatus[] },
+): Promise<number> {
+  const [row] = await tx
+    .select({ total: count() })
+    .from(schema.quotes)
+    .where(quotePredicate(options));
+
+  return Number(row?.total ?? 0);
+}
+
+/** The one WHERE both of the above use, so a page and its total cannot diverge. */
+function quotePredicate(options?: { jobId?: string; statuses?: readonly QuoteStatus[] }) {
+  const clauses = [isNull(schema.quotes.deletedAt)];
+  if (options?.jobId) clauses.push(eq(schema.quotes.jobId, options.jobId));
+  if (options?.statuses && options.statuses.length > 0) {
+    clauses.push(inArray(schema.quotes.status, [...options.statuses]));
+  }
+  return and(...clauses);
 }
 
 export async function getQuoteWithLines(
@@ -871,32 +917,74 @@ export async function searchInvoices(
   };
 }
 
+/** Which ageing column an open balance falls in. */
+export type AgeingBucket = "current" | "days_1_30" | "days_31_60" | "days_61_plus";
+
 /**
- * Accounts receivable ageing.
+ * One open invoice, with the arithmetic that puts it in an ageing bucket.
  *
- * Computed from the invoice rows rather than by a stored status, because
- * "overdue" is a function of today's date and drifts the moment a status column
- * stops being updated by a nightly job nobody is watching.
+ * The row the accounting export writes and the row `arAgeing` counts. See the
+ * note on `arAgeing` for why there is only one of these functions.
  */
-export async function arAgeing(
+export interface ReceivableRow {
+  readonly invoiceId: string;
+  readonly reference: string;
+  readonly customerName: string;
+  readonly customerCode: string | null;
+  readonly customerTrn: string | null;
+  readonly issuedOn: Date | null;
+  readonly dueOn: Date | null;
+  readonly status: string;
+  readonly currency: string;
+  /** Tax-INCLUSIVE, as stored on the document. */
+  readonly totalMinor: number;
+  readonly paidMinor: number;
+  /** Tax-inclusive value of credit notes against this invoice. Positive. */
+  readonly creditedMinor: number;
+  /** total - paid - credited. Always greater than zero; settled rows are absent. */
+  readonly outstandingMinor: number;
+  /** Days past the due date. Zero or negative means not yet due. */
+  readonly overdueDays: number;
+  readonly bucket: AgeingBucket;
+}
+
+/**
+ * Every invoice with money still owed on it, aged.
+ *
+ * ── WHY THIS EXISTS SEPARATELY FROM `arAgeing` ──────────────────────────────
+ *
+ * It does not, really — `arAgeing` is a fold over this list, and that is the
+ * point. `INV-16` puts an AR schedule in front of an accountant, and an
+ * accountant reconciles the detail against the summary the moment they receive
+ * both. Two functions computing "outstanding" independently would agree until
+ * the day one of them learned about a new status and the other did not, and the
+ * first symptom would be a schedule that misses the control total by one
+ * invoice — the single most credibility-destroying thing this export could do.
+ *
+ * There is no `limit`. A capped receivables list is a wrong control total, and
+ * the number of invoices a maintenance contractor has open at once is bounded
+ * by its collections process rather than by its history.
+ */
+export async function openReceivables(
   tx: TenantScopedTx,
   now: Date = new Date(),
-): Promise<{
-  currentMinor: number;
-  days1to30Minor: number;
-  days31to60Minor: number;
-  days61PlusMinor: number;
-  totalOutstandingMinor: number;
-}> {
+): Promise<readonly ReceivableRow[]> {
   const rows = await tx
     .select({
       id: schema.invoices.id,
+      reference: schema.invoices.reference,
+      customerName: schema.customers.name,
+      customerCode: schema.customers.code,
+      customerTrn: schema.customers.taxRegistrationNumber,
       total: schema.invoices.total,
       amountPaid: schema.invoices.amountPaid,
+      issuedOn: schema.invoices.issuedOn,
       dueOn: schema.invoices.dueOn,
       status: schema.invoices.status,
+      currency: schema.invoices.currency,
     })
     .from(schema.invoices)
+    .innerJoin(schema.customers, eq(schema.customers.id, schema.invoices.customerId))
     .where(isNull(schema.invoices.deletedAt));
 
   // A partly credited invoice is still collectable for the remainder, so the
@@ -913,25 +1001,83 @@ export async function arAgeing(
     creditedByInvoice.set(c.invoiceId, (creditedByInvoice.get(c.invoiceId) ?? 0) + toMinor(c.total));
   }
 
-  let currentMinor = 0;
-  let days1to30Minor = 0;
-  let days31to60Minor = 0;
-  let days61PlusMinor = 0;
+  const open: ReceivableRow[] = [];
 
   for (const r of rows) {
     if (r.status === "paid" || r.status === "written_off" || r.status === "credited") continue;
-    const outstanding =
-      toMinor(r.total) - toMinor(r.amountPaid) - (creditedByInvoice.get(r.id) ?? 0);
-    if (outstanding <= 0) continue;
+    const creditedMinor = creditedByInvoice.get(r.id) ?? 0;
+    const outstandingMinor = toMinor(r.total) - toMinor(r.amountPaid) - creditedMinor;
+    if (outstandingMinor <= 0) continue;
 
     const overdueDays = r.dueOn
       ? Math.floor((now.getTime() - r.dueOn.getTime()) / (24 * 60 * 60 * 1000))
       : 0;
 
-    if (overdueDays <= 0) currentMinor += outstanding;
-    else if (overdueDays <= 30) days1to30Minor += outstanding;
-    else if (overdueDays <= 60) days31to60Minor += outstanding;
-    else days61PlusMinor += outstanding;
+    const bucket: AgeingBucket =
+      overdueDays <= 0
+        ? "current"
+        : overdueDays <= 30
+          ? "days_1_30"
+          : overdueDays <= 60
+            ? "days_31_60"
+            : "days_61_plus";
+
+    open.push({
+      invoiceId: r.id,
+      reference: r.reference,
+      customerName: r.customerName,
+      customerCode: r.customerCode,
+      customerTrn: r.customerTrn,
+      issuedOn: r.issuedOn,
+      dueOn: r.dueOn,
+      status: r.status,
+      currency: r.currency,
+      totalMinor: toMinor(r.total),
+      paidMinor: toMinor(r.amountPaid),
+      creditedMinor,
+      outstandingMinor,
+      overdueDays,
+      bucket,
+    });
+  }
+
+  // Oldest first: the order a collections call list is worked in, and the order
+  // an accountant expects an aged schedule to arrive in.
+  return open.sort((a, b) => b.overdueDays - a.overdueDays);
+}
+
+/**
+ * Accounts receivable ageing.
+ *
+ * Computed from the invoice rows rather than by a stored status, because
+ * "overdue" is a function of today's date and drifts the moment a status column
+ * stops being updated by a nightly job nobody is watching.
+ *
+ * A fold over `openReceivables` rather than its own query, so the totals on the
+ * dashboard and the detail in the accounting export cannot disagree.
+ */
+export async function arAgeing(
+  tx: TenantScopedTx,
+  now: Date = new Date(),
+): Promise<{
+  currentMinor: number;
+  days1to30Minor: number;
+  days31to60Minor: number;
+  days61PlusMinor: number;
+  totalOutstandingMinor: number;
+}> {
+  const open = await openReceivables(tx, now);
+
+  let currentMinor = 0;
+  let days1to30Minor = 0;
+  let days31to60Minor = 0;
+  let days61PlusMinor = 0;
+
+  for (const r of open) {
+    if (r.bucket === "current") currentMinor += r.outstandingMinor;
+    else if (r.bucket === "days_1_30") days1to30Minor += r.outstandingMinor;
+    else if (r.bucket === "days_31_60") days31to60Minor += r.outstandingMinor;
+    else days61PlusMinor += r.outstandingMinor;
   }
 
   return {

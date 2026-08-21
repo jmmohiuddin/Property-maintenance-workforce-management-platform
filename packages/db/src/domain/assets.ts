@@ -18,17 +18,25 @@ import { rowDate, requiredRowDate } from "./_rows";
  * ── THE PART THAT MAKES IT A REGISTER RATHER THAN A FORM ────────────────────
  *
  * Service history. `jobs.asset_id` has existed since migration 0000 with a
- * foreign key onto `assets`, and nothing has ever written it: no job screen
- * offers an asset, and `domain/jobs.ts` neither reads nor sets the column. A
- * register that no job can point at is a data-entry screen wearing the word
- * "history", so this module supplies the missing half from the asset side —
- * `listLinkableJobs` finds the work already recorded at the property, and
- * `linkJobToAsset` attaches one to the plant it was done on.
+ * foreign key onto `assets`, and for a long time nothing wrote it. A register
+ * that no job can point at is a data-entry screen wearing the word "history",
+ * so this module supplies both halves of the path.
  *
- * That is a real path, not the whole path. The job intake screens still do not
- * ask which asset the work is for, so history is attached after the fact rather
- * than captured at the point of work. Closing that means an asset picker on the
- * job form, in code this module does not own.
+ * **After the fact**, from the asset: `listLinkableJobs` finds the work already
+ * recorded at the property and `linkJobToAsset` attaches one to the plant it was
+ * done on. This is the correction path, and it is the only path for work that
+ * was raised before the plant was registered.
+ *
+ * **At the point of work**, from intake: `listAssetChoices` is the picker, and
+ * the portal request form uses it — the customer reporting the fault names the
+ * equipment, and `createPortalRequest` links it through `linkJobToAsset` inside
+ * the same transaction, so one rule about which property an asset belongs to
+ * governs both routes.
+ *
+ * Not every intake path can ask. Lead conversion creates the property in the
+ * same transaction as the job, so there is never any registered plant to offer;
+ * contract PPM knows the property but the contract model prices entitlements by
+ * service rather than by asset, so there is nothing to carry through yet.
  *
  * ── DAYS ARE STRINGS HERE, END TO END ───────────────────────────────────────
  *
@@ -746,6 +754,80 @@ export async function registerAsset(
 
 // ── The path from a job to an asset ──────────────────────────────────────────
 
+export interface AssetChoice {
+  readonly id: string;
+  /** The building this asset is fixed to. A picker must not cross it. */
+  readonly propertyId: string;
+  readonly name: string;
+  readonly categoryLabel: string | null;
+  readonly location: string | null;
+}
+
+/**
+ * The plant at these properties, projected down to what a picker needs.
+ *
+ * ── WHY THE PROJECTION IS THIS NARROW ───────────────────────────────────────
+ *
+ * `AssetRow` is the register: tag, make, model, serial number, condition,
+ * warranty, PPM interval. This is the intake picker, and the portal is one of
+ * its callers — so it carries the three things a person standing in the
+ * building would use to recognise a machine, and nothing else. The `tag` is
+ * deliberately absent: it is an internal code, and a customer asked to choose
+ * between `CH-01` and `CH-02` will guess.
+ *
+ * Takes a list of properties rather than one, because the portal form offers
+ * every property on the account and filtering an already-loaded list beats a
+ * round trip on every change of the dropdown above it. An empty list short-
+ * circuits: `in ()` is not valid SQL and a query built from nothing should not
+ * be sent.
+ *
+ * Under `withCustomerScope` the restrictive policy on `assets` narrows this to
+ * the caller's own plant. The join to `properties` below is for the ordering,
+ * not for the boundary — see sql/customer-scope.sql.
+ */
+export async function listAssetChoices(
+  tx: TenantScopedTx,
+  propertyIds: readonly string[],
+): Promise<readonly AssetChoice[]> {
+  if (propertyIds.length === 0) return [];
+
+  const idList = sql.join(
+    propertyIds.map((id) => sql`${id}::uuid`),
+    sql`, `,
+  );
+
+  const rows = (await tx.execute<{
+    id: string;
+    property_id: string;
+    name: string;
+    category_label: string | null;
+    location: string | null;
+  }>(sql`
+    select a.id, a.property_id, a.name,
+           cat.label as category_label,
+           a.location
+      from assets a
+      left join asset_categories cat on cat.id = a.category_id
+     where a.property_id in (${idList})
+       and a.deleted_at is null
+     order by cat.sort_order nulls last, a.name
+  `)) as unknown as {
+    id: string;
+    property_id: string;
+    name: string;
+    category_label: string | null;
+    location: string | null;
+  }[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    propertyId: r.property_id,
+    name: r.name,
+    categoryLabel: r.category_label,
+    location: r.location,
+  }));
+}
+
 export interface LinkableJob {
   readonly id: string;
   readonly reference: string;
@@ -800,29 +882,39 @@ export async function listLinkableJobs(
 /**
  * Attach a job to the asset the work was done on.
  *
- * ── WHY THIS WRITES `jobs` FROM THE ASSET SIDE ──────────────────────────────
+ * ── THE ONE RULE, AND WHY BOTH ROUTES COME THROUGH HERE ─────────────────────
  *
- * `jobs.asset_id` is the only link between a register and a history, and
- * nothing has ever set it — the job intake screens do not ask. Until they do,
- * the history has to be attachable from the asset, or `CON-13`'s "service
- * history" is a heading over an empty list on every asset for ever.
+ * `jobs.asset_id` is the only link between a register and a history, and there
+ * are two moments at which it can be set: at intake, when whoever is reporting
+ * the fault names the equipment, and afterwards, from the asset, for work that
+ * was raised before the plant was registered. Both call this.
  *
- * The job must already belong to this property: an asset is fixed to a
- * building, so a job somewhere else was not done on it, and accepting one would
- * put a visit into a history that a tender is later priced from.
+ * That is deliberate. The rule — the job must already belong to this asset's
+ * property — is not a form validation, it is the thing that keeps a service
+ * history worth pricing a tender from. An asset is fixed to a building, so a
+ * job somewhere else was not done on it. A second copy of that check written
+ * into the intake path is a second copy that can drift, and the drift is
+ * invisible: nothing looks wrong until a tender is priced off another
+ * building's failures.
  *
  * `last_serviced_at` and `next_service_due_at` are recomputed from the jobs
  * that are actually linked and actually finished, rather than being set to now.
  * They are the columns the PPM due list reads, and a due date derived from when
- * somebody happened to press a button is a due date that drifts.
+ * somebody happened to press a button is a due date that drifts. A job linked
+ * at intake has no `completed_at` yet, so it moves neither column until the
+ * work is actually done — which is the same rule, not an exception to it.
  */
 export async function linkJobToAsset(
   tx: TenantScopedTx,
   _ctx: TenantContext,
   input: { assetId: string; jobId: string },
-): Promise<{ reference: string }> {
+): Promise<{ reference: string; assetName: string }> {
   const [asset] = await tx
-    .select({ id: schema.assets.id, propertyId: schema.assets.propertyId })
+    .select({
+      id: schema.assets.id,
+      name: schema.assets.name,
+      propertyId: schema.assets.propertyId,
+    })
     .from(schema.assets)
     .where(and(eq(schema.assets.id, input.assetId), isNull(schema.assets.deletedAt)))
     .limit(1);
@@ -847,7 +939,11 @@ export async function linkJobToAsset(
   const job = rows[0];
   if (!job) throw new UserFacingError("That job no longer exists.");
   if (job.property_id !== asset.propertyId) {
-    throw new UserFacingError("That job was raised at a different property.");
+    // Worded from neither side. This is reached from the asset page, where the
+    // person picked a job, and from portal intake, where they picked an asset;
+    // "that job was raised at a different property" is a confusing sentence to
+    // read after choosing a chiller.
+    throw new UserFacingError("That asset and that job are at different properties.");
   }
   if (job.asset_id === input.assetId) {
     throw new UserFacingError(`${job.reference} is already on this asset's history.`);
@@ -882,5 +978,5 @@ export async function linkJobToAsset(
      where a.id = ${input.assetId} and h.last_completed is not null
   `);
 
-  return { reference: job.reference };
+  return { reference: job.reference, assetName: asset.name };
 }

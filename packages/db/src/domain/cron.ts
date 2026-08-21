@@ -1,6 +1,7 @@
 import { sql, and, eq, lt, isNull, inArray } from "drizzle-orm";
 import { db, withoutTenantBoundary, type TenantScopedTx } from "../index";
 import * as schema from "../schema";
+import { today, type CalendarDay } from "@meridian/core";
 
 /**
  * Scheduled work: the run ledger, and the queries the scheduled routes drive.
@@ -53,6 +54,14 @@ export const CRON_JOBS = [
   // and the only symptom is silence — which is exactly what the module exists
   // to prevent, arriving through the back door.
   "recruitment",
+  // ATS-9 / TRD 8.6. The virus sweep, and the reclamation of upload sessions
+  // nobody finished. In this list as well as in vercel.json, and the emphasis
+  // is earned: the recruitment job above was in CRON_JOBS and *absent* from
+  // vercel.json, so in production it never ran, no applicant was ever told
+  // their outcome, and /api/cron/health red-lighted about it forever with
+  // nobody able to say why. A scan job that stops firing is quieter still —
+  // every uploaded CV simply stays undownloadable.
+  "scan",
   "health",
 ] as const;
 export type CronJob = (typeof CRON_JOBS)[number];
@@ -78,6 +87,10 @@ export const CRON_MAX_AGE_MINUTES: Readonly<Record<CronJob, number>> = {
   // applicant reads as "they got it", and an hour of silence after tapping
   // Submit is when people phone the office.
   recruitment: 60,
+  // Every 10 minutes. Three missed runs, on the same reasoning as `sla`: a
+  // recruiter waiting on a CV notices within the hour, and an alert that fires
+  // on one late invocation is an alert somebody mutes.
+  scan: 35,
   health: 20, // every 5 minutes
 };
 
@@ -356,17 +369,25 @@ export interface ExpiringCertification {
  * query because the alert is the same shape and the recipient is the same
  * person — the difference is urgency, which the number carries.
  *
- * SCOPE — this is the part of `/api/cron/compliance` that can be built today.
- * The employee document register (`HR-5`: passport, residence visa, Emirates
- * ID, work permit, medical fitness, health insurance) and the company
- * accreditation register (`HR-14`: the trade licence and its 23 Jan 2027
- * expiry, DEWA enrolment, insurances) do not have tables yet; they arrive in
- * Phase 1 and plug into the same route. Saying so here rather than shipping a
- * route that reports "ok" while checking nothing is the whole point.
+ * This was the part of `/api/cron/compliance` that could be built before the
+ * employee document register (`HR-5`) and company accreditation register
+ * (`HR-14`) had tables. Phase 1 gave both their own tables and their own
+ * sweeps — `findExpiringEmployeeDocuments` and `findExpiringAccreditations` in
+ * `domain/compliance.ts` — and this route now runs all three from the same
+ * cron.
+ *
+ * `now` is Dubai's day, from `today()`, not `current_date`. `current_date` is
+ * the Postgres session's idea of today, whatever timezone the cluster was
+ * initialised with — not necessarily `Asia/Dubai`. For the hours where those
+ * disagree, the countdown here is off by one in the direction that reports a
+ * lapsed certification as still having a day left, which feeds directly into
+ * `HR-9`. `findExpiringAccreditations` in `domain/compliance.ts` carries the
+ * full reasoning; this follows the same fix.
  */
 export async function findExpiringCertifications(
   tx: TenantScopedTx,
   withinDays = 90,
+  now: CalendarDay = today(),
 ): Promise<readonly ExpiringCertification[]> {
   const rows = (await tx.execute<{
     technician_id: string;
@@ -381,14 +402,14 @@ export async function findExpiringCertifications(
            -- so the cast to date happens first. This threw on the first real
            -- run against seeded data, which is the argument for running the
            -- route rather than only typechecking it.
-           (c.expires_on::date - current_date)::int as days_remaining
+           (c.expires_on::date - ${now}::date)::int as days_remaining
       from technician_certifications c
       join technicians t on t.id = c.technician_id
      where c.expires_on is not null
        -- The cast on the parameter is required, not decorative. A bare
        -- date + placeholder is ambiguous to the planner (date + integer or
        -- date + interval?) and it refuses to guess.
-       and c.expires_on::date <= current_date + (${withinDays})::int
+       and c.expires_on::date <= ${now}::date + (${withinDays})::int
        and c.deleted_at is null
        and t.is_active
        and t.deleted_at is null

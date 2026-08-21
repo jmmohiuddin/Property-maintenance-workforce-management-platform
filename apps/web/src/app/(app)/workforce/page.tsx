@@ -344,6 +344,32 @@ export default async function WorkforcePage() {
           </p>
         </section>
 
+        {/* ── 3b. The people this company does not employ (HR-19) ────────
+            Placed between the company's own accreditations and its employment
+            records, because that is where it belongs conceptually: it is the
+            same question — is the paperwork current — asked about an
+            organisation rather than a person, and about workers on somebody
+            else's payroll. Responsibility for site compliance does not transfer
+            with the work, so their permits are this board's business too. */}
+        <section aria-labelledby="subcontractors-heading" className="mt-10">
+          <div id="subcontractors-heading">
+            <SectionHeading tone="warning" title="Subcontractors and manpower suppliers">
+              licence, insurance and per-worker permit verification (HR-19)
+            </SectionHeading>
+          </div>
+          <p className="prose-body mt-2 text-[13px]">
+            Nothing here blocks a dispatch &mdash; supplied workers are not assignable in this
+            system. What the register earns is the expiry nobody was watching: deploying a worker
+            without a valid permit carries AED 100,000 to AED 1,000,000 under Article 60, and an
+            inspector does not ask whose payroll they were on.
+          </p>
+          <p className="mt-3 text-[13px]">
+            <Link href="/workforce/subcontractors" style={{ color: "var(--accent-text)" }}>
+              Open the subcontractor register &rarr;
+            </Link>
+          </p>
+        </section>
+
         {/* ── 4. The register everything above is computed from ─────────── */}
         <section aria-labelledby="register-heading" className="mt-10">
           <div id="register-heading">

@@ -304,6 +304,18 @@ export const invoices = pgTable(
     lastReminderAt: timestamp("last_reminder_at", { withTimezone: true }),
     reminderCount: smallint("reminder_count").notNull().default(0),
     writtenOffReason: text("written_off_reason"),
+    /**
+     * When the business stopped pursuing this debt (`0031`).
+     *
+     * Its position in the customer's statement ledger, which is why it is a
+     * column of its own and not `updated_at`: that timestamp moves on a
+     * re-rendered PDF or a reminder count, and a write-off filed at the wrong
+     * date makes the running balance wrong for every row after it.
+     *
+     * `invoices_written_off_date` makes it compulsory whenever `status` is
+     * `written_off`, so the ledger can never carry an undated write-off.
+     */
+    writtenOffAt: timestamp("written_off_at", { withTimezone: true }),
     ...timestamps,
   },
   (t) => [

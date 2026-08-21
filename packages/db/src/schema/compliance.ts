@@ -4,6 +4,7 @@ import {
   text,
   boolean,
   integer,
+  smallint,
   bigint,
   date,
   timestamp,
@@ -99,6 +100,28 @@ export const employees = pgTable(
      * CHECK constraint that makes recording it as one impossible.
      */
     healthPremium: money("health_premium"),
+    /**
+     * ISCO-08 occupational major group, 1–9. The first leg of `HR-18`.
+     *
+     * ── WHY NULLABLE, AND WHY THAT IS THE IMPORTANT PART ────────────────────
+     *
+     * Emiratisation targets apply at 50 or more **skilled** employees, and
+     * "skilled" is a conjunction: ISCO major group 1–5, **and** a
+     * post-secondary certificate, **and** at least AED 4,000 a month. The wage
+     * is already here; these two columns are the other two legs.
+     *
+     * Null means nobody has recorded it, and `classifySkilledEmployee` treats
+     * that as `unknown` rather than as unskilled. NOT NULL with a default would
+     * have to invent a group for every existing employee, and every invented
+     * group would be indistinguishable from one somebody chose — which is how
+     * an establishment discovers it crossed the threshold a quarter ago.
+     * `assessEmiratisation` counts the unknowns into the upper bound, so a
+     * missing fact reads as "this may already have been crossed" instead of as
+     * a reassuring low number.
+     */
+    iscoMajorGroup: smallint("isco_major_group"),
+    /** Second leg of `HR-18`. Null is "not recorded", not "no". */
+    postSecondaryCertificate: boolean("post_secondary_certificate"),
     status: varchar("status", { length: 24 }).notNull().default("active"),
     terminatedAt: timestamp("terminated_at", { withTimezone: true }),
     /** `HR-15` — 2 years post-termination minimum. Purged by a job, not a policy. */
@@ -109,6 +132,12 @@ export const employees = pgTable(
     uniqueIndex("employees_tenant_no_key").on(t.tenantId, t.employeeNo),
     index("employees_technician_idx").on(t.tenantId, t.technicianId),
     index("employees_retention_idx").on(t.deleteAfter).where(sql`${t.deleteAfter} is not null`),
+    // The Emiratisation denominator's exact predicate. The skilled count is
+    // recomputed on every render of the HR board and on every compliance cron
+    // run; without this it is a sequential scan of the whole establishment.
+    index("employees_skilled_idx")
+      .on(t.tenantId, t.iscoMajorGroup, t.postSecondaryCertificate)
+      .where(sql`${t.status} = 'active' and ${t.deletedAt} is null`),
   ],
 );
 

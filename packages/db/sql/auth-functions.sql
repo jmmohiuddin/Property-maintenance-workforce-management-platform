@@ -322,6 +322,118 @@ BEGIN
 END;
 $$;
 
+-- ── Field devices (SEC-7, TRD 8.5) ──────────────────────────────────────────
+--
+-- A technician's phone is not a browser session, and this is the one function
+-- that lets it authenticate. It lives here, with the rest of the authentication
+-- surface, rather than in a file of its own, for two reasons: the bootstrap
+-- problem is identical -- resolving a device token happens before a tenant is
+-- known, so RLS matches zero rows -- and the order of the sql/ files is
+-- load-bearing, so a new file is a change to the README's list and one more
+-- thing to get wrong during a restore.
+--
+-- ── WHY THIS IS THE ONLY DEFINER FUNCTION THE FIELD API NEEDS ───────────────
+--
+-- Everything else a device does -- rotating its token, recording its clock
+-- skew, revoking itself on sign-out, pulling work, pushing mutations -- happens
+-- AFTER this call, by which point the tenant is known and withTenant() can open
+-- an ordinary RLS-scoped transaction. So the privileged surface is one function
+-- with one argument, and every write the field app performs is subject to the
+-- same policies as the dispatch board.
+--
+-- Registration is deliberately absent too: a device is registered from an
+-- already-authenticated session, inside the tenant, under RLS. There is no path
+-- by which a phone acquires a credential without a human first signing in.
+--
+-- ── WHAT `match` MEANS, AND WHY IT IS NOT A BOOLEAN ─────────────────────────
+--
+-- Four outcomes, and collapsing them to "valid / not valid" throws away the two
+-- that matter operationally:
+--
+--   current  the live token. Ordinary case.
+--   grace    the token this one replaced, still inside its grace window. The
+--            rotation response was lost in transit -- the commonest failure on
+--            a mobile network -- and the phone is retrying with what it has.
+--            Accept it and re-send the current token.
+--   expired  the live token, past its expiry. The handset has been in a drawer.
+--            The person signs in again; nothing is wrong with the device.
+--   reuse    the replaced token, presented after its successor was issued and
+--            its grace has passed. This did not come from the phone. The caller
+--            revokes the device.
+--
+-- Liveness is enforced here rather than by the caller, exactly as
+-- app_auth_resolve_session does it: not revoked, membership active, tenant
+-- active, technician active, user not deleted. A revoked device therefore
+-- returns ZERO rows and is indistinguishable from an unknown token, which is
+-- the intended answer to somebody holding a stolen credential.
+DROP FUNCTION IF EXISTS app_auth_resolve_device(text);
+
+CREATE OR REPLACE FUNCTION app_auth_resolve_device(p_token_hash text)
+RETURNS TABLE (
+  device_id uuid,
+  match text,
+  tenant_id uuid,
+  technician_id uuid,
+  user_id uuid,
+  full_name text,
+  email text,
+  brand_name text,
+  role text,
+  overrides jsonb,
+  label text,
+  token_issued_at timestamptz,
+  token_expires_at timestamptz
+)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  -- Two index scans unioned, not an OR. `token_hash` is a unique index and
+  -- `previous_token_hash` has its own; an OR across the pair plans as a
+  -- sequential scan over every device in the estate, on the hottest path in
+  -- the field API.
+  WITH presented AS (
+    SELECT d.*, 'current'::text AS how
+      FROM field_devices d
+     WHERE d.token_hash = p_token_hash
+    UNION ALL
+    SELECT d.*, 'previous'::text AS how
+      FROM field_devices d
+     WHERE d.previous_token_hash = p_token_hash
+  )
+  SELECT
+    p.id,
+    CASE
+      WHEN p.how = 'current' AND p.token_expires_at > now() THEN 'current'
+      WHEN p.how = 'current' THEN 'expired'
+      WHEN p.previous_token_grace_until > now() THEN 'grace'
+      ELSE 'reuse'
+    END,
+    p.tenant_id,
+    p.technician_id,
+    p.user_id,
+    u.full_name::text,
+    u.email::text,
+    t.brand_name::text,
+    m.role::text,
+    m.permission_overrides,
+    p.label::text,
+    p.token_issued_at,
+    p.token_expires_at
+  FROM presented p
+  JOIN users u        ON u.id = p.user_id
+  JOIN tenants t      ON t.id = p.tenant_id
+  JOIN memberships m  ON m.user_id = p.user_id AND m.tenant_id = p.tenant_id
+  JOIN technicians te ON te.id = p.technician_id
+  WHERE p.revoked_at IS NULL
+    AND p.deleted_at IS NULL
+    AND m.is_active
+    AND t.is_active
+    AND te.is_active
+    AND u.deleted_at IS NULL
+  LIMIT 1;
+$$;
+
 -- ── Grants ──────────────────────────────────────────────────────────────────
 -- EXECUTE is public by default on new functions, which would let any role call
 -- them. Lock that down and grant explicitly.
@@ -337,7 +449,8 @@ BEGIN
     'app_auth_touch_session(text, integer)',
     'app_auth_resolve_session(text)',
     'app_auth_revoke_session(text)',
-    'app_auth_revoke_all_sessions(uuid, uuid)'
+    'app_auth_revoke_all_sessions(uuid, uuid)',
+    'app_auth_resolve_device(text)'
   ] LOOP
     EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', fn);
     EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO meridian_app', fn);

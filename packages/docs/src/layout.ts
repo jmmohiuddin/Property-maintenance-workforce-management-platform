@@ -334,7 +334,21 @@ export class Canvas {
    * design doc §8.2 requires on *every* document — so it is applied here, once,
    * where no template can forget it.
    */
-  async finish(footer: { legal: string; note?: string | null }): Promise<Uint8Array> {
+  /**
+   * `pageLabel` replaces the computed "Page 1 of 3", and `null` suppresses it.
+   *
+   * Added for the tender pack (`CON-12`), which is one document assembled from
+   * several renders: a body, and a divider sheet in front of each certificate
+   * copied in from object storage. Those dividers are rendered as separate
+   * one-page canvases and merged, so each of them would otherwise stamp
+   * "Page 1 of 1" onto what is really page fourteen. A page number that is
+   * confidently wrong is worse than none on a document a stranger evaluates.
+   */
+  async finish(footer: {
+    legal: string;
+    note?: string | null;
+    pageLabel?: string | null;
+  }): Promise<Uint8Array> {
     const total = this.pages.length;
 
     this.pages.forEach((page, index) => {
@@ -366,7 +380,10 @@ export class Canvas {
         });
       }
 
-      const label = `Page ${index + 1} of ${total}`;
+      const label =
+        footer.pageLabel === undefined ? `Page ${index + 1} of ${total}` : footer.pageLabel;
+      if (label === null) return;
+
       page.drawText(label, {
         x: PAGE.marginX + CONTENT_WIDTH - this.regular.widthOfTextAtSize(label, 7.5),
         y: baseline,

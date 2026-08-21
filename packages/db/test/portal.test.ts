@@ -1,7 +1,7 @@
 /**
  * Customer-portal scoping — integration test against real Postgres.
  *
- * `POR-1`, `POR-3`, `POR-4`, `POR-5`.
+ * `POR-1`, `POR-3`, `POR-4`, `POR-5`, `POR-9`.
  *
  * ── WHAT THIS TEST IS ACTUALLY FOR ─────────────────────────────────────────
  *
@@ -33,6 +33,7 @@ import {
   withCustomerScope,
   listPortalRequests,
   getPortalRequestDetail,
+  getPortalJobPhoto,
   listPortalInvoices,
   portalStatement,
   getPortalInvoiceRef,
@@ -63,6 +64,14 @@ function checkTrue(label: string, got: boolean): void {
 }
 
 const TAG = "__PORTALTEST";
+
+// The written-off invoice's chain, spread over real days so the statement's
+// ORDER can be asserted at all. Fixed offsets from one `Date.now()` read, not
+// three separate calls, so the intervals cannot drift mid-setup.
+const NOW = Date.now();
+const THREE_DAYS_AGO = NOW - 3 * 86_400_000;
+const TWO_DAYS_AGO = NOW - 2 * 86_400_000;
+const DAY_AGO = NOW - 86_400_000;
 
 /**
  * Remove every fixture this file creates.
@@ -111,7 +120,21 @@ async function purge(tenantId: string): Promise<void> {
     }
     if (jobIds.length > 0) {
       await tx.delete(schema.jobReports).where(inArray(schema.jobReports.jobId, jobIds));
+      // Hard deletes keyed on the job, so the soft-deleted `POR-9` fixtures —
+      // the withdrawn photograph and the withdrawn material line — go too. A
+      // purge that respected `deleted_at` would leave exactly the rows this
+      // file creates to prove they are hidden.
       await tx.delete(schema.jobAttachments).where(inArray(schema.jobAttachments.jobId, jobIds));
+      await tx.delete(schema.jobSignoffs).where(inArray(schema.jobSignoffs.jobId, jobIds));
+      await tx.delete(schema.jobMaterials).where(inArray(schema.jobMaterials.jobId, jobIds));
+      // Before the reasons below: `reason_code` cites a vocabulary row, and
+      // although it is a plain varchar rather than a foreign key here, deleting
+      // the reason first would leave a declaration citing a code that no longer
+      // resolves — which is the exact state the null-label fallback exists for,
+      // silently reintroduced into every later run of this suite.
+      await tx
+        .delete(schema.jobCardDeclarations)
+        .where(inArray(schema.jobCardDeclarations.jobId, jobIds));
       await tx.delete(schema.jobVisits).where(inArray(schema.jobVisits.jobId, jobIds));
       await tx.delete(schema.jobEvents).where(inArray(schema.jobEvents.jobId, jobIds));
     }
@@ -124,6 +147,12 @@ async function purge(tenantId: string): Promise<void> {
       await tx.delete(schema.jobs).where(inArray(schema.jobs.id, jobIds));
     }
     await tx.delete(schema.leads).where(like(schema.leads.name, `${TAG}%`));
+    // Anchored to this file's own tag, not to every reason in the tenant. The
+    // seeded vocabulary is real data and `installStandardPhotoExemptionReasons`
+    // is another suite's fixture.
+    await tx
+      .delete(schema.jobPhotoExemptionReasons)
+      .where(like(schema.jobPhotoExemptionReasons.code, `${TAG.toLowerCase()}%`));
 
     if (customerIds.length > 0) {
       await tx
@@ -188,7 +217,12 @@ async function main(): Promise<void> {
     const propertyA = await property(customerA.id, `${TAG} Alpha Tower`);
     const propertyB = await property(customerB.id, `${TAG} Beta Villas`);
 
-    const job = async (customerId: string, propertyId: string, suffix: string, status: "submitted" | "closed") => {
+    const job = async (
+      customerId: string,
+      propertyId: string,
+      suffix: string,
+      status: "submitted" | "closed" | "draft",
+    ) => {
       const [row] = await tx
         .insert(schema.jobs)
         .values({
@@ -221,12 +255,17 @@ async function main(): Promise<void> {
 
     const jobA = await job(customerA.id, propertyA, "A1", "submitted");
     const jobAclosed = await job(customerA.id, propertyA, "A2", "closed");
+    // A's own job that A cannot open: `draft` means operations has not raised
+    // it yet. `getPortalRequestDetail` refuses it, so the `POR-9` file route
+    // has to refuse its photographs too — otherwise the picture is reachable
+    // from a request that is not.
+    const jobAdraft = await job(customerA.id, propertyA, "A3", "draft");
     const jobB = await job(customerB.id, propertyB, "B1", "submitted");
 
     const invoice = async (
       customerId: string,
       suffix: string,
-      status: "draft" | "issued",
+      status: "draft" | "issued" | "written_off",
       total: string,
     ) => {
       const [row] = await tx
@@ -236,8 +275,12 @@ async function main(): Promise<void> {
           reference: `${TAG}-INV-${suffix}`,
           customerId,
           status,
-          issuedOn: status === "issued" ? new Date() : null,
-          dueOn: status === "issued" ? new Date(Date.now() + 30 * 86_400_000) : null,
+          issuedOn: status === "draft" ? null : new Date(),
+          dueOn: status === "draft" ? null : new Date(Date.now() + 30 * 86_400_000),
+          // `invoices_written_off_date` (0031) refuses a written-off invoice
+          // carrying no date, and it refuses it at INSERT — setting it in a
+          // later UPDATE is too late.
+          writtenOffAt: status === "written_off" ? new Date(DAY_AGO) : null,
           // `invoices_article59_fields` refuses an invoice issued from today
           // onwards without a date of supply and both party names. That check
           // is the point of the tax-invoice work, so the fixture satisfies it
@@ -264,6 +307,28 @@ async function main(): Promise<void> {
       .set({ amountPaid: "250.00", status: "part_paid" })
       .where(eq(schema.invoices.id, invoiceA));
     const invoiceAdraft = await invoice(customerA.id, "A2", "draft", "500.00");
+    // A written-off invoice that was PART-PAID before the business gave up on
+    // it. The part payment is the whole reason this fixture exists: writing off
+    // the full total rather than the open portion would subtract 400 from a
+    // balance that only ever carried 250 of it, and the customer would be shown
+    // as being in credit. A written-off invoice with nothing paid against it
+    // would pass either formula and prove neither.
+    const invoiceAwrittenOff = await invoice(customerA.id, "A3", "written_off", "400.00");
+    await tx
+      .update(schema.invoices)
+      .set({
+        amountPaid: "150.00",
+        writtenOffReason: `${TAG} INTERNAL uncollectable, customer dissolved`,
+        // Back-dated so the A3 chain is chronologically COHERENT: issued three
+        // days ago, part-paid two days ago, written off one day ago. The
+        // helper dates every invoice today, and a fixture where the write-off
+        // predates its own invoice asserts a state the business cannot reach —
+        // and one where every event shares a timestamp cannot detect a row
+        // filed in the wrong place, which is the entire reason 0031 exists.
+        issuedOn: new Date(THREE_DAYS_AGO),
+      })
+      .where(eq(schema.invoices.id, invoiceAwrittenOff));
+
     const invoiceB = await invoice(customerB.id, "B1", "issued", "7777.00");
 
     await tx.insert(schema.payments).values({
@@ -272,6 +337,19 @@ async function main(): Promise<void> {
       amount: "250.00",
       method: "bank_transfer",
       receivedAt: new Date(),
+    });
+
+    // The real payment row behind the written-off invoice's `amount_paid`.
+    // `portalStatement` sums the `payments` TABLE, not the maintained column, so
+    // setting `amount_paid` alone would leave the fixture in a state the
+    // application never produces — and the paid total would silently disagree
+    // with the ledger the customer is looking at.
+    await tx.insert(schema.payments).values({
+      tenantId,
+      invoiceId: invoiceAwrittenOff,
+      amount: "150.00",
+      method: "cash",
+      receivedAt: new Date(TWO_DAYS_AGO),
     });
 
     await tx.insert(schema.creditNotes).values({
@@ -325,9 +403,144 @@ async function main(): Promise<void> {
       }
     }
 
-    await tx.insert(schema.jobAttachments).values([
-      { tenantId, jobId: jobA, kind: "photo_after", storageKey: `${TAG}/a.jpg` },
-      { tenantId, jobId: jobB, kind: "photo_after", storageKey: `${TAG}/b.jpg` },
+    // ── POR-9 fixtures. Job evidence, and everything that is NOT evidence ───
+    //
+    // Every storage key here begins `__PORTALTEST/`, which is what makes the
+    // assertion "no storage key reaches the projection" testable: one substring
+    // search over the serialised result covers all of them at once, and it
+    // catches a key that arrives on a field nobody thought to look at.
+    const attachmentRows = await tx
+      .insert(schema.jobAttachments)
+      .values([
+        {
+          tenantId,
+          jobId: jobA,
+          kind: "photo_before",
+          storageKey: `${TAG}/a-before.jpg`,
+          mimeType: "image/jpeg",
+          caption: "Condensate tray before cleaning",
+          capturedAt: new Date(),
+        },
+        {
+          tenantId,
+          jobId: jobA,
+          kind: "photo_after",
+          storageKey: `${TAG}/a-after.jpg`,
+          mimeType: "image/jpeg",
+        },
+        // Removed on purpose — the wrong flat, a face in the frame. The row
+        // stays so the audit trail survives; the customer must not see it.
+        {
+          tenantId,
+          jobId: jobA,
+          kind: "photo_after",
+          storageKey: `${TAG}/a-withdrawn.jpg`,
+          deletedAt: new Date(),
+        },
+        // A signature image sitting in the same table as the photographs. This
+        // is the row the allowlist exists for.
+        { tenantId, jobId: jobA, kind: "signature", storageKey: `${TAG}/a-signature.png` },
+        // And an arbitrary attached document — a supplier's delivery note,
+        // somebody else's report. Nothing constrains what a technician attaches.
+        { tenantId, jobId: jobA, kind: "document", storageKey: `${TAG}/a-document.pdf` },
+        { tenantId, jobId: jobAdraft, kind: "photo_after", storageKey: `${TAG}/a3-draft.jpg` },
+        { tenantId, jobId: jobB, kind: "photo_after", storageKey: `${TAG}/b-after.jpg` },
+      ])
+      .returning({ id: schema.jobAttachments.id, storageKey: schema.jobAttachments.storageKey });
+
+    // Looked up by key rather than by position. `returning()` order is not a
+    // promise Postgres makes, and an index here would be a test that passes
+    // until the day the planner reorders the insert.
+    const attachmentId = (key: string): string => {
+      const row = attachmentRows.find((r) => r.storageKey === `${TAG}/${key}`);
+      if (!row) throw new Error(`fixture attachment ${key} was not created`);
+      return row.id;
+    };
+
+    // A signed job sheet on each side. B's exists so that "A sees no sign-off
+    // of B's" has something to fail on.
+    await tx.insert(schema.jobSignoffs).values([
+      {
+        tenantId,
+        jobId: jobA,
+        signedByName: `${TAG} Building Manager`,
+        signedByRole: "Building Manager",
+        signatureStorageKey: `${TAG}/a-signature.png`,
+        satisfactionRating: 4,
+      },
+      {
+        tenantId,
+        jobId: jobB,
+        signedByName: `${TAG} SHOULD NOT BE VISIBLE TO A`,
+        signatureStorageKey: `${TAG}/b-signature.png`,
+      },
+    ]);
+
+    // ── JOB-15 declared absences, on the CLOSED job ─────────────────────────
+    //
+    // Deliberately on jobAclosed, which has no photographs and no materials, so
+    // the declarations are the only thing that can explain the two empty
+    // sections. Putting them on jobA — which has both — would exercise the
+    // suppression rule and nothing else.
+    //
+    // The exemption reason is a real row in the vocabulary table, not a dangling
+    // code: the join to `job_photo_exemption_reasons` is half of what this test
+    // is for, and a code with no row would pass through the null fallback and
+    // prove nothing about the policy on that table.
+    const [exemptionReason] = await tx
+      .insert(schema.jobPhotoExemptionReasons)
+      .values({
+        tenantId,
+        code: `${TAG.toLowerCase()}_sealed_riser`,
+        label: "The equipment is inside a sealed riser",
+        sortOrder: 900,
+      })
+      .returning({ code: schema.jobPhotoExemptionReasons.code });
+    if (!exemptionReason) throw new Error("could not create the fixture exemption reason");
+
+    await tx.insert(schema.jobCardDeclarations).values([
+      {
+        tenantId,
+        jobId: jobAclosed,
+        kind: "materials_none",
+        note: `${TAG} INTERNAL: told them the part is on back order, do not quote yet`,
+      },
+      {
+        tenantId,
+        jobId: jobAclosed,
+        kind: "photo_exempt",
+        reasonCode: exemptionReason.code,
+        note: `${TAG} INTERNAL: tenant would not let us in past the hallway`,
+      },
+      // B's own declaration, so "A sees none of B's" has something to fail on.
+      {
+        tenantId,
+        jobId: jobB,
+        kind: "materials_none",
+        note: `${TAG} SHOULD NOT BE VISIBLE TO A`,
+      },
+    ]);
+
+    // One live material line carrying a cost, and one withdrawn. `unit_cost` is
+    // what the part cost the business; the projection must not carry it, and
+    // the withdrawn line must not appear at all.
+    await tx.insert(schema.jobMaterials).values([
+      {
+        tenantId,
+        jobId: jobA,
+        description: "Run capacitor 45uF",
+        quantity: "1.000",
+        unit: "ea",
+        unitCost: "38.50",
+      },
+      {
+        tenantId,
+        jobId: jobA,
+        description: `${TAG} WITHDRAWN LINE`,
+        quantity: "2.000",
+        unit: "ea",
+        deletedAt: new Date(),
+      },
     ]);
 
     await tx.insert(schema.jobReports).values([
@@ -417,9 +630,18 @@ async function main(): Promise<void> {
       customerB: customerB.id,
       jobA,
       jobAclosed,
+      jobAdraft,
       jobB,
+      photoBeforeA: attachmentId("a-before.jpg"),
+      photoAfterA: attachmentId("a-after.jpg"),
+      photoWithdrawnA: attachmentId("a-withdrawn.jpg"),
+      signatureAttachmentA: attachmentId("a-signature.png"),
+      documentAttachmentA: attachmentId("a-document.pdf"),
+      photoOnDraft: attachmentId("a3-draft.jpg"),
+      photoB: attachmentId("b-after.jpg"),
       invoiceA,
       invoiceAdraft,
+      invoiceAwrittenOff,
       invoiceB,
       quoteA,
       quoteB,
@@ -472,13 +694,186 @@ async function main(): Promise<void> {
   check("A cannot open customer B's request by id", foreignDetail, null);
 
   // ═══════════════════════════════════════════════════════════════════════
+  // POR-9 — job evidence: what is shown, what is withheld, and the file route
+  //
+  // Two separate questions, and they need separate assertions. The PROJECTION
+  // decides what a customer is told exists; the FILE ROUTE decides what bytes
+  // they can pull. A projection that hides a signature is worthless if the
+  // route serves it to anyone who names its id, and a route that scopes
+  // correctly is worthless if the page hands out storage keys.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const evidence = await asA((tx) => getPortalRequestDetail(tx, ids.jobA));
+
+  check("A sees the before and after photographs", evidence?.photos.length, 2);
+  checkTrue(
+    "and they are the two live ones",
+    evidence?.photos.map((p) => p.id).sort().join() ===
+      [ids.photoBeforeA, ids.photoAfterA].sort().join(),
+  );
+  // THE NEGATIVE. A soft-deleted attachment was removed on purpose — the wrong
+  // property, a face in the frame. Showing it publishes what the deletion was
+  // for. This filter was missing before `POR-9`.
+  checkTrue(
+    "a withdrawn photograph is not shown",
+    evidence?.photos.some((p) => p.id === ids.photoWithdrawnA) === false,
+  );
+  // THE NEGATIVE. Not everything in `job_attachments` is evidence of the work.
+  checkTrue(
+    "the signature image is not among the photographs",
+    evidence?.photos.some((p) => p.id === ids.signatureAttachmentA) === false,
+  );
+  checkTrue(
+    "nor is an arbitrary attached document",
+    evidence?.photos.some((p) => p.id === ids.documentAttachmentA) === false,
+  );
+
+  // THE NEGATIVE THAT COVERS THE WHOLE PROJECTION. Every fixture storage key
+  // starts `__PORTALTEST/`, so this one search catches a key arriving on any
+  // field — including one added later by somebody who did not read this file.
+  checkTrue(
+    "no object-storage key of any kind reaches the request detail",
+    JSON.stringify(evidence ?? {}).includes(`${TAG}/`) === false,
+  );
+
+  check("the list counts only the live photographs",
+    mine.find((r) => r.reference === `${TAG}-J-A1`)?.photoCount, 2);
+
+  // The sign-off is a STATEMENT: who, in what capacity, when. The signature
+  // graphic is deliberately never served — see `PORTAL_SIGNATURE_POLICY`.
+  check("the sign-off names who signed", evidence?.signoff?.signedByName, `${TAG} Building Manager`);
+  check("and in what capacity", evidence?.signoff?.signedByRole, "Building Manager");
+  check("and the rating they gave", evidence?.signoff?.satisfactionRating, 4);
+  // THE NEGATIVE.
+  checkTrue(
+    "A sees no sign-off of customer B's",
+    JSON.stringify(evidence?.signoff ?? {}).includes("SHOULD NOT BE VISIBLE") === false,
+  );
+
+  check("A sees the live material line", evidence?.materials.length, 1);
+  checkTrue(
+    "a withdrawn material line is not shown",
+    JSON.stringify(evidence?.materials ?? []).includes("WITHDRAWN") === false,
+  );
+  // What the part cost the business is nobody's business but the business's.
+  checkTrue(
+    "and no material carries its cost",
+    JSON.stringify(evidence?.materials ?? []).includes("38.5") === false,
+  );
+
+  // ── JOB-15's declared absences, newly readable from the portal ──────────
+  //
+  // These two tables were closed to portal sessions by the customer-scope
+  // backstop until this change. The failure mode being guarded against is the
+  // SILENT one the backstop's own comment describes: a table promoted from
+  // closed to scoped that keeps its `customer_scope_default`, whose restrictive
+  // policies are then ANDed, so every read returns zero rows with no error at
+  // all. A test that only asserted "A cannot see B's" would pass perfectly
+  // against that broken state. So the positive is asserted first and it is load
+  // bearing.
+
+  const closed = await asA((tx) => getPortalRequestDetail(tx, ids.jobAclosed));
+
+  checkTrue("the closed job genuinely has no materials to list", closed?.materials.length === 0);
+  checkTrue(
+    "so the declaration is what says no parts were used — and it reads",
+    closed?.materialsNone !== null && closed?.materialsNone !== undefined,
+  );
+  checkTrue("the closed job genuinely has no photographs", closed?.photos.length === 0);
+  check("and one exemption explains why", closed?.photoExemptions.length, 1);
+  // The JOIN to `job_photo_exemption_reasons` is the second half of the policy
+  // work. A closed vocabulary table returns no row, the label falls through to
+  // the null fallback, and the customer gets a generic sentence instead of the
+  // reason — which is the silently-degraded outcome, not an error.
+  check(
+    "the reason resolves to its label, so the vocabulary table reads too",
+    closed?.photoExemptions[0]?.reasonLabel,
+    "The equipment is inside a sealed riser",
+  );
+
+  // THE NEGATIVE.
+  const foreignDeclarations = await withCustomerScope(
+    { tenantId, customerId: ids.customerB },
+    (tx) => getPortalRequestDetail(tx, ids.jobAclosed),
+  );
+  check("B cannot read A's declarations at all", foreignDeclarations, null);
+
+  // THE NEGATIVE that matters for the projection rather than the policy: the
+  // declaration note is technician free text on an internal form, the same
+  // field and the same argument as `job_events.note`.
+  checkTrue(
+    "no declaration note reaches the customer",
+    JSON.stringify(closed ?? {}).includes("INTERNAL") === false,
+  );
+
+  // The suppression rule. jobA HAS materials and photographs, so a declaration
+  // has nothing to declare absent — saying "no parts were used" above a list of
+  // the parts used is the failure this guards.
+  check("a job with materials shows no 'none were used' claim", evidence?.materialsNone, null);
+  check("nor an exemption when photographs exist", evidence?.photoExemptions.length, 0);
+
+  // ── The file route. This is the surface that serves bytes ───────────────
+
+  const ownPhoto = await asA((tx) => getPortalJobPhoto(tx, ids.jobA, ids.photoAfterA));
+  check(
+    "A can resolve its own photograph for the file route",
+    ownPhoto?.storageKey,
+    `${TAG}/a-after.jpg`,
+  );
+
+  // THE NEGATIVE, and the one that matters most: this is the file route, and a
+  // photograph is an object-storage key. Under customer scope B's attachment is
+  // absent rather than refused, so this returns null and the route answers 404.
+  const foreignPhoto = await asA((tx) => getPortalJobPhoto(tx, ids.jobB, ids.photoB));
+  check("A cannot resolve customer B's photograph", foreignPhoto, null);
+
+  // The same id under a path A DOES own, which is the URL a caller controls.
+  const smuggledPhoto = await asA((tx) => getPortalJobPhoto(tx, ids.jobA, ids.photoB));
+  check("nor B's photograph mounted under A's own request", smuggledPhoto, null);
+
+  // A's own photograph under A's other job. Ownership is not the only rule —
+  // the pair has to match, or the page can show one building's photograph under
+  // another building's heading. That is not a leak; it is wrong evidence
+  // presented as evidence.
+  const mismatchedPhoto = await asA((tx) => getPortalJobPhoto(tx, ids.jobAclosed, ids.photoAfterA));
+  check("nor its own photograph under the wrong request", mismatchedPhoto, null);
+
+  const withdrawnPhoto = await asA((tx) => getPortalJobPhoto(tx, ids.jobA, ids.photoWithdrawnA));
+  check("a withdrawn photograph cannot be fetched by id", withdrawnPhoto, null);
+
+  // The route is for photographs. A signature is a reusable credential, and
+  // hiding it from the list would mean nothing if the route served it.
+  const signatureBytes = await asA((tx) =>
+    getPortalJobPhoto(tx, ids.jobA, ids.signatureAttachmentA),
+  );
+  check("the signature image is not servable through the photograph route", signatureBytes, null);
+
+  const documentBytes = await asA((tx) => getPortalJobPhoto(tx, ids.jobA, ids.documentAttachmentA));
+  check("nor is an attached document", documentBytes, null);
+
+  // A's own draft job. The detail read refuses it, so the file route must too.
+  const draftPhoto = await asA((tx) => getPortalJobPhoto(tx, ids.jobAdraft, ids.photoOnDraft));
+  check("nor a photograph on a draft request the customer cannot open", draftPhoto, null);
+
+  // And in the other direction, so the result above is a property of the
+  // boundary rather than of A's fixtures.
+  const reversePhoto = await withCustomerScope({ tenantId, customerId: ids.customerB }, (tx) =>
+    getPortalJobPhoto(tx, ids.jobA, ids.photoAfterA),
+  );
+  check("B cannot resolve customer A's photograph either", reversePhoto, null);
+
+  // ═══════════════════════════════════════════════════════════════════════
   // POR-4 — invoices, statement, document reference
   // ═══════════════════════════════════════════════════════════════════════
 
   const invoices = await asA((tx) => listPortalInvoices(tx, { limit: 100 }));
   const myInvoices = invoices.filter((i) => i.reference.startsWith(TAG));
 
-  check("A sees its issued invoice", myInvoices.length, 1);
+  // Two: the issued one and the written-off one. A written-off invoice is still
+  // a document that was issued to this customer, so it stays on their list —
+  // what changes is that nothing is outstanding on it, asserted below. Hiding it
+  // outright would erase an invoice they were genuinely sent.
+  check("A sees both of its non-draft invoices", myInvoices.length, 2);
   check(
     "and not its own draft — a draft has no legal existence",
     myInvoices.filter((i) => i.reference === `${TAG}-INV-A2`).length,
@@ -491,7 +886,12 @@ async function main(): Promise<void> {
     0,
   );
 
-  const invoiceA = myInvoices[0];
+  // Selected by reference, never by index. The list is ordered by issue date
+  // then reference descending, so `[0]` silently became the written-off A3 the
+  // moment that fixture was added — and the two assertions below then read a
+  // zeroed row and reported the credit-note logic as broken. This is the same
+  // trap `_tenant.ts` documents for `activeTenantIds()[0]`.
+  const invoiceA = myInvoices.find((i) => i.reference === `${TAG}-INV-A1`);
   check("the credit note is netted off the outstanding figure", invoiceA?.creditedMinor, 10_000);
   check("outstanding is total less paid less credited", invoiceA?.outstandingMinor, 65_000);
 
@@ -524,12 +924,94 @@ async function main(): Promise<void> {
   // entries" would no longer be testing the thing that can break.
   //
   // Customer A's account: one AED 1,000.00 invoice, one AED 100.00 credit note,
-  // one AED 250.00 payment.
-  check("the statement's invoiced total", statement.invoicedMinor, 100_000);
+  // one AED 250.00 payment, and one AED 400.00 invoice part-paid AED 150.00
+  // before being written off.
+  check("the statement's invoiced total", statement.invoicedMinor, 140_000);
   check("its credited total", statement.creditedMinor, 10_000);
-  check("its paid total", statement.paidMinor, 25_000);
+  check("its paid total", statement.paidMinor, 40_000);
+  // The FORGIVEN portion: 400.00 less the 150.00 already paid against it. The
+  // formula that subtracts the whole invoice total would give 40_000 here, and
+  // the balance below would come out 25_000 short.
+  check("the debt it stopped pursuing", statement.writtenOffMinor, 25_000);
   check("and the balance that follows", statement.balanceMinor, 65_000);
+  // The footer has to reconcile, or a reader who adds the columns finds what
+  // looks like an arithmetic error. Asserted as arithmetic rather than as a
+  // fourth literal, because this is the relationship that must hold and not the
+  // particular numbers of this fixture.
+  checkTrue(
+    "invoiced less credited less paid less written off IS the balance",
+    statement.invoicedMinor -
+      statement.creditedMinor -
+      statement.paidMinor -
+      statement.writtenOffMinor ===
+      statement.balanceMinor,
+  );
+  // THE POINT OF THE WHOLE CHANGE, stated as the property it protects: writing
+  // a debt off does not move what the customer is told they owe. Before the fix
+  // this balance was 65_000 + 25_000 — the portal asking for money the business
+  // had already decided not to chase, and the only place in the codebase that
+  // disagreed with `arAgeing`.
+  check(
+    "so writing a debt off leaves the customer's balance exactly where it was",
+    statement.balanceMinor,
+    65_000,
+  );
   check("nothing was truncated at this size", statement.truncated, false);
+  // ── THE GAP THIS CHECK USED TO MEASURE IS CLOSED (0031) ─────────────────
+  //
+  // It previously asserted that the rows exceeded the balance by exactly the
+  // written-off amount — a known defect, left as a number somebody could close
+  // rather than a paragraph somebody could ignore. `written_off_at` let the
+  // write-off become a ledger ENTRY, so the running balance down the rows now
+  // lands on the balance itself.
+  //
+  // The two sides are computed independently and that is the point: the rows
+  // come from the ledger union, `balanceMinor` from its own aggregate over
+  // every invoice. Agreeing is therefore evidence, not tautology.
+  //
+  // Reducing over `entries` is safe ONLY because `truncated` is asserted false
+  // immediately above; this is a relationship check, not a headline figure.
+  const ledgerEnd = statement.entries.reduce((sum, e) => sum + e.amountMinor, 0);
+  check("the running balance down the rows lands on the balance", ledgerEnd, statement.balanceMinor);
+
+  const writeOffRows = statement.entries.filter((e) => e.kind === "write_off");
+  check("the write-off is one ledger row", writeOffRows.length, 1);
+  check("against the invoice it forgave", writeOffRows[0]?.reference, `${TAG}-INV-A3`);
+  // Negative: it reduced what was owed. And the FORGIVEN portion — 400.00 less
+  // the 150.00 already paid — not the invoice total, which would double-count
+  // the payment that is already its own row above.
+  check("reducing the balance by what was still open on it", writeOffRows[0]?.amountMinor, -25_000);
+  // THE NEGATIVE. `written_off_reason` is internal free text and the page
+  // renders `detail` straight after the reference.
+  check("and carrying no internal reason", writeOffRows[0]?.detail, null);
+  checkTrue(
+    "no write-off reason reaches the customer anywhere in the statement",
+    JSON.stringify(statement).includes("INTERNAL") === false,
+  );
+  // ORDERING is the reason the column exists at all. A write-off dated from
+  // `updated_at` files in the wrong place, and every row after it then carries
+  // a wrong running balance. Asserted as the shape of one invoice's own chain —
+  // issued, then part-paid, then written off — because that is the sequence a
+  // reader is checking when they scan a statement, and it is the sequence a
+  // wrong timestamp would scramble.
+  check(
+    "the write-off is placed after the invoice it forgave and the payment against it",
+    statement.entries
+      .filter((e) => e.reference === `${TAG}-INV-A3`)
+      .map((e) => e.kind)
+      .join(" → "),
+    "invoice → payment → write_off",
+  );
+
+  // The per-invoice figure, which is the same decision one row at a time.
+  const writtenOffRow = myInvoices.find((i) => i.reference === `${TAG}-INV-A3`);
+  checkTrue("the written-off invoice is still LISTED, not hidden", writtenOffRow !== undefined);
+  check("but nothing is outstanding on it", writtenOffRow?.outstandingMinor, 0);
+  check("and it is not reported as overdue", writtenOffRow?.daysOverdue, null);
+  // Not a vacuous zero: the row really does carry a total and a part payment,
+  // so `max(total - paid - credited, 0)` would have returned 25_000 here.
+  check("though the invoice itself still shows its total", writtenOffRow?.totalMinor, 40_000);
+  check("and the part payment that was made against it", writtenOffRow?.paidMinor, 15_000);
 
   // ═══════════════════════════════════════════════════════════════════════
   // The policies themselves, read raw.

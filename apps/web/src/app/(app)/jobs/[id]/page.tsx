@@ -13,6 +13,8 @@ import {
   listJobOutcomeCodes,
   faultCodeOptions,
   getJobOutcome,
+  getJobCard,
+  listPhotoExemptionReasons,
   schema,
   ASSIGNMENT_WARNING_LABEL,
   QUOTE_STATUS_LABEL,
@@ -39,6 +41,7 @@ import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 import { StatusActions, AssignPanel, type CandidateOption } from "./job-actions";
 import { OutcomePanel } from "./outcome-panel";
+import { JobCardPanel, type JobCardView } from "./job-card-panel";
 import { QuotePanel, SendQuoteButton, QuoteDocumentLink } from "./quote-panel";
 import { InvoicePanel } from "./invoice-panel";
 import { OutOfScopePanel } from "./out-of-scope-panel";
@@ -68,6 +71,15 @@ function dubaiFieldValue(instant: Date): string {
   const t = toDubai(instant);
   const pad = (n: number): string => String(n).padStart(2, "0");
   return `${t.year}-${pad(t.month)}-${pad(t.day)}T${pad(t.hour)}:${pad(t.minute)}`;
+}
+
+/** Dubai wall-clock, short. Used for "when was this photograph taken". */
+function dubaiStamp(instant: Date): string {
+  return instant.toLocaleString("en-GB", {
+    timeZone: "Asia/Dubai",
+    dateStyle: "short",
+    timeStyle: "short",
+  });
 }
 
 export async function generateMetadata({
@@ -164,6 +176,13 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
         ? await faultCodeOptions(tx, job.serviceSlug)
         : { symptom: [], cause: [], remedy: [] };
 
+      // JOB-15. Loaded for every job, not only completable ones: a signed-off
+      // job's card is the record of what was done, and hiding it behind a
+      // status check would make it invisible exactly where somebody is reading
+      // back what happened.
+      const card = await getJobCard(tx, id);
+      const exemptionReasons = await listPhotoExemptionReasons(tx);
+
       const quotes = await listQuotes(tx, { jobId: id });
       const invoices = await listInvoices(tx, { jobId: id });
 
@@ -190,6 +209,8 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
         outcome,
         outcomeCodes,
         faults,
+        card,
+        exemptionReasons,
         windowStart,
         windowEnd,
       };
@@ -211,6 +232,8 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
     outcome,
     outcomeCodes,
     faults,
+    card,
+    exemptionReasons,
     windowStart,
     windowEnd,
   } = data;
@@ -218,6 +241,55 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
   const remaining = job.resolveByAt ? minutesUntil(job.resolveByAt, now) : null;
   const canUpdate = can(session.principal, "jobs:update");
   const canAssign = can(session.principal, "jobs:assign");
+
+  // Formatted on the server. `formatMoney` and `formatDuration` live in
+  // `@meridian/core`, and the panel is a client component — shaping the values
+  // here keeps the money helpers out of the browser bundle and, more to the
+  // point, keeps one implementation of "what does 90 minutes look like".
+  const jobCardView: JobCardView = {
+    jobId: job.id,
+    photos: card.photos.map((p) => ({
+      id: p.id,
+      kind: p.kind,
+      caption: p.caption,
+      capturedAt: p.capturedAt ? dubaiStamp(p.capturedAt) : null,
+    })),
+    afterPhotoCount: card.afterPhotoCount,
+    exemption: card.photoExemption
+      ? { label: card.photoExemption.reasonLabel, note: card.photoExemption.note }
+      : null,
+    materials: card.materials.map((m) => ({
+      id: m.id,
+      sku: m.sku,
+      description: m.description,
+      quantity: m.quantity,
+      unit: m.unit,
+      cost: m.unitCostMinor === null ? null : formatMoney(m.unitCostMinor, m.currency),
+      isBillable: m.isBillable,
+    })),
+    materialsNone: card.materialsNone ? { note: card.materialsNone.note } : null,
+    labour: card.labour.map((l) => ({
+      visitId: l.visitId,
+      sequence: l.sequence,
+      technicianName: l.technicianName,
+      worked: l.workMinutes === null ? null : formatDuration(l.workMinutes),
+      travel: l.travelMinutes === null ? null : formatDuration(l.travelMinutes),
+    })),
+    labourTotal: card.labourMinutes === null ? null : formatDuration(card.labourMinutes),
+    signature: card.signature
+      ? {
+          signedByName: card.signature.signedByName,
+          signedByRole: card.signature.signedByRole,
+          signedAt: dubaiStamp(card.signature.signedAt),
+        }
+      : null,
+    gaps: [...card.gaps],
+    reasons: exemptionReasons.map((r) => ({
+      code: r.code,
+      label: r.label,
+      description: r.description,
+    })),
+  };
 
   return (
     <AppShell session={session} active="jobs">
@@ -327,6 +399,19 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
                 ))}
               </ul>
             )}
+
+            {/*
+              ── The job card (JOB-15) ─────────────────────────────────────
+
+              In the main column rather than the sidebar, and above the
+              timeline, because it is the record of the work rather than a
+              control beside it — and because the four things it collects are
+              what the completion gate in `assertJobCardComplete` refuses
+              without. `canUpdate` gates the panel: a reader sees the card
+              through the same component, with the forms it renders refused by
+              the server rather than merely hidden.
+            */}
+            {canUpdate ? <JobCardPanel card={jobCardView} /> : null}
 
             {/* ── Timeline ──────────────────────────────────────────────── */}
             <h2 className="mt-10 text-lg font-semibold tracking-tight">Timeline</h2>
@@ -473,6 +558,7 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
                 }
                 recordedFaults={outcome.faultCodes.map((f) => ({ kind: f.kind, label: f.label }))}
                 isComplete={job.status === "work_complete"}
+                jobCardGaps={[...card.gaps]}
               />
             ) : null}
 

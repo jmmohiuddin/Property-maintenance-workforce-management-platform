@@ -39,7 +39,7 @@
  * to that is to stop trusting the suite.
  */
 
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, like, lt, sql } from "drizzle-orm";
 import {
   withTenant,
   schema,
@@ -74,9 +74,46 @@ function dubai(iso: string): Date {
 
 const MINUTE = 60_000;
 
+/**
+ * Reap the technician a killed run of this file left behind.
+ *
+ * This suite's own technician (`__TEST scheduler ${RUN}`, below) is deleted by
+ * ID at the end of a clean run, but a run that dies first — a failed assertion
+ * that threw, a killed process — never reaches that block, and the row is
+ * orphaned for good: it sorts ahead of the seeded roster and gets picked up by
+ * anything that reads the `technicians` table positionally, most notably
+ * `workforce.test.ts`.
+ *
+ * Age-gated to an hour, far longer than this suite takes, so it cannot reach a
+ * concurrent run's live fixture — same shape as `sweepStale()` in
+ * `recruitment.test.ts`. `job_visits.technician_id` is `ON DELETE RESTRICT`, so
+ * a leaked technician's visits have to go first; the parent jobs are left for
+ * `jobs`' own housekeeping rather than swept here, to keep this narrowly about
+ * the table that breaks other suites.
+ */
+async function sweepStale(ctx: { tenantId: string }): Promise<void> {
+  await withTenant(ctx, async (tx) => {
+    const stale = await tx
+      .select({ id: schema.technicians.id })
+      .from(schema.technicians)
+      .where(
+        and(
+          like(schema.technicians.fullName, "__TEST scheduler %"),
+          lt(schema.technicians.createdAt, new Date(Date.now() - 60 * 60 * 1000)),
+        ),
+      );
+    if (stale.length === 0) return;
+    const staleIds = stale.map((t) => t.id);
+    await tx.delete(schema.jobVisits).where(inArray(schema.jobVisits.technicianId, staleIds));
+    await tx.delete(schema.technicians).where(inArray(schema.technicians.id, staleIds));
+  });
+}
+
 async function main(): Promise<void> {
   const tenantId = await testTenantId();
   const ctx = { tenantId };
+
+  await sweepStale(ctx);
 
   const createdJobs: string[] = [];
   const createdVisits: string[] = [];

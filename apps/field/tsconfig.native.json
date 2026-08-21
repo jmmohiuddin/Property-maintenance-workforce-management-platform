@@ -1,0 +1,15 @@
+{
+  // The React Native half. Requires `npm install` in this workspace first;
+  // see the comment in tsconfig.json for why it is not the default project.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node", "react"],
+    "jsx": "react-jsx",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    // Decorators: WatermelonDB models are declared with @field / @date / @text.
+    "experimentalDecorators": true
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "index.js"],
+  "exclude": ["node_modules"]
+}

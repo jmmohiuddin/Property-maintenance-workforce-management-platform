@@ -2,14 +2,14 @@
 #
 # `CI-1` / `CI-2`. Both the PRD and the TRD name this as the highest-leverage
 # item in the whole backlog, and the reason is arithmetic: the repository
-# already contains 32 test suites, a 13-check adversarial row-level-security
+# already contains 32 test suites, a 14-check adversarial row-level-security
 # harness, a 72-pair WCAG contrast gate and typechecking across seven
 # workspaces — apps/web included, which is easy to assume is skipped and is not.
 # None of it ran automatically. Every regression risk in the system was
 # human-shaped — it depended on somebody remembering.
 #
 # The RLS harness is the one that matters most. `verify-rls.sql` proves the
-# tenant boundary holds by trying to cross it thirteen different ways. A schema
+# tenant boundary holds by trying to cross it fourteen different ways. A schema
 # change that quietly drops a policy produces no error, no failing feature and
 # no visible symptom; it produces one tenant able to read another's data. This
 # workflow is what turns that from a thing somebody might check into a thing
@@ -98,6 +98,39 @@ jobs:
 
       - name: Install
         run: npm ci
+
+      # ── 0. The backtick trap ─────────────────────────────────────────────
+      # Runs BEFORE typecheck, because when it fires, typecheck's message is
+      # actively misleading.
+      #
+      # A backtick inside a SQL comment terminates the enclosing tagged
+      # template literal. TypeScript then reports something like "TS1005: ','
+      # expected" tens of lines further down, at a character that is not the
+      # problem, and the whole workspace stops compiling -- so every test and
+      # every consumer fails, not just the file that has the typo.
+      #
+      # This is documented in the README and it has still cost three separate
+      # blockages in one evening, in three different files, written by three
+      # different people. One of the offending comments was itself explaining a
+      # template-literal gotcha. Prose is not enough; this is the check.
+      - name: No backticks in SQL comments
+        run: |
+          # TypeScript sources only. A backtick in a plain .sql file is read by
+          # psql, not by a TypeScript parser, so it is harmless prose -- and
+          # verify-rls.sql alone has seven. A guard that fails on files which are
+          # fine is a guard people learn to ignore.
+          #
+          # The pattern anchors to a SQL comment at the START of a line, which is
+          # how they appear inside a sql template. Matching `--` anywhere flags a
+          # JSDoc mentioning a CSS custom property and an email signature
+          # separator, both harmless -- checked, both exist in this repo.
+          if grep -rnE --include='*.ts' --include='*.tsx' '^[[:space:]]*--.*`' packages/*/src/ apps/web/src/; then
+            echo
+            echo "A backtick inside a SQL comment terminates the tagged template literal."
+            echo "Write identifiers in SQL comments as bare prose."
+            exit 1
+          fi
+          echo "No backticks found in SQL comments."
 
       # ── 1. Typecheck ─────────────────────────────────────────────────────
       # First, because it is the fastest way to fail and it fails on the widest

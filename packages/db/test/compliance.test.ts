@@ -30,6 +30,7 @@
  */
 
 import { sql } from "drizzle-orm";
+import { today, addDays } from "@meridian/core";
 import { withTenant, closeConnection, db } from "../src/index";
 import { testTenantId } from "./_tenant";
 import {
@@ -37,6 +38,7 @@ import {
   blockForTechnician,
   findExpiringEmployeeDocuments,
   findExpiringAccreditations,
+  findExpiringCertifications,
   workforceSummary,
   assignTechnician,
   findCandidates,
@@ -53,6 +55,16 @@ function checkTrue(label: string, got: boolean): void {
 }
 
 const TAG = "COMPLIANCE-TEST";
+
+// Dubai's day, computed once in JS — the same day `findExpiringAccreditations`
+// and `findExpiringCertifications` now take as `now` instead of falling back to
+// Postgres `current_date`, which is the session's timezone and not necessarily
+// Dubai's. Fixtures below are seeded relative to NOW and assertions read
+// NOW-relative expectations, so this test would catch either function quietly
+// reverting to `current_date`: on a session whose timezone disagrees with
+// Dubai for even a couple of hours a day, `current_date` and NOW diverge by a
+// day and every days-remaining assertion below would be off by one.
+const NOW = today();
 
 async function main(): Promise<void> {
   // Resolved by slug, not by taking whichever tenant sorts first. See
@@ -88,7 +100,7 @@ async function main(): Promise<void> {
 
     // Whatever is already there is the baseline. The fixtures below are
     // measured against it.
-    const before = await blockedTechnicians(tx);
+    const before = await blockedTechnicians(tx, NOW);
     const blockedBefore = new Set(before.map((b) => b.technicianId));
     const summaryBefore = await workforceSummary(tx);
 
@@ -121,10 +133,10 @@ async function main(): Promise<void> {
 
     await tx.execute(sql`
       insert into employee_documents (tenant_id, employee_id, kind, expires_at, blocking, note)
-      values (${tenantId}::uuid, ${employee.id}::uuid, 'work_permit', current_date - 1, true, ${TAG})
+      values (${tenantId}::uuid, ${employee.id}::uuid, 'work_permit', ${addDays(NOW, -1)}::date, true, ${TAG})
     `);
 
-    const blocked = await blockedTechnicians(tx);
+    const blocked = await blockedTechnicians(tx, NOW);
     check("exactly one more technician is blocked", blocked.length, before.length + 1);
 
     const ours = blocked.find((b) => b.technicianId === doomed.id);
@@ -203,7 +215,11 @@ async function main(): Promise<void> {
     // ── Expiry sweeps ──────────────────────────────────────────────────────
     console.log("\n— expiry reporting (HR-5, HR-14) —");
 
-    const expiring = await findExpiringEmployeeDocuments(tx, 90);
+    // `now` is passed explicitly, matching `NOW` above — the whole point of
+    // the fix. Passing nothing would exercise the `today()` default and could
+    // still happen to pass; passing NOW explicitly is what proves this query
+    // reads the argument at all rather than reaching for `current_date`.
+    const expiring = await findExpiringEmployeeDocuments(tx, 90, NOW);
     checkTrue(
       "an already-expired document is reported",
       expiring.some((d) => d.employeeId === employee.id && d.daysRemaining < 0),
@@ -212,16 +228,65 @@ async function main(): Promise<void> {
       "and is marked blocking",
       expiring.find((d) => d.employeeId === employee.id)?.blocking === true,
     );
+    check(
+      "expired yesterday reads as -1, computed from NOW and not from whatever day the session thinks it is",
+      expiring.find((d) => d.employeeId === employee.id)?.daysRemaining,
+      -1,
+    );
 
+    // Both sides of the 90-day window, the way HR-19's sweep proves its own
+    // boundary: one accreditation exactly at the edge (included, `<=`) and one
+    // one day past it (excluded).
     await tx.execute(sql`
       insert into company_accreditations (tenant_id, kind, name, reference_no, expires_at)
-      values (${tenantId}::uuid, 'trade_licence', ${`${TAG} licence`}, '930137', current_date + 30)
+      values
+        (${tenantId}::uuid, 'trade_licence', ${`${TAG} licence in window`}, '930137', ${addDays(NOW, 30)}::date),
+        (${tenantId}::uuid, 'trade_licence', ${`${TAG} licence at boundary`}, '930138', ${addDays(NOW, 90)}::date),
+        (${tenantId}::uuid, 'trade_licence', ${`${TAG} licence past boundary`}, '930139', ${addDays(NOW, 91)}::date)
     `);
 
-    const accreditations = await findExpiringAccreditations(tx, 90);
-    const licence = accreditations.find((a) => a.name.startsWith(TAG));
+    const accreditations = await findExpiringAccreditations(tx, 90, NOW);
+    const licence = accreditations.find((a) => a.name === `${TAG} licence in window`);
     checkTrue("an accreditation inside the window is reported", licence !== undefined);
     check("with the right days remaining", licence?.daysRemaining, 30);
+    checkTrue(
+      "exactly 90 days out is INSIDE the window — the comparison is <=, not <",
+      accreditations.some((a) => a.name === `${TAG} licence at boundary` && a.daysRemaining === 90),
+    );
+    checkTrue(
+      "and 91 days out is outside it",
+      !accreditations.some((a) => a.name === `${TAG} licence past boundary`),
+    );
+
+    // ── HR-3 / HR-9: technician certifications, the other half of the same
+    //    off-by-one — `findExpiringCertifications` had no test at all before
+    //    this. It shares the bug's root cause (`current_date` instead of
+    //    Dubai's day) and the same fix.
+    console.log("\n— expiry reporting (HR-3, feeding HR-9) —");
+
+    await tx.execute(sql`
+      insert into technician_certifications (tenant_id, technician_id, name, expires_on)
+      values
+        (${tenantId}::uuid, ${clean.id}::uuid, ${`${TAG} cert expired`}, (${addDays(NOW, -3)}::date)::timestamptz),
+        (${tenantId}::uuid, ${clean.id}::uuid, ${`${TAG} cert at boundary`}, (${addDays(NOW, 90)}::date)::timestamptz),
+        (${tenantId}::uuid, ${clean.id}::uuid, ${`${TAG} cert past boundary`}, (${addDays(NOW, 91)}::date)::timestamptz)
+    `);
+
+    const certifications = await findExpiringCertifications(tx, 90, NOW);
+    const mineCerts = certifications.filter((c) => c.certification.startsWith(TAG));
+    check("two of the three fixture certifications are inside 90 days", mineCerts.length, 2);
+    checkTrue(
+      "the already-expired one is reported with a negative countdown, from NOW",
+      mineCerts.some((c) => c.certification === `${TAG} cert expired` && c.daysRemaining === -3),
+    );
+    checkTrue(
+      "exactly 90 days out is INSIDE the window",
+      mineCerts.some((c) => c.certification === `${TAG} cert at boundary` && c.daysRemaining === 90),
+    );
+    checkTrue(
+      "and 91 days out is outside it",
+      !mineCerts.some((c) => c.certification === `${TAG} cert past boundary`),
+    );
 
     // ── A non-blocking document must NOT block ─────────────────────────────
     // The block/warn split is the whole design. Over-blocking gets the control
@@ -230,10 +295,10 @@ async function main(): Promise<void> {
 
     await tx.execute(sql`
       insert into employee_documents (tenant_id, employee_id, kind, expires_at, blocking, note)
-      values (${tenantId}::uuid, ${employee.id}::uuid, 'driving_licence', current_date - 30, false, ${TAG})
+      values (${tenantId}::uuid, ${employee.id}::uuid, 'driving_licence', ${addDays(NOW, -30)}::date, false, ${TAG})
     `);
 
-    const stillOne = await blockedTechnicians(tx);
+    const stillOne = await blockedTechnicians(tx, NOW);
     check("an expired driving licence adds no new block", stillOne.length, before.length + 1);
 
     // ── Two lapsed documents must not become two blocked people ───────────
@@ -247,10 +312,10 @@ async function main(): Promise<void> {
 
     await tx.execute(sql`
       insert into employee_documents (tenant_id, employee_id, kind, expires_at, blocking, note)
-      values (${tenantId}::uuid, ${employee.id}::uuid, 'residence_visa', current_date - 40, true, ${TAG})
+      values (${tenantId}::uuid, ${employee.id}::uuid, 'residence_visa', ${addDays(NOW, -40)}::date, true, ${TAG})
     `);
 
-    const twice = await blockedTechnicians(tx);
+    const twice = await blockedTechnicians(tx, NOW);
     check("still exactly one more blocked than the baseline", twice.length, before.length + 1);
 
     const entry = twice.find((b) => b.technicianId === doomed.id);
@@ -273,8 +338,9 @@ async function main(): Promise<void> {
     await tx.execute(sql`delete from employee_documents where note = ${TAG}`);
     await tx.execute(sql`delete from employees where employee_no = ${`${TAG}-1`}`);
     await tx.execute(sql`delete from company_accreditations where name like ${`${TAG}%`}`);
+    await tx.execute(sql`delete from technician_certifications where name like ${`${TAG}%`}`);
 
-    const after = await blockedTechnicians(tx);
+    const after = await blockedTechnicians(tx, NOW);
     check("cleanup restores the baseline exactly", after.length, before.length);
     checkTrue(
       "and our fixture is gone from it",

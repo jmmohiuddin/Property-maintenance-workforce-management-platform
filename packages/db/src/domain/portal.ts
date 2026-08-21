@@ -1,4 +1,4 @@
-import { and, eq, isNull, asc, desc, sql, inArray } from "drizzle-orm";
+import { and, eq, isNull, ne, asc, desc, sql, inArray } from "drizzle-orm";
 import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
 import { loadWorkingCalendar } from "./reference";
@@ -13,6 +13,7 @@ import {
   type JobStatus,
 } from "@meridian/core";
 import { nextJobReference } from "./jobs";
+import { linkJobToAsset } from "./assets";
 import { rowDate, requiredRowDate } from "./_rows";
 // Type-only, so this stays a compile-time reference and adds no import cycle:
 // the invoice status vocabulary belongs to commerce and is not restated here.
@@ -54,6 +55,28 @@ export async function listCustomerProperties(
  * Portal-raised jobs start at `submitted`, not `triaged`: a customer describes
  * a symptom, and deciding the trade, the priority and the duration is the
  * operator's judgement. Skipping triage would let a customer set their own SLA.
+ *
+ * ── WHY THIS IS THE INTAKE PATH THAT ASKS WHICH ASSET (`CON-13`) ────────────
+ *
+ * Three code paths create a job and only this one can usefully offer a picker.
+ * Lead conversion builds the property in the same transaction as the job, so
+ * there is no registered plant to choose from — the dropdown would be empty on
+ * every single conversion. Contract PPM knows the property, but a contract
+ * prices entitlements by service and carries no asset, so there is nothing for
+ * it to pass through.
+ *
+ * That leaves the customer describing a fault at a building they already have,
+ * which is also the person most likely to be looking at the machine. What they
+ * are shown is the asset's NAME and where it is, never its tag: an internal
+ * code is not something to make a customer guess between, and a wrong guess
+ * here writes a visit into the wrong plant's history.
+ *
+ * The link goes through `linkJobToAsset` rather than an `asset_id` on the
+ * insert. That function owns the rule that an asset and a job must be at the
+ * same property, and it owns the recomputation of the PPM dates; calling it
+ * inside this transaction means a request naming an asset at somebody else's
+ * building rolls the whole thing back rather than creating a job with a bad
+ * link on it.
  */
 export async function createPortalRequest(
   tx: TenantScopedTx,
@@ -65,8 +88,10 @@ export async function createPortalRequest(
     description?: string | undefined;
     /** What the customer says. Operations may revise it at triage. */
     requestedPriority: JobPriority;
+    /** `CON-13`. The plant the customer says this is about, when they know. */
+    assetId?: string | undefined;
   },
-): Promise<{ jobId: string; reference: string }> {
+): Promise<{ jobId: string; reference: string; assetName: string | null }> {
   const properties = await tx
     .select({ id: schema.properties.id })
     .from(schema.properties)
@@ -110,17 +135,29 @@ export async function createPortalRequest(
 
   if (!job) throw new Error("Could not raise the request");
 
+  // CON-13, before the timeline entry so the note can name what was attached.
+  // Refusals here abort the whole request rather than leaving a job that claims
+  // an asset it is not at.
+  const linked = input.assetId
+    ? await linkJobToAsset(tx, ctx, { assetId: input.assetId, jobId: job.id })
+    : null;
+
   await tx.insert(schema.jobEvents).values({
     tenantId: ctx.tenantId,
     jobId: job.id,
     fromStatus: null,
     toStatus: "submitted",
-    note: "Raised by the customer in the portal",
+    // Whose word it is, on the job's own timeline. The customer identified the
+    // plant; the dispatcher triaging this is entitled to know that a person
+    // standing in the building chose it rather than the office.
+    note: linked
+      ? `Raised by the customer in the portal · equipment identified as ${linked.assetName}`
+      : "Raised by the customer in the portal",
     actorId: ctx.userId ?? null,
     actorKind: "customer",
   });
 
-  return { jobId: job.id, reference };
+  return { jobId: job.id, reference, assetName: linked?.assetName ?? null };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -238,8 +275,17 @@ export async function listPortalRequests(
            v.scheduled_end   as visit_end,
            v.technician_name,
            o.label as outcome,
+           -- Excluding soft-deleted rows is not tidiness. A soft-deleted
+           -- attachment is one somebody removed on purpose, and counting it
+           -- promises the customer a photograph the detail screen will not
+           -- show them.
+           --
+           -- No backticks in here, ever. This comment is inside a tagged
+           -- template literal, so one backtick terminates it and the error
+           -- surfaces as a syntax failure dozens of lines further down.
            (select count(*) from job_attachments a
              where a.job_id = j.id
+               and a.deleted_at is null
                and a.kind in ('photo_before', 'photo_after')) as photo_count
       from jobs j
       join properties p on p.id = j.property_id
@@ -325,14 +371,52 @@ export interface PortalRequestDetail {
   readonly workCarriedOut: readonly string[];
   readonly recommendations: readonly string[];
   readonly materials: readonly { readonly description: string; readonly quantity: string; readonly unit: string }[];
+  /**
+   * `JOB-15`'s declared absences (`POR-9`).
+   *
+   * Non-null when somebody asserted that no parts were used, which is a
+   * different fact from an empty `materials` list — that is the whole reason
+   * `job_card_declarations` exists. Read the rule at the query below for when
+   * the screen is entitled to say it.
+   */
+  readonly materialsNone: { readonly declaredAt: Date } | null;
+  /**
+   * Why there is no photograph, in the administrator's words rather than a
+   * machine code. Empty when none was declared.
+   *
+   * A list because the declaration is per visit: a three-visit job where two
+   * visits had nothing to photograph carries two, and they may cite different
+   * reasons. Collapsing them to one would mean picking a reason that was true
+   * of one visit and asserting it of the job.
+   */
+  readonly photoExemptions: readonly {
+    readonly reasonLabel: string;
+    readonly declaredAt: Date;
+  }[];
+  /**
+   * `POR-9`'s before-and-after evidence. Row ids, never storage keys — see the
+   * note on `getPortalJobPhoto` for why that distinction is the whole feature.
+   */
   readonly photos: readonly {
     readonly id: string;
-    readonly kind: string;
+    readonly kind: PortalPhotoKind;
     readonly caption: string | null;
     readonly capturedAt: Date | null;
+    /**
+     * What the uploader said it was, so the screen can decide between an
+     * `<img>` and a download link without fetching the bytes. Nullable, and
+     * advisory: the route serves the type sniffed from the stored bytes and
+     * disregards this column if the two disagree.
+     */
+    readonly mimeType: string | null;
   }[];
+  /**
+   * `POR-9`'s signed job sheet, as a STATEMENT and not as an image. The
+   * signature graphic is deliberately absent — see the comment below.
+   */
   readonly signoff: {
     readonly signedByName: string;
+    readonly signedByRole: string | null;
     readonly signedAt: Date;
     readonly satisfactionRating: number | null;
   } | null;
@@ -341,7 +425,7 @@ export interface PortalRequestDetail {
 /**
  * One request, with everything the customer is entitled to see (`POR-3`).
  *
- * ── THREE DELIBERATE OMISSIONS ─────────────────────────────────────────────
+ * ── FIVE DELIBERATE OMISSIONS ──────────────────────────────────────────────
  *
  * 1. **Event notes.** `job_events.note` is staff free text — "customer was
  *    abusive on the phone", "third callout this month, check the warranty",
@@ -360,6 +444,14 @@ export interface PortalRequestDetail {
  * 3. **Costs on materials.** `job_materials` carries `unit_cost` — what the
  *    part cost the business. `POR-3` asks for what was used, and the price is
  *    on the invoice.
+ *
+ * 4. **Storage keys, of anything.** `POR-9` puts photographs on this screen and
+ *    the browser is given attachment row ids, never object keys. The keys are
+ *    resolved server-side by `getPortalJobPhoto`; see the argument there.
+ *
+ * 5. **The signature image.** The sign-off is projected as a statement — who
+ *    signed, in what capacity, when — and `signature_storage_key` is not
+ *    selected at all. `PORTAL_SIGNATURE_POLICY` sets out why.
  */
 export async function getPortalRequestDetail(
   tx: TenantScopedTx,
@@ -451,7 +543,11 @@ export async function getPortalRequestDetail(
       unit: schema.jobMaterials.unit,
     })
     .from(schema.jobMaterials)
-    .where(eq(schema.jobMaterials.jobId, jobId));
+    // A withdrawn line — the wrong part, the wrong job, a duplicate — is
+    // soft-deleted rather than removed, because costing has to be able to see
+    // that it was once claimed. The customer does not: telling them a part was
+    // fitted when the record says it was not is how a warranty argument starts.
+    .where(and(eq(schema.jobMaterials.jobId, jobId), isNull(schema.jobMaterials.deletedAt)));
 
   const photos = await tx
     .select({
@@ -459,27 +555,59 @@ export async function getPortalRequestDetail(
       kind: schema.jobAttachments.kind,
       caption: schema.jobAttachments.caption,
       capturedAt: schema.jobAttachments.capturedAt,
+      mimeType: schema.jobAttachments.mimeType,
     })
     .from(schema.jobAttachments)
-    .where(
+    .where(and(eq(schema.jobAttachments.jobId, jobId), portalPhotoPredicate))
+    .orderBy(asc(schema.jobAttachments.createdAt));
+
+  // ── JOB-15's declared absences (POR-9) ──────────────────────────────────
+  //
+  // An empty `job_materials` cannot tell "no parts were fitted" apart from
+  // "nobody filled the section in", and those two have opposite meanings in a
+  // warranty argument. `JOB-15` records the first as a fact somebody asserted;
+  // without this read the portal inherits exactly the ambiguity that table was
+  // built to remove, and can only render an empty section — which a customer
+  // reads as "nothing happened".
+  //
+  // No `deleted_at` filter, and that is not an omission. This table has no soft
+  // delete and the schema says it must not gain one: a withdrawn declaration is
+  // deleted outright, because a soft-deleted one would go on satisfying every
+  // gate that forgot to filter. If a `deleted_at` column ever appears here, this
+  // query needs revisiting and so does `assertJobCardComplete`.
+  //
+  // The reason LABEL is joined; `reason_code` and `note` are deliberately not
+  // selected. The code is an internal machine key, and the note is technician
+  // free text on an internal form — the same field, and the same argument, as
+  // `job_events.note` in the omissions above.
+  const declarations = await tx
+    .select({
+      kind: schema.jobCardDeclarations.kind,
+      declaredAt: schema.jobCardDeclarations.createdAt,
+      reasonLabel: schema.jobPhotoExemptionReasons.label,
+    })
+    .from(schema.jobCardDeclarations)
+    .leftJoin(
+      schema.jobPhotoExemptionReasons,
       and(
-        eq(schema.jobAttachments.jobId, jobId),
-        // Photographs only. `document` and `signature` attachments are neither
-        // evidence of the work nor safe to hand over blind — a signature image
-        // is a reusable credential.
-        inArray(schema.jobAttachments.kind, ["photo_before", "photo_after"]),
+        eq(schema.jobPhotoExemptionReasons.tenantId, schema.jobCardDeclarations.tenantId),
+        eq(schema.jobPhotoExemptionReasons.code, schema.jobCardDeclarations.reasonCode),
       ),
     )
-    .orderBy(asc(schema.jobAttachments.createdAt));
+    .where(eq(schema.jobCardDeclarations.jobId, jobId))
+    .orderBy(asc(schema.jobCardDeclarations.createdAt));
 
   const signoffs = await tx
     .select({
       signedByName: schema.jobSignoffs.signedByName,
+      signedByRole: schema.jobSignoffs.signedByRole,
       signedAt: schema.jobSignoffs.signedAt,
       satisfactionRating: schema.jobSignoffs.satisfactionRating,
+      // `signature_storage_key` is NOT selected, and that is the decision this
+      // projection exists to record. See `PORTAL_SIGNATURE_POLICY` below.
     })
     .from(schema.jobSignoffs)
-    .where(eq(schema.jobSignoffs.jobId, jobId))
+    .where(and(eq(schema.jobSignoffs.jobId, jobId), isNull(schema.jobSignoffs.deletedAt)))
     .orderBy(desc(schema.jobSignoffs.signedAt))
     .limit(1);
 
@@ -505,8 +633,203 @@ export async function getPortalRequestDetail(
       .map((r) => r.recommendation)
       .filter((t): t is string => Boolean(t && t.trim())),
     materials,
-    photos,
+    // ── WHEN A DECLARED ABSENCE IS SHOWN, AND WHEN IT IS SUPPRESSED ────────
+    //
+    // Only when the thing it declares absent is genuinely absent. The
+    // declaration is per VISIT and this screen is per JOB, so a three-visit job
+    // where the first visit fitted a capacitor and the second used nothing
+    // carries a `materials_none` row AND a material line. Showing both would
+    // put "no parts were used on this job" directly above a list of the parts
+    // used on it.
+    //
+    // The rule is therefore: list what was used if anything was; otherwise, if
+    // somebody declared that nothing was, say so. Silence is the third state
+    // and it stays silent — that is the honest rendering of "nobody filled this
+    // in", and the screen says which of the three it is rather than showing an
+    // empty section that reads as "nothing happened".
+    materialsNone:
+      materials.length === 0
+        ? (() => {
+            const row = declarations.find((d) => d.kind === "materials_none");
+            return row ? { declaredAt: row.declaredAt } : null;
+          })()
+        : null,
+    // The same rule, and the same reason: an exemption explains why a
+    // photograph is missing, so it has nothing to explain once one exists.
+    photoExemptions:
+      photos.length === 0
+        ? declarations
+            .filter((d) => d.kind === "photo_exempt")
+            .map((d) => ({
+              // The code's own vocabulary row is referenced with ON DELETE
+              // restrict, so a missing label means somebody deleted a reason
+              // out from under a completed job. A blank line would be worse
+              // than a plain sentence, and the customer cannot act on a code.
+              reasonLabel: d.reasonLabel ?? "No photograph was possible on this visit",
+              declaredAt: d.declaredAt,
+            }))
+        : [],
+    photos: photos.map((p) => ({ ...p, kind: p.kind as PortalPhotoKind })),
     signoff: signoffs[0] ?? null,
+  };
+}
+
+// ── POR-9. Job evidence, and the two rules it turns on ──────────────────────
+
+/**
+ * The only two attachment kinds a customer is shown.
+ *
+ * `job_attachments.kind` accepts six (`JOB_ATTACHMENT_KINDS` in `jobcard.ts`)
+ * and the other four are each excluded for their own reason, which is why this
+ * is an allowlist and not a "not signature" filter:
+ *
+ *   * `signature` is a reusable credential. A signature image lifted out of a
+ *     portal page can be pasted onto a document the person never signed, and
+ *     the schema has said so about `job_signoffs` since `0000`.
+ *   * `document` is whatever a technician attached — a supplier's delivery
+ *     note, a manufacturer's report, a photograph of a colleague's paperwork.
+ *     Nothing constrains it to this customer's business.
+ *   * `photo_recommendation` is `FLD-12`: a technician noticing a failing part
+ *     on an unrelated visit. It is a sales observation about work not yet
+ *     agreed, not evidence of the work this customer is reading about, and
+ *     publishing it would quote them on a job nobody has priced.
+ *   * `video` has no writer yet. The day something captures one, adding it here
+ *     is a decision somebody makes on purpose rather than a default they
+ *     inherit by having written the filter the other way round.
+ *
+ * That `photo_recommendation` arrived after this comment was written and was
+ * excluded without anybody editing this file is the allowlist working: a new
+ * kind is closed to the portal until somebody opens it deliberately.
+ */
+export const PORTAL_PHOTO_KINDS = ["photo_before", "photo_after"] as const;
+export type PortalPhotoKind = (typeof PORTAL_PHOTO_KINDS)[number];
+
+/**
+ * Live, customer-facing photographs. One predicate, used by the list read and
+ * by the file route, so the two cannot drift into disagreeing about which rows
+ * exist — a screen that offers a thumbnail the route then 404s is a bug report.
+ *
+ * `deleted_at is null` is the half that was missing and matters most. An
+ * attachment is soft-deleted when somebody removed it deliberately: the wrong
+ * property, the wrong job, a face in the frame, the neighbouring flat's meter.
+ * The row survives so the audit trail survives the mistake. Publishing it to
+ * the customer would hand over precisely what the deletion was for.
+ */
+const portalPhotoPredicate = and(
+  isNull(schema.jobAttachments.deletedAt),
+  inArray(schema.jobAttachments.kind, [...PORTAL_PHOTO_KINDS]),
+);
+
+/**
+ * WHAT THE CUSTOMER IS TOLD ABOUT THE SIGNATURE, AND WHY IT IS NOT THE IMAGE.
+ *
+ * `POR-9` asks for "signed job sheet". Two readings were available and this
+ * code takes the narrow one: the customer is told **that** the sheet was
+ * signed, **by whom**, in **what capacity** and **when**, and the signature
+ * graphic itself is never served.
+ *
+ * The reason is not squeamishness about images, it is what a signature is. The
+ * `job_signoffs` schema comment — "kept separate because it carries legal
+ * weight" — is the whole argument. A signature is the one artefact on a job
+ * whose value depends on it being hard to obtain a copy of. Publish it behind a
+ * session cookie and it is one screenshot from being pasted onto a completion
+ * certificate for work that never happened, or onto next month's variation
+ * order; and the person best placed to do that is the customer who is about to
+ * dispute the job. Serving it to them removes the only thing that made it
+ * evidence.
+ *
+ * The deflection value is in the statement, not the pixels. "Ahmed Rahman,
+ * Building Manager, signed for this on 14 August at 16:22" answers "did anyone
+ * sign off" completely. Nobody looks at their own signature to check that they
+ * signed.
+ *
+ * So: the image stays in object storage, reachable by staff and producible on
+ * request through a person, and `getPortalRequestDetail` does not select
+ * `signature_storage_key` at all. There is deliberately no portal route that
+ * serves one — the absence is the control, and `portal.test.ts` asserts the key
+ * never reaches the projection.
+ */
+export const PORTAL_SIGNATURE_POLICY =
+  "statement-not-image: the portal states who signed and when, never the signature graphic";
+
+export interface PortalJobPhotoRef {
+  readonly id: string;
+  readonly kind: PortalPhotoKind;
+  /** Never leaves the server. The route reads bytes with it and discards it. */
+  readonly storageKey: string;
+  readonly caption: string | null;
+  /** For the download filename, so a saved photo says which job it came from. */
+  readonly jobReference: string;
+}
+
+/**
+ * Resolve one photograph's storage key for the file route (`POR-9`).
+ *
+ * ── THIS IS THE SECURITY SURFACE, AND IT IS THE SAME ONE AS THE INVOICE PDF ─
+ *
+ * `getPortalInvoiceRef` above exists so that the invoice download route never
+ * takes a storage key from the URL. This is that function for photographs, and
+ * every clause below is doing the same job:
+ *
+ *   * The key is resolved **from the row**, inside the customer-scoped
+ *     transaction. The caller supplies two ids and receives bytes; it never
+ *     names an object. There is no key to guess, enumerate or replay, and no
+ *     `WHERE customer_id = ?` in this file for anyone to forget — the
+ *     RESTRICTIVE policy on `job_attachments` scopes through the parent job, so
+ *     another customer's photograph is absent rather than refused.
+ *
+ *   * **Both** ids are required to match. The policy alone would already make
+ *     another customer's photograph invisible, so `job_id` is not what enforces
+ *     the boundary — it enforces that the URL means what it says. Without it a
+ *     photo id from one of your own jobs serves happily under a different job's
+ *     path, and the page is then capable of showing a photograph of one
+ *     building under the heading of another. That is not a leak; it is worse in
+ *     one specific way — it is wrong evidence, presented as evidence.
+ *
+ *   * The parent job is joined and must be visible on its own terms: not
+ *     soft-deleted, not `draft`. `getPortalRequestDetail` refuses both, and a
+ *     photograph reachable from a request that is not is a link somebody can
+ *     still type.
+ *
+ * Null for "not yours", "not there", "deleted" and "not a photograph" alike.
+ * The route turns all four into 404, so the response cannot be read as an
+ * existence oracle for somebody else's job.
+ */
+export async function getPortalJobPhoto(
+  tx: TenantScopedTx,
+  jobId: string,
+  photoId: string,
+): Promise<PortalJobPhotoRef | null> {
+  const rows = await tx
+    .select({
+      id: schema.jobAttachments.id,
+      kind: schema.jobAttachments.kind,
+      storageKey: schema.jobAttachments.storageKey,
+      caption: schema.jobAttachments.caption,
+      jobReference: schema.jobs.reference,
+    })
+    .from(schema.jobAttachments)
+    .innerJoin(schema.jobs, eq(schema.jobs.id, schema.jobAttachments.jobId))
+    .where(
+      and(
+        eq(schema.jobAttachments.id, photoId),
+        eq(schema.jobAttachments.jobId, jobId),
+        portalPhotoPredicate,
+        isNull(schema.jobs.deletedAt),
+        ne(schema.jobs.status, "draft"),
+      ),
+    )
+    .limit(1);
+
+  const row = rows[0];
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    kind: row.kind as PortalPhotoKind,
+    storageKey: row.storageKey,
+    caption: row.caption,
+    jobReference: row.jobReference,
   };
 }
 
@@ -610,8 +933,26 @@ export async function listPortalInvoices(
     const totalMinor = toMinor(r.total);
     const paidMinor = toMinor(r.amount_paid);
     const creditedMinor = toMinor(r.credited);
-    const outstandingMinor = Math.max(totalMinor - paidMinor - creditedMinor, 0);
+    // ── WHAT "SETTLED" MEANS, AND WHY IT ZEROES THE OUTSTANDING FIGURE ────
+    //
+    // `paid` and `credited` already net to zero by arithmetic. `written_off`
+    // does not: a write-off is a status change carrying a reason, not a credit
+    // note, so nothing reduces the sum and the invoice went on being added to
+    // what this customer was told they owe.
+    //
+    // The tie-breaker is not an opinion about write-offs, it is that the rest
+    // of this codebase had already decided. `arAgeing` and the per-customer
+    // credit-exposure check both skip exactly these three statuses — the same
+    // line, written twice, in `commerce.ts`. The business's own definition of
+    // outstanding excludes a written-off invoice; the portal was the single
+    // place that disagreed, and it disagreed in front of the customer. So this
+    // is not the portal taking a view, it is the portal being corrected to the
+    // view already held everywhere else.
+    //
+    // The customer-facing reading points the same way: "outstanding" is read as
+    // "what you are asking me for", and nobody intends to ask for this one.
     const settled = r.status === "paid" || r.status === "written_off" || r.status === "credited";
+    const outstandingMinor = settled ? 0 : Math.max(totalMinor - paidMinor - creditedMinor, 0);
 
     return {
       id: r.id,
@@ -638,7 +979,7 @@ export async function listPortalInvoices(
 }
 
 export interface StatementEntry {
-  readonly kind: "invoice" | "credit_note" | "payment";
+  readonly kind: "invoice" | "credit_note" | "payment" | "write_off";
   readonly reference: string;
   readonly occurredAt: Date;
   /** Positive increases what is owed, negative reduces it. */
@@ -654,6 +995,27 @@ export interface PortalStatement {
   readonly invoicedMinor: number;
   readonly creditedMinor: number;
   readonly paidMinor: number;
+  /**
+   * Debt the business has stopped pursuing, and the amount by which `invoiced`
+   * less `credited` less `paid` overstates what is actually owed.
+   *
+   * The FORGIVEN portion, not the invoice total: an invoice for 1,000 that was
+   * part-paid 300 before being written off contributes 700 here, so its three
+   * figures net to zero rather than to minus 300.
+   *
+   * Exposed rather than folded silently into `balanceMinor` because the footer
+   * has to reconcile. A reader who adds the first three columns and does not
+   * arrive at the balance has found what looks like an arithmetic error, and
+   * "worse than no statement" is this function's own standard.
+   *
+   * Since `0031` this is also the sum of the `write_off` ENTRIES, so the
+   * running balance down the rows now ends exactly on `balanceMinor` rather
+   * than above it. The two are computed independently — this from its own
+   * aggregate over every invoice, the rows from the ledger union — and
+   * `portal.test.ts` asserts they agree.
+   */
+  readonly writtenOffMinor: number;
+  /** Invoiced less credited less paid less written off. Negative means in credit. */
   readonly balanceMinor: number;
   readonly currency: string;
 }
@@ -662,13 +1024,33 @@ export interface PortalStatement {
  * Statement of account (`POR-4`, and the customer-facing half of `INV-13`).
  *
  * One chronological ledger of everything that moved the balance: invoices up,
- * credit notes down, payments down. Signed amounts rather than three separate
- * lists, because the question is "how did I get to this number" and three
- * lists side by side is the reader doing the arithmetic.
+ * credit notes down, payments down, write-offs down. Signed amounts rather than
+ * separate lists, because the question is "how did I get to this number" and
+ * four lists side by side is the reader doing the arithmetic.
  *
- * The balance is derived from the entries in the same pass that builds them, so
- * the total and the lines cannot disagree — a statement whose footer does not
- * match its rows is worse than no statement, because somebody will act on it.
+ * The write-off is a first-class entry rather than a footer adjustment, which
+ * is what `0031`'s `written_off_at` bought: an event that moved the balance is
+ * in the ledger that explains the balance, and the running total down the rows
+ * lands on the same number as the card at the top.
+ *
+ * ── THE TOTALS ARE NOT SUMMED FROM THE ENTRIES, AND MUST NOT BE ────────────
+ *
+ * This doc block used to claim the opposite — "the balance is derived from the
+ * entries in the same pass that builds them" — and that was not merely stale,
+ * it described the bug this code was written to avoid. Anybody refactoring
+ * towards it would have reintroduced it, which is the one kind of wrong comment
+ * that actively costs something.
+ *
+ * `entries` is CAPPED. Summing a capped ledger gives a total that is correct
+ * for a customer with a short history and quietly wrong — understated — for the
+ * long-standing customer with the largest balance, who is exactly the customer
+ * whose number matters most. So the totals below come from their own aggregate
+ * over every row, and `truncated` tells the screen when the list it is showing
+ * is not the whole ledger.
+ *
+ * The consequence to keep in mind when reading the screen: the running-balance
+ * column and the footer agree only when `truncated` is false. That is inherent
+ * to capping the list, not a defect to reconcile away.
  */
 export async function portalStatement(
   tx: TenantScopedTx,
@@ -720,6 +1102,57 @@ export async function portalStatement(
         join invoices i on i.id = p.invoice_id
        where p.deleted_at is null
 
+       union all
+
+      -- The write-off, as the ledger event it is (0031).
+      --
+      -- NO BACKTICKS IN THIS COMMENT. It sits inside a tagged template literal,
+      -- so one backtick ends the template and the error surfaces as a syntax
+      -- failure dozens of lines below. This comment was written with them once.
+      --
+      -- Previously the write-off was subtracted from the footer while the
+      -- invoice stayed in the rows, so the running-balance column ended above
+      -- the balance by exactly the amount written off. A row here reconciles
+      -- them, and it is only placeable because the written_off_at column
+      -- exists: updated_at moves on a re-rendered PDF or a reminder, and a
+      -- write-off filed at the wrong date makes every later row's running
+      -- balance wrong.
+      --
+      -- The AMOUNT is the forgiven portion, not the invoice total. The invoice
+      -- and any payments against it are already rows in this same ledger, so
+      -- subtracting the whole total here would double-count what was paid and
+      -- drive the balance below zero, showing the customer as in credit. The
+      -- greatest(..., 0) covers the overpaid invoice.
+      --
+      -- The DETAIL is null, deliberately. written_off_reason is internal free
+      -- text, of the "uncollectable, customer dissolved" kind, and the page
+      -- renders detail straight after the reference. Same field and same
+      -- argument as the note on job_events: there is no way to sanitise prose
+      -- written by somebody who believed it was internal. The customer is told
+      -- the debt was written off, which is the part that concerns them, and not
+      -- what was said about them while doing it.
+      --
+      -- Zero-value write-offs are excluded rather than rendered as a 0.00 row
+      -- that moves nothing.
+      select 'write_off',
+             w.reference,
+             coalesce(w.written_off_at, w.updated_at),
+             greatest(w.total
+                      - w.amount_paid
+                      - coalesce((select sum(n2.total) from credit_notes n2
+                                   where n2.invoice_id = w.id and n2.deleted_at is null), 0),
+                      0),
+             null::text,
+             w.currency
+        from invoices w
+       where w.deleted_at is null
+         and w.status = 'written_off'
+         and greatest(w.total
+                      - w.amount_paid
+                      - coalesce((select sum(n4.total) from credit_notes n4
+                                   where n4.invoice_id = w.id and n4.deleted_at is null), 0),
+                      0) > 0
+
        order by occurred_at asc, reference asc
        limit ${limit}
   `)) as unknown as {
@@ -745,6 +1178,7 @@ export async function portalStatement(
     invoiced: string;
     credited: string;
     paid: string;
+    written_off: string;
     entry_count: string;
     currency: string | null;
   }>(sql`
@@ -756,12 +1190,38 @@ export async function portalStatement(
       coalesce((select sum(p.amount) from payments p
                  join invoices i2 on i2.id = p.invoice_id
                 where p.deleted_at is null), 0)::text as paid,
+      -- Debt written off: the FORGIVEN portion, not the invoice total.
+      --
+      -- An invoice for 1,000 part-paid 300 and then written off has its 1,000
+      -- in invoiced and its 300 in paid already, so subtracting the full 1,000
+      -- here would drive the balance to minus 300 and tell the customer they
+      -- are in credit. What was forgiven is what was still open: total, less
+      -- what was paid, less what was credited.
+      --
+      -- greatest(..., 0) because an overpaid invoice that is then written off
+      -- would otherwise contribute a negative and silently inflate the balance.
+      coalesce((
+        select sum(greatest(
+                 i6.total
+                 - i6.amount_paid
+                 - coalesce((select sum(n3.total) from credit_notes n3
+                              where n3.invoice_id = i6.id and n3.deleted_at is null), 0),
+                 0))
+          from invoices i6
+         where i6.deleted_at is null and i6.status = 'written_off'), 0)::text as written_off,
       (
         (select count(*) from invoices i3 where i3.deleted_at is null and i3.status <> 'draft')
         + (select count(*) from credit_notes n2 where n2.deleted_at is null)
         + (select count(*) from payments p2
             join invoices i4 on i4.id = p2.invoice_id
            where p2.deleted_at is null)
+        + (select count(*) from invoices i7
+            where i7.deleted_at is null and i7.status = 'written_off'
+              and greatest(i7.total
+                           - i7.amount_paid
+                           - coalesce((select sum(n5.total) from credit_notes n5
+                                        where n5.invoice_id = i7.id and n5.deleted_at is null), 0),
+                           0) > 0)
       )::text as entry_count,
       (select i5.currency from invoices i5
         where i5.deleted_at is null and i5.status <> 'draft'
@@ -770,6 +1230,7 @@ export async function portalStatement(
     invoiced: string;
     credited: string;
     paid: string;
+    written_off: string;
     entry_count: string;
     currency: string | null;
   }[];
@@ -778,6 +1239,7 @@ export async function portalStatement(
   const invoicedMinor = toMinor(totals?.invoiced ?? "0");
   const creditedMinor = toMinor(totals?.credited ?? "0");
   const paidMinor = toMinor(totals?.paid ?? "0");
+  const writtenOffMinor = toMinor(totals?.written_off ?? "0");
 
   const entries: StatementEntry[] = rows.map((r) => ({
     kind: r.kind as StatementEntry["kind"],
@@ -796,7 +1258,8 @@ export async function portalStatement(
     invoicedMinor,
     creditedMinor,
     paidMinor,
-    balanceMinor: invoicedMinor - creditedMinor - paidMinor,
+    writtenOffMinor,
+    balanceMinor: invoicedMinor - creditedMinor - paidMinor - writtenOffMinor,
     currency: totals?.currency || "AED",
   };
 }

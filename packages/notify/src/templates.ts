@@ -166,12 +166,20 @@ export interface TemplatePayloads {
     }[];
   };
   /**
-   * The compliance digest (`HR-5`, `HR-9`, `HR-14`).
+   * The compliance digest (`HR-5`, `HR-9`, `HR-14`, `HR-19`).
    *
-   * One message, four sections, ordered by consequence: who cannot legally be
+   * One message, five sections, ordered by consequence: who cannot legally be
    * sent to work, then company accreditations, then employee documents, then
-   * trade certifications. Sending four separate emails would put the AED
-   * 100,000 item and the driving-licence renewal on equal footing in an inbox.
+   * trade certifications, then subcontractor obligations. Sending five
+   * separate emails would put the AED 100,000 item and the driving-licence
+   * renewal on equal footing in an inbox.
+   *
+   * `subcontractors` goes last, not because it matters least, but because it
+   * is the one obligation that is somebody else's licence — `HR-19`'s point is
+   * that "responsibility for site compliance does not transfer with the work",
+   * so an expired subcontractor trade licence is still our exposure and
+   * belongs in the same email HR and the owner already read, not a separate
+   * one nobody opens.
    */
   compliance_expiry: {
     recipientName: string;
@@ -185,6 +193,19 @@ export interface TemplatePayloads {
     }[];
     accreditations: readonly { name: string; reference: string | null; daysRemaining: number }[];
     certifications: readonly { name: string; certification: string; daysRemaining: number }[];
+    subcontractors: readonly {
+      subcontractorName: string;
+      label: string;
+      /**
+       * The worker, for a permit; the certificate, for an accreditation. Null
+       * for the trade licence and the two insurance policies, which the
+       * organisation holds directly. (Was `workerName`, renamed when the sweep
+       * grew to cover the supplier's own accreditations — a name on one of
+       * those rows is a certificate, not a person.)
+       */
+      subject: string | null;
+      daysRemaining: number;
+    }[];
   };
   /**
    * The 14-day issuance clock (`INV-5`).
@@ -751,7 +772,7 @@ export const TEMPLATES: {
     subject:
       p.blocked.length > 0
         ? `URGENT: ${p.blocked.length} technician${p.blocked.length === 1 ? "" : "s"} cannot be dispatched`
-        : `Compliance expiries — ${p.documents.length + p.accreditations.length + p.certifications.length} item(s)`,
+        : `Compliance expiries — ${p.documents.length + p.accreditations.length + p.certifications.length + p.subcontractors.length} item(s)`,
     body:
       `${p.recipientName},\n` +
       // Consequence order, exactly as the lists on screen are ordered: the item
@@ -788,6 +809,18 @@ export const TEMPLATES: {
         ? `\nTRADE CERTIFICATIONS (${p.certifications.length})\n` +
           p.certifications
             .map((c) => `  ${c.name} — ${c.certification} — ${remaining(c.daysRemaining)}`)
+            .join("\n") +
+          "\n"
+        : "") +
+      (p.subcontractors.length > 0
+        ? `\nSUBCONTRACTOR OBLIGATIONS (${p.subcontractors.length})\n` +
+          p.subcontractors
+            .map(
+              (s) =>
+                `  ${s.subcontractorName} — ${s.label}` +
+                (s.subject ? ` (${s.subject})` : "") +
+                ` — ${remaining(s.daysRemaining)}`,
+            )
             .join("\n") +
           "\n"
         : "") +
