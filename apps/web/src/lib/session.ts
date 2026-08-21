@@ -1,6 +1,12 @@
 import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
-import { resolveSession, SESSION_COOKIE, MFA_CHALLENGE_COOKIE, type SessionContext } from "@meridian/auth";
+import {
+  resolveSession,
+  touchSession,
+  SESSION_COOKIE,
+  MFA_CHALLENGE_COOKIE,
+  type SessionContext,
+} from "@meridian/auth";
 import { can, isStaff, type Permission } from "@meridian/auth";
 
 /**
@@ -16,7 +22,37 @@ import { can, isStaff, type Permission } from "@meridian/auth";
 
 export async function getSession(): Promise<SessionContext | null> {
   const store = await cookies();
-  return resolveSession(store.get(SESSION_COOKIE)?.value);
+  const token = store.get(SESSION_COOKIE)?.value;
+  const session = await resolveSession(token);
+  if (!session || !token) return session;
+
+  /*
+   * SEC-11. Renew on activity, near the end of the window only.
+   *
+   * `touchSession` returns null unless the session is inside its last quarter,
+   * so the common case is a comparison and no write at all — renewing on every
+   * page view would mean a database write per request for no benefit.
+   *
+   * The renewal is clamped to the session's absolute ceiling inside the SQL
+   * function, so this cannot extend a session indefinitely no matter how often
+   * it is called.
+   *
+   * Deliberately NOT re-issuing the cookie here. A server component cannot set
+   * cookies in Next — only actions and route handlers can — so the cookie keeps
+   * its original expiry while the *server-side* session slides. The practical
+   * effect is that the cookie is the shorter of the two, which fails in the
+   * safe direction: the user signs in again rather than holding a cookie the
+   * server has stopped honouring.
+   */
+  try {
+    await touchSession(token, session.expiresAt);
+  } catch (error) {
+    // Renewal is an optimisation. A failure here must never turn a valid
+    // session into a signed-out one.
+    console.error("[session] could not renew", error);
+  }
+
+  return session;
 }
 
 export async function requireSession(): Promise<SessionContext> {
