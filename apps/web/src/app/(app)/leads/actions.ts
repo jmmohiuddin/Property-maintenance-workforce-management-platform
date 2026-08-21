@@ -5,6 +5,7 @@ import { redirect } from "next/navigation";
 import {
   withTenant,
   convertLeadToJob,
+  convertCustomerCandidates,
   setLeadStage,
   logCommunication,
   setLeadFollowUp,
@@ -26,12 +27,68 @@ export interface ConvertState {
   error?: string;
 }
 
+/** One customer this lead might already be, as the convert form renders it. */
+export interface ConvertCandidateView {
+  customerId: string;
+  name: string;
+  phone: string | null;
+  email: string | null;
+  isStrict: boolean;
+  isLinked: boolean;
+}
+
+export interface CandidateState {
+  candidates?: ConvertCandidateView[];
+  error?: string;
+}
+
+/**
+ * The customers this lead may already be (`LEAD-5`), for the convert form.
+ *
+ * Loaded when the form is opened rather than with the list. A leads page shows
+ * twenty-five rows and somebody converts one of them; running the matcher for
+ * all twenty-five to answer a question about one is twenty-four indexed queries
+ * nobody reads. Opening the form is the moment the answer is needed, and it is
+ * before the decision rather than after it.
+ *
+ * This is a convenience, not the guard. `convertLeadToJob` runs the same check
+ * inside the transaction that creates the customer, so a form that never called
+ * this — or called it and was overtaken — is refused there.
+ */
+export async function loadConvertCandidates(leadId: string): Promise<CandidateState> {
+  const session = await requireSession();
+
+  try {
+    requirePermission(session.principal, "customers:read");
+  } catch {
+    return { error: "Your role cannot read customers." };
+  }
+
+  if (!leadId) return { error: "No lead selected." };
+
+  try {
+    const candidates = await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) => convertCustomerCandidates(tx, leadId),
+    );
+    return { candidates: candidates.map((c) => ({ ...c })) };
+  } catch (error) {
+    return { error: userMessage(error, "Could not check for existing customers.", "leads") };
+  }
+}
+
 /**
  * Convert a lead into a customer, property and job.
  *
  * Permission is checked here, not only in the UI. The page hides this form for
  * roles that cannot convert, but hiding a form is not authorisation - a POST
  * can be sent directly.
+ *
+ * `customerId` and `createNewCustomer` are the operator's answer to the
+ * duplicate check (`LEAD-5`), and neither is inferred here: an absent answer is
+ * passed on as an absent answer so the domain refuses it. Defaulting
+ * `createNewCustomer` to true in this layer would silently restore the bug the
+ * check exists to stop.
  */
 export async function convertLead(_prev: ConvertState, formData: FormData): Promise<ConvertState> {
   const session = await requireSession();
@@ -48,6 +105,8 @@ export async function convertLead(_prev: ConvertState, formData: FormData): Prom
   const addressLine = String(formData.get("addressLine") ?? "").trim();
   const title = String(formData.get("title") ?? "").trim();
   const urgency = String(formData.get("urgency") ?? "this-week");
+  const customerId = String(formData.get("customerId") ?? "").trim();
+  const createNewCustomer = formData.get("createNewCustomer") === "1";
 
   if (!leadId || !propertyName || !addressLine || !title) {
     return { error: "Property name, address and job title are all required." };
@@ -71,6 +130,8 @@ export async function convertLead(_prev: ConvertState, formData: FormData): Prom
             addressLine,
             title,
             priority: priorityForUrgency(urgency),
+            customerId: customerId || undefined,
+            createNewCustomer,
           },
         ),
     );
@@ -80,6 +141,7 @@ export async function convertLead(_prev: ConvertState, formData: FormData): Prom
   }
 
   revalidatePath("/leads");
+  revalidatePath("/customers");
   revalidatePath("/dispatch");
   redirect(`/jobs/${jobId}`);
 }
@@ -228,8 +290,13 @@ export async function logLeadCommunication(
     return { error: userMessage(error, "Could not log that.", "leads") };
   }
 
-  revalidatePath("/leads");
-  if (leadId) revalidatePath(`/leads/${leadId}`);
+  // Only what this touched. A customer-side log has nothing to say to the leads
+  // list, and revalidating it would throw away a cached page to no effect.
+  if (leadId) {
+    revalidatePath("/leads");
+    revalidatePath(`/leads/${leadId}`);
+  }
+  if (customerId) revalidatePath(`/customers/${customerId}`);
   return { success: "Logged." };
 }
 

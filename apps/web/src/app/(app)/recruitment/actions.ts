@@ -14,11 +14,17 @@ import {
   mergeCandidates,
   moveApplicationStage,
   publishRequisition,
+  reconfirmTalentPoolMember,
   reopenApplication,
+  withdrawTalentPoolConsent,
   setBlockedOn,
   setVisaStatus,
 } from "@meridian/db/domain";
-import { applicationStatusUrl } from "@meridian/core";
+import {
+  applicationStatusUrl,
+  talentPoolReconfirmSchema,
+  talentPoolWithdrawSchema,
+} from "@meridian/core";
 import { enqueue } from "@meridian/notify";
 import { requirePermission } from "@meridian/auth";
 import { requireSession } from "@/lib/session";
@@ -107,6 +113,9 @@ export async function createRequisitionAction(
         salaryBandMinMinor: money("salaryMin"),
         salaryBandMaxMinor: money("salaryMax"),
         closesAt: closesRaw ? new Date(closesRaw) : undefined,
+        // `ATS-1`. Empty means nobody was named, which is a state — not a
+        // reason to write an empty string into a uuid column.
+        hiringManagerUserId: String(formData.get("hiringManagerUserId") ?? "").trim() || undefined,
       }),
     );
     requisitionId = result.requisitionId;
@@ -474,6 +483,129 @@ export async function mergeCandidatesAction(
   } catch (error) {
     return { error: userMessage(error, "Could not merge those records.", "recruitment") };
   }
+}
+
+// ── Talent pool (`ATS-13`) ──────────────────────────────────────────────────
+
+/**
+ * Re-confirm a pool member's consent.
+ *
+ * ── WHY THIS IS A BUTTON A PERSON PRESSES ───────────────────────────────────
+ *
+ * The consent clock was being set on the way in and alerted on when it ran out,
+ * and nothing could ever stop it — there was no path in the product that wrote
+ * `reconfirmed_at`. So the pool could only accumulate overdue members, and a
+ * list that only grows is a list that gets ignored, which leaves the details
+ * held past the consent that justified holding them.
+ *
+ * It is deliberately one row at a time and deliberately manual. The fact being
+ * recorded is that somebody spoke to this person and they said yes; a "confirm
+ * all" button would record that fact about people nobody called.
+ *
+ * No message is enqueued. The conversation already happened — that is what is
+ * being written down — so there is nothing to send and nothing to schedule.
+ */
+export async function reconfirmPoolMemberAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const parsed = talentPoolReconfirmSchema.safeParse({
+    candidateId: String(formData.get("candidateId") ?? ""),
+    poolKey: String(formData.get("poolKey") ?? ""),
+    note: String(formData.get("note") ?? ""),
+  });
+  if (!parsed.success) {
+    return { error: "That re-confirmation was not complete enough to record." };
+  }
+
+  const { session, ctx } = await staff();
+  try {
+    requirePermission(session.principal, "recruitment:write");
+  } catch {
+    return { error: "Your role cannot re-confirm a pool member." };
+  }
+
+  let result: { fullName: string; nextDueAt: Date };
+  try {
+    result = await withTenant(ctx, (tx) =>
+      reconfirmTalentPoolMember(tx, ctx, {
+        candidateId: parsed.data.candidateId,
+        poolKey: parsed.data.poolKey,
+        note: parsed.data.note || undefined,
+      }),
+    );
+  } catch (error) {
+    return { error: userMessage(error, "Could not record that re-confirmation.", "recruitment") };
+  }
+
+  revalidatePath("/recruitment/pool");
+  revalidatePath("/recruitment");
+
+  return {
+    success: `${result.fullName} re-confirmed. Due again ${result.nextDueAt.toLocaleDateString("en-GB", {
+      timeZone: "Asia/Dubai",
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    })}.`,
+  };
+}
+
+/**
+ * Withdraw a pool consent (`ATS-13`).
+ *
+ * The other half of the same cycle, and the half nothing in the product could
+ * do at all: `consent_withdrawn_at` was read by the pool list, both alerts and
+ * the retention purge, and written by nothing.
+ *
+ * It is on this screen rather than behind an administrator, because the request
+ * arrives as "take me off your list" on a phone call to whoever is working the
+ * pool that morning, and a right that requires a support ticket is a right with
+ * a queue in front of it.
+ */
+export async function withdrawPoolConsentAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const parsed = talentPoolWithdrawSchema.safeParse({
+    candidateId: String(formData.get("candidateId") ?? ""),
+    poolKey: String(formData.get("poolKey") ?? ""),
+    reason: String(formData.get("reason") ?? ""),
+  });
+  if (!parsed.success) {
+    return { error: "That withdrawal was not complete enough to record." };
+  }
+
+  const { session, ctx } = await staff();
+  try {
+    requirePermission(session.principal, "recruitment:write");
+  } catch {
+    return { error: "Your role cannot withdraw a pool consent." };
+  }
+
+  let result: { fullName: string; retentionBasis: string; remainingPools: number };
+  try {
+    result = await withTenant(ctx, (tx) =>
+      withdrawTalentPoolConsent(tx, ctx, {
+        candidateId: parsed.data.candidateId,
+        poolKey: parsed.data.poolKey,
+        reason: parsed.data.reason || undefined,
+      }),
+    );
+  } catch (error) {
+    return { error: userMessage(error, "Could not record that withdrawal.", "recruitment") };
+  }
+
+  revalidatePath("/recruitment/pool");
+  revalidatePath("/recruitment");
+
+  return {
+    success:
+      `${result.fullName} removed from this pool.` +
+      (result.remainingPools > 0
+        ? ` They are still in ${result.remainingPools} other pool(s), so their details stay on the consent clock.`
+        : " No consent remains, so their record is back on the six-month applicant clock and the nightly purge will delete it on time."),
+  };
 }
 
 /**

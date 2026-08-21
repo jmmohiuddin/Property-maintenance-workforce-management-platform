@@ -32,8 +32,24 @@ const INITIAL: ActionState = {};
  * anything else payable by the person hired. `HR-16` prohibits it, and the way
  * that prohibition is honoured is that no such field exists anywhere in the
  * module — not on this form, not in the action, not in the schema.
+ *
+ * ── THE HIRING MANAGER ──────────────────────────────────────────────────────
+ *
+ * `job_requisitions.hiring_manager_user_id` existed, and `createRequisition`
+ * accepted it, and this form had no field — so the column could only ever be
+ * null on anything the product created. `ATS-1` treats approval as a second
+ * decision by a second person; a column nobody can populate cannot carry that,
+ * and "who asked for this headcount" is the first question anybody asks when a
+ * vacancy has been open for two months.
+ *
+ * Optional, because a vacancy that cannot be opened until the right person is
+ * on the list is a vacancy somebody opens under the wrong name.
  */
-export function NewRequisitionForm() {
+export function NewRequisitionForm({
+  hiringManagers = [],
+}: {
+  hiringManagers?: readonly { userId: string; fullName: string; role: string }[];
+}) {
   const [state, formAction, pending] = useActionState(createRequisitionAction, INITIAL);
 
   return (
@@ -134,6 +150,22 @@ export function NewRequisitionForm() {
         <Field label="Applications close" description="Optional. The posting expires on this date.">
           {({ id, describedBy }) => (
             <TextInput id={id} name="closesAt" type="date" aria-describedby={describedBy} />
+          )}
+        </Field>
+
+        <Field
+          label="Hiring manager"
+          description="Who asked for this headcount, and who approves it. Optional — but a vacancy with nobody's name on it is one nobody chases."
+        >
+          {({ id, describedBy }) => (
+            <Select id={id} name="hiringManagerUserId" defaultValue="" aria-describedby={describedBy}>
+              <option value="">Not named</option>
+              {hiringManagers.map((manager) => (
+                <option key={manager.userId} value={manager.userId}>
+                  {manager.fullName} — {manager.role.replace(/_/g, " ")}
+                </option>
+              ))}
+            </Select>
           )}
         </Field>
 

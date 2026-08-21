@@ -200,6 +200,47 @@ BEGIN
 END
 $$;
 
+-- ── CON-5. What the customer is entitled to ─────────────────────────────────
+--
+-- CON-5 requires the entitlement to be visible on the customer record and in
+-- the portal, and the entitlement lives in contract_entitlements: visits per
+-- year per service, and how many of them have been consumed. The parent
+-- contracts table is already customer-scoped in the owned array above, so this
+-- is the one additional table the portal needs, and it is scoped through that
+-- parent the same way quote_lines and invoice_lines are.
+--
+-- USING only, no WITH CHECK. A portal session reads its entitlement and never
+-- writes it — consumption is decremented by the reconcile sweep on a staff
+-- transaction — so the backstop block below would be the only thing granting a
+-- write, and it grants none: an unscoped table is closed. Adding a WITH CHECK
+-- here would state a write path that does not exist.
+--
+-- ── WHAT IS DELIBERATELY LEFT CLOSED, AND WHY ───────────────────────────────
+--
+--   * contract_terms carries the discount rate and the payment terms. Those are
+--     internal commercial positions, they are what an out-of-scope quote is
+--     priced from, and CON-5 does not ask for them. It stays closed.
+--   * contract_exclusions stays closed and does not need opening: the
+--     customer-facing exclusion list is the JSONB column on contracts, which is
+--     already portal-visible and is documented in the schema as the list shown
+--     verbatim to the customer. The row table exists so CON-6 can match a code
+--     by machine, which is an internal concern.
+--   * contract_documents and contract_renewal_notices stay closed. Neither is
+--     named by CON-5, and a renewal notice records which member of staff was
+--     told what and when.
+--
+-- Each of those is closed by the backstop at the foot of this file rather than
+-- by omission, which is the distinction the block above was written to make.
+DROP POLICY IF EXISTS customer_scope ON public.contract_entitlements;
+CREATE POLICY customer_scope ON public.contract_entitlements
+  AS RESTRICTIVE
+  USING (
+    app_current_customer() IS NULL
+    OR EXISTS (SELECT 1 FROM public.contracts c
+                WHERE c.id = contract_entitlements.contract_id
+                  AND c.customer_id = app_current_customer())
+  );
+
 -- ── POR-5. Notification preferences ─────────────────────────────────────────
 -- Owned directly by the customer, and written by them: a portal user turning an
 -- event off is an INSERT or UPDATE from a portal session, so this one needs its
@@ -343,9 +384,27 @@ CREATE POLICY customer_scope ON public.technicians
 -- With separate names the loop owns its own policies outright: it drops and
 -- recreates `customer_scope_default` every run, and never touches a
 -- `customer_scope` written by hand above.
+--
+-- ── AND WHY IT DROPS FIRST AND DECIDES SECOND ───────────────────────────────
+--
+-- The loop walks every tenant-scoped table and unconditionally drops its
+-- `customer_scope_default`, then creates one again only where no explicit
+-- `customer_scope` exists. An earlier version selected only the tables without
+-- an explicit policy, which meant a table PROMOTED from closed to scoped kept
+-- the backstop it was given on the previous run — and because restrictive
+-- policies are ANDed, `USING (app_current_customer() IS NULL)` went on refusing
+-- every portal read regardless of the new policy sitting beside it.
+--
+-- That was found by opening `contract_entitlements` for `CON-5`: the explicit
+-- policy applied cleanly, the portal query returned nothing, and both policies
+-- were present and correct on their own terms. The promotion direction is the
+-- one this file will keep being asked for — a table is closed by default and
+-- opened when a requirement names it — so it is the direction that has to be
+-- re-runnable.
 DO $$
 DECLARE
   t text;
+  has_explicit boolean;
 BEGIN
   FOR t IN
     SELECT c.relname
@@ -358,13 +417,21 @@ BEGIN
           WHERE col.table_schema = 'public'
             AND col.table_name = c.relname
             AND col.column_name = 'tenant_id')
-       AND NOT EXISTS (
-         SELECT 1 FROM pg_policy p
-          WHERE p.polrelid = c.oid
-            AND p.polname = 'customer_scope')
      ORDER BY c.relname
   LOOP
     EXECUTE format('DROP POLICY IF EXISTS customer_scope_default ON public.%I', t);
+
+    SELECT EXISTS (
+      SELECT 1 FROM pg_policy p
+       JOIN pg_class c ON c.oid = p.polrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relname = t AND p.polname = 'customer_scope'
+    ) INTO has_explicit;
+
+    -- Scoped by hand above. The backstop stays off, and this is the branch the
+    -- old loop could not reach on a table that already had one.
+    CONTINUE WHEN has_explicit;
+
     -- Named-customer tables are closed to portal writes as well as reads.
     IF EXISTS (SELECT 1 FROM information_schema.columns col
                 WHERE col.table_schema = 'public'

@@ -691,6 +691,81 @@ export function isDownloadable(status: ScanStatus): boolean {
   return status === "clean" || status === "skipped";
 }
 
+// ── The talent pool (`ATS-13`) ──────────────────────────────────────────────
+
+/**
+ * How long a pool consent stands before somebody has to ask again.
+ *
+ * Ninety days, and it is a short clock on purpose. A tradesperson's
+ * availability and certificate validity go stale in weeks, so a pool nobody
+ * re-confirms is not a warm list — it is a list of people who have all found
+ * other work, held past the point the consent covered.
+ *
+ * The public submission path sets the same interval in SQL
+ * (`app_public_submit_application`, in sql/public-functions.sql), which this
+ * constant cannot reach. Changing one means changing the other.
+ */
+export const TALENT_POOL_RECONFIRM_DAYS = 90;
+
+/**
+ * The window "expiring soon" means, for a certificate.
+ *
+ * Forty-five days is long enough to renew a ticket without paying for haste and
+ * short enough that the list is a morning's calls rather than a report.
+ */
+export const CERTIFICATION_EXPIRY_WINDOW_DAYS = 45;
+
+/**
+ * How the pool can be filtered.
+ *
+ * These are the only two axes worth having — trade and whether the person's
+ * ticket is still good — because they are the two questions somebody staffing a
+ * job actually asks. There is no relevance score and no ranking (`ATS-19`);
+ * the list is ordered by consequence and a human reads it.
+ */
+export const TALENT_POOL_CERT_FILTERS = ["any", "lapsed", "expiring", "valid", "none"] as const;
+
+export type TalentPoolCertFilter = (typeof TALENT_POOL_CERT_FILTERS)[number];
+
+export const TALENT_POOL_CERT_FILTER_LABEL: Readonly<Record<TalentPoolCertFilter, string>> = {
+  any: "Any certification status",
+  lapsed: "Has a lapsed certificate",
+  expiring: `Expiring within ${CERTIFICATION_EXPIRY_WINDOW_DAYS} days`,
+  valid: "All certificates in date",
+  none: "No certificate recorded",
+};
+
+export function isTalentPoolCertFilter(value: string): value is TalentPoolCertFilter {
+  return (TALENT_POOL_CERT_FILTERS as readonly string[]).includes(value);
+}
+
+/**
+ * What a re-confirmation needs (`ATS-13`).
+ *
+ * A person, a pool, and optionally a line about the call. Nothing about
+ * availability or rate, because this records one fact — that the candidate was
+ * asked again and said yes — and a form that collects five things is a form
+ * somebody skips when they are holding a phone.
+ */
+export const talentPoolReconfirmSchema = z.object({
+  candidateId: z.uuid("Pick somebody in the pool"),
+  poolKey: z.string().trim().min(1).max(64),
+  note: z.string().trim().max(280).optional().or(z.literal("")),
+});
+
+/**
+ * What a withdrawal needs (`ATS-13`).
+ *
+ * The reason is optional and always will be. Somebody exercising the right to
+ * withdraw consent does not have to justify it, and a required field here would
+ * turn a right into a negotiation.
+ */
+export const talentPoolWithdrawSchema = z.object({
+  candidateId: z.uuid("Pick somebody in the pool"),
+  poolKey: z.string().trim().min(1).max(64),
+  reason: z.string().trim().max(280).optional().or(z.literal("")),
+});
+
 export type ParseStatus = "not_attempted" | "parsed" | "failed" | "unsupported";
 
 /**

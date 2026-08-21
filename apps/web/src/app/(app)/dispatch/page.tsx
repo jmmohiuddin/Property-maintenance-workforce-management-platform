@@ -118,7 +118,28 @@ export default async function DispatchPage() {
                     <tr key={job.id} className="border-b last:border-0 align-top">
                       <td className="tnum px-4 py-4 text-[13px] whitespace-nowrap">{job.reference}</td>
                       <td className="px-4 py-4">
-                        <p className="text-[15px] font-medium">{job.title}</p>
+                        <p className="flex flex-wrap items-center gap-2 text-[15px] font-medium">
+                          {job.title}
+                          {/*
+                            CON-6 is the mechanism that stops contract work
+                            being absorbed, and it is reached from the job page.
+                            A dispatcher who cannot tell a contract job from any
+                            other one has no reason to open it, which is why
+                            this chip exists rather than only the flag in the
+                            database.
+                          */}
+                          {job.contractReference ? (
+                            <span
+                              className="tnum shrink-0 rounded-sm px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide"
+                              style={{
+                                backgroundColor: "var(--accent-wash)",
+                                color: "var(--accent-text)",
+                              }}
+                            >
+                              AMC &middot; {job.contractReference}
+                            </span>
+                          ) : null}
+                        </p>
                         <p className="mt-1 text-[13px]" style={{ color: "var(--text-muted)" }}>
                           {job.customerName} &middot; {job.propertyName}
                           {job.propertyArea ? `, ${job.propertyArea}` : ""} &middot;{" "}

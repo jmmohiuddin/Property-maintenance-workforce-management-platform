@@ -1,3 +1,5 @@
+import { PPM_COMPLETION_TARGET_PERCENT } from "./contract";
+
 /**
  * The thresholds the owner dashboard measures against (`KPI-3`, `KPI-5`).
  *
@@ -141,10 +143,14 @@ export interface GoalTarget {
 /**
  * The subset of PRD §7.1 the owner dashboard can actually source today.
  *
- * G11 (first-time fix) and G12 (PPM completion) are on the wireframe and are
- * deliberately absent here: the first needs field-app outcome codes and the
- * second needs `CON-7` visit completion, and a target with no measurement is
- * a line on a screen that will read "—" forever while looking like a metric.
+ * G11 (first-time fix) is on the wireframe and is deliberately absent here: it
+ * needs field-app visit outcome codes, and a target with no measurement is a
+ * line on a screen that will read "—" forever while looking like a metric.
+ *
+ * G12 (PPM completion) used to sit beside it for the same reason, waiting on
+ * `CON-7` visit completion. That landed, so it is a goal now rather than a
+ * gap. The entry that removed it from `DASHBOARD_GAPS` is the point of this
+ * file: a target arrives when the measurement does, not before.
  */
 export const DASHBOARD_GOALS: Readonly<Record<string, GoalTarget>> = {
   slaBreachRate: {
@@ -172,6 +178,36 @@ export const DASHBOARD_GOALS: Readonly<Record<string, GoalTarget>> = {
     id: "G8",
     label: "Days sales outstanding",
     target: 45,
+    direction: "lower_is_better",
+    unit: "days",
+  },
+  /*
+   * G12, PRD §7.1 and CON-7. The target is not restated here: it is
+   * `PPM_COMPLETION_TARGET_PERCENT`, which the AMC screen already grades
+   * against, and two copies of 98 is one copy of 98 that somebody edits.
+   */
+  ppmCompletion: {
+    id: "G12",
+    label: "PPM completion",
+    target: PPM_COMPLETION_TARGET_PERCENT,
+    direction: "higher_is_better",
+    unit: "percent",
+  },
+  /*
+   * G13, PRD §7.1: "application received → offer accepted, median under 14
+   * days".
+   *
+   * A median rather than a mean, and the target is written for one. In this
+   * market a single hire can wait eleven weeks on a visa transfer or a notice
+   * period, and a mean over four hires a year is one such hire away from
+   * reporting a broken process that is working. The median says what the
+   * typical applicant experiences, which is the thing that loses candidates to
+   * the competitor who answered first.
+   */
+  daysToHire: {
+    id: "G13",
+    label: "Days to hire",
+    target: 14,
     direction: "lower_is_better",
     unit: "days",
   },
@@ -215,3 +251,18 @@ export const DASHBOARD_HORIZON_DAYS = 90;
 
 /** How far back "this week" reaches on the dashboard and in the digest. */
 export const DASHBOARD_WEEK_DAYS = 7;
+
+/**
+ * The window days-to-hire is measured over, in days.
+ *
+ * A year rather than the 90 the rest of the dashboard uses, and this is the one
+ * place the difference is justified. A maintenance contractor of this size
+ * hires a handful of people a year: a 90-day window would put the median over
+ * one or two hires most quarters, and a median over one hire is that hire's
+ * number wearing a statistic's name. Twelve months is also the period the
+ * comparison G13 invites — "are we slower than last year" — is asked about.
+ *
+ * Rolling, not calendar. A year-to-date window would report "not measured"
+ * every January for whoever is reading it on the 3rd.
+ */
+export const DASHBOARD_HIRING_WINDOW_DAYS = 365;

@@ -40,25 +40,32 @@
 
 import postgres from "postgres";
 import { closeConnection, withTenant } from "../src/index";
+import { activeTenantIds } from "../src/domain/cron";
 import {
   applicationStatusByToken,
   applicationsOwedAnOutcome,
+  attachCandidateDocument,
   closeApplication,
   closeRequisition,
   createRequisition,
+  getCandidateDocumentForDownload,
   getPipelineBoard,
   hireCandidate,
+  listTalentPool,
   moveApplicationStage,
   outcomeAccountability,
   publishRequisition,
   approveRequisition,
   purgeExpiredCandidates,
+  reconfirmTalentPoolMember,
   submitApplication,
+  withdrawTalentPoolConsent,
 } from "../src/domain/recruitment";
 import {
   PROHIBITED_APPLICANT_FIELDS,
   PROHIBITED_SCORING_FIELDS,
   UserFacingError,
+  isDownloadable,
   phoneLocalDigits,
 } from "@meridian/core";
 import { testTenantId } from "./_tenant";
@@ -337,6 +344,103 @@ async function main(): Promise<void> {
     check("ATS-16: an unknown token resolves to nothing", missing, null);
   }
 
+  // ── ATS-9: the download gate, and the tenant boundary under it ───────────
+  //
+  // The gate itself is four lines of pure function, so it is checked here as
+  // four lines. What is worth a database for is the lookup the route performs
+  // before it applies the gate: it takes a document id and nothing else, so the
+  // only thing standing between a recruiter at one tenant and a CV at another
+  // is row-level security. That is the assertion below, and it is the reason
+  // this block exists.
+  {
+    checkTrue("ATS-9: a clean file may be handed to a human", isDownloadable("clean"));
+    checkTrue(
+      "ATS-9: an explicitly unscanned file may be, with a warning — 'skipped' is a deployment state",
+      isDownloadable("skipped"),
+    );
+    check("ATS-9: a file mid-scan may not be", isDownloadable("pending"), false);
+    check("ATS-9: a file that failed the scan may not be", isDownloadable("infected"), false);
+
+    const attached = await withTenant(ctx, (tx) =>
+      attachCandidateDocument(tx, ctx, {
+        candidateId,
+        applicationId,
+        kind: "cv",
+        storageKey: `candidates/${candidateId}/zz-test-cv-${RUN}.pdf`,
+        filename: "zz-test-cv.pdf",
+        contentType: "application/pdf",
+        sizeBytes: 1024,
+        sha256: "0".repeat(64),
+        scanStatus: "skipped",
+      }),
+    );
+
+    const found = await withTenant(ctx, (tx) =>
+      getCandidateDocumentForDownload(tx, attached.documentId),
+    );
+    check("ATS-9: the download lookup resolves a document in this tenant", found?.documentId, attached.documentId);
+    check(
+      "ATS-9: and returns the storage key, which getCandidateDetail deliberately does not",
+      found?.storageKey,
+      `candidates/${candidateId}/zz-test-cv-${RUN}.pdf`,
+    );
+    checkTrue("ATS-9: the route's gate says yes to it", isDownloadable(found?.scanStatus ?? "pending"));
+
+    // The one that matters. Same uuid, different tenant context: RLS must
+    // return nothing, so the route's "there is no such document" is the truth
+    // rather than a message it prints while serving the file anyway.
+    // Through `activeTenantIds()`, a SECURITY DEFINER enumerator, and NOT
+    // through `otherTenantId()` in ./_tenant. That helper selects from
+    // `tenants` on the plain handle, outside a tenant transaction, where the
+    // policy is `id = app_current_tenant()` and the setting is unset — so it
+    // returns null whether or not a second tenant exists, and this check would
+    // report itself as skipped on every run for ever. The same footnote is on
+    // the reporting and HR suites; it is the third time it has been stepped in.
+    const other = (await activeTenantIds()).find((id) => id !== tenantId) ?? null;
+    if (other) {
+      const across = await withTenant(
+        { tenantId: other, actorKind: "system" as const },
+        (tx) => getCandidateDocumentForDownload(tx, attached.documentId),
+      );
+      check("ATS-9: the same document id resolves to nothing under another tenant", across, null);
+    } else {
+      // Said out loud rather than passing quietly. A single-tenant database is
+      // a valid state; a green tick that proved nothing is not.
+      console.log("skip  ATS-9: RLS isolation not proven — only one tenant exists in this database");
+    }
+
+    // A flagged file, end to end: the status the route reads is the status that
+    // was written, not a default the lookup filled in.
+    const flagged = await withTenant(ctx, (tx) =>
+      attachCandidateDocument(tx, ctx, {
+        candidateId,
+        applicationId,
+        kind: "other",
+        storageKey: `candidates/${candidateId}/zz-test-flagged-${RUN}.pdf`,
+        filename: "zz-test-flagged.pdf",
+        contentType: "application/pdf",
+        sizeBytes: 2048,
+        sha256: "1".repeat(64),
+        scanStatus: "infected",
+      }),
+    );
+
+    const infected = await withTenant(ctx, (tx) =>
+      getCandidateDocumentForDownload(tx, flagged.documentId),
+    );
+    check("ATS-9: an infected file round-trips its status through the lookup", infected?.scanStatus, "infected");
+    check(
+      "ATS-9: and the gate refuses it, so the route returns 409 rather than the bytes",
+      isDownloadable(infected?.scanStatus ?? "clean"),
+      false,
+    );
+
+    const unknown = await withTenant(ctx, (tx) =>
+      getCandidateDocumentForDownload(tx, "00000000-0000-0000-0000-000000000000"),
+    );
+    check("ATS-9: an id that does not exist resolves to nothing", unknown, null);
+  }
+
   // ── ATS-13: consent, on the path that actually writes it ─────────────────
   //
   // A separate applicant with the talent-pool box ticked. This case was missing
@@ -407,6 +511,132 @@ async function main(): Promise<void> {
         dispositionCode: "role_filled",
       }),
     );
+
+    // ── ATS-13: the pool as something you can actually use ────────────────
+    //
+    // The pool had a way in, a clock, and an alert, and no way to browse it and
+    // no way to stop the clock. These two assertions cover the two halves that
+    // were missing.
+    const inTrade = await withTenant(ctx, (tx) =>
+      listTalentPool(tx, { poolKey: "hvac-installation-maintenance", certifications: "valid" }),
+    );
+    checkTrue(
+      "ATS-13: the pool can be browsed by trade, and a member with an in-date ticket is in it",
+      inTrade.some((m) => m.candidateId === consented.candidateId),
+    );
+
+    const noCertificates = await withTenant(ctx, (tx) =>
+      listTalentPool(tx, { poolKey: "hvac-installation-maintenance", certifications: "none" }),
+    );
+    check(
+      "ATS-13: and the certification filter excludes rather than decorates",
+      noCertificates.some((m) => m.candidateId === consented.candidateId),
+      false,
+    );
+
+    const reconfirmed = await withTenant(ctx, (tx) =>
+      reconfirmTalentPoolMember(tx, ctx, {
+        candidateId: consented.candidateId,
+        poolKey: "hvac-installation-maintenance",
+        note: "zz-test call",
+      }),
+    );
+    const stamp = await admin<{ reconfirmed_at: Date | null; days: number }[]>`
+      select reconfirmed_at,
+             round(extract(epoch from (reconfirm_due_at - now())) / 86400)::int as days
+        from talent_pool_members where candidate_id = ${consented.candidateId}::uuid
+    `;
+    checkTrue(
+      "ATS-13: re-confirming writes reconfirmed_at — the column nothing used to write",
+      stamp[0]?.["reconfirmed_at"] !== null,
+    );
+    check("ATS-13: and the clock is pushed ninety days out, so the cycle can complete",
+      stamp[0]?.["days"], 90);
+    checkTrue("ATS-13: the caller is told when it falls due again",
+      reconfirmed.nextDueAt.getTime() > Date.now());
+
+    // ── ATS-13 / ATS-18: withdrawal, and what it does to the clock ────────
+    //
+    // `consent_withdrawn_at` was read in four places and written in none. The
+    // interesting half is not the flag: it is that `touchCandidate` reads
+    // `retention_basis` to choose between a twelve-month and a six-month
+    // clock, so a withdrawal that left the basis saying 'consent' would keep
+    // renewing a twelve-month retention on a consent that no longer existed.
+    const beforeWithdrawal = await admin<{ retention_basis: string; delete_after: string }[]>`
+      select retention_basis, to_char(delete_after, 'YYYY-MM-DD') as delete_after
+        from candidates where id = ${consented.candidateId}::uuid
+    `;
+    check("ATS-18: the consented candidate is on the consent basis to start with",
+      beforeWithdrawal[0]?.["retention_basis"], "consent");
+
+    const withdrawal = await withTenant(ctx, (tx) =>
+      withdrawTalentPoolConsent(tx, ctx, {
+        candidateId: consented.candidateId,
+        poolKey: "hvac-installation-maintenance",
+        reason: "zz-test withdrawal",
+      }),
+    );
+    check("ATS-13: withdrawal leaves no live consent behind", withdrawal.remainingPools, 0);
+
+    const afterWithdrawal = await admin<{
+      retention_basis: string;
+      delete_after: string;
+      withdrawn: Date | null;
+    }[]>`
+      select c.retention_basis,
+             to_char(c.delete_after, 'YYYY-MM-DD') as delete_after,
+             t.consent_withdrawn_at as withdrawn
+        from candidates c
+        join talent_pool_members t on t.candidate_id = c.id
+       where c.id = ${consented.candidateId}::uuid
+    `;
+    checkTrue("ATS-13: consent_withdrawn_at is written — the column nothing used to write",
+      afterWithdrawal[0]?.["withdrawn"] !== null);
+    check("ATS-18: and the basis moves off consent, so the twelve-month clock stops renewing",
+      afterWithdrawal[0]?.["retention_basis"], "pre_contractual");
+    checkTrue(
+      "ATS-18: the record is now deleted sooner, never later, than it would have been",
+      String(afterWithdrawal[0]?.["delete_after"]) < String(beforeWithdrawal[0]?.["delete_after"]),
+    );
+
+    // And the purge stops shielding them: the pool row no longer counts as a
+    // live consent, so the only thing holding the record is the ordinary
+    // applicant clock.
+    const shielded = await admin<{ count: number }[]>`
+      select count(*)::int as count from talent_pool_members
+       where candidate_id = ${consented.candidateId}::uuid and consent_withdrawn_at is null
+    `;
+    check("ATS-18: the purge's consent shield is gone with it", shielded[0]?.["count"], 0);
+
+    let secondWithdrawalRefused = false;
+    try {
+      await withTenant(ctx, (tx) =>
+        withdrawTalentPoolConsent(tx, ctx, {
+          candidateId: consented.candidateId,
+          poolKey: "hvac-installation-maintenance",
+        }),
+      );
+    } catch (error) {
+      secondWithdrawalRefused = error instanceof UserFacingError;
+    }
+    checkTrue("ATS-13: withdrawing twice is refused rather than silently re-stamped",
+      secondWithdrawalRefused);
+
+    // Withdrawn is not stale. Re-confirming a withdrawal would revive a lawful
+    // basis nobody granted, so it is refused in words rather than silently
+    // resetting the clock.
+    let withdrawnRefused = false;
+    try {
+      await withTenant(ctx, (tx) =>
+        reconfirmTalentPoolMember(tx, ctx, {
+          candidateId: consented.candidateId,
+          poolKey: "hvac-installation-maintenance",
+        }),
+      );
+    } catch (error) {
+      withdrawnRefused = error instanceof UserFacingError;
+    }
+    checkTrue("ATS-13: a withdrawn consent cannot be re-confirmed back into existence", withdrawnRefused);
 
     await admin`delete from talent_pool_members where candidate_id = ${consented.candidateId}::uuid`;
   }

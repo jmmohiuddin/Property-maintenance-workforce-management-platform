@@ -46,9 +46,13 @@ import {
   AUDITED_TABLES,
 } from "../src/domain/reporting";
 import { activeTenantIds } from "../src/domain/cron";
+// Read-only, from the contracts stream. The dashboard calls this same function,
+// so the assertion below compares the headline against its own source.
+import { ppmCompliance } from "../src/domain/contracts";
 import {
   smallBusinessReliefPosition,
   gradeGoal,
+  ppmCompletion,
   DASHBOARD_GOALS,
   SMALL_BUSINESS_RELIEF_THRESHOLD_MINOR,
 } from "@meridian/core";
@@ -251,6 +255,213 @@ async function main(): Promise<void> {
       console.log("skip  no invoice to attach a payment to — seed the database for this check");
     }
 
+    /*
+     * ── The ATS emitter (KPI-2, migration 0018) ───────────────────────────
+     *
+     * This family was registered as `emitter: "none"`, blocked on "the ATS
+     * tables do not exist in this branch", while 0014_recruitment had already
+     * created them three migrations earlier. The checks below are what keeps
+     * the correction honest: they assert the events arrive from a bare SQL
+     * write with nothing in TypeScript calling anything, which is the only
+     * claim `emitter: "trigger"` makes.
+     */
+    console.log("\n— ATS events (KPI-2) —");
+
+    check(
+      "ats_stage_changed is no longer declared uninstrumented",
+      PRODUCT_EVENT_NAMES.find((e) => e.name === "ats_stage_changed")?.emitter,
+      "trigger",
+    );
+
+    const [requisition] = (await tx.execute<{ id: string }>(sql`
+      select id from job_requisitions where deleted_at is null order by created_at limit 1
+    `)) as unknown as { id: string }[];
+
+    const stages = (await tx.execute<{ id: string; stage_type: string }>(sql`
+      select s.id, s.stage_type
+        from requisition_stages s
+       where s.requisition_id = ${requisition?.id ?? null}::uuid
+         and s.deleted_at is null
+       order by s.sequence
+    `)) as unknown as { id: string; stage_type: string }[];
+
+    if (requisition && stages.length >= 2) {
+      const first = stages[0]!;
+      const second = stages[1]!;
+
+      const [candidate] = (await tx.execute<{ id: string }>(sql`
+        insert into candidates (tenant_id, full_name, phone, primary_trade, experience_band,
+                                current_location, notes)
+        values (${tenantId}::uuid, ${`${TAG} candidate`}, '+971500000111', 'ac_repair',
+                '2_to_5', 'in_uae', ${TAG})
+        returning id
+      `)) as unknown as { id: string }[];
+
+      if (!candidate) throw new Error("could not insert the fixture candidate");
+
+      /*
+       * `applied_at` is set ten days back deliberately. It is the START of the
+       * two timestamps G13 is bounded by, and a fixture applied "now" would let
+       * a days-to-hire of zero pass every assertion below while measuring
+       * nothing.
+       */
+      const [application] = (await tx.execute<{ id: string }>(sql`
+        insert into applications (tenant_id, reference, candidate_id, requisition_id,
+                                  current_stage_id, applied_at, outcome_due_at, status_token,
+                                  disposition_note)
+        values (${tenantId}::uuid, ${`${TAG}-APP-1`}, ${candidate.id}::uuid,
+                ${requisition.id}::uuid, ${first.id}::uuid,
+                now() - interval '10 days', now() + interval '14 days',
+                ${`${TAG}-token`}, ${TAG})
+        returning id
+      `)) as unknown as { id: string }[];
+
+      if (!application) throw new Error("could not insert the fixture application");
+
+      const eventsFor = async (name: string): Promise<number> => {
+        const rows = (await tx.execute<{ count: string }>(sql`
+          select count(*) as count from product_events
+           where entity_id = ${application.id}::uuid and event_name = ${name}
+        `)) as unknown as { count: string }[];
+        return Number(rows[0]?.count ?? 0);
+      };
+
+      /*
+       * The arrival, as its own family. It is NOT an ats_stage_changed: an
+       * insert has no prior state to diff, which is why 0017 pairs
+       * lead_created with lead_stage_changed rather than folding them.
+       *
+       * Both halves are asserted, because the failure that matters is the
+       * INSERT leaking into the transition family and inflating G14's funnel
+       * by one arrival per applicant.
+       */
+      check("inserting an application emits ats_application_received", await eventsFor("ats_application_received"), 1);
+      check("and is NOT counted as a transition", await eventsFor("ats_stage_changed"), 0);
+
+      await tx.execute(sql`
+        update applications
+           set current_stage_id = ${second.id}::uuid, stage_entered_at = now()
+         where id = ${application.id}::uuid
+      `);
+      check("a stage move emits ats_stage_changed", await eventsFor("ats_stage_changed"), 1);
+
+      /*
+       * THE ISOLATION ASSERTION.
+       *
+       * `product_events` has an INSERT policy of WITH CHECK (true), because the
+       * emitter is SECURITY DEFINER and runs outside tenant context. The row's
+       * own `tenant_id` is therefore the ONLY thing keeping one tenant's events
+       * out of another's report, and it has to come from NEW.tenant_id rather
+       * than from a session GUC that is unset during the seed.
+       */
+      const emitted = (await tx.execute<{ tenant_id: string }>(sql`
+        select tenant_id from product_events
+         where entity_id = ${application.id}::uuid
+         order by occurred_at limit 1
+      `)) as unknown as { tenant_id: string }[];
+      check(
+        "and stamps the tenant from the row being written, not from the session",
+        emitted[0]?.tenant_id,
+        tenantId,
+      );
+
+      const stageEvent = (await tx.execute<{ properties: Record<string, unknown> }>(sql`
+        select properties from product_events
+         where entity_id = ${application.id}::uuid and event_name = 'ats_stage_changed'
+         order by occurred_at desc limit 1
+      `)) as unknown as { properties: Record<string, unknown> }[];
+
+      check("carrying the stage it left", stageEvent[0]?.properties["from_stage_id"], first.id);
+      check("and the stage it entered", stageEvent[0]?.properties["to_stage_id"], second.id);
+      check(
+        "and the days since the application arrived, computed in Asia/Dubai",
+        stageEvent[0]?.properties["days_since_applied"],
+        10,
+      );
+      checkTrue(
+        "the payload carries no name or phone — these rows outlive the ATS-18 purge",
+        !JSON.stringify(stageEvent[0]?.properties ?? {}).includes(TAG),
+      );
+
+      /*
+       * The anti-noise assertion, mirroring the one the lead funnel already
+       * makes. `blocked_note` is neither the stage pointer nor the status, so
+       * this UPDATE must emit nothing — otherwise the funnel counts edits
+       * rather than progress and G14's stage conversion is computed over a
+       * denominator inflated by typo corrections.
+       */
+      await tx.execute(sql`
+        update applications set blocked_note = 'waiting on a callback'
+         where id = ${application.id}::uuid
+      `);
+      check("an edit to an unrelated column emits nothing", await eventsFor("ats_stage_changed"), 1);
+
+      /*
+       * ── THE HIRE, AND THE TRAP THIS CHECK EXISTS FOR ────────────────────
+       *
+       * `hireCandidate` sets `status = 'hired'` and does NOT touch
+       * `current_stage_id`. A trigger keyed on the stage pointer alone would
+       * miss every hire — the one transition the module exists to produce, and
+       * the END of the two timestamps G13 is measured between — and it would
+       * miss it silently.
+       *
+       * So the update below deliberately changes the status and NOTHING else.
+       * If the guard is ever narrowed back to the stage pointer, this is the
+       * check that fails.
+       *
+       * Two writes, because that is what `hireCandidate` does: the status on
+       * the application, and the activity row the days-to-hire query reads.
+       */
+      const hiringBefore = (await ownerDashboard(tx)).hiring;
+
+      await tx.execute(sql`
+        insert into application_events (tenant_id, application_id, event_type, actor_kind, note)
+        values (${tenantId}::uuid, ${application.id}::uuid, 'hired', 'system', ${TAG})
+      `);
+      await tx.execute(sql`
+        update applications set status = 'hired' where id = ${application.id}::uuid
+      `);
+
+      check(
+        "a hire changes the status and not the stage, and is STILL emitted",
+        await eventsFor("ats_stage_changed"),
+        2,
+      );
+      const closeEvent = (await tx.execute<{ properties: Record<string, unknown> }>(sql`
+        select properties from product_events
+         where entity_id = ${application.id}::uuid and event_name = 'ats_stage_changed'
+         order by occurred_at desc limit 1
+      `)) as unknown as { properties: Record<string, unknown> }[];
+      check("with the outcome as the discriminator", closeEvent[0]?.properties["to_status"], "hired");
+      check("and where it came from", closeEvent[0]?.properties["from_status"], "active");
+      check(
+        "the stage pointer did not move, and the payload says so rather than inventing one",
+        closeEvent[0]?.properties["from_stage_id"],
+        closeEvent[0]?.properties["to_stage_id"],
+      );
+
+      const hiringAfter = (await ownerDashboard(tx)).hiring;
+      check(
+        "the hire counts once in the days-to-hire window",
+        hiringAfter.hiresInWindow - hiringBefore.hiresInWindow,
+        1,
+      );
+      check(
+        "and applied_at to the hired event measures exactly ten days",
+        hiringBefore.hiresInWindow === 0 ? hiringAfter.medianDaysToHire : "n/a",
+        hiringBefore.hiresInWindow === 0 ? 10 : "n/a",
+      );
+
+      // Cleanup, before the shared cleanup block — these rows are foreign-keyed
+      // to each other, so the order matters.
+      await tx.execute(sql`delete from product_events where entity_id = ${application.id}::uuid`);
+      await tx.execute(sql`delete from application_events where application_id = ${application.id}::uuid`);
+      await tx.execute(sql`delete from applications where id = ${application.id}::uuid`);
+      await tx.execute(sql`delete from candidates where id = ${candidate.id}::uuid`);
+    } else {
+      console.log("skip  no requisition with a pipeline — seed the database for the ATS checks");
+    }
+
     // ── The registry is a gate, not documentation ──────────────────────────
     let rejected = false;
     try {
@@ -357,11 +568,89 @@ async function main(): Promise<void> {
       d.work.jobsWithDeadlineThisWeek === 0 ? d.work.breachRatePercent : "n/a",
       d.work.jobsWithDeadlineThisWeek === 0 ? null : "n/a",
     );
+    /*
+     * G12. TWO wrong answers are available here and they are wrong in opposite
+     * directions: 0% shows a contractor who has never sold an AMC as failing a
+     * 98% target, and 100% awards a perfect score to a business that has done
+     * no maintenance. `ppmCompletion` in core returns 100 when nothing is due —
+     * correct for one contract in its first month, wrong as a tenant headline —
+     * so the dashboard has to return null and this is the check that holds it
+     * to that.
+     */
+    check(
+      "PPM completion is null when no visit window has closed — not 0% and not 100%",
+      d.contracts.ppmVisitsDue === 0 ? d.contracts.ppmCompletionPercent : "n/a",
+      d.contracts.ppmVisitsDue === 0 ? null : "n/a",
+    );
+    check(
+      "and an unmeasured PPM completion never grades as missed",
+      d.contracts.ppmCompletionPercent === null ? d.contracts.ppmVerdict : "n/a",
+      d.contracts.ppmCompletionPercent === null ? "unknown" : "n/a",
+    );
+    /*
+     * SUMMED, NOT AVERAGED — and this is the assertion that tells them apart.
+     *
+     * Averaging per-contract percentages weights a contract with one visit due
+     * equally with one carrying fifty, so a single tiny contract at 0% can drag
+     * a tenant that met its obligations on 200 visits below the target. The two
+     * formulas agree only when every contract has the same number of visits
+     * due, so where the fixtures make them differ this pins down which one the
+     * dashboard used.
+     */
+    const ppmRows = await ppmCompliance(tx);
+    const dueTotal = ppmRows.reduce((n, c) => n + c.completed + c.overdue, 0);
+    const summed =
+      dueTotal === 0
+        ? null
+        : ppmCompletion({
+            scheduled: ppmRows.reduce((n, c) => n + c.scheduled, 0),
+            completed: ppmRows.reduce((n, c) => n + c.completed, 0),
+            overdue: ppmRows.reduce((n, c) => n + c.overdue, 0),
+          }).percent;
+    check("PPM completion is the summed ratio, not a mean of per-contract rates", d.contracts.ppmCompletionPercent, summed);
+    check(
+      "and the denominator is the visits actually due, taken from that same list",
+      d.contracts.ppmVisitsDue,
+      dueTotal,
+    );
+
+    checkTrue(
+      "visits completed never exceed visits due, so the rate cannot pass 100%",
+      d.contracts.ppmVisitsCompleted <= d.contracts.ppmVisitsDue &&
+        (d.contracts.ppmCompletionPercent === null ||
+          (d.contracts.ppmCompletionPercent >= 0 && d.contracts.ppmCompletionPercent <= 100)),
+    );
+
+    /*
+     * G13's own version of the rule, and the worst of the four to get wrong: a
+     * days-to-hire of 0 reads as "we hire the same day", and it is produced by
+     * hiring nobody.
+     */
+    check(
+      "days-to-hire is null, not zero, when nobody was hired in the window",
+      d.hiring.hiresInWindow === 0 ? d.hiring.medianDaysToHire : "n/a",
+      d.hiring.hiresInWindow === 0 ? null : "n/a",
+    );
+    check(
+      "and an unmeasured days-to-hire never grades as missed",
+      d.hiring.medianDaysToHire === null ? d.hiring.daysToHireVerdict : "n/a",
+      d.hiring.medianDaysToHire === null ? "unknown" : "n/a",
+    );
+    checkTrue(
+      "an open role wants at least one head, so headcount never trails the role count",
+      d.hiring.openHeadcount >= d.hiring.openRoles,
+    );
+    checkTrue(
+      "and the open roles are a subset of every requisition recorded",
+      d.hiring.openRoles + d.hiring.awaitingApproval <= d.hiring.requisitionsRecorded,
+    );
     checkTrue(
       "and an unmeasured figure never grades as missed",
       (d.pipeline.conversionPercent !== null || d.pipeline.conversionVerdict === "unknown") &&
         (d.cash.dsoDays !== null || d.cash.dsoVerdict === "unknown") &&
-        (d.work.breachRatePercent !== null || d.work.breachVerdict === "unknown"),
+        (d.work.breachRatePercent !== null || d.work.breachVerdict === "unknown") &&
+        (d.hiring.medianDaysToHire !== null || d.hiring.daysToHireVerdict === "unknown") &&
+        (d.contracts.ppmCompletionPercent !== null || d.contracts.ppmVerdict === "unknown"),
     );
 
     // Money is integer minor units end to end. A non-integer here means a

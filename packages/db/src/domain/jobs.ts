@@ -103,6 +103,13 @@ export interface DispatchBoardRow {
   readonly propertyArea: string | null;
   readonly propertyCity: string;
   readonly technicianName: string | null;
+  /**
+   * The AMC this job was raised under, or null. `CON-6` is what stops contract
+   * work being absorbed, and a dispatcher who cannot tell a contract job from
+   * any other one has no reason to look for it — so the reference travels with
+   * the row rather than being fetched by whoever remembers to ask.
+   */
+  readonly contractReference: string | null;
   readonly sla: SlaState;
 }
 
@@ -139,10 +146,15 @@ export async function listDispatchBoard(
       propertyArea: schema.properties.area,
       propertyCity: schema.properties.city,
       technicianName: schema.technicians.fullName,
+      contractReference: schema.contracts.reference,
     })
     .from(schema.jobs)
     .innerJoin(schema.customers, eq(schema.customers.id, schema.jobs.customerId))
     .innerJoin(schema.properties, eq(schema.properties.id, schema.jobs.propertyId))
+    // One join, both surfaces: the dispatch board and the jobs list call this
+    // function, so the AMC chip appears on each without either page knowing
+    // anything about contracts.
+    .leftJoin(schema.contracts, eq(schema.contracts.id, schema.jobs.contractId))
     .leftJoin(
       schema.jobVisits,
       and(

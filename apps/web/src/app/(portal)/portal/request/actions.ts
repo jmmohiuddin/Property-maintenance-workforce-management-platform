@@ -2,9 +2,10 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { withCustomerScope, createPortalRequest } from "@meridian/db";
+import { withCustomerScope, createPortalRequest, customerAccountName } from "@meridian/db";
 import { getService, priorityForUrgency, type JobPriority } from "@meridian/core";
-import { enqueue, dispatchPending } from "@meridian/notify";
+import { dispatchPending } from "@meridian/notify";
+import { sendCustomerNotification } from "@/lib/customer-notifications";
 import { requirePortalSession } from "@/lib/session";
 import { userMessage } from "@/lib/errors";
 
@@ -57,22 +58,48 @@ export async function raiseRequest(_prev: RequestState, formData: FormData): Pro
           { propertyId, serviceSlug, title, description: description || undefined, requestedPriority },
         );
 
-        await enqueue(
-          tx,
-          { tenantId: session.principal.tenantId, userId: session.principal.userId },
-          {
-            channel: "email",
-            template: "request_received",
-            to: session.user.email,
-            recipientUserId: session.principal.userId,
-            subject: { table: "jobs", id: created.jobId },
-            payload: {
-              customerName: session.user.fullName,
-              jobReference: created.reference,
-              jobTitle: title,
+        // ── WHO HEARS ABOUT THIS, AND WHY IT IS NOT THE PERSON WHO ASKED ────
+        //
+        // This used to go to `session.user.email` — the portal login's own
+        // address — while the sweep sent the same event to the account's
+        // notify-flagged contacts and its billing address. Two recipient rules
+        // for one event, and the account-level one is the right one: `POR-5` is
+        // a preference held by the *customer*, not by whoever happens to be
+        // signed in, and the person raising a request from a shared handover
+        // account is very often not the person who wants the paperwork. The
+        // codebase already argued this, in `customerNotificationRecipients`: a
+        // portal login is an identity for reading the account, not a
+        // subscription, and someone who could only stop these emails by giving
+        // up their access has not really been given the choice `POR-5`
+        // promises.
+        //
+        // Nothing is lost to the requester: the confirmation with the reference
+        // is on the screen they land on before any email would have arrived.
+        //
+        // `sendCustomerNotification` is the one door. It consults the opt-out,
+        // resolves the same recipients the sweep would, and enqueues inside
+        // this transaction so a request that rolls back is never acknowledged.
+        const accountName = await customerAccountName(tx, session.customerId);
+        if (accountName) {
+          await sendCustomerNotification(
+            tx,
+            { tenantId: session.principal.tenantId, userId: session.principal.userId },
+            {
+              event: "request_received",
+              customerId: session.customerId,
+              customerName: accountName,
+              subjectTable: "jobs",
+              subjectId: created.jobId,
+              reference: created.reference,
+              title,
+              detail: null,
+              amount: null,
+              currency: null,
+              occursAt: null,
+              occursEndAt: null,
             },
-          },
-        );
+          );
+        }
 
         return created;
       },

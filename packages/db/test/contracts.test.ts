@@ -33,7 +33,7 @@
  */
 
 import { sql } from "drizzle-orm";
-import { withTenant, closeConnection, db } from "../src/index";
+import { withTenant, withCustomerScope, closeConnection, db } from "../src/index";
 import { testTenantId } from "./_tenant";
 import {
   activateContract,
@@ -55,6 +55,9 @@ import {
   renewalNoticeSent,
   renewalPipeline,
   getContract,
+  jobContractScope,
+  listContracts,
+  listPortalContracts,
 } from "../src/domain";
 import {
   DEFAULT_CALENDAR,
@@ -326,6 +329,23 @@ async function main(): Promise<void> {
 
   /** Jobs this test inserted directly, rather than through materialisation. */
   const jobIdsToPurge: string[] = [];
+
+  /**
+   * The customer this test's contract belongs to, and one that it does not.
+   *
+   * Captured out here because the `CON-5` portal assertions have to run AFTER
+   * the transaction above commits: `withCustomerScope` opens its own
+   * transaction and cannot see uncommitted rows, and the whole point of those
+   * assertions is that Postgres does the scoping rather than a WHERE clause.
+   *
+   * The second customer is another one in the SAME tenant, deliberately — not
+   * another tenant. Tenant isolation is `rls.sql`'s job and is verified there;
+   * what `customer-scope.sql` adds is the boundary between two customers who
+   * are both legitimately inside this tenant, and only a same-tenant pair
+   * exercises it.
+   */
+  let contractCustomerId = "";
+  let otherCustomerId = "";
 
   try {
     await withTenant(ctx, async (tx) => {
@@ -776,6 +796,87 @@ async function main(): Promise<void> {
       }
       checkTrue("quoting work the contract covers is REFUSED", refusedCoveredQuote);
 
+      // ── CON-6: the scope check has an entry point ───────────────────────
+      //
+      // `checkContractScope` shipped correct and unreachable — nothing in the
+      // application called it, so the mechanism that stops work being absorbed
+      // could not fire. `jobContractScope` is what the job detail page renders
+      // from, on every contract job and with nobody pressing anything, so these
+      // assertions are about the automatic half: the verdict a page can state
+      // before a technician has said a word.
+      console.log("\n— CON-6: the automatic scope check —");
+
+      const autoScope = await jobContractScope(tx, firstJobId);
+      checkTrue("a contract job resolves its contract", autoScope !== null);
+      check("and reports the reference the banner shows", autoScope?.contractReference, created.reference);
+      check("with the coverage type the panel branches on", autoScope?.coverageType, "comprehensive");
+      // The exclusions offered are THIS contract's three, not the standard
+      // catalogue. A code the contract does not carry cannot change the
+      // verdict, so offering it would be a control that does nothing.
+      check("it offers this contract's own exclusions", autoScope?.exclusions.length, 3);
+      checkTrue(
+        "and only ones the contract actually carries",
+        (autoScope?.exclusions ?? []).every((e) =>
+          ["compressor_replacement", "fan_motor_replacement", "waterproofing"].includes(e.code),
+        ),
+      );
+      // `firstJobId` was quoted above, but the verdict is about coverage and
+      // entitlement, not about whether somebody already raised a quote.
+      checkTrue(
+        "the verdict is one decideScope produces",
+        ["covered", "excluded", "entitlement_exhausted", "not_covered", "parts_not_covered"].includes(
+          autoScope?.decision.verdict ?? "",
+        ),
+      );
+
+      // The other half of "reachable": a job with no contract must produce no
+      // banner at all rather than an empty or a wrong one. Most jobs are this.
+      const plainJobs = (await tx.execute<{ id: string }>(sql`
+        select id from jobs
+         where contract_id is null and deleted_at is null
+         limit 1
+      `)) as unknown as { id: string }[];
+      const plainJobId = plainJobs[0]?.id;
+      checkTrue("the seed has a job that is not contract work", plainJobId !== undefined);
+      if (plainJobId) {
+        check("a job with no contract has no scope", await jobContractScope(tx, plainJobId), null);
+      }
+
+      // ── CON-5: the customer record's filter ─────────────────────────────
+      console.log("\n— CON-5: contracts by customer —");
+
+      contractCustomerId = target.customer_id;
+      otherCustomerId = otherCustomerProperty?.customer_id ?? "";
+
+      const mineOnly = await listContracts(tx, {
+        customerId: contractCustomerId,
+        includeEnded: true,
+      });
+      checkTrue("the customer's own contract is in the filtered list", mineOnly.some((c) => c.id === contractId));
+      checkTrue(
+        "and every row belongs to that customer",
+        mineOnly.every((c) => c.customerId === contractCustomerId),
+      );
+      // The entitlement travels with the row. Without it the customer record
+      // would have to call getContract once per contract to answer CON-5.
+      const mineRow = mineOnly.find((c) => c.id === contractId);
+      check("the row carries its entitlements", mineRow?.entitlements.length, 2);
+      check(
+        "measured over the term, like every other entitlement figure",
+        mineRow?.entitlements.find((e) => e.serviceSlug === "hvac-installation-maintenance")
+          ?.entitledForTerm,
+        4,
+      );
+
+      checkTrue("the seed has a second customer to scope against", otherCustomerId !== "");
+      if (otherCustomerId) {
+        const theirs = await listContracts(tx, { customerId: otherCustomerId, includeEnded: true });
+        checkTrue(
+          "another customer's filtered list does not contain it",
+          !theirs.some((c) => c.id === contractId),
+        );
+      }
+
       // ── CON-7: PPM compliance ───────────────────────────────────────────
       console.log("\n— CON-7: PPM compliance —");
 
@@ -903,6 +1004,104 @@ async function main(): Promise<void> {
         2,
       );
     });
+
+    // ── CON-5: what the customer paying for it can see ────────────────────
+    //
+    // Outside the transaction above, deliberately: `withCustomerScope` opens
+    // its own, so these run against committed rows and against the RESTRICTIVE
+    // policies rather than against anything this file filtered by hand. Not one
+    // query below carries a `customer_id =` predicate — that is the property
+    // being asserted. If the policy were missing, the "another customer"
+    // assertions would fail rather than passing on an application filter.
+    console.log("\n— CON-5: the portal —");
+
+    // What the office sees, read now rather than earlier: the CON-9 assertions
+    // above move `ends_on` to 45 days out, and entitlement is scaled to the
+    // term, so a figure captured before that would be measuring a term the
+    // contract no longer has.
+    const staffView = await withTenant(ctx, (tx) => getContract(tx, contractId));
+    const staffAcEntitlement = staffView?.entitlements.find(
+      (e) => e.serviceSlug === "hvac-installation-maintenance",
+    );
+    checkTrue("the office has an AC entitlement to compare against", staffAcEntitlement !== undefined);
+
+    await withCustomerScope({ tenantId, customerId: contractCustomerId }, async (tx) => {
+      const mine = await listPortalContracts(tx);
+      const ours = mine.find((c) => c.id === contractId);
+      checkTrue("the customer sees their own contract", ours !== undefined);
+      check("with both entitlements on it", ours?.entitlements.length, 2);
+      const portalAc = ours?.entitlements.find(
+        (e) => e.serviceSlug === "hvac-installation-maintenance",
+      );
+      // The invariant that matters is not a literal, it is agreement: the
+      // customer and the office must be quoting each other the same number, or
+      // the renewal conversation starts with two figures.
+      check(
+        "the customer's entitlement matches the office's, over the term",
+        portalAc?.entitledForTerm,
+        staffAcEntitlement?.entitledForTerm,
+      );
+      check(
+        "and so does consumption",
+        portalAc?.consumedVisits,
+        staffAcEntitlement?.consumedVisits,
+      );
+
+      // Objects with a label and a sentence, not codes. `contracts.exclusions`
+      // is the customer-facing list precisely because it carries the prose;
+      // reading it as an array of strings produced an empty list on every
+      // contract and was caught here rather than in the browser.
+      checkTrue(
+        "and the carve-outs written for them, from the contract header",
+        (ours?.exclusions.length ?? 0) > 0,
+      );
+      checkTrue(
+        "each one carrying the sentence written for a customer, not a code",
+        (ours?.exclusions ?? []).every((x) => x.label !== "" && x.label !== x.code),
+      );
+
+      // The entitlement table is open to them, which is the policy this work
+      // added. Asserted directly rather than only through the read above, so a
+      // future query that stops using `listPortalContracts` still has the
+      // boundary tested.
+      const ownEntitlements = (await tx.execute<{ count: number }>(sql`
+        select count(*)::int as count from contract_entitlements where contract_id = ${contractId}
+      `)) as unknown as { count: number }[];
+      check("the entitlement rows are readable", ownEntitlements[0]?.count, 2);
+
+      // And these stay shut. `contract_terms` carries the discount rate and the
+      // payment terms — the position an out-of-scope quote is priced from —
+      // and `contract_exclusions` exists for CON-6 machine matching, not for
+      // reading. Neither is named by CON-5.
+      const terms = (await tx.execute<{ count: number }>(sql`
+        select count(*)::int as count from contract_terms
+      `)) as unknown as { count: number }[];
+      check("the commercial terms behind it stay closed", terms[0]?.count, 0);
+
+      const exclusionRows = (await tx.execute<{ count: number }>(sql`
+        select count(*)::int as count from contract_exclusions
+      `)) as unknown as { count: number }[];
+      check("and so does the machine-matching exclusion table", exclusionRows[0]?.count, 0);
+    });
+
+    if (otherCustomerId) {
+      await withCustomerScope({ tenantId, customerId: otherCustomerId }, async (tx) => {
+        const theirs = await listPortalContracts(tx);
+        checkTrue(
+          "another customer in the same tenant does not see this contract",
+          !theirs.some((c) => c.id === contractId),
+        );
+
+        const strayEntitlements = (await tx.execute<{ count: number }>(sql`
+          select count(*)::int as count from contract_entitlements where contract_id = ${contractId}
+        `)) as unknown as { count: number }[];
+        check(
+          "nor its entitlements, asked for by id",
+          strayEntitlements[0]?.count,
+          0,
+        );
+      });
+    }
   } finally {
     // ── Cleanup ───────────────────────────────────────────────────────────
     //

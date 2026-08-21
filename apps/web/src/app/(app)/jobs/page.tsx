@@ -129,6 +129,19 @@ export default async function JobsPage({
                         {job.reference}
                       </span>
                       <h2 className="text-[15px] font-medium">{job.title}</h2>
+                      {/* The same chip the dispatch board shows, from the same
+                          join: both screens call `listDispatchBoard`. */}
+                      {job.contractReference ? (
+                        <span
+                          className="tnum rounded-sm px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide"
+                          style={{
+                            backgroundColor: "var(--accent-wash)",
+                            color: "var(--accent-text)",
+                          }}
+                        >
+                          AMC &middot; {job.contractReference}
+                        </span>
+                      ) : null}
                     </div>
                     <div className="flex shrink-0 items-center gap-3 text-[13px]">
                       <span style={{ color: "var(--text-secondary)" }}>{STATUS_LABEL[job.status]}</span>

@@ -16,6 +16,7 @@ import {
   UserFacingError,
 } from "@meridian/core";
 import { nextJobReference } from "./jobs";
+import { OPEN_JOB_STATUSES } from "./customers";
 import { rowDate, requiredRowDate } from "./_rows";
 
 /**
@@ -401,11 +402,127 @@ export async function getLead(tx: TenantScopedTx, leadId: string): Promise<LeadR
 }
 
 /**
+ * The customers a lead might already belong to, at the moment of conversion
+ * (`LEAD-5`).
+ *
+ * `findDuplicateMatches` answers "who does this enquiry look like"; this
+ * narrows that to the only half conversion can act on — customers — and folds
+ * in the pointer already on the lead, which the matcher would miss if the
+ * customer's phone or email has been edited since the link was made.
+ *
+ * Recomputed rather than read from `matched_customer_id` alone, and for the
+ * same reason the lead screen recomputes: a customer created last week from a
+ * different enquiry is a duplicate this lead did not have when it arrived.
+ */
+export interface ConvertCandidate {
+  readonly customerId: string;
+  readonly name: string;
+  readonly phone: string | null;
+  readonly email: string | null;
+  /** Phone AND email both matched this customer. */
+  readonly isStrict: boolean;
+  /** The pointer is already on the lead — auto-linked at creation, or linked by hand. */
+  readonly isLinked: boolean;
+}
+
+/** True for a candidate that conversion refuses to decide about on its own. */
+function needsDecision(candidate: ConvertCandidate): boolean {
+  return candidate.isStrict || candidate.isLinked;
+}
+
+export async function convertCustomerCandidates(
+  tx: TenantScopedTx,
+  leadId: string,
+): Promise<readonly ConvertCandidate[]> {
+  const lead = await getLead(tx, leadId);
+  if (!lead) return [];
+
+  const report = await findDuplicateMatches(tx, {
+    phone: lead.phone,
+    email: lead.email,
+    excludeLeadId: lead.id,
+  });
+
+  const candidates: ConvertCandidate[] = report.matches
+    .filter((m) => m.kind === "customer")
+    .map((m) => ({
+      customerId: m.id,
+      name: m.name,
+      phone: m.phone,
+      email: m.email,
+      isStrict: m.isStrict,
+      isLinked: m.id === lead.matchedCustomerId,
+    }));
+
+  // The linked customer, when the matcher no longer finds it. Somebody changed
+  // that account's phone number after the link was made; the link is still a
+  // decision a person took about this lead and dropping it here would put the
+  // duplicate back.
+  if (lead.matchedCustomerId && !candidates.some((c) => c.isLinked)) {
+    const [row] = await tx
+      .select({
+        id: schema.customers.id,
+        name: schema.customers.name,
+        phone: schema.customers.phone,
+        billingEmail: schema.customers.billingEmail,
+      })
+      .from(schema.customers)
+      .where(eq(schema.customers.id, lead.matchedCustomerId))
+      .limit(1);
+
+    if (row) {
+      candidates.unshift({
+        customerId: row.id,
+        name: row.name,
+        phone: row.phone,
+        email: row.billingEmail,
+        isStrict: false,
+        isLinked: true,
+      });
+    }
+  }
+
+  // Strict and linked first: the ones conversion will refuse to guess about are
+  // the ones worth reading.
+  return [...candidates].sort((a, b) => Number(needsDecision(b)) - Number(needsDecision(a)));
+}
+
+/**
  * Convert a qualified lead into a customer, a property and a job.
  *
  * One transaction. A half-converted lead - a customer with no property, or a
  * property with no job - is worse than an unconverted one, because it looks
  * like real data to every report that follows.
+ *
+ * ── WHY THIS REFUSES RATHER THAN REUSING (`LEAD-5`) ────────────────────────
+ *
+ * The duplicate matcher used to run only on create. So a lead the strict tier
+ * had already tied to an existing customer — pointer written, badge on the
+ * screen, everything working — produced a second customer for the same person
+ * the moment somebody pressed Convert. The check existed and the one action
+ * that creates a customer never asked it.
+ *
+ * Running it here raises the question of what to do with a hit, and the two
+ * obvious answers are both wrong in the same way:
+ *
+ *  * **Silently create** is the bug as it stands: two accounts for one person,
+ *    their history split across both, and an ageing report that agrees with
+ *    neither.
+ *  * **Silently reuse** is not the safe opposite of it. This call attaches a
+ *    property, a job and everything invoiced against it to an account, and a
+ *    dispatcher who did not choose that account has no reason to check it. A
+ *    wrong link at creation is undone by clearing a column; work filed under
+ *    the wrong customer is undone by moving jobs and re-issuing invoices.
+ *
+ * So a strict or already-linked match makes the decision a person's, and this
+ * refuses until it has one — `customerId` to attach to that account, or
+ * `createNewCustomer` to say the match was seen and rejected. The refusal names
+ * the account, which is the only way the outcome reaches the screen either way.
+ *
+ * A loose match — phone OR email — never reaches here. It is a suggestion the
+ * convert form shows and the operator may ignore, because being wrong about a
+ * shared switchboard number costs somebody dismissing a suggestion, and being
+ * unable to convert costs them the job.
  */
 export async function convertLeadToJob(
   tx: TenantScopedTx,
@@ -414,19 +531,60 @@ export async function convertLeadToJob(
     leadId: string;
     /** Reuse an existing customer, or create one from the lead's details. */
     customerId?: string | undefined;
+    /**
+     * Create a new customer even though this lead matches one.
+     *
+     * The operator's acknowledgement that the match was put in front of them
+     * and rejected. Without it a strict or linked match refuses.
+     */
+    createNewCustomer?: boolean | undefined;
     propertyName: string;
     addressLine: string;
     priority: JobPriority;
     title: string;
   },
-): Promise<{ jobId: string; reference: string; customerId: string; propertyId: string }> {
+): Promise<{
+  jobId: string;
+  reference: string;
+  customerId: string;
+  /** Named so the caller can say on screen which account the work went to. */
+  customerName: string;
+  /** False when an existing customer was reused. */
+  customerCreated: boolean;
+  propertyId: string;
+}> {
   const lead = await getLead(tx, input.leadId);
   if (!lead) throw new Error("Lead not found in this tenant");
   if (lead.convertedCustomerId) throw new UserFacingError("This lead has already been converted");
 
   let customerId = input.customerId;
+  let customerName: string;
+  let customerCreated = false;
 
-  if (!customerId) {
+  if (customerId) {
+    // Resolved, not trusted. Under RLS an id from another tenant selects
+    // nothing here, so this is the cross-tenant check as well as the lookup
+    // that gets the name back onto the screen.
+    const [chosen] = await tx
+      .select({ id: schema.customers.id, name: schema.customers.name })
+      .from(schema.customers)
+      .where(eq(schema.customers.id, customerId))
+      .limit(1);
+    if (!chosen) throw new UserFacingError("That customer is not one this lead can be attached to.");
+    customerName = chosen.name;
+  } else {
+    const candidates = await convertCustomerCandidates(tx, input.leadId);
+    const blocking = candidates.filter(needsDecision);
+
+    if (blocking.length > 0 && !input.createNewCustomer) {
+      const names = blocking.map((c) => c.name).join(", ");
+      throw new UserFacingError(
+        `This enquiry matches an existing customer: ${names}. ` +
+          `Choose whether to attach the job to that account or create a new one — ` +
+          `converting cannot decide that for you.`,
+      );
+    }
+
     // Tenant-unique code derived from the name, with a short suffix so two
     // customers called "Al Futtaim" cannot collide.
     const base = lead.name.replace(/[^A-Za-z0-9]/g, "").slice(0, 8).toUpperCase() || "CUST";
@@ -443,9 +601,11 @@ export async function convertLeadToJob(
         billingEmail: lead.email,
         paymentTermsDays: 0,
       })
-      .returning({ id: schema.customers.id });
+      .returning({ id: schema.customers.id, name: schema.customers.name });
     if (!customer) throw new Error("Failed to create customer");
     customerId = customer.id;
+    customerName = customer.name;
+    customerCreated = true;
   }
 
   const [property] = await tx
@@ -500,7 +660,13 @@ export async function convertLeadToJob(
     jobId: job.id,
     fromStatus: null,
     toStatus: "triaged",
-    note: `Converted from web enquiry ENQ-${lead.id.slice(0, 8).toUpperCase()}`,
+    // Which account this landed on, on the job's own timeline. The dispatcher
+    // sees it at the moment of the decision; this is what the next person to
+    // open the job sees, and it is the difference between an account that was
+    // chosen and one that was assumed.
+    note:
+      `Converted from web enquiry ENQ-${lead.id.slice(0, 8).toUpperCase()}` +
+      (customerCreated ? "" : ` · attached to existing customer ${customerName}`),
     actorId: ctx.userId ?? null,
     actorKind: "user",
   });
@@ -510,7 +676,14 @@ export async function convertLeadToJob(
     .set({ stage: "won", convertedCustomerId: customerId, nextFollowUpAt: null, updatedAt: now })
     .where(eq(schema.leads.id, input.leadId));
 
-  return { jobId: job.id, reference, customerId, propertyId: property.id };
+  return {
+    jobId: job.id,
+    reference,
+    customerId,
+    customerName,
+    customerCreated,
+    propertyId: property.id,
+  };
 }
 
 /**
@@ -942,26 +1115,55 @@ export interface CustomerSearchRow {
   readonly phone: string | null;
   readonly billingEmail: string | null;
   readonly isActive: boolean;
+  readonly industry: string | null;
+  readonly currency: string;
+  readonly paymentTermsDays: number;
+  readonly accountManagerName: string | null;
   readonly propertyCount: number;
+  readonly openJobs: number;
+  /** Minor units. Issued and part-paid invoices, never written-off ones. */
+  readonly outstandingMinor: number;
+  /** The part of that balance past its due date. */
+  readonly overdueMinor: number;
 }
 
 /**
- * Search and page the customer list (`LEAD-8`).
+ * Search and page the customer list (`LEAD-8`, closing `TD-10` on this screen).
  *
- * Here rather than in `domain/customers.ts` for a boring reason worth stating
- * plainly: that file belongs to another workstream this week and appending to
- * it would collide at integration. The search predicate and the cursor are
- * shared with `searchLeads` above, so the two lists behave identically — the
- * same box finds a phone number the same way in both, which is the property a
- * user actually notices. Moving this next to the other customer queries is a
- * one-line change whenever that file is free.
+ * Here rather than in `domain/customers.ts` because the cursor, the page
+ * boundary and the search predicate are private to this file and shared with
+ * `searchLeads` above. That sharing is the point rather than an accident of
+ * layout: the same box finds a phone number the same way on both screens, which
+ * is the property a user actually notices, and one predicate cannot drift from
+ * itself.
+ *
+ * ── WHY THE MONEY IS IN THIS QUERY ─────────────────────────────────────────
+ *
+ * The customer screen exists to put work in flight and money outstanding on the
+ * same row, and `listCustomers` produced both — by reading every customer, then
+ * every open job, then every unpaid invoice, and joining them in JavaScript.
+ * That is the unbounded read `TD-10` names, and paging it in the application
+ * would page the display while still fetching everything.
+ *
+ * So the balances are correlated subqueries against `invoices` and `jobs`,
+ * evaluated for the twenty-five rows this page returns and no others. The
+ * arithmetic stays in integer minor units — `round(x * 100)` on a
+ * `numeric(14,2)` is exact, and this number is read next to the ledger.
  */
 export async function searchCustomers(
   tx: TenantScopedTx,
-  options?: { q?: string | undefined; cursor?: string | undefined; limit?: number | undefined },
+  options?: {
+    q?: string | undefined;
+    cursor?: string | undefined;
+    limit?: number | undefined;
+    /** Inactive accounts are hidden by default, as the list has always done. */
+    includeInactive?: boolean | undefined;
+    now?: Date | undefined;
+  },
 ): Promise<Page<CustomerSearchRow>> {
   const limit = Math.min(Math.max(options?.limit ?? 25, 1), MAX_PAGE);
   const cursor = decodeCursor(options?.cursor);
+  const now = (options?.now ?? new Date()).toISOString();
 
   const search = searchPredicate(options?.q, {
     name: "c.name",
@@ -973,12 +1175,33 @@ export async function searchCustomers(
     ? sql`and (c.created_at, c.id) < (${cursor.createdAt.toISOString()}::timestamptz, ${cursor.id}::uuid)`
     : sql``;
 
+  const activeOnly = options?.includeInactive ? sql`` : sql`and c.is_active`;
+
   const rows = (await tx.execute<Record<string, never>>(sql`
     select c.id, c.created_at, c.code, c.name, c.phone, c.billing_email, c.is_active,
+           c.industry, c.currency, c.payment_terms_days,
+           u.full_name as account_manager_name,
            (select count(*) from properties p
-             where p.customer_id = c.id and p.deleted_at is null) as property_count
+             where p.customer_id = c.id and p.deleted_at is null) as property_count,
+           (select count(*) from jobs j
+             where j.customer_id = c.id and j.deleted_at is null
+               and j.status::text in (${sql.join(OPEN_JOB_STATUSES.map((s) => sql`${s}`), sql`, `)})) as open_jobs,
+           -- greatest(..., 0) per invoice, not on the sum: an overpaid invoice
+           -- is not a credit against the next one here, and letting it net off
+           -- would understate a balance that accounts is chasing.
+           coalesce((select sum(round(greatest(i.total - i.amount_paid, 0) * 100))
+                       from invoices i
+                      where i.customer_id = c.id and i.deleted_at is null
+                        and i.status::text in ('issued', 'part_paid', 'overdue')), 0) as outstanding_minor,
+           coalesce((select sum(round(greatest(i.total - i.amount_paid, 0) * 100))
+                       from invoices i
+                      where i.customer_id = c.id and i.deleted_at is null
+                        and i.status::text in ('issued', 'part_paid', 'overdue')
+                        and i.due_on is not null and i.due_on < ${now}::timestamptz), 0) as overdue_minor
       from customers c
+      left join users u on u.id = c.account_manager_id
      where c.deleted_at is null
+       ${activeOnly}
        ${search ? sql`and ${search}` : sql``}
        ${keyset}
      order by c.created_at desc, c.id desc
@@ -991,7 +1214,14 @@ export async function searchCustomers(
     phone: string | null;
     billing_email: string | null;
     is_active: boolean;
+    industry: string | null;
+    currency: string;
+    payment_terms_days: number;
+    account_manager_name: string | null;
     property_count: string;
+    open_jobs: string;
+    outstanding_minor: string;
+    overdue_minor: string;
   }[];
 
   return toPage(
@@ -1003,7 +1233,14 @@ export async function searchCustomers(
       phone: r.phone,
       billingEmail: r.billing_email,
       isActive: r.is_active,
+      industry: r.industry,
+      currency: r.currency,
+      paymentTermsDays: Number(r.payment_terms_days),
+      accountManagerName: r.account_manager_name,
       propertyCount: Number(r.property_count),
+      openJobs: Number(r.open_jobs),
+      outstandingMinor: Number(r.outstanding_minor),
+      overdueMinor: Number(r.overdue_minor),
     })),
     limit,
   );

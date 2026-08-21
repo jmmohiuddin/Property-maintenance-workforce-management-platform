@@ -7,6 +7,7 @@ import {
   toMinor,
   UserFacingError,
   CUSTOMER_NOTIFICATION_EVENTS,
+  visitsForTerm,
   type CustomerNotificationEvent,
   type JobPriority,
   type JobStatus,
@@ -842,6 +843,162 @@ export async function getPortalInvoiceRef(
   return { id: row.id, reference: row.reference, status: row.status as InvoiceStatus };
 }
 
+// ── CON-5. The contract, as the customer paying for it sees it ──────────────
+
+export interface PortalEntitlementRow {
+  readonly serviceSlug: string;
+  readonly label: string;
+  readonly visitsPerYear: number;
+  /** Over the whole term, not per year. A two-year contract owes twice. */
+  readonly entitledForTerm: number;
+  readonly consumedVisits: number;
+  readonly remaining: number;
+}
+
+export interface PortalContractRow {
+  readonly id: string;
+  readonly reference: string;
+  readonly name: string;
+  readonly status: string;
+  readonly startsOn: Date;
+  readonly endsOn: Date;
+  readonly daysRemaining: number;
+  /** The customer-facing carve-out list, verbatim from the contract header. */
+  readonly exclusions: readonly {
+    readonly code: string;
+    readonly label: string;
+    readonly description: string | null;
+  }[];
+  readonly entitlements: readonly PortalEntitlementRow[];
+}
+
+/**
+ * The customer's own contracts and what is left on them (`CON-5`).
+ *
+ * ── WHAT THIS DELIBERATELY DOES NOT READ ───────────────────────────────────
+ *
+ * Not `contract_terms`. The discount rate and the payment terms live there,
+ * they are the internal position an out-of-scope quote is priced from, and
+ * `CON-5` asks for the entitlement and not for them. The policy in
+ * `sql/customer-scope.sql` opens `contract_entitlements` alone, so this is not
+ * a matter of which columns were typed here: a query that reached for the terms
+ * from a portal session would return nothing.
+ *
+ * The exclusion list comes from `contracts.exclusions`, the JSONB column the
+ * schema documents as the list shown verbatim to the customer, rather than from
+ * `contract_exclusions`. Those rows exist so `CON-6` can match a code by
+ * machine, and a customer reading `compressor_replacement` learns less than the
+ * sentence that was written for them.
+ *
+ * Drafts and cancellations are excluded for the same reason a draft invoice is:
+ * an unsigned contract is a working document, and publishing one shows the
+ * customer a term nobody has committed to.
+ */
+export async function listPortalContracts(
+  tx: TenantScopedTx,
+  options?: { now?: Date },
+): Promise<readonly PortalContractRow[]> {
+  const now = options?.now ?? new Date();
+
+  // Query builder rather than raw SQL, so `starts_on` and `ends_on` arrive as
+  // real Dates. `tx.execute` hands back space-separated strings and the type
+  // parameter would not have said so.
+  const rows = await tx
+    .select({
+      id: schema.contracts.id,
+      reference: schema.contracts.reference,
+      name: schema.contracts.name,
+      status: schema.contracts.status,
+      startsOn: schema.contracts.startsOn,
+      endsOn: schema.contracts.endsOn,
+      exclusions: schema.contracts.exclusions,
+    })
+    .from(schema.contracts)
+    .where(
+      and(
+        isNull(schema.contracts.deletedAt),
+        inArray(schema.contracts.status, ["active", "suspended", "expired"]),
+      ),
+    )
+    .orderBy(desc(schema.contracts.endsOn));
+
+  if (rows.length === 0) return [];
+
+  const entitlements = await tx
+    .select({
+      contractId: schema.contractEntitlements.contractId,
+      serviceSlug: schema.contractEntitlements.serviceSlug,
+      label: schema.contractEntitlements.label,
+      visitsPerYear: schema.contractEntitlements.visitsPerYear,
+      consumedVisits: schema.contractEntitlements.consumedVisits,
+    })
+    .from(schema.contractEntitlements)
+    .where(
+      and(
+        inArray(
+          schema.contractEntitlements.contractId,
+          rows.map((r) => r.id),
+        ),
+        isNull(schema.contractEntitlements.deletedAt),
+      ),
+    )
+    .orderBy(asc(schema.contractEntitlements.label));
+
+  return rows.map((r) => {
+    const termDays = Math.max(
+      1,
+      Math.round((r.endsOn.getTime() - r.startsOn.getTime()) / 86_400_000),
+    );
+
+    return {
+      id: r.id,
+      reference: r.reference,
+      name: r.name,
+      status: r.status,
+      startsOn: r.startsOn,
+      endsOn: r.endsOn,
+      daysRemaining: Math.ceil((r.endsOn.getTime() - now.getTime()) / 86_400_000),
+      // Objects, not strings. `createContract` writes
+      // `{ code, label, description }` into this column — the label and the
+      // sentence are the whole reason it is the customer-facing list rather
+      // than the code table — and a first pass here read it as an array of
+      // strings, which silently produced an empty list on every contract.
+      exclusions: (Array.isArray(r.exclusions) ? (r.exclusions as unknown[]) : []).flatMap((e) => {
+        if (typeof e === "string") return [{ code: e, label: e, description: null }];
+        if (e === null || typeof e !== "object") return [];
+        const entry = e as Record<string, unknown>;
+        const code = typeof entry["code"] === "string" ? entry["code"] : "";
+        const label = typeof entry["label"] === "string" ? entry["label"] : code;
+        if (label === "") return [];
+        return [
+          {
+            code: code || label,
+            label,
+            description: typeof entry["description"] === "string" ? entry["description"] : null,
+          },
+        ];
+      }),
+      entitlements: entitlements
+        .filter((e) => e.contractId === r.id)
+        .map((e) => {
+          const entitledForTerm = visitsForTerm(e.visitsPerYear, termDays);
+          return {
+            serviceSlug: e.serviceSlug,
+            label: e.label,
+            visitsPerYear: e.visitsPerYear,
+            entitledForTerm,
+            consumedVisits: e.consumedVisits,
+            // Floored at zero. A contract that has been used past its
+            // entitlement is at zero remaining, not at minus two — the
+            // negative is a fact for the renewal conversation, not a number to
+            // put in front of the customer as if we owed them less than none.
+            remaining: Math.max(entitledForTerm - e.consumedVisits, 0),
+          };
+        }),
+    };
+  });
+}
+
 // ── POR-5. Customer notifications, and the per-event opt-out ────────────────
 
 export interface CustomerNotificationSetting {
@@ -926,6 +1083,226 @@ export async function setCustomerNotificationPreference(
 }
 
 /**
+ * The template each customer event is queued under.
+ *
+ * ── WHY THIS IS ONE CONSTANT AND NOT SEVEN LITERALS ────────────────────────
+ *
+ * Template plus subject id *is* the idempotency key, and it is what lets the
+ * immediate sends and the sweep coexist: the candidate query below refuses to
+ * offer anything the notifications ledger already names, so a quote the jobs
+ * screen announced at 21:40 is one the next sweep steps over. That only works
+ * while the query and the web app's typed enqueue agree on the exact string. As
+ * two independent sets of literals, a rename in one of them would have turned
+ * every already-announced invoice back into an un-announced one and told every
+ * customer twice — silently, because both halves would still compile.
+ *
+ * Declared `as const` so each value keeps its literal type. That is what lets
+ * the web app pass `CUSTOMER_NOTIFICATION_TEMPLATE.work_complete` where a
+ * template id is expected and still have its payload checked against the right
+ * template, rather than widening to `string` and losing the check.
+ */
+export const CUSTOMER_NOTIFICATION_TEMPLATE = {
+  request_received: "request_received",
+  visit_scheduled: "visit_scheduled",
+  technician_en_route: "technician_en_route",
+  work_complete: "job_completed",
+  quote_awaiting_decision: "quote_sent",
+  invoice_issued: "invoice_issued",
+  payment_received: "payment_received",
+} as const satisfies Record<CustomerNotificationEvent, string>;
+
+/** The record a customer notification can be about. */
+export type CustomerNotificationSubjectTable =
+  | "jobs"
+  | "job_visits"
+  | "quotes"
+  | "invoices"
+  | "payments";
+
+/**
+ * Does this customer want to hear about this event (`POR-5`)?
+ *
+ * ── WHY THIS EXISTS SEPARATELY FROM THE SWEEP'S FILTER ─────────────────────
+ *
+ * The opt-out used to be enforced in exactly one place: the `muted` CTE in
+ * `pendingCustomerNotifications` below. That is the right shape for a sweep,
+ * which asks the question about hundreds of customers at once and wants a set,
+ * not hundreds of round trips.
+ *
+ * It is the wrong shape — and was simply absent — for the three events that are
+ * *also* sent the instant they happen. A portal request is acknowledged while
+ * the customer is still looking at the screen; a quote and an invoice are
+ * announced by the action that raised them. Those three called `enqueue`
+ * directly and never read this table at all, so a customer who switched invoice
+ * emails off received every one of them. Permanently, because the ledger row
+ * the immediate send wrote is what tells the sweep an invoice has already been
+ * announced, so the sweep never revisited it either.
+ *
+ * So there are two readers of one table, deliberately: a set for the sweep and
+ * a row for a single decision. What matters is that they cannot disagree, and
+ * the thing that could make them disagree is the default. Absence of a row
+ * means opted IN — the customer has never expressed a preference — and that
+ * default is written here, in `customerNotificationSettings`, and in the CTE's
+ * `where not is_enabled`, all three saying the same thing. The first one to
+ * read a missing row as "off" would silently stop messages nobody asked to
+ * stop, and there is a test pinning the two to the same answer for every event
+ * and every customer in the fixture.
+ *
+ * Whichever reader answers no, the answer is recorded the same way:
+ * `recordSuppressedCustomerNotification`. See there for why refusing has to
+ * leave a trace.
+ */
+export async function isCustomerNotificationEnabled(
+  tx: TenantScopedTx,
+  customerId: string,
+  event: CustomerNotificationEvent,
+): Promise<boolean> {
+  const rows = await tx
+    .select({ isEnabled: schema.customerNotificationPreferences.isEnabled })
+    .from(schema.customerNotificationPreferences)
+    .where(
+      and(
+        eq(schema.customerNotificationPreferences.customerId, customerId),
+        eq(schema.customerNotificationPreferences.event, event),
+      ),
+    )
+    .limit(1);
+
+  return rows[0]?.isEnabled ?? true;
+}
+
+/**
+ * Record that a customer notification was deliberately withheld (`POR-5`).
+ *
+ * ── WHY REFUSING HAS TO LEAVE A TRACE ──────────────────────────────────────
+ *
+ * The sweep works out what is owed by asking what the `notifications` ledger
+ * does not already name. Withholding a message by simply not writing a row
+ * therefore does not withhold it — it defers it. The subject stays owed for as
+ * long as its `recorded_at` is inside the lookback window, so the moment the
+ * customer switched the event back on, the next sweep would deliver the backlog
+ * they had muted: three back-dated invoice emails at once, on the Friday, for
+ * invoices they said no to on the Monday.
+ *
+ * That is the experience that teaches people their preference controls do not
+ * work, so it is not what happens. A mute is a refusal, not a pause. The
+ * customer said no at the time the invoice was raised, and that answer is the
+ * one that governs — a setting toggled afterwards changes what happens next, it
+ * does not retroactively consent to what already went by.
+ *
+ * This is an explicit product decision, taken by the people who own the
+ * product, and not a default that fell out of the implementation. It was
+ * originally built the other way round and changed on purpose. Anyone who finds
+ * this row surprising is looking at the answer to a question that was asked and
+ * settled, not at an oversight to tidy up.
+ *
+ * ── HOW IT INTERACTS WITH THE DEDUP, WHICH IS THE SUBTLE PART ──────────────
+ *
+ * The row uses the same (template, subject_id) key the sweep dedupes on, and
+ * status `suppressed`, which nothing ever sends: `dispatchPending` claims only
+ * `queued` and `failed`. So a withheld message settles its subject in exactly
+ * the way a sent one does, and the sweep steps over it forever after.
+ *
+ * The obvious worry is that this becomes the opposite bug — a marker that
+ * blocks a later, genuinely new event. It does not, and the reason is that this
+ * row is not doing anything a delivered row was not already doing. Every one of
+ * the seven events is keyed so that a genuine recurrence gets a NEW subject id
+ * rather than a second notification under the old one: a rescheduled visit is a
+ * new `job_visits` row, a second payment is a new `payments` row, and
+ * `technician_en_route` hangs off a single `en_route_at` timestamp that a
+ * second departure overwrites. Where a key genuinely can repeat — a job
+ * re-opened and completed twice writes `completed_at` on the same job id — the
+ * subject key was already the limiter and a *sent* row already suppressed the
+ * second notice. This changes nothing about that; it only makes a refusal as
+ * final as a delivery.
+ *
+ * Nor can it block a different event: no two of the seven share a template, so
+ * a suppression under `invoice_issued` is invisible to every other kind of
+ * message about the same customer.
+ *
+ * ── WHAT IS DELIBERATELY *NOT* RECORDED ────────────────────────────────────
+ *
+ * An event the customer wants, for an account with no email address on file,
+ * writes nothing. That is a different situation and must not be flattened into
+ * this one: the message is still owed, and the sweep should send it the moment
+ * somebody fills the billing email in. The dispatch cron counts those
+ * separately so the gap stays visible.
+ */
+export async function recordSuppressedCustomerNotification(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    event: CustomerNotificationEvent;
+    subjectTable: CustomerNotificationSubjectTable;
+    subjectId: string;
+    /** The address it would have gone to, for the "why didn't they get it" question. */
+    address: string;
+  },
+): Promise<void> {
+  const template = CUSTOMER_NOTIFICATION_TEMPLATE[input.event];
+
+  // Guarded by a read rather than an upsert, because there is no unique index
+  // on (template, subject_id) to hang one on — the ledger legitimately holds
+  // several rows for one subject when an account has several notify contacts.
+  // Two sweeps racing here would write two suppression rows, which costs a
+  // duplicate ledger line and sends nothing, so the race is not worth a
+  // constraint.
+  //
+  // The guard is blind inside a portal session, and deliberately so. Reads of
+  // this table are closed to a customer scope by the restrictive default in
+  // customer-scope.sql, while writes to it stay open because accepting a quote
+  // has to be able to enqueue one. So the probe returns nothing there and the
+  // insert always happens — which costs nothing in the one place it applies:
+  // the portal only reaches here for a job it created in this same transaction,
+  // which by definition nothing has written a row for yet.
+  const existing = await tx
+    .select({ id: schema.notifications.id })
+    .from(schema.notifications)
+    .where(
+      and(
+        eq(schema.notifications.template, template),
+        eq(schema.notifications.subjectId, input.subjectId),
+      ),
+    )
+    .limit(1);
+
+  if (existing.length > 0) return;
+
+  await tx.insert(schema.notifications).values({
+    tenantId: ctx.tenantId,
+    channel: "email",
+    template,
+    recipientAddress: input.address,
+    subjectTable: input.subjectTable,
+    subjectId: input.subjectId,
+    payload: { suppressed: "customer_opted_out", event: input.event },
+    status: "suppressed",
+  });
+}
+
+/**
+ * The name to address a customer notification to.
+ *
+ * The account's name, not the name on the portal login that triggered the
+ * message. The sweep greets every one of the seven events with `customers.name`
+ * and the immediate sends have to match it, or the same customer gets two
+ * differently-addressed versions of the same email depending on which path
+ * happened to reach them first.
+ */
+export async function customerAccountName(
+  tx: TenantScopedTx,
+  customerId: string,
+): Promise<string | null> {
+  const rows = await tx
+    .select({ name: schema.customers.name })
+    .from(schema.customers)
+    .where(and(eq(schema.customers.id, customerId), isNull(schema.customers.deletedAt)))
+    .limit(1);
+
+  return rows[0]?.name ?? null;
+}
+
+/**
  * A customer notification that is owed and has not been queued.
  *
  * The payload shapes match `@meridian/notify`'s templates exactly, but this
@@ -939,7 +1316,7 @@ export interface PendingCustomerNotification {
   readonly customerId: string;
   readonly customerName: string;
   /** The record this is about. Also the idempotency key — see below. */
-  readonly subjectTable: string;
+  readonly subjectTable: CustomerNotificationSubjectTable;
   readonly subjectId: string;
   readonly reference: string;
   readonly title: string;
@@ -948,7 +1325,12 @@ export interface PendingCustomerNotification {
   readonly currency: string | null;
   readonly occursAt: Date | null;
   readonly occursEndAt: Date | null;
-  readonly recipients: readonly { readonly email: string; readonly name: string }[];
+  readonly recipients: readonly CustomerNotificationRecipient[];
+  /**
+   * The customer has switched this event off. Offered anyway, so the caller can
+   * record the refusal rather than silently defer it — see the note above.
+   */
+  readonly muted: boolean;
 }
 
 /**
@@ -980,6 +1362,31 @@ export interface PendingCustomerNotification {
  * the portal form is the same (template, subject) pair the sweep would produce,
  * so the sweep skips it. The two mechanisms compose instead of double-sending.
  *
+ * ── THE OPT-OUT: A FLAG HERE, NOT A FILTER ─────────────────────────────────
+ *
+ * The `muted` CTE below is the set-based half of `POR-5` — the right shape for
+ * a sweep asking about hundreds of customers at once, where the single-row half
+ * (`isCustomerNotificationEnabled`) would be hundreds of round trips. Both read
+ * the same table with the same default, and a test pins them to the same answer
+ * for every event and every customer in the fixture.
+ *
+ * What the CTE does *not* do is remove the row. It used to: muted candidates
+ * were filtered out here, which meant the sweep never saw them, which meant
+ * nothing ever recorded that they had been withheld. A muted event that leaves
+ * no trace is not withheld, only deferred — it stays owed for as long as it is
+ * inside the lookback window, so lifting the mute on Friday delivered the whole
+ * week's worth of what the customer had said no to on Monday.
+ *
+ * So `muted` comes back as a column and the caller acts on it: it writes a
+ * suppression row instead of an email, which settles the subject for good. That
+ * is an explicit product decision — a mute is a refusal, not a pause — and the
+ * reasoning, including why a suppression row cannot become the opposite bug,
+ * is written out on `recordSuppressedCustomerNotification`.
+ *
+ * The cost of flagging rather than filtering is that muted candidates take up
+ * room in the `limit` budget. They take it once: the row the caller writes
+ * settles them, and the next sweep does not see them again.
+ *
  * ── THE LOOKBACK WINDOW ────────────────────────────────────────────────────
  *
  * `sinceDays` is not a performance tuning knob, it is a safety catch. Without
@@ -1009,25 +1416,37 @@ export async function pendingCustomerNotifications(
     currency: string | null;
     occurs_at: string | null;
     occurs_end_at: string | null;
+    muted: boolean;
   };
 
   const rows = (await tx.execute<Row>(sql`
     with cutoff as (select now() - make_interval(days => ${sinceDays}) as since),
 
-    -- Opted out, per customer per event. A LEFT JOIN against this is what
-    -- honours POR-5; the absence of a row means opted in, so only rows with
-    -- is_enabled = false suppress anything.
+    -- Opted out, per customer per event. This set is what honours POR-5 on the
+    -- sweep's side; the absence of a row means opted in, so only rows with
+    -- is_enabled = false mute anything. The single-row form of the same
+    -- question, for the sends that happen the moment the event does, is
+    -- isCustomerNotificationEnabled above.
+    --
+    -- Projected as a column below rather than filtered out here, so that the
+    -- caller can record the refusal in the ledger. Filtering meant the sweep
+    -- never saw a muted event, so nothing ever wrote it down, so lifting the
+    -- mute delivered the backlog.
     muted as (
       select customer_id, event from customer_notification_preferences where not is_enabled
     ),
 
     candidate as (
-      -- Request received.
+      -- Request received. The template column in every branch is bound from
+      -- CUSTOMER_NOTIFICATION_TEMPLATE rather than written out, because it is
+      -- half the idempotency key and the route writes the other half of the
+      -- story under the same name.
       select 'request_received'::text as event, j.customer_id, 'jobs'::text as subject_table,
              j.id as subject_id, j.reference, j.title,
              null::text as detail, null::text as amount, null::text as currency,
              j.created_at as occurs_at, null::timestamptz as occurs_end_at,
-             j.created_at as recorded_at, 'request_received'::text as template
+             j.created_at as recorded_at,
+             ${CUSTOMER_NOTIFICATION_TEMPLATE.request_received}::text as template
         from jobs j, cutoff c
        where j.deleted_at is null and j.status <> 'draft' and j.created_at >= c.since
 
@@ -1037,7 +1456,7 @@ export async function pendingCustomerNotifications(
       -- a second visit and the customer needs telling about the new window.
       select 'visit_scheduled', j.customer_id, 'job_visits', v.id, j.reference, j.title,
              t.full_name, null, null, v.scheduled_start, v.scheduled_end,
-             v.created_at, 'visit_scheduled'
+             v.created_at, ${CUSTOMER_NOTIFICATION_TEMPLATE.visit_scheduled}::text
         from job_visits v
         join jobs j on j.id = v.job_id
         join technicians t on t.id = v.technician_id, cutoff c
@@ -1053,7 +1472,7 @@ export async function pendingCustomerNotifications(
       -- timestamp is the condition rather than the status.
       select 'technician_en_route', j.customer_id, 'job_visits', v.id, j.reference, j.title,
              t.full_name, null, null, v.en_route_at, null,
-             v.en_route_at, 'technician_en_route'
+             v.en_route_at, ${CUSTOMER_NOTIFICATION_TEMPLATE.technician_en_route}::text
         from job_visits v
         join jobs j on j.id = v.job_id
         join technicians t on t.id = v.technician_id, cutoff c
@@ -1063,7 +1482,7 @@ export async function pendingCustomerNotifications(
 
       select 'work_complete', j.customer_id, 'jobs', j.id, j.reference, j.title,
              null, null, null, j.completed_at, null,
-             j.completed_at, 'job_completed'
+             j.completed_at, ${CUSTOMER_NOTIFICATION_TEMPLATE.work_complete}::text
         from jobs j, cutoff c
        where j.completed_at is not null and j.completed_at >= c.since and j.deleted_at is null
 
@@ -1071,7 +1490,8 @@ export async function pendingCustomerNotifications(
 
       select 'quote_awaiting_decision', q.customer_id, 'quotes', q.id, q.reference, q.title,
              null, q.total::text, q.currency::text, q.sent_at, q.valid_until,
-             coalesce(q.sent_at, q.created_at), 'quote_sent'
+             coalesce(q.sent_at, q.created_at),
+             ${CUSTOMER_NOTIFICATION_TEMPLATE.quote_awaiting_decision}::text
         from quotes q, cutoff c
        where q.status in ('sent', 'viewed')
          and q.deleted_at is null
@@ -1081,7 +1501,8 @@ export async function pendingCustomerNotifications(
 
       select 'invoice_issued', i.customer_id, 'invoices', i.id, i.reference, i.reference,
              null, i.total::text, i.currency::text, i.due_on, null,
-             coalesce(i.issued_on, i.created_at), 'invoice_issued'
+             coalesce(i.issued_on, i.created_at),
+             ${CUSTOMER_NOTIFICATION_TEMPLATE.invoice_issued}::text
         from invoices i, cutoff c
        where i.status <> 'draft'
          and i.deleted_at is null
@@ -1091,7 +1512,7 @@ export async function pendingCustomerNotifications(
 
       select 'payment_received', i.customer_id, 'payments', p.id, i.reference, i.reference,
              p.method::text, p.amount::text, p.currency::text, p.received_at, null,
-             p.received_at, 'payment_received'
+             p.received_at, ${CUSTOMER_NOTIFICATION_TEMPLATE.payment_received}::text
         from payments p
         join invoices i on i.id = p.invoice_id, cutoff c
        where p.deleted_at is null and p.received_at >= c.since
@@ -1108,14 +1529,14 @@ export async function pendingCustomerNotifications(
            k.amount,
            k.currency,
            k.occurs_at,
-           k.occurs_end_at
+           k.occurs_end_at,
+           exists (
+             select 1 from muted m
+              where m.customer_id = k.customer_id and m.event = k.event
+           ) as muted
       from candidate k
       join customers cu on cu.id = k.customer_id
      where not exists (
-             select 1 from muted m
-              where m.customer_id = k.customer_id and m.event = k.event
-           )
-       and not exists (
              -- Already in the ledger, queued by this sweep or by an action.
              select 1 from notifications n
               where n.template = k.template and n.subject_id = k.subject_id
@@ -1127,6 +1548,12 @@ export async function pendingCustomerNotifications(
 
   if (rows.length === 0) return [];
 
+  // Resolved in bulk — one query for every customer in the batch — through the
+  // same function the immediate sends call for a single customer. That shared
+  // function is the point: the immediate sends used to email
+  // `customers.billing_email` directly (or, in the portal's case, the logged-in
+  // user's own address), so a contact flagged `notify_on_jobs` heard about a
+  // quote from the sweep and never from the jobs screen that actually sent it.
   const recipients = await customerNotificationRecipients(tx, [
     ...new Set(rows.map((r) => r.customer_id)),
   ]);
@@ -1135,7 +1562,7 @@ export async function pendingCustomerNotifications(
     event: r.event as CustomerNotificationEvent,
     customerId: r.customer_id,
     customerName: r.customer_name,
-    subjectTable: r.subject_table,
+    subjectTable: r.subject_table as CustomerNotificationSubjectTable,
     subjectId: r.subject_id,
     reference: r.reference,
     title: r.title,
@@ -1145,7 +1572,14 @@ export async function pendingCustomerNotifications(
     occursAt: rowDate(r.occurs_at),
     occursEndAt: rowDate(r.occurs_end_at),
     recipients: recipients.get(r.customer_id) ?? [],
+    muted: r.muted,
   }));
+}
+
+/** One address a customer notification goes to, and who it belongs to. */
+export interface CustomerNotificationRecipient {
+  readonly email: string;
+  readonly name: string;
 }
 
 /**
@@ -1161,12 +1595,27 @@ export async function pendingCustomerNotifications(
  * for reading the account, not a subscription: the person who holds the login
  * is often not the person who wants the emails, and conflating them is how
  * somebody ends up unable to stop messages without losing their access.
+ *
+ * ── WHY THIS IS EXPORTED, WHEN IT USED TO BE PRIVATE ───────────────────────
+ *
+ * Because it was private, it was the sweep's rule and nobody else's. The three
+ * events that are also sent the moment they happen each invented their own:
+ * the quote and invoice actions emailed `customers.billing_email` straight from
+ * `getQuoteForNotification` / `getInvoiceForNotification`, and the portal's
+ * request form emailed the address on the login session. So a contact flagged
+ * `notify_on_jobs` was told about a quote by the cron sweep and not by the
+ * screen that sent it, and the billing contact was told about a request by the
+ * sweep and not by the portal. Three recipient rules for seven events.
+ *
+ * One exported function, called by both the sweep (in bulk) and every immediate
+ * send (for one customer), is what makes that structural rather than
+ * remembered: there is no second rule to be inconsistent with.
  */
-async function customerNotificationRecipients(
+export async function customerNotificationRecipients(
   tx: TenantScopedTx,
   customerIds: readonly string[],
-): Promise<Map<string, { email: string; name: string }[]>> {
-  const byCustomer = new Map<string, { email: string; name: string }[]>();
+): Promise<Map<string, CustomerNotificationRecipient[]>> {
+  const byCustomer = new Map<string, CustomerNotificationRecipient[]>();
   if (customerIds.length === 0) return byCustomer;
 
   // `inArray`, not `= any(${ids})` in a raw template. Drizzle's `sql` tag

@@ -2,14 +2,18 @@ import { and, asc, desc, eq, isNull, isNotNull, sql } from "drizzle-orm";
 import { db, type TenantScopedTx, type TenantContext } from "../index";
 import * as schema from "../schema";
 import { writeAuditNote } from "./staff";
+import { requiredRowDate, rowDate } from "./_rows";
 import {
   CANDIDATE_GRADES,
+  CERTIFICATION_EXPIRY_WINDOW_DAYS,
   DEFAULT_PIPELINE,
   DISPOSITION_BY_CODE,
   MAX_PIPELINE_STAGES,
   OUTCOME_MINIMUM_DELAY_HOURS,
+  TALENT_POOL_RECONFIRM_DAYS,
   UserFacingError,
   blockedState,
+  isDownloadable,
   outcomeMessage,
   phoneLocalDigits,
   type Availability,
@@ -20,6 +24,7 @@ import {
   type PublicRequisition,
   type RequisitionStatus,
   type ScanStatus,
+  type TalentPoolCertFilter,
   type VisaStatus,
 } from "@meridian/core";
 
@@ -1116,7 +1121,7 @@ export async function closeApplication(
         poolKey: application.primary_trade,
         consentCapturedAt: now,
         consentSource: "staff_recorded",
-        reconfirmDueAt: new Date(now.getTime() + 90 * 86_400_000),
+        reconfirmDueAt: new Date(now.getTime() + TALENT_POOL_RECONFIRM_DAYS * 86_400_000),
         addedReason: input.dispositionCode,
       })
       .onConflictDoNothing();
@@ -2256,22 +2261,48 @@ export async function talentPoolNeedingReconfirmation(
   }));
 }
 
-/** `ATS-13`'s killer feature: pool members whose certification has lapsed. */
+export interface TalentPoolExpiry {
+  readonly candidateId: string;
+  readonly fullName: string;
+  readonly phone: string;
+  readonly scheme: string;
+  /**
+   * `YYYY-MM-DD`, as a string, all the way to the screen.
+   *
+   * Never a Date. This is a day-valued column, and a day put through a JS Date
+   * moves by the local UTC offset — in the direction that reports a ticket
+   * which lapsed yesterday as still valid, which is the exact failure this
+   * whole query exists to catch.
+   */
+  readonly expiresOn: string;
+  /** Already gone, rather than going. Decided by Postgres, in Asia/Dubai. */
+  readonly lapsed: boolean;
+}
+
+/**
+ * `ATS-13`'s killer feature: pool members whose certification has lapsed.
+ *
+ * Called by the recruitment cron, which counts it and warns on it, and by the
+ * pool screen, which names them. It was written before either existed, and an
+ * alert nothing calls is the same thing as no alert — see the note on the cron
+ * route about why it fires there and not only on a screen.
+ */
 export async function talentPoolExpiringCertifications(
   tx: TenantScopedTx,
-  withinDays = 45,
-): Promise<
-  readonly { candidateId: string; fullName: string; phone: string; scheme: string; expiresOn: Date }[]
-> {
+  withinDays = CERTIFICATION_EXPIRY_WINDOW_DAYS,
+): Promise<readonly TalentPoolExpiry[]> {
   const rows = (await tx.execute<{
     candidate_id: string;
     full_name: string;
     phone: string;
     scheme: string;
     expires_on: string;
+    lapsed: boolean;
   }>(sql`
     select distinct on (cc.id)
-           c.id as candidate_id, c.full_name, c.phone, cc.scheme, cc.expires_on
+           c.id as candidate_id, c.full_name, c.phone, cc.scheme,
+           to_char(cc.expires_on, 'YYYY-MM-DD') as expires_on,
+           (cc.expires_on < (now() at time zone 'Asia/Dubai')::date) as lapsed
       from candidate_certifications cc
       join candidates c on c.id = cc.candidate_id
       join talent_pool_members t on t.candidate_id = c.id and t.consent_withdrawn_at is null
@@ -2285,6 +2316,7 @@ export async function talentPoolExpiringCertifications(
     phone: string;
     scheme: string;
     expires_on: string;
+    lapsed: boolean;
   }[];
 
   return rows.map((r) => ({
@@ -2292,8 +2324,356 @@ export async function talentPoolExpiringCertifications(
     fullName: r.full_name,
     phone: r.phone,
     scheme: r.scheme,
-    expiresOn: new Date(r.expires_on),
+    expiresOn: r.expires_on,
+    lapsed: r.lapsed,
   }));
+}
+
+export interface TalentPoolMemberRow {
+  readonly candidateId: string;
+  readonly fullName: string;
+  readonly phone: string;
+  readonly email: string | null;
+  readonly primaryTrade: string;
+  readonly poolKey: string;
+  readonly addedReason: string | null;
+  readonly consentCapturedAt: Date;
+  readonly reconfirmDueAt: Date;
+  readonly reconfirmedAt: Date | null;
+  /** The consent is stale now, not at some point in the future. */
+  readonly reconfirmDue: boolean;
+  readonly certificationCount: number;
+  readonly lapsedCount: number;
+  readonly expiringCount: number;
+  /** `YYYY-MM-DD` or null. A day, kept as a day — see `TalentPoolExpiry`. */
+  readonly earliestExpiry: string | null;
+}
+
+/**
+ * Browse the pool (`ATS-13`).
+ *
+ * ── WHY THERE ARE EXACTLY TWO FILTERS ───────────────────────────────────────
+ *
+ * Trade, and whether the person's ticket is still good. Those are the two
+ * questions somebody staffing a job on Sunday morning actually asks, and a pool
+ * that cannot answer them is a table nobody opens twice.
+ *
+ * What is not here: a relevance score, a ranking, a match percentage, a
+ * "strength" (`ATS-19`). The order is by consequence — lapsed certificates
+ * first, then ones about to lapse, then consents that have gone stale — and a
+ * human reads the list. Ordering *is* a judgement, so it is one that can be
+ * stated in a sentence and argued with, rather than a number nobody can audit.
+ *
+ * Certifications are counted in the same statement rather than fetched per row,
+ * because the whole point is a list somebody scans.
+ */
+export async function listTalentPool(
+  tx: TenantScopedTx,
+  filter: {
+    poolKey?: string | undefined;
+    certifications?: TalentPoolCertFilter | undefined;
+    limit?: number | undefined;
+  } = {},
+): Promise<readonly TalentPoolMemberRow[]> {
+  const poolKey = filter.poolKey?.trim() || null;
+  const certificates = filter.certifications ?? "any";
+  const limit = Math.min(Math.max(filter.limit ?? 100, 1), 500);
+
+  // Written as SQL fragments rather than as a filter over the fetched rows: a
+  // filter applied after LIMIT returns a short page of the wrong thing, and the
+  // person reading it has no way of telling.
+  const having =
+    certificates === "lapsed"
+      ? sql`having count(cc.id) filter (where cc.expires_on < (now() at time zone 'Asia/Dubai')::date) > 0`
+      : certificates === "expiring"
+        ? sql`having count(cc.id) filter (
+                 where cc.expires_on >= (now() at time zone 'Asia/Dubai')::date
+                   and cc.expires_on <= (now() at time zone 'Asia/Dubai')::date
+                        + make_interval(days => ${CERTIFICATION_EXPIRY_WINDOW_DAYS})
+               ) > 0`
+        : certificates === "valid"
+          ? sql`having count(cc.id) > 0
+                   and count(cc.id) filter (where cc.expires_on < (now() at time zone 'Asia/Dubai')::date) = 0`
+          : certificates === "none"
+            ? sql`having count(cc.id) = 0`
+            : sql``;
+
+  type Row = {
+    candidate_id: string;
+    full_name: string;
+    phone: string;
+    email: string | null;
+    primary_trade: string;
+    pool_key: string;
+    added_reason: string | null;
+    consent_captured_at: string;
+    reconfirm_due_at: string;
+    reconfirmed_at: string | null;
+    reconfirm_due: boolean;
+    certification_count: number;
+    lapsed_count: number;
+    expiring_count: number;
+    earliest_expiry: string | null;
+  };
+
+  const rows = (await tx.execute<Row>(sql`
+    select c.id as candidate_id, c.full_name, c.phone, c.email, c.primary_trade,
+           t.pool_key, t.added_reason,
+           t.consent_captured_at, t.reconfirm_due_at, t.reconfirmed_at,
+           (t.reconfirm_due_at <= now()) as reconfirm_due,
+           count(cc.id)::int as certification_count,
+           count(cc.id) filter (
+             where cc.expires_on < (now() at time zone 'Asia/Dubai')::date
+           )::int as lapsed_count,
+           count(cc.id) filter (
+             where cc.expires_on >= (now() at time zone 'Asia/Dubai')::date
+               and cc.expires_on <= (now() at time zone 'Asia/Dubai')::date
+                    + make_interval(days => ${CERTIFICATION_EXPIRY_WINDOW_DAYS})
+           )::int as expiring_count,
+           to_char(min(cc.expires_on), 'YYYY-MM-DD') as earliest_expiry
+      from talent_pool_members t
+      join candidates c on c.id = t.candidate_id
+      left join candidate_certifications cc
+             on cc.candidate_id = c.id and cc.deleted_at is null
+     where t.consent_withdrawn_at is null
+       and t.deleted_at is null
+       and c.deleted_at is null
+       and (${poolKey}::text is null or t.pool_key = ${poolKey}::text)
+     group by c.id, c.full_name, c.phone, c.email, c.primary_trade,
+              t.pool_key, t.added_reason, t.consent_captured_at,
+              t.reconfirm_due_at, t.reconfirmed_at
+     ${having}
+     order by (count(cc.id) filter (
+                where cc.expires_on < (now() at time zone 'Asia/Dubai')::date
+              ) > 0) desc,
+              (count(cc.id) filter (
+                where cc.expires_on >= (now() at time zone 'Asia/Dubai')::date
+                  and cc.expires_on <= (now() at time zone 'Asia/Dubai')::date
+                       + make_interval(days => ${CERTIFICATION_EXPIRY_WINDOW_DAYS})
+              ) > 0) desc,
+              (t.reconfirm_due_at <= now()) desc,
+              c.full_name
+     limit ${limit}
+  `)) as unknown as Row[];
+
+  return rows.map((r) => ({
+    candidateId: r.candidate_id,
+    fullName: r.full_name,
+    phone: r.phone,
+    email: r.email,
+    primaryTrade: r.primary_trade,
+    poolKey: r.pool_key,
+    addedReason: r.added_reason,
+    consentCapturedAt: requiredRowDate(r.consent_captured_at),
+    reconfirmDueAt: requiredRowDate(r.reconfirm_due_at),
+    reconfirmedAt: rowDate(r.reconfirmed_at),
+    reconfirmDue: r.reconfirm_due,
+    certificationCount: Number(r.certification_count ?? 0),
+    lapsedCount: Number(r.lapsed_count ?? 0),
+    expiringCount: Number(r.expiring_count ?? 0),
+    earliestExpiry: r.earliest_expiry,
+  }));
+}
+
+/**
+ * Record that somebody re-confirmed their consent (`ATS-13`).
+ *
+ * ── WHY THIS WAS THE MISSING HALF ───────────────────────────────────────────
+ *
+ * `reconfirm_due_at` was set on the way in and read by the alert, and nothing
+ * anywhere wrote `reconfirmed_at`. So the cycle had a start and an alarm and no
+ * way to finish: every member who came due stayed due for ever, the list only
+ * grew, and the one honest response left was to stop looking at it.
+ *
+ * This is the finish. It is not an automated consent — the clock is reset by a
+ * person who has just spoken to the candidate, which is the only thing that
+ * makes the record true. There is no bulk version and there will not be one.
+ *
+ * A withdrawn consent is refused rather than quietly revived, because the two
+ * are not the same fact and the difference is the lawful basis for holding the
+ * row at all.
+ */
+export async function reconfirmTalentPoolMember(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: { candidateId: string; poolKey: string; note?: string | undefined },
+): Promise<{ fullName: string; nextDueAt: Date }> {
+  type StateRow = {
+    id: string;
+    full_name: string;
+    consent_withdrawn_at: string | null;
+  };
+
+  const state = (await tx.execute<StateRow>(sql`
+    select t.id, c.full_name, t.consent_withdrawn_at
+      from talent_pool_members t
+      join candidates c on c.id = t.candidate_id
+     where t.candidate_id = ${input.candidateId}::uuid
+       and t.pool_key = ${input.poolKey}
+       and t.deleted_at is null
+       and c.deleted_at is null
+     limit 1
+  `)) as unknown as StateRow[];
+
+  const member = state[0];
+  if (!member) {
+    throw new UserFacingError("That person is not in this pool.");
+  }
+  if (member.consent_withdrawn_at) {
+    throw new UserFacingError(
+      "This person withdrew their consent. Re-confirming is not the same thing as asking again — " +
+        "they have to be added back through a new conversation.",
+    );
+  }
+
+  type UpdatedRow = { reconfirm_due_at: string };
+  const updated = (await tx.execute<UpdatedRow>(sql`
+    update talent_pool_members
+       set reconfirmed_at = now(),
+           reconfirm_due_at = now() + make_interval(days => ${TALENT_POOL_RECONFIRM_DAYS}),
+           updated_at = now()
+     where id = ${member.id}::uuid
+    returning reconfirm_due_at
+  `)) as unknown as UpdatedRow[];
+
+  const nextDueAt = requiredRowDate(updated[0]?.reconfirm_due_at);
+
+  // Consent is the lawful basis for holding this row, so when it was last
+  // confirmed and by whom is a fact somebody may have to produce. No trigger
+  // can capture it: the event is a phone call.
+  await writeAuditNote(tx, ctx, {
+    tableName: "talent_pool_members",
+    recordId: member.id,
+    // Sixteen characters, because that is what audit_log.action is. Not
+    // "consent_reconfirmed", which is clearer and does not fit.
+    action: "reconfirmed",
+    detail: {
+      rule: "ATS-13",
+      poolKey: input.poolKey,
+      candidateId: input.candidateId,
+      nextDueAt: nextDueAt.toISOString(),
+      lawfulBasis: "consent (Federal Decree-Law 45/2021)",
+      ...(input.note ? { note: input.note } : {}),
+    },
+  });
+
+  await touchCandidate(tx, input.candidateId);
+
+  return { fullName: member.full_name, nextDueAt };
+}
+
+/**
+ * Withdraw a pool consent (`ATS-13`, `ATS-18`).
+ *
+ * ── WHY THIS EXISTS, GIVEN NOTHING ASKED FOR IT ─────────────────────────────
+ *
+ * `consent_withdrawn_at` was read in four places — the pool list, the
+ * re-confirmation alert, the expiry alert and the retention purge — and written
+ * in none. It is the same shape of gap as `reconfirmed_at`: a column the system
+ * makes decisions on that no path in the product can set.
+ *
+ * It matters more than the other one, because consent is the *only* lawful
+ * basis holding these rows and withdrawal is the right that comes with it. A
+ * pool somebody can join and never leave is not a consented pool.
+ *
+ * ── AND WHY IT TOUCHES THE RETENTION CLOCK ──────────────────────────────────
+ *
+ * `touchCandidate` reads `retention_basis` to decide the clock: twelve months
+ * on `consent`, six on everything else. Flipping `consent_withdrawn_at` alone
+ * would leave the basis saying `consent`, so the next interaction of any kind
+ * would renew a twelve-month retention on a consent that had been withdrawn —
+ * the row outliving the permission for it, quietly, via a column nobody was
+ * looking at.
+ *
+ * So the basis moves back, but only when no *other* pool consent survives (a
+ * person can sit in several pools), and never for somebody who became an
+ * employee — `HR-15` owns that clock and this has no business touching it.
+ *
+ * The new `delete_after` is counted from the existing `last_interaction_at`,
+ * not from now. Withdrawing consent must not be able to *extend* how long the
+ * record is kept, which is what re-using `touchCandidate` here would do.
+ */
+export async function withdrawTalentPoolConsent(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: { candidateId: string; poolKey: string; reason?: string | undefined },
+): Promise<{ fullName: string; retentionBasis: string; remainingPools: number }> {
+  type StateRow = {
+    id: string;
+    full_name: string;
+    retention_basis: string;
+    consent_withdrawn_at: string | null;
+  };
+
+  const state = (await tx.execute<StateRow>(sql`
+    select t.id, c.full_name, c.retention_basis, t.consent_withdrawn_at
+      from talent_pool_members t
+      join candidates c on c.id = t.candidate_id
+     where t.candidate_id = ${input.candidateId}::uuid
+       and t.pool_key = ${input.poolKey}
+       and t.deleted_at is null
+       and c.deleted_at is null
+     limit 1
+  `)) as unknown as StateRow[];
+
+  const member = state[0];
+  if (!member) throw new UserFacingError("That person is not in this pool.");
+  if (member.consent_withdrawn_at) {
+    throw new UserFacingError("This consent has already been withdrawn.");
+  }
+
+  await tx.execute(sql`
+    update talent_pool_members
+       set consent_withdrawn_at = now(),
+           updated_at = now()
+     where id = ${member.id}::uuid
+  `);
+
+  const remaining = (await tx.execute<{ count: number }>(sql`
+    select count(*)::int as count
+      from talent_pool_members
+     where candidate_id = ${input.candidateId}::uuid
+       and consent_withdrawn_at is null
+       and deleted_at is null
+  `)) as unknown as { count: number }[];
+
+  const remainingPools = Number(remaining[0]?.count ?? 0);
+  let retentionBasis = member.retention_basis;
+
+  if (remainingPools === 0 && member.retention_basis === "consent") {
+    // Counted from the last interaction rather than from now, so a withdrawal
+    // can only ever shorten the retention. Employees are excluded by the basis
+    // check itself: theirs never reads consent.
+    await tx.execute(sql`
+      update candidates
+         set retention_basis = 'pre_contractual',
+             delete_after = ((last_interaction_at at time zone 'Asia/Dubai')::date
+                              + interval '6 months')::date,
+             updated_at = now()
+       where id = ${input.candidateId}::uuid
+         and retention_basis = 'consent'
+    `);
+    retentionBasis = "pre_contractual";
+  }
+
+  // Sixteen characters is the limit on audit_log.action, which rules out
+  // "consent_withdrawn". The detail below carries what the name cannot.
+  await writeAuditNote(tx, ctx, {
+    tableName: "talent_pool_members",
+    recordId: member.id,
+    action: "withdrawn",
+    detail: {
+      rule: "ATS-13",
+      poolKey: input.poolKey,
+      candidateId: input.candidateId,
+      remainingPools,
+      retentionBasis,
+      retentionClockShortened: retentionBasis === "pre_contractual" && member.retention_basis === "consent",
+      ...(input.reason ? { reason: input.reason } : {}),
+    },
+  });
+
+  return { fullName: member.full_name, retentionBasis, remainingPools };
 }
 
 // ── Candidate detail (wireframe §5.2) ───────────────────────────────────────
@@ -2556,8 +2936,11 @@ export async function getCandidateDetail(
       sizeBytes: d.sizeBytes,
       uploadedAt: d.uploadedAt,
       // `ATS-9`. Computed here rather than in the template, so a second screen
-      // showing the same file cannot forget the gate.
-      downloadable: d.scanStatus === "clean" || d.scanStatus === "skipped",
+      // showing the same file cannot forget the gate — and computed by the
+      // *same function the download route uses*, so the link a recruiter is
+      // shown and the refusal they would get are one decision rather than two
+      // copies of one that can drift apart.
+      downloadable: isDownloadable(d.scanStatus as ScanStatus),
     })),
     events,
     priorApplications: prior.map((p) => ({
@@ -2634,6 +3017,74 @@ export async function attachCandidateDocument(
 
   await touchCandidate(tx, input.candidateId);
   return { documentId: row.id };
+}
+
+export interface CandidateDocumentForDownload {
+  readonly documentId: string;
+  readonly candidateId: string;
+  readonly applicationId: string | null;
+  readonly kind: string;
+  readonly storageKey: string;
+  readonly filename: string | null;
+  readonly scanStatus: ScanStatus;
+}
+
+/**
+ * One candidate document, with its storage key, for the download route
+ * (`ATS-9`).
+ *
+ * ── WHY THIS IS NOT PART OF `getCandidateDetail` ────────────────────────────
+ *
+ * `getCandidateDetail` deliberately omits `storage_key` from its document
+ * shape, so that a Server Component rendering a candidate never holds one and
+ * cannot leak one into the HTML it sends. That omission is only worth anything
+ * if the key is fetched somewhere narrower, by something that needs it — which
+ * is this, called by exactly one route.
+ *
+ * Keyed on the document id alone, and not on the application. A document
+ * belongs to a *candidate*; `application_id` is nullable, because a CV can be
+ * attached to somebody who is in the talent pool and has no live application.
+ * A route nested under an application would be unable to address those files at
+ * all. The id is a uuid and row-level security scopes it to the tenant, so a
+ * document id from another tenant simply does not resolve.
+ *
+ * The scan status is returned, not judged. The gate is `isDownloadable`, and
+ * the route applies it to what this returns.
+ */
+export async function getCandidateDocumentForDownload(
+  tx: TenantScopedTx,
+  documentId: string,
+): Promise<CandidateDocumentForDownload | null> {
+  const [row] = await tx
+    .select({
+      id: schema.candidateDocuments.id,
+      candidateId: schema.candidateDocuments.candidateId,
+      applicationId: schema.candidateDocuments.applicationId,
+      kind: schema.candidateDocuments.kind,
+      storageKey: schema.candidateDocuments.storageKey,
+      filename: schema.candidateDocuments.filename,
+      scanStatus: schema.candidateDocuments.scanStatus,
+    })
+    .from(schema.candidateDocuments)
+    .where(
+      and(
+        eq(schema.candidateDocuments.id, documentId),
+        isNull(schema.candidateDocuments.deletedAt),
+      ),
+    )
+    .limit(1);
+
+  if (!row) return null;
+
+  return {
+    documentId: row.id,
+    candidateId: row.candidateId,
+    applicationId: row.applicationId,
+    kind: row.kind,
+    storageKey: row.storageKey,
+    filename: row.filename,
+    scanStatus: row.scanStatus as ScanStatus,
+  };
 }
 
 /** Grades, exported for the forms, so the picker cannot drift from the CHECK. */

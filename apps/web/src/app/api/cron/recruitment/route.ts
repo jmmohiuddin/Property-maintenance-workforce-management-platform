@@ -7,10 +7,11 @@ import {
   outcomeAccountability,
   pendingAcknowledgements,
   purgeExpiredCandidates,
+  talentPoolExpiringCertifications,
   talentPoolNeedingReconfirmation,
 } from "@meridian/db/domain";
 import { enqueue, selectTransport } from "@meridian/notify";
-import { applicationStatusUrl } from "@meridian/core";
+import { applicationStatusUrl, CERTIFICATION_EXPIRY_WINDOW_DAYS } from "@meridian/core";
 import { runCron } from "@/lib/cron";
 
 /**
@@ -64,6 +65,9 @@ export async function GET(request: Request) {
     let outcomesUnreachable = 0;
     let candidatesPurged = 0;
     let poolReconfirmationsDue = 0;
+    let poolCertificatesLapsed = 0;
+    let poolCertificatesExpiring = 0;
+    const poolCertificateNames: string[] = [];
     const orphanedStorageKeys: string[] = [];
 
     let owedTotal = 0;
@@ -149,6 +153,40 @@ export async function GET(request: Request) {
         // ── ATS-13: consent goes stale ──────────────────────────────────────
         poolReconfirmationsDue += (await talentPoolNeedingReconfirmation(tx, 500)).length;
 
+        // ── ATS-13: and so do certificates ──────────────────────────────────
+        //
+        // Counted here rather than only on /recruitment/pool, and the reason is
+        // the same one that put G14 in this ledger. A lapsed ticket is not a
+        // thing somebody goes looking for; it is a thing that has to arrive.
+        // The screen names them and is where the phone calls get made from —
+        // but a screen only alerts the people who open it, and the week nobody
+        // opens it is the week a certificate lapses on somebody who is about to
+        // be offered a job. So: the cron carries the count and the warning, and
+        // the screen carries the names.
+        //
+        // WHAT IS NOT BUILT, SAID PLAINLY: this does not email anybody. The
+        // pattern for that is next door in /api/cron/health — alertRecipients
+        // over owner/admin/hr, suppressed with recentlyNotified at 1440 minutes
+        // so it sends once a day rather than once every fifteen-minute run —
+        // and every piece of it exists except the template. The one template
+        // that looks close, `certification_expiring`, is the HR-3 message about
+        // an employee: its payload field is literally `technicianName`, and
+        // sending it about a pool member would tell an owner that a technician
+        // they do not employ has a lapsing ticket. A message that misdescribes
+        // who somebody is, is worse than a warning in a ledger. This needs a
+        // `talent_pool_certification_expiring` template in packages/notify,
+        // which is not this change's to write.
+        const expiring = await talentPoolExpiringCertifications(tx);
+        for (const certificate of expiring) {
+          if (certificate.lapsed) poolCertificatesLapsed += 1;
+          else poolCertificatesExpiring += 1;
+          if (poolCertificateNames.length < 20) {
+            poolCertificateNames.push(
+              `${certificate.fullName} (${certificate.scheme}, ${certificate.lapsed ? "lapsed" : "expires"} ${certificate.expiresOn})`,
+            );
+          }
+        }
+
         // ── ATS-18: retention ───────────────────────────────────────────────
         //
         // Run here as well as being available to /api/cron/retention. The daily
@@ -213,6 +251,19 @@ export async function GET(request: Request) {
       );
     }
 
+    if (poolCertificatesLapsed + poolCertificatesExpiring > 0) {
+      warnings.push(
+        `${poolCertificatesLapsed} talent-pool certificate(s) have already lapsed and ` +
+          `${poolCertificatesExpiring} lapse within the next ${CERTIFICATION_EXPIRY_WINDOW_DAYS} ` +
+          "days. Nobody has been emailed about this — there is no template for it " +
+          "yet (see the note in this file). A pool member whose ticket " +
+          "has expired is not a prospect, they are a phone call — and under HR-9 an expired " +
+          "certificate blocks the dispatch the day after they are hired. The named list is on " +
+          "/recruitment/pool: " +
+          poolCertificateNames.join("; "),
+      );
+    }
+
     if (orphanedStorageKeys.length > 0) {
       warnings.push(
         `${orphanedStorageKeys.length} object-storage key(s) are orphaned by the applicant purge: ` +
@@ -240,6 +291,8 @@ export async function GET(request: Request) {
         candidatesPurged,
         orphanedStorageKeys: orphanedStorageKeys.length,
         poolReconfirmationsDue,
+        poolCertificatesLapsed,
+        poolCertificatesExpiring,
       },
       warnings,
     };

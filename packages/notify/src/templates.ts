@@ -846,7 +846,7 @@ export const TEMPLATES: {
         `  Auto-renew  ${p.autoRenew ? "yes" : "no"}\n\n` +
         `${reading}\n\n` +
         `Open the contract and generate a renewal quote:\n` +
-        `${absoluteUrl(`/contracts/${p.contractId}`)}\n\n` +
+        `${absoluteUrl(`/amc/${p.contractId}`)}\n\n` +
         (p.autoRenew && !expired
           ? "This contract auto-renews, so nothing lapses if it is not actioned — but the value " +
             "rolls over unchanged, which on an under-priced contract is the expensive outcome.\n"

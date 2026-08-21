@@ -6,7 +6,7 @@ import {
   renewalPipeline,
   ppmCompliance,
   contractableProperties,
-  listCustomers,
+  searchCustomers,
 } from "@meridian/db";
 import {
   PPM_COMPLETION_TARGET_PERCENT,
@@ -62,7 +62,12 @@ export default async function ContractsPage() {
       renewals: await renewalPipeline(tx),
       compliance: await ppmCompliance(tx),
       properties: canWrite ? await contractableProperties(tx) : [],
-      customers: canWrite ? await listCustomers(tx) : [],
+      // `searchCustomers`, not `listCustomers`. TD-10: the unbounded list read
+      // every customer, then every open job, then every unpaid invoice, and
+      // joined them in JavaScript — to fill a picker that needs a name and a
+      // code. This is one bounded query, and the form below still shows what it
+      // showed before.
+      customers: canWrite ? (await searchCustomers(tx, { limit: 100 })).rows : [],
     }),
   );
 
@@ -117,6 +122,20 @@ export default async function ContractsPage() {
               inside {RENEWAL_PIPELINE_DAYS} days of expiry, plus anything already lapsed
             </SectionHeading>
           </div>
+
+          {/*
+            CON-8 asks for margin at renewal and this page does not show it.
+            Said here rather than left as a blank space, because an absent
+            number reads as an oversight and somebody eventually fills it with
+            an estimate.
+          */}
+          <p className="mt-2 text-[12px]" style={{ color: "var(--text-muted)" }}>
+            No margin figure is shown, and that is deliberate. The system records what a contract
+            is worth and not what it costs to service — there is no labour or material cost
+            anywhere in the schema — so a margin here would be estimated rather than measured, and
+            a made-up number that looks precise is worse than no number at renewal. Utilisation
+            and the job count in the term are what these rows are renewed on.
+          </p>
 
           {renewals.length === 0 ? (
             <div className="mt-4">

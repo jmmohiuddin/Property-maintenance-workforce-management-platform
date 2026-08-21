@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { withTenant } from "@meridian/db";
-import { getPipelineBoard } from "@meridian/db/domain";
+import { getPipelineBoard, listStaff } from "@meridian/db/domain";
 import {
   CANDIDATE_GRADE_LABEL,
   EXPERIENCE_BAND_LABEL,
@@ -44,15 +44,30 @@ export default async function PipelinePage({
   const session = await requireSessionWith("recruitment:read");
   const { requisitionId } = await params;
 
-  const board = await withTenant(
+  const { board, staff } = await withTenant(
     { tenantId: session.principal.tenantId, userId: session.principal.userId },
-    (tx) => getPipelineBoard(tx, requisitionId),
+    async (tx) => ({
+      board: await getPipelineBoard(tx, requisitionId),
+      staff: await listStaff(tx),
+    }),
   );
 
   if (!board) notFound();
 
   const canWrite = ["owner", "admin", "hr"].includes(session.principal.role);
   const { requisition } = board;
+
+  /*
+    `ATS-1`. The name, not the uuid.
+
+    Shown even when it is null, and said in words: a vacancy nobody's name is on
+    is the one that stays open for two months because chasing it is nobody's
+    job. That is worth a line of text on the screen where it is being chased.
+  */
+  const hiringManager = requisition.hiringManagerUserId
+    ? (staff.find((member) => member.userId === requisition.hiringManagerUserId)?.fullName ??
+      "somebody who is no longer on the staff list")
+    : null;
 
   return (
     <AppShell session={session} active="recruitment">
@@ -101,6 +116,11 @@ export default async function PipelinePage({
                     month: "short",
                   })}`
                 : ""}
+            </p>
+            <p className="mt-1 text-[13px]" style={{ color: "var(--text-muted)" }}>
+              {hiringManager
+                ? `Hiring manager: ${hiringManager}`
+                : "No hiring manager named — nobody owns chasing this one."}
             </p>
           </div>
 

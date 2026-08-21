@@ -2,10 +2,12 @@ import { sql } from "drizzle-orm";
 import type { TenantScopedTx } from "../index";
 import {
   DASHBOARD_GOALS,
+  DASHBOARD_HIRING_WINDOW_DAYS,
   DASHBOARD_HORIZON_DAYS,
   DASHBOARD_WEEK_DAYS,
   EMIRATISATION_SKILLED_THRESHOLD,
   gradeGoal,
+  ppmCompletion,
   smallBusinessReliefPosition,
   type GoalVerdict,
   type ReliefPosition,
@@ -19,6 +21,10 @@ import {
 } from "./compliance";
 import { listDispatchBoard } from "./jobs";
 import { findExpiringCertifications } from "./cron";
+import { listRequisitions } from "./recruitment";
+// Read, never written by this stream. The dashboard and the AMC screen have to
+// agree about PPM completion, and calling the same function is what guarantees it.
+import { ppmCompliance } from "./contracts";
 
 /**
  * Reporting: the product event stream (`KPI-2`), the owner dashboard (`KPI-3`,
@@ -56,9 +62,9 @@ import { findExpiringCertifications } from "./cron";
 /**
  * How an event family gets into `product_events`.
  *
- *  * `trigger` — a database trigger from `0017_kpi_and_admin` emits it. It
- *    cannot be forgotten, it survives a hand-repair during an incident, and it
- *    is already recording.
+ *  * `trigger` — a database trigger from `0017_kpi_and_admin` or
+ *    `0018_ats_product_events` emits it. It cannot be forgotten, it survives a
+ *    hand-repair during an incident, and it is already recording.
  *  * `none` — declared, specified, and **not instrumented**. The reason is
  *    stated on the entry.
  *
@@ -83,11 +89,28 @@ export interface ProductEventName {
 /**
  * The registry.
  *
- * `KPI-2` names eleven event families. Five of them are emitted — lead stage
+ * `KPI-2` names eleven event families. Six of them are emitted — lead stage
  * changes, job status changes, quote sent/decided, invoice issued, payment
- * recorded — and six are not. `contract_status_changed` is a sixth emitted
- * family that `KPI-2` does not ask for; it costs one trigger and it is what
- * G10's renewal rate will eventually be computed from.
+ * recorded and applicant stage changes — and five are not.
+ * `contract_status_changed` is an emitted family that `KPI-2` does not ask for;
+ * it costs one trigger and it is what G10's renewal rate will eventually be
+ * computed from.
+ *
+ * ── THE ATS ENTRY THAT WAS FALSE FOR THREE MIGRATIONS ───────────────────────
+ *
+ * `ats_stage_changed` sat here marked `none`, blocked on "the ATS tables do not
+ * exist in this branch", while `0014_recruitment` — three migrations earlier,
+ * in this same tree — had already created `job_requisitions`, `applications`,
+ * `requisition_stages` and `application_events`. The entry was written before
+ * 0014 landed and never revisited, so the weekly report printed "the applicant
+ * pipeline is not instrumented" over a database that was recording applicants
+ * the whole time.
+ *
+ * That is worth stating rather than quietly deleting, because it is the same
+ * failure this registry exists to prevent, pointed the other way. The registry
+ * defends against a zero that is really a hole; a stale blocker is a hole that
+ * is really a table away from being filled, and it is harder to notice — a gap
+ * list nobody can act on is a gap list nobody reads.
  *
  * ── WHY THE UNINSTRUMENTED ONES ARE LISTED AT ALL ───────────────────────────
  *
@@ -136,6 +159,46 @@ export const PRODUCT_EVENT_NAMES: readonly ProductEventName[] = [
     emitter: "trigger",
     description: "Contract signed, renewed, expired or cancelled (G10).",
   },
+  /*
+   * The ATS family, from `0018_ats_product_events`.
+   *
+   * Two names, and the split is the one 0017 already makes twice —
+   * `lead_created` beside `lead_stage_changed`, `job_created` beside
+   * `job_status_changed`. An arrival is not a transition: it has no prior state
+   * to diff and nothing to put in `from_status`.
+   *
+   * Everything that IS a transition shares ONE name, with the sub-case in the
+   * properties, exactly as `job_status_changed` does it. A stage move, a hire
+   * and an archival all arrive as `ats_stage_changed`, discriminated by
+   * `from_status`/`to_status` and `from_stage_id`/`to_stage_id`. Splitting
+   * those into a name per outcome multiplies the names a report has to union
+   * before it can answer one question, and a query that forgets one of them
+   * loses a share of the traffic without saying so.
+   *
+   * It hangs off `applications` rather than off `application_events`. The
+   * activity feed is written by application code, so a hand-repair or the
+   * unauthenticated careers-site path leaves no trace in it — 0018 carries the
+   * full argument.
+   *
+   * The trigger watches `status` as well as `current_stage_id`, and that is the
+   * load-bearing detail: `hireCandidate` sets `status = 'hired'` without
+   * touching the stage pointer, so a trigger keyed on the pointer alone would
+   * silently miss every hire — the one transition the module exists to produce.
+   */
+  {
+    name: "ats_application_received",
+    emitter: "trigger",
+    description:
+      "An application arrived, with its requisition and source. G13's denominator, and the " +
+      "only trace the unauthenticated careers-site path leaves in this stream (G13, G14).",
+  },
+  {
+    name: "ats_stage_changed",
+    emitter: "trigger",
+    description:
+      "An application moved stage or changed status — hires and archivals included, " +
+      "discriminated by to_status, carrying time in stage and days since applied (G13, G14).",
+  },
   {
     name: "quote_form_step",
     emitter: "none",
@@ -152,14 +215,28 @@ export const PRODUCT_EVENT_NAMES: readonly ProductEventName[] = [
     emitter: "none",
     description: "A dispatcher assigned past a certification or availability warning (JOB-10).",
     blockedOn:
-      "DB-7 — `job_assignments.override_reason` and `override_warning_type` do not exist yet. " +
-      "Until they do the override is not recorded anywhere, so there is nothing to emit.",
+      "The dispatch UI, not the schema. This entry used to say the columns did not exist and to " +
+      "name a `job_assignments` table that has never existed in this repository. The columns are " +
+      "`job_visits.override_warning_type` and `job_visits.override_reason`, present since 0005, and " +
+      "`assignTechnician` in `domain/assignment.ts` accepts and writes both. But its only caller — " +
+      "the `assign` server action in `app/(app)/jobs/[id]/actions.ts` — reads jobId, technicianId, " +
+      "score and reason from the form and passes none of the override fields, so in practice both " +
+      "columns are always null. A trigger would faithfully emit nothing. JOB-10 has to capture the " +
+      "override at the point the dispatcher makes it before there is anything here to measure.",
   },
   {
     name: "portal_action",
     emitter: "none",
     description: "A customer did something in the portal instead of phoning (G9).",
-    blockedOn: "The portal stream. Portal actions are not yet distinguishable from staff writes.",
+    blockedOn:
+      "Only the half that writes no row. Portal writes ARE distinguishable now: " +
+      "`withCustomerScope` sets `app.actor_kind` to `customer`, `app_product_event` stamps it onto " +
+      "every row it writes, and a portal-raised job additionally carries `source = customer_portal` " +
+      "in its `job_created` properties — so those are already counted, under their own event names. " +
+      "What has no emitter is the rest of G9: viewing an invoice, downloading a statement, reading a " +
+      "quotation. Those are the actions that replace a phone call and none of them writes a row, so " +
+      "there is nothing for a trigger to fire on. It needs a `recordProductEvent` call on the portal " +
+      "read paths, which belongs to the portal stream.",
   },
   {
     name: "auth_event",
@@ -168,12 +245,6 @@ export const PRODUCT_EVENT_NAMES: readonly ProductEventName[] = [
     blockedOn:
       "`packages/auth`. Authentication writes to `sessions` and `audit_log`, neither of which " +
       "carries a tenant at the moment of a failed login, so a trigger cannot attribute one.",
-  },
-  {
-    name: "ats_stage_changed",
-    emitter: "none",
-    description: "An applicant moved through the hiring pipeline (G13, G14).",
-    blockedOn: "The recruitment stream — the ATS tables do not exist in this branch.",
   },
   {
     name: "field_sync_health",
@@ -392,6 +463,22 @@ export interface ContractPosition {
     autoRenew: boolean;
   }[];
   readonly currency: string;
+  /**
+   * G12 / CON-7, as a whole percent. Null when no visit has come due yet.
+   *
+   * Null rather than zero AND null rather than 100. Both wrong answers are
+   * available here and each is wrong in an opposite, plausible direction: 0%
+   * shows a contractor who has never sold an AMC as catastrophically failing a
+   * 98% target, and 100% awards a perfect score to a business that has done no
+   * maintenance. `ppmCompletion` in `core` returns 100 for a single contract
+   * with nothing yet due, which is right for one contract inside its first
+   * month and wrong as a headline for a whole tenant.
+   */
+  readonly ppmCompletionPercent: number | null;
+  readonly ppmVerdict: GoalVerdict;
+  /** Visits whose window has closed: completed plus overdue. The denominator. */
+  readonly ppmVisitsDue: number;
+  readonly ppmVisitsCompleted: number;
 }
 
 export interface CompliancePosition {
@@ -407,6 +494,34 @@ export interface CompliancePosition {
   /** The single most urgent expiry across all three registers, or null. */
   readonly nextExpiry: { label: string; daysRemaining: number } | null;
   readonly horizonDays: number;
+}
+
+/**
+ * Hiring (`KPI-3` — "open roles and days-to-hire").
+ *
+ * `requisitionsRecorded` is not decoration. Zero open roles on a business that
+ * has recorded fifteen requisitions is a business that is not hiring this
+ * month, which is fine; zero open roles on an empty table is a module nobody
+ * has started using, and the two must not render the same way. It is the same
+ * good-zero/gap-zero distinction `EmptyState` draws, carried as data so the
+ * screen does not have to guess.
+ */
+export interface HiringPosition {
+  /** Approved, published and not past their closing date. */
+  readonly openRoles: number;
+  /** Heads wanted across those roles. A role can be open for three people. */
+  readonly openHeadcount: number;
+  /** Approved but not yet published — a role nobody can apply to. */
+  readonly awaitingApproval: number;
+  /** Every requisition ever recorded, any status. Zero means an unused module. */
+  readonly requisitionsRecorded: number;
+  /** Live applications against the open roles. */
+  readonly liveApplications: number;
+  readonly hiresInWindow: number;
+  /** Median, in days. Null when nobody was hired in the window — never zero. */
+  readonly medianDaysToHire: number | null;
+  readonly daysToHireVerdict: GoalVerdict;
+  readonly windowDays: number;
 }
 
 export interface BillingRisk {
@@ -444,6 +559,7 @@ export interface OwnerDashboard {
   readonly work: WorkPosition;
   readonly contracts: ContractPosition;
   readonly compliance: CompliancePosition;
+  readonly hiring: HiringPosition;
   readonly billing: BillingRisk;
   readonly attention: readonly Attention[];
   readonly gaps: readonly DashboardGap[];
@@ -467,15 +583,17 @@ export async function ownerDashboard(
   const now = options?.now ?? new Date();
   const horizonDays = options?.horizonDays ?? DASHBOARD_HORIZON_DAYS;
 
-  const [ageing, revenue, pipeline, work, contracts, compliance, billing] = await Promise.all([
-    arAgeing(tx, now),
-    revenuePosition(tx, now),
-    pipelinePosition(tx, now),
-    workPosition(tx, now),
-    contractPosition(tx, now, horizonDays),
-    compliancePosition(tx, horizonDays),
-    billingRisk(tx, now),
-  ]);
+  const [ageing, revenue, pipeline, work, contracts, compliance, hiring, billing] =
+    await Promise.all([
+      arAgeing(tx, now),
+      revenuePosition(tx, now),
+      pipelinePosition(tx, now),
+      workPosition(tx, now),
+      contractPosition(tx, now, horizonDays),
+      compliancePosition(tx, horizonDays),
+      hiringPosition(tx, now),
+      billingRisk(tx, now),
+    ]);
 
   const overdueMinor =
     ageing.days1to30Minor + ageing.days31to60Minor + ageing.days61PlusMinor;
@@ -517,6 +635,7 @@ export async function ownerDashboard(
     work,
     contracts,
     compliance,
+    hiring,
     billing,
     attention: attentionItems({ cash, revenue, work, contracts, compliance, billing }),
     gaps: DASHBOARD_GAPS,
@@ -532,13 +651,6 @@ export async function ownerDashboard(
  * investigation.
  */
 export const DASHBOARD_GAPS: readonly DashboardGap[] = [
-  {
-    requirement: "KPI-3",
-    metric: "Open roles and days-to-hire",
-    waitingOn:
-      "The recruitment stream (ATS-1…ATS-19). No requisition or application table exists in this branch, " +
-      "so both the numerator and the denominator are missing.",
-  },
   {
     requirement: "KPI-3 / HR-18",
     metric: "Skilled headcount against the Emiratisation threshold",
@@ -559,13 +671,6 @@ export const DASHBOARD_GAPS: readonly DashboardGap[] = [
     metric: "First-time fix rate",
     waitingOn:
       "The field app (M11, Phase 3). It is computed from visit outcome codes, and no visit records one yet.",
-  },
-  {
-    requirement: "KPI-3 / G12",
-    metric: "PPM completion rate",
-    waitingOn:
-      "The contracts stream (CON-7). `contract_visits` exists but nothing generates or completes rows in it, " +
-      "so the ratio would be 0/0 rendered as 0%.",
   },
   {
     requirement: "KPI-3 / G10",
@@ -921,6 +1026,40 @@ async function contractPosition(
     auto_renew: boolean;
   }[];
 
+  /*
+   * G12 — PPM completion, read from `ppmCompliance` rather than recomputed.
+   *
+   * This was `DASHBOARD_GAPS`' PPM entry, blocked on "nothing generates or
+   * completes `contract_visits` rows". CON-4 and CON-5 landed, so it is a
+   * measurement now.
+   *
+   * ── SUMMED, NOT AVERAGED ────────────────────────────────────────────────
+   *
+   * The totals are summed across contracts and the percentage taken once at
+   * the end. Averaging the per-contract percentages would weight a contract
+   * with one visit due equally with one carrying fifty, so a single tiny
+   * contract at 0% could drag a tenant meeting its obligations on 200 visits
+   * below the target — and the number an OA management company asks for at
+   * renewal is "of the visits you owed us, how many happened", which is the
+   * summed one.
+   *
+   * The denominator is `completed + overdue`, which is what `ppmCompletion`
+   * uses and why the arithmetic is borrowed from it rather than written again:
+   * a visit whose window has not closed cannot have been missed, and counting
+   * it would make every contract in its first month look like a failing one.
+   */
+  const ppm = await ppmCompliance(tx);
+  const ppmVisitsCompleted = ppm.reduce((n, c) => n + c.completed, 0);
+  const ppmVisitsDue = ppmVisitsCompleted + ppm.reduce((n, c) => n + c.overdue, 0);
+  const ppmCompletionPercent =
+    ppmVisitsDue === 0
+      ? null
+      : ppmCompletion({
+          scheduled: ppm.reduce((n, c) => n + c.scheduled, 0),
+          completed: ppmVisitsCompleted,
+          overdue: ppmVisitsDue - ppmVisitsCompleted,
+        }).percent;
+
   const totals = (await tx.execute<{ active: string; annual_value_minor: string; currency: string | null }>(sql`
     select count(*)::text as active,
            coalesce(sum((annual_value * 100)::bigint), 0)::text as annual_value_minor,
@@ -933,6 +1072,10 @@ async function contractPosition(
     active: Number(totals[0]?.active ?? 0),
     annualValueMinor: Number(totals[0]?.annual_value_minor ?? 0),
     currency: totals[0]?.currency ?? "AED",
+    ppmCompletionPercent,
+    ppmVerdict: gradeGoal(ppmCompletionPercent, DASHBOARD_GOALS["ppmCompletion"]!),
+    ppmVisitsDue,
+    ppmVisitsCompleted,
     expiringWithinHorizon: rows.map((r) => ({
       id: r.id,
       reference: r.reference,
@@ -993,6 +1136,151 @@ async function compliancePosition(
     certificationsExpiring: certifications.length,
     nextExpiry: candidates[0] ?? null,
     horizonDays,
+  };
+}
+
+/**
+ * Open roles and days-to-hire (`KPI-3`, G13).
+ *
+ * This was `DASHBOARD_GAPS[0]` — "no requisition or application table exists in
+ * this branch" — while `0014_recruitment` had already created both, three
+ * migrations earlier in the same tree.
+ *
+ * ── THE TWO TIMESTAMPS G13 IS BOUNDED BY ────────────────────────────────────
+ *
+ * PRD §7.1 states G13 as "application received → offer accepted, median under
+ * 14 days". Precisely:
+ *
+ *   START  `applications.applied_at` — stamped by the row's own default when
+ *          the application is inserted, by the careers-site path and the staff
+ *          path alike. Not `created_at`: they are the same instant today, and
+ *          `applied_at` is the one that means "the applicant applied" rather
+ *          than "a row was written", which is what survives a backfill.
+ *
+ *   END    `application_events.occurred_at` where `event_type = 'hired'` — the
+ *          row `hireCandidate` writes in the same transaction as the conversion
+ *          to a technician. That transaction IS the offer being accepted:
+ *          nothing creates an employment record on a maybe.
+ *
+ * The end stamp is a join because `applications` carries no `hired_at` column
+ * and this file does not get to add one — a column added by a migration without
+ * a matching declaration in `schema/recruitment.ts` is a column the next
+ * generated diff proposes dropping.
+ *
+ * Two nearby columns were rejected. `updated_at` moves on any later edit, so a
+ * corrected phone number would rewrite history. `outcome_sent_at` is set to the
+ * same instant by `hireCandidate`, but it means "we told them", and reusing a
+ * notification stamp as a hire date is the kind of proxy that survives until
+ * somebody re-sends an outcome.
+ *
+ * Its one failure mode, stated rather than hidden: a hire performed by a
+ * hand-written `UPDATE applications SET status = 'hired'` writes no activity
+ * row and is not counted. That is detectable rather than silent — 0018's
+ * trigger emits `ats_application_closed` from the table itself, so a
+ * discrepancy between that count and `hiresInWindow` is exactly the sign of one.
+ *
+ * ── DATES ARE BOUNDED IN SQL, IN Asia/Dubai ─────────────────────────────────
+ *
+ * Both endpoints are converted to local dates before subtracting, so "applied
+ * Sunday, hired Wednesday" is three days regardless of where the database runs.
+ * Nothing here computes a boundary in JavaScript.
+ */
+async function hiringPosition(tx: TenantScopedTx, now: Date): Promise<HiringPosition> {
+  const windowDays = DASHBOARD_HIRING_WINDOW_DAYS;
+
+  /*
+   * Requisitions come from `listRequisitions`, not from a second `count(*)`.
+   *
+   * The rule at the top of this file: the dashboard and the recruitment board
+   * must agree about how many roles are open, and the only way to guarantee
+   * that is for both to read the same function. A parallel aggregate here that
+   * filtered `deleted_at` slightly differently would produce two defensible
+   * numbers and destroy trust in the pair.
+   */
+  const requisitions = await listRequisitions(tx, { includeClosed: true });
+
+  /*
+   * `closesAt` is compared against `now` in JavaScript, and that is not the
+   * boundary arithmetic this file computes in SQL. A closing date is an instant
+   * against an instant — there is no calendar bucket, no month edge and no
+   * timezone question in it. The SQL rule exists for `date_trunc` over a local
+   * month, where doing it here would move an invoice issued at 02:00 on the 1st
+   * into the previous month.
+   */
+  const live = requisitions.filter(
+    (r) => r.status === "open" && (r.closesAt === null || r.closesAt.getTime() >= now.getTime()),
+  );
+
+  const openIds = live.map((r) => r.id);
+
+  const rows = (await tx.execute<{
+    live_applications: string;
+    hires: string;
+    median_days: string | null;
+  }>(sql`
+    with open_reqs as (
+      -- The open set, passed in from the list this card's count is taken from,
+      -- so the two cannot drift. An empty array yields an empty set, which is
+      -- the correct answer and not a special case.
+      select value::uuid as id
+        from jsonb_array_elements_text(${JSON.stringify(openIds)}::jsonb) as t(value)
+    ),
+    hires as (
+      select ((h.hired_at at time zone 'Asia/Dubai')::date
+              - (a.applied_at at time zone 'Asia/Dubai')::date) as days_to_hire
+        from applications a
+        -- The earliest hire stamp, because an application that was reopened and
+        -- hired again should measure from the first offer accepted, not the
+        -- second. LATERAL rather than a grouped join so a missing activity row
+        -- drops the application rather than contributing a null to the median.
+        join lateral (
+          select min(ev.occurred_at) as hired_at
+            from application_events ev
+           where ev.application_id = a.id
+             and ev.event_type = 'hired'
+        ) h on h.hired_at is not null
+       where a.deleted_at is null
+         and a.status = 'hired'
+         and h.hired_at >= ${now.toISOString()}::timestamptz - make_interval(days => ${windowDays})
+         and h.hired_at <= ${now.toISOString()}::timestamptz
+    )
+    select
+      (select count(*)::text from applications a
+        where a.deleted_at is null
+          and a.status = 'active'
+          and a.requisition_id in (select id from open_reqs)) as live_applications,
+      (select count(*)::text from hires) as hires,
+      (select percentile_cont(0.5) within group (order by days_to_hire)::text
+         from hires) as median_days
+  `)) as unknown as {
+    live_applications: string;
+    hires: string;
+    median_days: string | null;
+  }[];
+
+  const r = rows[0];
+  const median = r?.median_days;
+
+  /*
+   * Null, not zero, when nobody was hired in the window.
+   *
+   * The same rule DSO and conversion follow, and it bites harder here: a
+   * days-to-hire of 0 reads as "we hire the same day", which is the most
+   * flattering number this card could show and is produced by hiring nobody.
+   */
+  const medianDaysToHire =
+    median === null || median === undefined ? null : Math.round(Number(median));
+
+  return {
+    openRoles: live.length,
+    openHeadcount: live.reduce((n, req) => n + req.headcount, 0),
+    awaitingApproval: requisitions.filter((req) => req.status === "pending_approval").length,
+    requisitionsRecorded: requisitions.length,
+    liveApplications: Number(r?.live_applications ?? 0),
+    hiresInWindow: Number(r?.hires ?? 0),
+    medianDaysToHire,
+    daysToHireVerdict: gradeGoal(medianDaysToHire, DASHBOARD_GOALS["daysToHire"]!),
+    windowDays,
   };
 }
 
@@ -1157,7 +1445,11 @@ function attentionItems(input: {
           ? `${notRenewing.length} of them ${notRenewing.length === 1 ? "does" : "do"} not ` +
             `auto-renew, so ${notRenewing.length === 1 ? "it ends" : "they end"} unless somebody acts.`
           : "All of them auto-renew, so this needs a decision only if the answer is no.",
-      href: "/customers",
+      // `/amc`, not `/customers`. This link was written before the contracts
+      // stream shipped a screen, and pointed at the customer list because that
+      // was the closest thing that existed. It now sends the reader one click
+      // short of the record the item is about.
+      href: "/amc",
     });
   }
 

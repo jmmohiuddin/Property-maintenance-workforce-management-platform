@@ -8,6 +8,7 @@ import {
   listQuotes,
   getQuoteWithLines,
   listInvoices,
+  jobContractScope,
   QUOTE_STATUS_LABEL,
   INVOICE_STATUS_LABEL,
 } from "@meridian/db";
@@ -18,7 +19,8 @@ import { AppShell } from "@/components/app-shell";
 import { StatusActions, AssignPanel } from "./job-actions";
 import { QuotePanel, SendQuoteButton, QuoteDocumentLink } from "./quote-panel";
 import { InvoicePanel } from "./invoice-panel";
-import { MapPin, Key, Clock } from "@phosphor-icons/react/dist/ssr";
+import { OutOfScopePanel } from "./out-of-scope-panel";
+import { MapPin, Key, Clock, ShieldCheck, Warning } from "@phosphor-icons/react/dist/ssr";
 
 export const dynamic = "force-dynamic";
 
@@ -62,7 +64,14 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
       const approved = quotes.find((q) => q.status === "approved");
       const approvedQuote = approved ? await getQuoteWithLines(tx, approved.id) : null;
 
-      return { job, candidates, needsAssignment, quotes, invoices, approvedQuote };
+      // CON-6, automatically. Null when the job is not contract work, which is
+      // most jobs. Computed here rather than behind a button on purpose: a
+      // check somebody has to remember to run is a check that gets forgotten on
+      // exactly the job that needed it, and the work is then absorbed. See the
+      // note on `jobContractScope`.
+      const contractScope = await jobContractScope(tx, id);
+
+      return { job, candidates, needsAssignment, quotes, invoices, approvedQuote, contractScope };
     },
   );
 
@@ -70,7 +79,7 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
   // here, which is exactly the intended behaviour.
   if (!data) notFound();
 
-  const { job, candidates, needsAssignment, quotes, invoices, approvedQuote } = data;
+  const { job, candidates, needsAssignment, quotes, invoices, approvedQuote, contractScope } = data;
   const service = getService(job.serviceSlug);
   const remaining = job.resolveByAt ? minutesUntil(job.resolveByAt, now) : null;
   const canUpdate = can(session.principal, "jobs:update");
@@ -234,6 +243,57 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
               ) : null}
             </div>
 
+            {/*
+              ── CON-6, stated whether or not anybody asked ────────────────
+
+              Beside the SLA banner, and for the same reason it is: both are
+              facts about this job that decide what happens to it, and both are
+              worthless if reading them is optional. The verdict here is the
+              automatic one — service coverage and remaining entitlement — so
+              it is true of every contract job on first render. What it cannot
+              know is what the technician found, which is what the panel below
+              collects.
+            */}
+            {contractScope ? (
+              <div
+                className="rounded border p-5"
+                style={{
+                  backgroundColor: "var(--surface-raised)",
+                  borderColor: contractScope.decision.isCovered
+                    ? undefined
+                    : "var(--accent)",
+                }}
+              >
+                <h2 className="text-[14px] font-semibold">Contract</h2>
+                <p className="mt-3 flex items-start gap-2 text-[15px] font-semibold">
+                  {contractScope.decision.isCovered ? (
+                    <ShieldCheck
+                      size={15}
+                      weight="fill"
+                      aria-hidden
+                      className="mt-0.5 shrink-0"
+                      style={{ color: "var(--accent)" }}
+                    />
+                  ) : (
+                    <Warning
+                      size={15}
+                      weight="fill"
+                      aria-hidden
+                      className="mt-0.5 shrink-0"
+                      style={{ color: "var(--accent-text)" }}
+                    />
+                  )}
+                  {contractScope.decision.isCovered
+                    ? `Covered by ${contractScope.contractReference}`
+                    : `NOT COVERED by ${contractScope.contractReference}`}
+                </p>
+                <p className="prose-body mt-2 text-[13px]">{contractScope.decision.reason}</p>
+                <p className="tnum mt-2 text-[12px]" style={{ color: "var(--text-muted)" }}>
+                  {contractScope.contractName}
+                </p>
+              </div>
+            ) : null}
+
             {canUpdate ? (
               <StatusActions jobId={job.id} allowed={[...allowedTransitions(job.status)]} />
             ) : null}
@@ -267,6 +327,27 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
                   </ul>
                 )}
               </div>
+            ) : null}
+
+            {/*
+              The on-demand half, and only on contract work. `quotes:create` is
+              the same permission an ordinary quote needs, because what this
+              produces is an ordinary quote — priced by the contract rather than
+              by whoever is filling the form in.
+            */}
+            {contractScope && can(session.principal, "quotes:create") ? (
+              <OutOfScopePanel
+                jobId={job.id}
+                contractId={contractScope.contractId}
+                contractReference={contractScope.contractReference}
+                coverageType={contractScope.coverageType}
+                exclusions={contractScope.exclusions.map((e) => ({
+                  code: e.code,
+                  label: e.label,
+                  description: e.description,
+                }))}
+                verdict={contractScope.decision.verdict}
+              />
             ) : null}
 
             {can(session.principal, "quotes:create") ? <QuotePanel jobId={job.id} /> : null}

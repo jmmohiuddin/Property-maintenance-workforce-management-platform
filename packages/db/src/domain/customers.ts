@@ -37,8 +37,15 @@ export interface CustomerRow {
   overdueMinor: number;
 }
 
-/** Statuses that mean "work we still owe this customer". */
-const OPEN_JOB_STATUSES = [
+/**
+ * Statuses that mean "work we still owe this customer".
+ *
+ * Exported because the paged customer search in `./leads.ts` counts open jobs
+ * against the same definition. Two lists would drift, and the first anybody
+ * would hear of it is a customer screen whose open-job count disagrees with the
+ * one beside it.
+ */
+export const OPEN_JOB_STATUSES = [
   "submitted",
   "triaged",
   "scheduled",
@@ -149,6 +156,118 @@ export async function listCustomers(
   }));
 }
 
+/**
+ * The portfolio totals that sit above the customer list (`LEAD-8`, `TD-10`).
+ *
+ * These used to be `customers.reduce(...)` over the whole list, which is only
+ * correct while the screen fetches every customer — the thing that had to stop.
+ * Summing the page instead would be worse than removing the figure: "AED 4,200
+ * outstanding" that silently means "on this page" is a number somebody will
+ * quote to a customer.
+ *
+ * So the total is a total: one aggregate over the invoice ledger, in integer
+ * minor units, independent of how the list beneath it is paged.
+ *
+ * `overdueAccounts` is capped rather than complete, and the count beside it is
+ * the honest one. A banner that names eight accounts is read; a banner that
+ * names ninety is scrolled past, and building it would put an unbounded list
+ * back on the screen this work exists to bound.
+ */
+export interface PortfolioTotals {
+  readonly customerCount: number;
+  readonly outstandingMinor: number;
+  readonly overdueMinor: number;
+  /** How many accounts are past due, in full. */
+  readonly overdueCount: number;
+  /** The worst of them, largest first. At most `overdueSample` rows. */
+  readonly overdueAccounts: readonly {
+    readonly id: string;
+    readonly name: string;
+    readonly overdueMinor: number;
+    readonly currency: string;
+  }[];
+}
+
+export async function customerPortfolioTotals(
+  tx: TenantScopedTx,
+  opts: { includeInactive?: boolean; now?: Date; overdueSample?: number } = {},
+): Promise<PortfolioTotals> {
+  const now = (opts.now ?? new Date()).toISOString();
+  const sample = Math.min(Math.max(opts.overdueSample ?? 8, 1), 50);
+  const activeOnly = opts.includeInactive ? sql`` : sql`and c.is_active`;
+
+  // One expression, defined once and used three times below. The balance rule
+  // is per invoice — an overpaid one is not a credit against the next — and
+  // writing it out three times is how the overdue figure stops agreeing with
+  // the outstanding one.
+  const balance = sql`round(greatest(i.total - i.amount_paid, 0) * 100)`;
+  const openInvoice = sql`
+    i.deleted_at is null and i.status::text in ('issued', 'part_paid', 'overdue')
+  `;
+
+  const [totals] = (await tx.execute<{
+    customer_count: number;
+    outstanding_minor: string;
+    overdue_minor: string;
+    overdue_count: number;
+  }>(sql`
+    with balances as (
+      select c.id,
+             coalesce(sum(${balance}), 0) as outstanding,
+             coalesce(sum(case when i.due_on is not null and i.due_on < ${now}::timestamptz
+                               then ${balance} else 0 end), 0) as overdue
+        from customers c
+        left join invoices i on i.customer_id = c.id and ${openInvoice}
+       where c.deleted_at is null
+         ${activeOnly}
+       group by c.id
+    )
+    select count(*)::int as customer_count,
+           coalesce(sum(outstanding), 0) as outstanding_minor,
+           coalesce(sum(overdue), 0) as overdue_minor,
+           count(*) filter (where overdue > 0)::int as overdue_count
+      from balances
+  `)) as unknown as {
+    customer_count: number;
+    outstanding_minor: string;
+    overdue_minor: string;
+    overdue_count: number;
+  }[];
+
+  const worst = (await tx.execute<{
+    id: string;
+    name: string;
+    currency: string;
+    overdue_minor: string;
+  }>(sql`
+    select c.id, c.name, c.currency,
+           sum(case when i.due_on is not null and i.due_on < ${now}::timestamptz
+                    then ${balance} else 0 end) as overdue_minor
+      from customers c
+      join invoices i on i.customer_id = c.id and ${openInvoice}
+     where c.deleted_at is null
+       ${activeOnly}
+     group by c.id, c.name, c.currency
+    having sum(case when i.due_on is not null and i.due_on < ${now}::timestamptz
+                    then ${balance} else 0 end) > 0
+     order by overdue_minor desc
+     limit ${sample}
+  `)) as unknown as { id: string; name: string; currency: string; overdue_minor: string }[];
+
+  return {
+    customerCount: Number(totals?.customer_count ?? 0),
+    outstandingMinor: Number(totals?.outstanding_minor ?? 0),
+    overdueMinor: Number(totals?.overdue_minor ?? 0),
+    overdueCount: Number(totals?.overdue_count ?? 0),
+    overdueAccounts: worst.map((r) => ({
+      id: r.id,
+      name: r.name,
+      overdueMinor: Number(r.overdue_minor),
+      currency: r.currency,
+    })),
+  };
+}
+
 export interface CustomerDetail {
   customer: CustomerRow & {
     taxRegistrationNumber: string | null;
@@ -190,28 +309,104 @@ export interface CustomerDetail {
   portalUsers: { id: string; fullName: string; email: string; lastLoginAt: Date | null }[];
 }
 
+/**
+ * One customer's summary, in one query (`TD-10`).
+ *
+ * This used to be `listCustomers({ includeInactive: true }).find(...)`: every
+ * customer in the tenant, every open job and every unpaid invoice belonging to
+ * all of them, read and joined in memory to answer a question about a single
+ * account. It is the same unbounded read the customer *list* just shed, and
+ * leaving the detail screen carrying it while the list is fixed would be an odd
+ * place to stop.
+ *
+ * The counts and balances are correlated subqueries evaluated for this one row,
+ * against the same rules `listCustomers` applies — `greatest(…, 0)` per invoice
+ * so an overpayment cannot net off another one, and the same three statuses,
+ * because written-off debt is not outstanding. The test asserts the two agree
+ * rather than trusting that they do.
+ *
+ * The columns the list does not carry — TRN, credit limit, notes, created —
+ * come back in the same round trip instead of a second one.
+ */
+async function customerSummary(
+  tx: TenantScopedTx,
+  customerId: string,
+  now: Date,
+): Promise<
+  | (CustomerRow & {
+      taxRegistrationNumber: string | null;
+      creditLimit: string | null;
+      notes: string | null;
+      createdAt: Date;
+    })
+  | null
+> {
+  // The balance rule, written once and used twice. Two copies is how the
+  // overdue figure stops agreeing with the outstanding one it is part of.
+  const openInvoice = sql`
+    i.customer_id = ${customerId} and i.deleted_at is null
+      and i.status::text in ('issued', 'part_paid', 'overdue')
+  `;
+  const balance = sql`round(greatest(i.total - i.amount_paid, 0) * 100)`;
+
+  const [row] = await tx
+    .select({
+      id: schema.customers.id,
+      code: schema.customers.code,
+      name: schema.customers.name,
+      isCompany: schema.customers.isCompany,
+      industry: schema.customers.industry,
+      billingEmail: schema.customers.billingEmail,
+      phone: schema.customers.phone,
+      paymentTermsDays: schema.customers.paymentTermsDays,
+      currency: schema.customers.currency,
+      isActive: schema.customers.isActive,
+      accountManagerId: schema.customers.accountManagerId,
+      accountManagerName: schema.users.fullName,
+      taxRegistrationNumber: schema.customers.taxRegistrationNumber,
+      creditLimit: schema.customers.creditLimit,
+      notes: schema.customers.notes,
+      createdAt: schema.customers.createdAt,
+      propertyCount: sql<number>`(
+        select count(*)::int from properties p
+         where p.customer_id = ${customerId} and p.deleted_at is null)`,
+      openJobs: sql<number>`(
+        select count(*)::int from jobs j
+         where j.customer_id = ${customerId} and j.deleted_at is null
+           and j.status::text in (${sql.join(OPEN_JOB_STATUSES.map((s) => sql`${s}`), sql`, `)}))`,
+      // Numeric, not cast to int: minor units for a large account can pass what
+      // an int4 holds, and the failure mode of that cast is an error mid-page
+      // rather than a wrong number. Converted in TypeScript instead.
+      outstanding: sql<string>`coalesce((
+        select sum(${balance}) from invoices i where ${openInvoice}), 0)`,
+      overdue: sql<string>`coalesce((
+        select sum(${balance}) from invoices i
+         where ${openInvoice} and i.due_on is not null and i.due_on < ${now.toISOString()}), 0)`,
+    })
+    .from(schema.customers)
+    .leftJoin(schema.users, eq(schema.users.id, schema.customers.accountManagerId))
+    .where(and(eq(schema.customers.id, customerId), isNull(schema.customers.deletedAt)))
+    .limit(1);
+
+  if (!row) return null;
+
+  const { outstanding, overdue, ...rest } = row;
+  return {
+    ...rest,
+    propertyCount: Number(rest.propertyCount),
+    openJobs: Number(rest.openJobs),
+    outstandingMinor: Number(outstanding),
+    overdueMinor: Number(overdue),
+  };
+}
+
 export async function getCustomer(
   tx: TenantScopedTx,
   customerId: string,
   now = new Date(),
 ): Promise<CustomerDetail | null> {
-  const summary = (await listCustomers(tx, { includeInactive: true, now })).find(
-    (c) => c.id === customerId,
-  );
+  const summary = await customerSummary(tx, customerId, now);
   if (!summary) return null;
-
-  const [extra] = await tx
-    .select({
-      taxRegistrationNumber: schema.customers.taxRegistrationNumber,
-      creditLimit: schema.customers.creditLimit,
-      notes: schema.customers.notes,
-      createdAt: schema.customers.createdAt,
-    })
-    .from(schema.customers)
-    .where(eq(schema.customers.id, customerId))
-    .limit(1);
-
-  if (!extra) return null;
 
   const [contacts, properties, recentJobs, portalUsers] = await Promise.all([
     tx
@@ -288,7 +483,7 @@ export async function getCustomer(
   const openBy = new Map(openByProperty.map((p) => [p.propertyId, p.count]));
 
   return {
-    customer: { ...summary, ...extra },
+    customer: summary,
     contacts,
     properties: properties.map((p) => ({ ...p, openJobs: openBy.get(p.id) ?? 0 })),
     recentJobs,

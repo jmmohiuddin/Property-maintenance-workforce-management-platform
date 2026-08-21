@@ -5,12 +5,14 @@ import {
   listDispatchBoard,
   listQuotes,
   listPortalInvoices,
+  listPortalContracts,
   INVOICE_STATUS_LABEL,
 } from "@meridian/db";
 import { getService, STATUS_LABEL, formatMoney, toMinor, OPEN_STATUSES } from "@meridian/core";
 import { requirePortalSession } from "@/lib/session";
 import { PortalShell } from "@/components/portal-shell";
-import { Clock, FileText, Receipt, CheckCircle } from "@phosphor-icons/react/dist/ssr";
+import { EmptyState } from "@/components/empty-state";
+import { Clock, FileText, Receipt, CheckCircle, ShieldCheck } from "@phosphor-icons/react/dist/ssr";
 
 export const metadata: Metadata = { title: "Your account" };
 export const dynamic = "force-dynamic";
@@ -27,7 +29,7 @@ export default async function PortalPage({
   // Every read goes through withCustomerScope, so Postgres restricts these rows
   // to this customer. A forgotten filter here returns nothing rather than
   // another customer's records.
-  const { jobs, quotes, invoices } = await withCustomerScope(
+  const { jobs, quotes, invoices, contracts } = await withCustomerScope(
     {
       tenantId: session.principal.tenantId,
       customerId: session.customerId,
@@ -43,6 +45,11 @@ export default async function PortalPage({
       // committed to. Customer scope made the list safe across customers and
       // did nothing about which of their own rows they should see.
       invoices: await listPortalInvoices(tx, { limit: 20 }),
+      // CON-5. Entitlement was visible to staff on the contract page and
+      // nowhere else, so a customer on an AMC could not see how many of the
+      // visits they had paid for were left. Most customers have no contract and
+      // get nothing rendered — see the section below.
+      contracts: await listPortalContracts(tx),
     }),
   );
 
@@ -147,7 +154,25 @@ export default async function PortalPage({
             See every request, including completed ones
           </Link>
           {jobs.length === 0 ? (
-            <p className="prose-body mt-3 text-[14px]">Nothing open at the moment.</p>
+            /*
+              ADM-12. A GOOD zero, and it has to look like one.
+
+              "Nothing open at the moment." was written for whoever was staring
+              at seed data, and to a customer on their first morning it reads
+              like a screen that failed to load. Nothing open is the outcome
+              they are paying for — everything they asked for is finished — so
+              this is `good` and not `start`, and it says what to do next
+              anyway, because the next thing is the only reason to come back.
+            */
+            <div className="mt-3">
+              <EmptyState kind="good" title="Nothing is open right now.">
+                <p>
+                  Every request you have raised has been finished. When something needs attention,
+                  raise it above and you will have a reference straight away &mdash; no phone call
+                  needed.
+                </p>
+              </EmptyState>
+            </div>
           ) : (
             <ul className="mt-4 divide-y rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>
               {jobs.map((j) => (
@@ -170,6 +195,82 @@ export default async function PortalPage({
           )}
         </section>
 
+        {/* ── CON-5. Your contract, and what is left on it ──────────────────
+            Nothing renders when there is no contract. Most customers are not on
+            an AMC, and a "Your contract" heading followed by "none" on every
+            one of their visits is clutter that trains people to scroll past the
+            section — including the customers it was written for. */}
+        {contracts.length > 0 ? (
+          <section className="mt-10">
+            <h2 className="flex items-center gap-2 text-lg font-semibold tracking-tight">
+              <ShieldCheck size={18} weight="fill" aria-hidden style={{ color: "var(--accent)" }} />
+              Your maintenance contract
+            </h2>
+            <p className="prose-body mt-2 text-[14px]">
+              Visits are counted across the whole term of the contract rather than per year.
+            </p>
+            <ul
+              className="mt-4 divide-y rounded border"
+              style={{ backgroundColor: "var(--surface-raised)" }}
+            >
+              {contracts.map((c) => (
+                <li key={c.id} className="p-5">
+                  <div className="flex flex-wrap items-baseline justify-between gap-3">
+                    <p className="text-[15px] font-medium">{c.name}</p>
+                    <span className="tnum text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                      {c.reference}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-[13px]" style={{ color: "var(--text-muted)" }}>
+                    {c.startsOn.toLocaleDateString("en-GB", { timeZone: "Asia/Dubai", dateStyle: "medium" })}
+                    {" – "}
+                    {c.endsOn.toLocaleDateString("en-GB", { timeZone: "Asia/Dubai", dateStyle: "medium" })}
+                    {c.daysRemaining >= 0
+                      ? ` · ${c.daysRemaining} days remaining`
+                      : " · this term has ended"}
+                  </p>
+
+                  {c.entitlements.length > 0 ? (
+                    <dl className="mt-4 space-y-1.5">
+                      {c.entitlements.map((e) => (
+                        <div key={e.serviceSlug} className="flex flex-wrap justify-between gap-3">
+                          <dt className="text-[14px]">{e.label}</dt>
+                          <dd
+                            className="tnum text-[14px] font-medium"
+                            style={
+                              e.remaining === 0 ? { color: "var(--accent-text)" } : undefined
+                            }
+                          >
+                            {e.remaining} of {e.entitledForTerm} visits remaining
+                          </dd>
+                        </div>
+                      ))}
+                    </dl>
+                  ) : null}
+
+                  {c.exclusions.length > 0 ? (
+                    <div className="mt-4">
+                      <p className="text-[13px] font-medium">Not included</p>
+                      <ul className="mt-1 space-y-0.5">
+                        {c.exclusions.map((x) => (
+                          <li key={x.code} className="text-[13px]" style={{ color: "var(--text-muted)" }}>
+                            {x.label}
+                            {x.description ? ` — ${x.description}` : ""}
+                          </li>
+                        ))}
+                      </ul>
+                      <p className="mt-2 text-[13px]" style={{ color: "var(--text-muted)" }}>
+                        Work outside the contract is always quoted before it is carried out, at the
+                        discount agreed in your contract.
+                      </p>
+                    </div>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
+
         {/* ── Invoices ───────────────────────────────────────────────────── */}
         <section className="mt-10">
           <h2 className="flex items-center gap-2 text-lg font-semibold tracking-tight">
@@ -180,7 +281,23 @@ export default async function PortalPage({
             All invoices, PDFs and your statement
           </Link>
           {invoices.length === 0 ? (
-            <p className="prose-body mt-3 text-[14px]">No invoices yet.</p>
+            /*
+              A START zero, deliberately a different kind from the one above.
+
+              An empty invoice list is neither good news nor a hole: it is what
+              a new account looks like before the first job is signed off. Both
+              zeros rendering identically is what teaches somebody to stop
+              reading the section — and neither of them is a `gap`, because
+              nothing here is going unrecorded.
+            */
+            <div className="mt-3">
+              <EmptyState kind="start" title="No invoices have been raised yet.">
+                <p>
+                  An invoice appears here once a job has been completed and signed off. Nothing is
+                  owed in the meantime.
+                </p>
+              </EmptyState>
+            </div>
           ) : (
             <ul className="mt-4 divide-y rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>
               {invoices.map((i) => (

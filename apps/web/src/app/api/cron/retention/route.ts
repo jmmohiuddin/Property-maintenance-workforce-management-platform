@@ -106,10 +106,19 @@ export async function GET(request: Request) {
     );
 
     warnings.push(
-      "Not yet purged, because the mechanism does not exist: applicant and candidate data " +
-        "(ATS-18) — no `candidates` table; lead and marketing consent records (LEAD-7) — `leads` " +
-        "has no `delete_after` or `last_interaction_at` column; customer contact PII on closed " +
-        "accounts — no retention clock defined. Each needs a column before it can need a job.",
+      "Purged, but not by this route: applicant and candidate data (ATS-18). `candidates` now " +
+        "carries `delete_after` and `last_interaction_at`, and /api/cron/recruitment purges " +
+        "against them every 15 minutes, reporting its own count and sparing employees, " +
+        "consented talent-pool members and live applicants. It is named here because this is " +
+        "the route someone reads to ask what this system deletes, and an answer that omits it " +
+        "reads as nothing deleting it.",
+    );
+
+    warnings.push(
+      "Not yet purged, because the mechanism does not exist: lead and marketing consent records " +
+        "(LEAD-7) — `leads` has no `delete_after` or `last_interaction_at` column; customer " +
+        "contact PII on closed accounts — no retention clock defined. Each needs a column " +
+        "before it can need a job.",
     );
 
     warnings.push(

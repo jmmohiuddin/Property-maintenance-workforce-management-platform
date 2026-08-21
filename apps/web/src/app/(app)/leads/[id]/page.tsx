@@ -8,17 +8,11 @@ import {
   listCommunications,
   listDispositionReasons,
 } from "@meridian/db";
-import {
-  getService,
-  LEAD_STAGE_LABEL,
-  COMMUNICATION_CHANNEL_LABEL,
-  COMMUNICATION_OUTCOME_LABEL,
-  type CommunicationChannel,
-  type CommunicationOutcome,
-} from "@meridian/core";
+import { getService, LEAD_STAGE_LABEL } from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 import { LogCommunicationForm } from "../log-form";
+import { CommunicationTimeline } from "../communication-timeline";
 import { StageForm } from "../stage-form";
 import { FollowUpForm } from "../follow-up-form";
 import { LinkDuplicateForm } from "../link-duplicate-form";
@@ -194,39 +188,10 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
             <h2 className="mt-10 text-lg font-semibold tracking-tight">
               History ({communications.length})
             </h2>
-            {communications.length === 0 ? (
-              <p className="prose-body mt-3 text-[14px]">
-                Nothing logged yet. Every call, WhatsApp and site visit recorded here survives
-                whoever leaves.
-              </p>
-            ) : (
-              <ul className="mt-4 space-y-3">
-                {communications.map((c) => (
-                  <li key={c.id} className="rounded border p-4" style={{ backgroundColor: "var(--surface-raised)" }}>
-                    <div className="flex flex-wrap items-baseline justify-between gap-3">
-                      <p className="text-[13px] font-semibold">
-                        {COMMUNICATION_CHANNEL_LABEL[c.channel as CommunicationChannel] ?? c.channel}
-                        {c.direction === "inbound" ? " · they contacted us" : ""}
-                        {c.outcome
-                          ? ` · ${COMMUNICATION_OUTCOME_LABEL[c.outcome as CommunicationOutcome] ?? c.outcome}`
-                          : ""}
-                      </p>
-                      <p className="tnum text-[12px]" style={{ color: "var(--text-muted)" }}>
-                        {c.occurredAt.toLocaleString("en-GB", {
-                          timeZone: "Asia/Dubai",
-                          dateStyle: "medium",
-                          timeStyle: "short",
-                        })}
-                      </p>
-                    </div>
-                    {c.body ? <p className="prose-body mt-2 text-[14px]">{c.body}</p> : null}
-                    <p className="mt-2 text-[12px]" style={{ color: "var(--text-muted)" }}>
-                      {c.isAutomated ? "Automated" : (c.authorName ?? "Unknown")}
-                    </p>
-                  </li>
-                ))}
-              </ul>
-            )}
+            <CommunicationTimeline
+              entries={communications}
+              empty="Nothing logged yet. Every call, WhatsApp and site visit recorded here survives whoever leaves."
+            />
           </div>
 
           <aside className="space-y-8">

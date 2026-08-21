@@ -234,6 +234,18 @@ export async function decideQuote(
  *
  * Lives here rather than in the notify package because notify depends on db;
  * the reverse would be a cycle. The app layer joins the two.
+ *
+ * ── WHY `customerId` IS HERE AND `customerEmail` IS NO LONGER THE ADDRESS ──
+ *
+ * `POR-5` is a preference held by the customer, so anything about to send this
+ * has to be able to name the customer — and to name the right one, from the
+ * quote rather than from whatever the caller happened to have to hand.
+ *
+ * `customerEmail` stays, because the jobs screen shows it, but it is no longer
+ * where a notification gets its recipient. Emailing the billing address from
+ * here was how the immediate send came to disagree with the sweep, which
+ * resolves the contacts flagged `notify_on_jobs` and falls back to billing only
+ * when there are none. `customerNotificationRecipients` is the one rule now.
  */
 export async function getQuoteForNotification(
   tx: TenantScopedTx,
@@ -245,6 +257,7 @@ export async function getQuoteForNotification(
   total: string;
   currency: string;
   validUntil: Date | null;
+  customerId: string;
   customerName: string;
   customerEmail: string | null;
 } | null> {
@@ -256,6 +269,10 @@ export async function getQuoteForNotification(
       total: schema.quotes.total,
       currency: schema.quotes.currency,
       validUntil: schema.quotes.validUntil,
+      // From `customers`, not `quotes.customer_id`: the join has already proved
+      // the row exists, and the column on `quotes` is nullable while this one
+      // is not — so the type says `string` and means it.
+      customerId: schema.customers.id,
       customerName: schema.customers.name,
       customerEmail: schema.customers.billingEmail,
     })
@@ -793,6 +810,11 @@ export async function arAgeing(
  *
  * Separate from `listInvoices` because a notification must not depend on a
  * list query's filters or ordering ever changing.
+ *
+ * `customerId` for the same reason as `getQuoteForNotification`: the `POR-5`
+ * opt-out is the customer's, so the sender has to be able to name the customer,
+ * and the invoice is the only trustworthy source of which one. `customerEmail`
+ * is no longer the recipient — see the note there.
  */
 export async function getInvoiceForNotification(
   tx: TenantScopedTx,
@@ -802,6 +824,7 @@ export async function getInvoiceForNotification(
   total: string;
   currency: string;
   dueOn: Date | null;
+  customerId: string;
   customerName: string;
   customerEmail: string | null;
 } | null> {
@@ -811,6 +834,7 @@ export async function getInvoiceForNotification(
       total: schema.invoices.total,
       currency: schema.invoices.currency,
       dueOn: schema.invoices.dueOn,
+      customerId: schema.customers.id,
       customerName: schema.customers.name,
       customerEmail: schema.customers.billingEmail,
     })

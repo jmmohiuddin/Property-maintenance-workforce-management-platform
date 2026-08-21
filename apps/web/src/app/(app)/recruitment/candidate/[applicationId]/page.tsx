@@ -250,8 +250,11 @@ export default async function CandidatePage({
                         `ATS-9`. Downloads are gated on scan status. No virus
                         scanner is contracted for this deployment, so files are
                         recorded as `skipped` — explicitly unscanned rather than
-                        stuck pending — and that is said here rather than
-                        implied by a working download button.
+                        stuck pending — and that is said here every time, next
+                        to a link that works. The warning is not a substitute
+                        for the link and the link is not a reason to drop the
+                        warning: a file somebody can open is exactly the file
+                        they need telling about.
                       */}
                       {document.scanStatus === "skipped" ? (
                         <p className="mt-2 text-[13px]" style={{ color: "var(--text-muted)" }}>
@@ -259,14 +262,29 @@ export default async function CandidatePage({
                           as untrusted, and never forward it by email.
                         </p>
                       ) : null}
-                      {!document.downloadable ? (
+                      {document.downloadable ? (
+                        /*
+                          A plain link, not a button or a client component. The
+                          route sets `Content-Disposition: attachment`, so the
+                          browser saves the file rather than navigating to it,
+                          and the same route re-checks the scan status — this
+                          link is a convenience, never the gate.
+                        */
+                        <a
+                          href={`/recruitment/documents/${document.id}`}
+                          className="mt-2 inline-block text-[13px] font-medium hover:underline"
+                          style={{ color: "var(--accent-text)" }}
+                        >
+                          Download {document.filename ?? document.kind}
+                        </a>
+                      ) : (
                         <p
                           className="mt-2 text-[13px]"
                           style={{ color: "var(--status-critical-text)" }}
                         >
                           Download blocked until the scan completes (SEC-8).
                         </p>
-                      ) : null}
+                      )}
                     </li>
                   ))}
                 </ul>

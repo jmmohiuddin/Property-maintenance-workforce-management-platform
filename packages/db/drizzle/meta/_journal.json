@@ -92,6 +92,48 @@
       "when": 1786475000000,
       "tag": "0012_taxonomies",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1786500000000,
+      "tag": "0013_contracts_amc",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1786525000000,
+      "tag": "0014_recruitment",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1786550000000,
+      "tag": "0015_hr_lifecycle",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1786575000000,
+      "tag": "0016_portal_and_leads",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1786600000000,
+      "tag": "0017_kpi_and_admin",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1786625000000,
+      "tag": "0018_ats_product_events",
+      "breakpoints": true
     }
   ]
 }

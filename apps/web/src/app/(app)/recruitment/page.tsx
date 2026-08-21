@@ -4,6 +4,7 @@ import { withTenant } from "@meridian/db";
 import {
   applicationsOwedAnOutcome,
   listRequisitions,
+  listStaff,
   outcomeAccountability,
   talentPoolNeedingReconfirmation,
 } from "@meridian/db/domain";
@@ -14,6 +15,7 @@ import {
   type CandidateGrade,
   type RequisitionStatus,
 } from "@meridian/core";
+import { isStaff, type Role } from "@meridian/auth";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 import { NewRequisitionForm } from "./new-requisition-form";
@@ -42,17 +44,31 @@ export const dynamic = "force-dynamic";
 export default async function RecruitmentPage() {
   const session = await requireSessionWith("recruitment:read");
 
-  const { requisitions, accountability, owed, poolDue } = await withTenant(
+  const { requisitions, accountability, owed, poolDue, staff } = await withTenant(
     { tenantId: session.principal.tenantId, userId: session.principal.userId },
     async (tx) => ({
       requisitions: await listRequisitions(tx),
       accountability: await outcomeAccountability(tx),
       owed: await applicationsOwedAnOutcome(tx, 25),
       poolDue: await talentPoolNeedingReconfirmation(tx, 25),
+      staff: await listStaff(tx),
     }),
   );
 
   const canWrite = ["owner", "admin", "hr"].includes(session.principal.role);
+
+  /*
+    `ATS-1`. Who can be named as the hiring manager.
+
+    Every active member of staff, and nobody outside the office — a portal user
+    is in `memberships` too. Sorted by name rather than by `listStaff`'s
+    consequence order, which puts locked accounts first: that is the right order
+    for the administration screen and the wrong one for a picker.
+  */
+  const hiringManagers = staff
+    .filter((member) => member.isActive && isStaff(member.role as Role))
+    .map((member) => ({ userId: member.userId, fullName: member.fullName, role: member.role }))
+    .sort((a, b) => a.fullName.localeCompare(b.fullName));
 
   return (
     <AppShell session={session} active="recruitment">
@@ -239,38 +255,55 @@ export default async function RecruitmentPage() {
         </section>
 
         {/* ── ATS-13 ───────────────────────────────────────────────────── */}
-        {poolDue.length > 0 ? (
-          <section className="mt-12">
-            <h2 className="text-[19px] font-semibold">Talent pool — consent to re-confirm</h2>
-            <p className="prose-body mt-2 text-[14px]">
-              {poolDue.length} pool {poolDue.length === 1 ? "member" : "members"} last confirmed more
-              than three months ago. A tradesperson&rsquo;s availability and certificate validity go
-              stale in weeks, so a pool nobody re-confirms is a list of people who have all found
-              other work — and holding their details past their consent is a separate problem.
-            </p>
-            <ul className="mt-4 space-y-2">
-              {poolDue.slice(0, 10).map((member) => (
-                <li
-                  key={`${member.candidateId}-${member.poolKey}`}
-                  className="flex flex-wrap items-center justify-between gap-3 rounded border px-5 py-3 text-[14px]"
-                  style={{ backgroundColor: "var(--surface-raised)" }}
-                >
-                  <span>
-                    {member.fullName} · {member.phone}
-                  </span>
-                  <span style={{ color: "var(--text-muted)" }}>
-                    {getService(member.poolKey)?.shortName ?? member.poolKey} · due{" "}
-                    {member.dueAt.toLocaleDateString("en-GB", {
-                      timeZone: "Asia/Dubai",
-                      day: "numeric",
-                      month: "short",
-                    })}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </section>
-        ) : null}
+        <section className="mt-12">
+          <div className="flex flex-wrap items-baseline justify-between gap-4">
+            <h2 className="text-[19px] font-semibold">Talent pool</h2>
+            {/*
+              A link, not a second panel. The pool is a screen somebody works
+              from — filtered by trade, with a phone number on every row and the
+              button that re-confirms a consent — and summarising it here would
+              produce a worse copy of it. What stays on this page is the count
+              that has a deadline attached.
+            */}
+            <Link href="/recruitment/pool" className="text-[14px] font-medium hover:underline">
+              Browse the pool by trade &rarr;
+            </Link>
+          </div>
+
+          {poolDue.length > 0 ? (
+            <>
+              <h3 className="mt-4 text-[16px] font-semibold">Consent to re-confirm</h3>
+              <p className="prose-body mt-2 text-[14px]">
+                {poolDue.length} pool {poolDue.length === 1 ? "member" : "members"} last confirmed
+                more than three months ago. A tradesperson&rsquo;s availability and certificate
+                validity go stale in weeks, so a pool nobody re-confirms is a list of people who
+                have all found other work — and holding their details past their consent is a
+                separate problem. Each of them can be re-confirmed on the pool screen.
+              </p>
+              <ul className="mt-4 space-y-2">
+                {poolDue.slice(0, 10).map((member) => (
+                  <li
+                    key={`${member.candidateId}-${member.poolKey}`}
+                    className="flex flex-wrap items-center justify-between gap-3 rounded border px-5 py-3 text-[14px]"
+                    style={{ backgroundColor: "var(--surface-raised)" }}
+                  >
+                    <span>
+                      {member.fullName} · {member.phone}
+                    </span>
+                    <span style={{ color: "var(--text-muted)" }}>
+                      {getService(member.poolKey)?.shortName ?? member.poolKey} · due{" "}
+                      {member.dueAt.toLocaleDateString("en-GB", {
+                        timeZone: "Asia/Dubai",
+                        day: "numeric",
+                        month: "short",
+                      })}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : null}
+        </section>
 
         {canWrite ? (
           <section className="mt-12">
@@ -281,7 +314,7 @@ export default async function RecruitmentPage() {
               site.
             </p>
             <div className="mt-5 max-w-3xl">
-              <NewRequisitionForm />
+              <NewRequisitionForm hiringManagers={hiringManagers} />
             </div>
           </section>
         ) : null}

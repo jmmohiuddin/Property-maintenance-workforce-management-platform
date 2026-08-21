@@ -49,7 +49,7 @@ export default async function DashboardPage() {
     }),
   );
 
-  const { cash, revenue, pipeline, work, contracts, compliance, billing } = dashboard;
+  const { cash, revenue, pipeline, work, contracts, compliance, hiring, billing } = dashboard;
   const critical = dashboard.attention.filter((a) => a.severity === "critical");
 
   const asOf = dashboard.generatedAt.toLocaleString("en-GB", {
@@ -340,7 +340,7 @@ export default async function DashboardPage() {
           </Card>
 
           {/* ── 6. Contracts ─────────────────────────────────────────────── */}
-          <Card title="Contracts" href="/customers" subtitle={`Expiring within ${compliance.horizonDays} days`}>
+          <Card title="Contracts" href="/amc" subtitle={`Expiring within ${compliance.horizonDays} days`}>
             {contracts.active === 0 ? (
               <EmptyState kind="gap" title="No active contracts are recorded.">
                 <p>
@@ -360,6 +360,27 @@ export default async function DashboardPage() {
                   label="Expiring"
                   value={`${contracts.expiringWithinHorizon.length}`}
                   verdict={contracts.expiringWithinHorizon.length > 0 ? "missed" : "met"}
+                />
+                {/*
+                  G12. Null renders "not measured", which is the only honest
+                  answer before a visit window has closed — 0% would show a
+                  contractor who has just signed their first AMC as failing a
+                  98% target, and 100% would award a perfect score to a business
+                  that has not done any maintenance yet.
+                */}
+                <Metric
+                  label="PPM completion"
+                  value={
+                    contracts.ppmCompletionPercent === null
+                      ? null
+                      : `${contracts.ppmCompletionPercent}%`
+                  }
+                  verdict={contracts.ppmVerdict}
+                  note={
+                    contracts.ppmCompletionPercent === null
+                      ? "No planned visit has reached the end of its window yet, so nothing can have been missed."
+                      : `${contracts.ppmVisitsCompleted} of ${contracts.ppmVisitsDue} visits due were done. Target ${DASHBOARD_GOALS["ppmCompletion"]!.target}% or better (G12).`
+                  }
                 />
                 {contracts.expiringWithinHorizon.length > 0 ? (
                   <ul className="mt-3 space-y-2">
@@ -467,7 +488,88 @@ export default async function DashboardPage() {
             />
           </Card>
 
-          {/* ── 9. Not measured ──────────────────────────────────────────── */}
+          {/* ── 9. Hiring ────────────────────────────────────────────────── */}
+          <Card title="Hiring" href="/recruitment" subtitle={`Open roles, and how long a hire takes`}>
+            {/*
+              This card was a line in "Not measured" until migration 0018,
+              declaring that no requisition or application table existed. Both
+              had existed since 0014, in the same branch. It is placed here —
+              below the four cards with a statutory penalty behind them and
+              above the gap list — because a slow hire costs money and a lapsed
+              work permit costs AED 100,000, and consequence order is the only
+              order this stack has.
+            */}
+            {hiring.requisitionsRecorded === 0 ? (
+              /*
+                A START zero, not a `gap`.
+
+                Nothing is going unrecorded here — the module simply has not
+                been used yet, which is exactly what day one looks like. A `gap`
+                would put a warning colour on a business that has never needed
+                to hire, and that is how a reader learns to ignore the warning
+                colours everywhere else on this screen.
+              */
+              <EmptyState kind="start" title="No role has been opened yet.">
+                <p>
+                  Days-to-hire and applicant flow are both computed from requisitions, so they
+                  begin being measured the moment the first one is raised. Nothing is missing
+                  &mdash; there is simply nothing to hire for yet.
+                </p>
+              </EmptyState>
+            ) : (
+              <>
+                {hiring.openRoles === 0 ? (
+                  <EmptyState kind="good" title="No role is open at the moment.">
+                    <p>
+                      {hiring.requisitionsRecorded} requisition
+                      {hiring.requisitionsRecorded === 1 ? " has" : "s have"} been recorded and none
+                      is currently taking applications. Nobody is waiting on you.
+                    </p>
+                  </EmptyState>
+                ) : (
+                  <>
+                    <Metric label="Open roles" value={`${hiring.openRoles}`} emphasis />
+                    <Metric
+                      label="Heads wanted"
+                      value={`${hiring.openHeadcount}`}
+                      note="A single requisition can be open for more than one person."
+                    />
+                    <Metric label="Live applications" value={`${hiring.liveApplications}`} />
+                  </>
+                )}
+
+                {/*
+                  A role approved and never published is invisible to every
+                  applicant while looking, on the recruitment board, exactly
+                  like a role that is live.
+                */}
+                {hiring.awaitingApproval > 0 ? (
+                  <Metric
+                    label="Waiting for approval"
+                    value={`${hiring.awaitingApproval}`}
+                    verdict="missed"
+                    note="Nobody can apply to these until they are approved and published."
+                  />
+                ) : null}
+
+                <div className="my-2 border-t" />
+                <Metric
+                  label="Days to hire"
+                  value={
+                    hiring.medianDaysToHire === null ? null : `${hiring.medianDaysToHire} days`
+                  }
+                  verdict={hiring.daysToHireVerdict}
+                  note={
+                    hiring.medianDaysToHire === null
+                      ? `Nobody has been hired in ${hiring.windowDays} days, so there is nothing to take a median of.`
+                      : `Median across ${hiring.hiresInWindow} hire${hiring.hiresInWindow === 1 ? "" : "s"} in ${hiring.windowDays} days, from application received to offer accepted. Target under ${DASHBOARD_GOALS["daysToHire"]!.target} days (G13).`
+                  }
+                />
+              </>
+            )}
+          </Card>
+
+          {/* ── 10. Not measured ─────────────────────────────────────────── */}
           <div className="lg:col-span-2">
             <Card
               title="Not measured"

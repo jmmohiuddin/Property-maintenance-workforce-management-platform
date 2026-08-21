@@ -26,12 +26,17 @@ import { sql } from "drizzle-orm";
 import { db, withTenant, closeConnection } from "../src/index";
 import {
   createLeadFromEnquiry,
+  convertLeadToJob,
+  convertCustomerCandidates,
   enquiryRecipients,
   findDuplicateMatches,
   logCommunication,
   listCommunications,
   searchLeads,
   searchCustomers,
+  listCustomers,
+  customerPortfolioTotals,
+  getCustomer,
   encodeCursor,
   decodeCursor,
   setLeadStage,
@@ -74,9 +79,26 @@ async function cleanup(): Promise<void> {
   // every one of them behind — where the next run would find them as duplicates
   // and report a failure that is entirely the previous run's fault.
   await admin`delete from communications where body like ${TAG + "%"}`;
-  await admin`delete from leads where name like ${TAG + "%"}`;
+
+  // Conversion writes a customer, a property and a job in one transaction, and
+  // they have to come back out in the opposite order: both foreign keys onto
+  // `customers` are ON DELETE RESTRICT, deliberately, so that an account with
+  // work filed against it cannot quietly disappear. `job_events` cascades.
+  //
+  // Matched on the name as well as the code, because a customer created by
+  // converting a lead takes its code from the lead's name — `LEADNOTI-1234`,
+  // which no `TAG%` pattern would ever find.
+  const mine = TAG + "%";
+  await admin`delete from invoices where reference like ${mine}`;
+  await admin`
+    delete from jobs
+     where customer_id in (select id from customers where name like ${mine} or code like ${mine})`;
+  await admin`
+    delete from properties
+     where customer_id in (select id from customers where name like ${mine} or code like ${mine})`;
+  await admin`delete from leads where name like ${mine}`;
   await admin`delete from lead_disposition_reasons where code like ${"__test_" + "%"}`;
-  await admin`delete from customers where code like ${TAG + "%"}`;
+  await admin`delete from customers where name like ${mine} or code like ${mine}`;
 }
 
 async function main(): Promise<void> {
@@ -268,6 +290,56 @@ async function main(): Promise<void> {
   check("a fragment is not a phone key", shortKey, null);
   check("and the mirror says the same", localPhoneKey("12345"), null);
 
+  // ── Landlines ─────────────────────────────────────────────────────────────
+  //
+  // The eight-digit case, which migration 0016 argues for at length and which
+  // nothing above exercises. A UAE mobile has a nine-digit national number and
+  // a landline has eight, so a matcher built on "the last nine digits" works
+  // for one and silently fails for the other — and an owners association, the
+  // customer most likely to enquire twice about the same building, answers on a
+  // landline.
+  const landlineForms = ["+971 4 555 0100", "04 555 0100", "0097145550100", "971 4 555 0100"];
+  const landlineKeys = await withTenant({ tenantId }, async (tx) => {
+    const out: (string | null)[] = [];
+    for (const form of landlineForms) {
+      const rows = (await tx.execute<{ k: string | null }>(
+        sql`select app_phone_key(${form}) as k`,
+      )) as unknown as { k: string | null }[];
+      out.push(rows[0]?.k ?? null);
+    }
+    return out;
+  });
+  checkTrue(
+    "app_phone_key normalises every way a UAE landline is written",
+    landlineKeys.every((k) => k === "45550100"),
+  );
+  checkTrue(
+    "and the TypeScript mirror agrees with it on landlines too",
+    landlineForms.every((form) => localPhoneKey(form) === "45550100"),
+  );
+
+  // Why the function is written the way it is, stated as an assertion rather
+  // than as a comment: the rule it replaced turns one landline into two keys.
+  const naiveLastNine = (raw: string) => raw.replace(/\D/g, "").slice(-9);
+  checkTrue(
+    "where the last-nine rule would have split that landline in two",
+    naiveLastNine("+971 4 555 0100") !== naiveLastNine("04 555 0100"),
+  );
+
+  const mixedKeys = await withTenant({ tenantId }, async (tx) => {
+    const rows = (await tx.execute<{ landline: string | null; mobile: string | null }>(sql`
+      select app_phone_key('04 555 0100') as landline,
+             app_phone_key('054 555 0100') as mobile
+    `)) as unknown as { landline: string | null; mobile: string | null }[];
+    return rows[0];
+  });
+  checkTrue(
+    "a landline and a mobile never collapse to the same key",
+    Boolean(mixedKeys?.landline) &&
+      Boolean(mixedKeys?.mobile) &&
+      mixedKeys?.landline !== mixedKeys?.mobile,
+  );
+
   // A loose match: same phone, different email. It must be reported and must
   // NOT be auto-linked — a switchboard number is shared by everybody in the
   // building, and linking on it alone merges unrelated enquiries.
@@ -293,6 +365,203 @@ async function main(): Promise<void> {
     findDuplicateMatches(tx, { phone: null, email: null }),
   );
   check("an enquiry with no contact details matches nothing", noSignal.matches.length, 0);
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // LEAD-5 at the point of conversion
+  //
+  // The matcher ran on create and nowhere else, so a lead the strict tier had
+  // already tied to an existing customer — pointer written, badge on the
+  // screen — produced a second customer for the same person the moment
+  // somebody pressed Convert. Everything below is about the one action that
+  // creates a customer asking the check that already existed.
+  // ═════════════════════════════════════════════════════════════════════════
+
+  console.log("\n— converting a lead we already have (LEAD-5, LEAD-7) —");
+
+  const convertPhone = "+971 50 777 0001";
+  const convertEmail = "convert-strict@example.invalid";
+
+  const existingCustomerId = await withTenant({ tenantId }, async (tx) => {
+    const rows = (await tx.execute<{ id: string }>(sql`
+      insert into customers (tenant_id, code, name, phone, billing_email)
+      values (${tenantId}::uuid, ${TAG + "-CONV"}, ${TAG + " Existing Account"},
+              ${convertPhone}, ${convertEmail})
+      returning id
+    `)) as unknown as { id: string }[];
+    return rows[0]?.id ?? "";
+  });
+
+  /** How many accounts carry this number. The duplicate, counted. */
+  const accountsOnThatNumber = async (): Promise<number> =>
+    (
+      await admin<{ count: number }[]>`
+        select count(*)::int as count from customers
+         where tenant_id = ${tenantId}::uuid
+           and app_phone_key(phone) = app_phone_key(${convertPhone})
+      `
+    )[0]?.count ?? 0;
+
+  check("the fixture starts as one account", await accountsOnThatNumber(), 1);
+
+  const strictLead = await createLeadFromEnquiry(
+    tenantId,
+    {
+      ...enquiry,
+      name: `${TAG}-CONV-STRICT`,
+      phone: convertPhone,
+      email: convertEmail,
+      details: "Same phone and same email as an account we already have.",
+    },
+    { onCreated: async () => {} },
+  );
+
+  check(
+    "the strict tier ties the enquiry to that account on arrival",
+    strictLead.duplicates.autoLinkCustomerId,
+    existingCustomerId,
+  );
+
+  // A silent duplicate and a silent reuse are the same mistake in opposite
+  // directions, so conversion does neither: it refuses until a person has said
+  // which account the work belongs to.
+  let refusedConvert = false;
+  try {
+    await withTenant({ tenantId, actorKind: "user" }, (tx) =>
+      convertLeadToJob(
+        tx,
+        { tenantId },
+        {
+          leadId: strictLead.leadId,
+          propertyName: `${TAG} Tower`,
+          addressLine: "1 Test Street, Dubai Marina",
+          priority: "p3_standard",
+          title: `${TAG} convert with no answer`,
+        },
+      ),
+    );
+  } catch {
+    refusedConvert = true;
+  }
+
+  checkTrue("converting it without an answer is refused", refusedConvert);
+  check("and no second account was created", await accountsOnThatNumber(), 1);
+
+  const reused = await withTenant({ tenantId, actorKind: "user" }, (tx) =>
+    convertLeadToJob(
+      tx,
+      { tenantId },
+      {
+        leadId: strictLead.leadId,
+        customerId: existingCustomerId,
+        propertyName: `${TAG} Tower`,
+        addressLine: "1 Test Street, Dubai Marina",
+        priority: "p3_standard",
+        title: `${TAG} converted onto the existing account`,
+      },
+    ),
+  );
+
+  check("answering with the matched account reuses it", reused.customerId, existingCustomerId);
+  // Reported, not inferred. The caller has to be able to say on screen which
+  // account the job went to, and "created" and "reused" look identical from an
+  // id alone.
+  check("and reports that nothing new was created", reused.customerCreated, false);
+  check("so there is still one account on that number", await accountsOnThatNumber(), 1);
+
+  const convertedRow = (
+    await admin<{ customer_id: string; converted_customer_id: string | null }[]>`
+      select j.customer_id, l.converted_customer_id
+        from jobs j
+        join leads l on l.id = ${strictLead.leadId}::uuid
+       where j.id = ${reused.jobId}::uuid
+    `
+  )[0];
+  check("the job is filed under it", convertedRow?.customer_id, existingCustomerId);
+  check("and so is the lead", convertedRow?.converted_customer_id, existingCustomerId);
+
+  // ── The loose tier, which suggests and nothing more ──────────────────────
+  //
+  // Same switchboard number, a different person on it. Blocking this would
+  // cost somebody the job; auto-linking it would file their work under a
+  // stranger's account.
+  const looseConvert = await createLeadFromEnquiry(
+    tenantId,
+    {
+      ...enquiry,
+      name: `${TAG}-CONV-LOOSE`,
+      phone: convertPhone,
+      email: "someone-else-entirely@example.invalid",
+      details: "Same switchboard, different person.",
+    },
+    { onCreated: async () => {} },
+  );
+
+  check("a phone-only match is not auto-linked", looseConvert.duplicates.autoLinkCustomerId, null);
+
+  const looseCandidates = await withTenant({ tenantId }, (tx) =>
+    convertCustomerCandidates(tx, looseConvert.leadId),
+  );
+  checkTrue(
+    "the account is still offered to the operator",
+    looseCandidates.some((c) => c.customerId === existingCustomerId),
+  );
+  checkTrue(
+    "but nothing about it blocks the conversion",
+    looseCandidates.every((c) => !c.isStrict && !c.isLinked),
+  );
+
+  const looseResult = await withTenant({ tenantId, actorKind: "user" }, (tx) =>
+    convertLeadToJob(
+      tx,
+      { tenantId },
+      {
+        leadId: looseConvert.leadId,
+        propertyName: `${TAG} Tower B`,
+        addressLine: "2 Test Street, Dubai Marina",
+        priority: "p3_standard",
+        title: `${TAG} converted from a loose match`,
+      },
+    ),
+  );
+
+  check("so a loose match converts into a new customer", looseResult.customerCreated, true);
+  checkTrue("which is not the matched account", looseResult.customerId !== existingCustomerId);
+  check("leaving two accounts on that number, by decision", await accountsOnThatNumber(), 2);
+
+  // ── And the ordinary case, unchanged ─────────────────────────────────────
+  const freshLead = await createLeadFromEnquiry(
+    tenantId,
+    {
+      ...enquiry,
+      name: `${TAG}-CONV-NEW`,
+      phone: "+971 50 777 0009",
+      email: "convert-fresh@example.invalid",
+      details: "Nobody we have ever heard from.",
+    },
+    { onCreated: async () => {} },
+  );
+
+  const freshCandidates = await withTenant({ tenantId }, (tx) =>
+    convertCustomerCandidates(tx, freshLead.leadId),
+  );
+  check("an enquiry matching nothing offers no account", freshCandidates.length, 0);
+
+  const freshResult = await withTenant({ tenantId, actorKind: "user" }, (tx) =>
+    convertLeadToJob(
+      tx,
+      { tenantId },
+      {
+        leadId: freshLead.leadId,
+        propertyName: `${TAG} Villa`,
+        addressLine: "3 Test Street, Jumeirah",
+        priority: "p3_standard",
+        title: `${TAG} converted with no match at all`,
+      },
+    ),
+  );
+
+  check("and converts by creating one, as it always did", freshResult.customerCreated, true);
+  checkTrue("with the customer named after the enquiry", freshResult.customerName === `${TAG}-CONV-NEW`);
 
   // ═════════════════════════════════════════════════════════════════════════
   // LEAD-9 — the communications log
@@ -456,6 +725,97 @@ async function main(): Promise<void> {
   );
   check("the customer list pages one at a time when asked", customerPaged.rows.length, 1);
   checkTrue("and offers a cursor for the next page", customerPaged.nextCursor !== null);
+
+  // ── The paged query against the one it replaces (TD-10) ──────────────────
+  //
+  // `listCustomers` reads every customer and every unpaid invoice and adds the
+  // balances up in JavaScript, which is the unbounded read that had to go. The
+  // paged query does the same arithmetic in SQL, so the only thing worth
+  // asserting is that it gets the same answer — a faster screen showing a
+  // different number to the ledger would be a worse outcome than the slow one.
+  //
+  // Both are given the same `now`, because "overdue" is a comparison against it
+  // and two clock readings a millisecond apart can disagree about an invoice.
+  // Money to add up. Without it both sides of the comparison below are zero,
+  // and two queries that agree on nothing prove nothing. One invoice past its
+  // due date and one not yet due, against the account created above: 1,000.00
+  // with 250.00 paid, and 500.00 outstanding in full.
+  await admin`
+    insert into invoices (tenant_id, reference, customer_id, status, issued_on, due_on, subtotal, total, amount_paid)
+    values (${tenantId}::uuid, ${TAG + "-INV-OVERDUE"}, ${existingCustomerId}::uuid, 'issued',
+            now() - interval '35 days', now() - interval '5 days', 1000.00, 1000.00, 250.00),
+           (${tenantId}::uuid, ${TAG + "-INV-CURRENT"}, ${existingCustomerId}::uuid, 'issued',
+            now() - interval '2 days', now() + interval '10 days', 500.00, 500.00, 0)`;
+
+  const asOf = new Date();
+  const [legacy, totals] = await withTenant({ tenantId }, async (tx) => [
+    await listCustomers(tx, { now: asOf }),
+    await customerPortfolioTotals(tx, { now: asOf }),
+  ]);
+
+  check("the portfolio total counts the same accounts", totals?.customerCount, legacy?.length);
+  check(
+    "and owes the same money",
+    totals?.outstandingMinor,
+    (legacy ?? []).reduce((sum, c) => sum + c.outstandingMinor, 0),
+  );
+  check(
+    "and is overdue by the same amount",
+    totals?.overdueMinor,
+    (legacy ?? []).reduce((sum, c) => sum + c.overdueMinor, 0),
+  );
+  check(
+    "with the right number of accounts behind that figure",
+    totals?.overdueCount,
+    (legacy ?? []).filter((c) => c.overdueMinor > 0).length,
+  );
+
+  // Per row, the same check. `sum()` in Postgres returns a string through this
+  // driver, so a missing `Number()` here would be silent string concatenation
+  // on the screen rather than an error anywhere.
+  const legacyById = new Map((legacy ?? []).map((c) => [c.id, c]));
+  const pagedRows = await withTenant({ tenantId }, (tx) =>
+    searchCustomers(tx, { limit: 100, now: asOf }),
+  );
+
+  // The detail screen against the list row, for the same account (TD-10).
+  //
+  // `getCustomer` used to read every customer in the tenant and `.find()` one of
+  // them, so its figures agreed with the list by construction. It now runs its
+  // own single-row query, which means "they agree" has stopped being a tautology
+  // and started being a claim — so it is asserted rather than assumed.
+  const detail = await withTenant({ tenantId }, (tx) =>
+    getCustomer(tx, existingCustomerId, asOf),
+  );
+  const listRow = legacyById.get(existingCustomerId);
+  check("the detail screen agrees with the list on what is outstanding",
+    detail?.customer.outstandingMinor, listRow?.outstandingMinor);
+  check("and on what is overdue", detail?.customer.overdueMinor, listRow?.overdueMinor);
+  check("and on open jobs", detail?.customer.openJobs, listRow?.openJobs);
+  check("and on properties", detail?.customer.propertyCount, listRow?.propertyCount);
+  check("and still carries the columns only it selects", detail?.customer.code, listRow?.code);
+  checkTrue("with a real created date rather than a string", detail?.customer.createdAt instanceof Date);
+
+  const withInvoices = pagedRows.rows.find((r) => r.id === existingCustomerId);
+  // 1,000.00 less 250.00 paid, plus 500.00 untouched. Stated as the number
+  // rather than as an agreement between two queries, because both of them
+  // reading the same column wrongly would still agree.
+  check("the balance on a row is the sum of what is unpaid", withInvoices?.outstandingMinor, 125_000);
+  check("and only the part past its due date is overdue", withInvoices?.overdueMinor, 75_000);
+
+  checkTrue(
+    "every paged row carries the same balances as the unpaged one",
+    pagedRows.rows.every((r) => {
+      const was = legacyById.get(r.id);
+      return (
+        was === undefined ||
+        (r.outstandingMinor === was.outstandingMinor &&
+          r.overdueMinor === was.overdueMinor &&
+          r.openJobs === was.openJobs &&
+          r.propertyCount === was.propertyCount)
+      );
+    }),
+  );
 
   // ═════════════════════════════════════════════════════════════════════════
   // The disposition report (LEAD-6, LEAD-9)

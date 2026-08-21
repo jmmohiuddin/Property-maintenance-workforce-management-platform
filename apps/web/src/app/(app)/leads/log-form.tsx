@@ -128,7 +128,11 @@ export function LogCommunicationForm({
       {state.success ? (
         <p role="status" className="mt-3 flex items-start gap-2 text-[13px]" style={{ color: "var(--accent-text)" }}>
           <CheckCircle size={14} weight="fill" aria-hidden className="mt-0.5 shrink-0" />
-          {state.success} The follow-up date has been set from the outcome.
+          {/* Only a lead carries a follow-up date, and only an outcome moves
+              it. Saying otherwise on the customer screen would be this form
+              claiming a side effect the domain does not have there. */}
+          {state.success}
+          {leadId ? " If you recorded an outcome, the follow-up date has moved with it." : ""}
         </p>
       ) : null}
     </form>

@@ -1,4 +1,4 @@
-import { sql, and, eq, isNull } from "drizzle-orm";
+import { sql, and, asc, eq, inArray, isNull } from "drizzle-orm";
 import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
 import {
@@ -823,6 +823,115 @@ export async function checkContractScope(
   return decision;
 }
 
+export interface JobContractScope {
+  readonly contractId: string;
+  readonly contractReference: string;
+  readonly contractName: string;
+  readonly coverageType: CoverageType;
+  /** The job's own service. Carried so a caller never has to re-read the job. */
+  readonly serviceSlug: string;
+  /**
+   * The exclusion codes THIS contract carries, not the standard set. A code
+   * that is not on the contract excludes nothing, however standard it is
+   * elsewhere, so offering the full list would invite an operator to tick
+   * something that cannot change the verdict.
+   */
+  readonly exclusions: readonly {
+    readonly code: string;
+    readonly label: string;
+    readonly description: string | null;
+  }[];
+  /**
+   * The verdict from the job's own data alone — service and entitlement, no
+   * human observation. That is what makes it safe to compute on every render.
+   */
+  readonly decision: ScopeDecision;
+}
+
+/**
+ * The contract scope of one job, or null when the job is not contract work.
+ *
+ * ── WHY THIS IS COMPUTED ON RENDER RATHER THAN BEHIND A BUTTON ──────────────
+ *
+ * `checkContractScope` shipped correct, ordered and tested, and with no caller
+ * at all. A button would have made it reachable and reproduced the exact
+ * failure `CON-6` exists to prevent: a technician who does not press it has
+ * silently absorbed the work, which is the same outcome as not having the
+ * check. So the automatic half runs here, on every job that carries a
+ * contract, and the verdict is stated whether anybody asked for it or not.
+ *
+ * The split is in what the inputs are. Service coverage and remaining
+ * entitlement are facts already on the job, so `not_covered` and
+ * `entitlement_exhausted` need nobody. Which exclusion a fault matches, and
+ * whether parts were needed, are observations only the person doing the
+ * diagnosis has — those arrive through `quoteOutOfScopeWork` and recompute
+ * this decision server-side.
+ *
+ * Only `materialisePpmJobs` sets `jobs.contract_id` today, so this returns null
+ * for a reactive callout raised against an AMC customer. That gap is real and
+ * is about the linking, not about this function.
+ */
+export async function jobContractScope(
+  tx: TenantScopedTx,
+  jobId: string,
+): Promise<JobContractScope | null> {
+  const rows = (await tx.execute<{
+    contract_id: string;
+    reference: string;
+    name: string;
+    coverage_type: string;
+    service_slug: string;
+  }>(sql`
+    select c.id as contract_id,
+           c.reference,
+           c.name,
+           coalesce(t.coverage_type, 'comprehensive') as coverage_type,
+           j.service_slug
+      from jobs j
+      join contracts c on c.id = j.contract_id and c.deleted_at is null
+      left join contract_terms t on t.contract_id = c.id and t.deleted_at is null
+     where j.id = ${jobId} and j.deleted_at is null
+  `)) as unknown as {
+    contract_id: string;
+    reference: string;
+    name: string;
+    coverage_type: string;
+    service_slug: string;
+  }[];
+
+  const row = rows[0];
+  if (!row) return null;
+
+  const exclusions = (await tx.execute<{
+    code: string;
+    label: string;
+    description: string | null;
+  }>(sql`
+    select code, label, description
+      from contract_exclusions
+     where contract_id = ${row.contract_id} and deleted_at is null
+     order by label
+  `)) as unknown as { code: string; label: string; description: string | null }[];
+
+  const decision = await checkContractScope(tx, row.contract_id, {
+    serviceSlug: row.service_slug,
+  });
+
+  return {
+    contractId: row.contract_id,
+    contractReference: row.reference,
+    contractName: row.name,
+    coverageType: row.coverage_type === "labour_only" ? "labour_only" : "comprehensive",
+    serviceSlug: row.service_slug,
+    exclusions: exclusions.map((e) => ({
+      code: e.code,
+      label: e.label,
+      description: e.description,
+    })),
+    decision,
+  };
+}
+
 export interface OutOfScopeLine {
   readonly description: string;
   readonly quantity: string;
@@ -1474,6 +1583,13 @@ export interface ContractRow {
   readonly plannedVisits: number;
   readonly completedVisits: number;
   readonly overdueVisits: number;
+  /**
+   * `CON-5`. What this contract entitles the customer to, per service, and how
+   * much of it is left. Carried on the row rather than fetched per contract by
+   * whoever needs it: the customer record has to show entitlement, and the
+   * alternative was `getContract` in a loop.
+   */
+  readonly entitlements: readonly ContractEntitlementRow[];
 }
 
 /**
@@ -1485,11 +1601,19 @@ export interface ContractRow {
  */
 export async function listContracts(
   tx: TenantScopedTx,
-  options: { includeEnded?: boolean } = {},
+  options: { includeEnded?: boolean; customerId?: string } = {},
 ): Promise<readonly ContractRow[]> {
   const statusFilter = options.includeEnded
     ? sql``
     : sql`and c.status not in ('cancelled', 'renewed')`;
+
+  // A WHERE clause rather than a filter over the whole list. The customer
+  // record needs one account's contracts and there is an index on
+  // (tenant_id, customer_id) for exactly this; filtering in memory would read
+  // every contract in the tenant to display three.
+  const customerFilter = options.customerId
+    ? sql`and c.customer_id = ${options.customerId}`
+    : sql``;
 
   const rows = (await tx.execute<{
     id: string;
@@ -1541,6 +1665,7 @@ export async function listContracts(
       left join contract_terms t on t.contract_id = c.id and t.deleted_at is null
      where c.deleted_at is null
        ${statusFilter}
+       ${customerFilter}
      order by c.ends_on
   `)) as unknown as {
     id: string;
@@ -1562,25 +1687,73 @@ export async function listContracts(
     overdue_visits: number;
   }[];
 
-  return rows.map((r) => ({
-    id: r.id,
-    reference: r.reference,
-    name: r.name,
-    customerId: r.customer_id,
-    customerName: r.customer_name,
-    status: r.status,
-    coverageType: r.coverage_type ?? "comprehensive",
-    startsOn: new Date(r.starts_on),
-    endsOn: new Date(r.ends_on),
-    daysRemaining: r.days_remaining,
-    annualValue: r.annual_value,
-    currency: r.currency,
-    billingFrequency: r.billing_frequency,
-    propertyCount: r.property_count,
-    plannedVisits: r.planned_visits,
-    completedVisits: r.completed_visits,
-    overdueVisits: r.overdue_visits,
-  }));
+  if (rows.length === 0) return [];
+
+  // One query for every contract on the list, not one per contract. Ordered by
+  // label because that is what the screens show.
+  const entitlements = await tx
+    .select({
+      id: schema.contractEntitlements.id,
+      contractId: schema.contractEntitlements.contractId,
+      serviceSlug: schema.contractEntitlements.serviceSlug,
+      label: schema.contractEntitlements.label,
+      visitsPerYear: schema.contractEntitlements.visitsPerYear,
+      consumedVisits: schema.contractEntitlements.consumedVisits,
+    })
+    .from(schema.contractEntitlements)
+    .where(
+      and(
+        inArray(
+          schema.contractEntitlements.contractId,
+          rows.map((r) => r.id),
+        ),
+        isNull(schema.contractEntitlements.deletedAt),
+      ),
+    )
+    .orderBy(asc(schema.contractEntitlements.label));
+
+  return rows.map((r) => {
+    const startsOn = new Date(r.starts_on);
+    const endsOn = new Date(r.ends_on);
+    // Entitlement is a per-year figure and what is owed is measured over the
+    // term. A two-year contract at four visits a year owes eight; comparing
+    // consumption against four reports it exhausted halfway through.
+    const termDays = Math.max(1, Math.round((endsOn.getTime() - startsOn.getTime()) / 86_400_000));
+
+    return {
+      id: r.id,
+      reference: r.reference,
+      name: r.name,
+      customerId: r.customer_id,
+      customerName: r.customer_name,
+      status: r.status,
+      coverageType: r.coverage_type ?? "comprehensive",
+      startsOn,
+      endsOn,
+      daysRemaining: r.days_remaining,
+      annualValue: r.annual_value,
+      currency: r.currency,
+      billingFrequency: r.billing_frequency,
+      propertyCount: r.property_count,
+      plannedVisits: r.planned_visits,
+      completedVisits: r.completed_visits,
+      overdueVisits: r.overdue_visits,
+      entitlements: entitlements
+        .filter((e) => e.contractId === r.id)
+        .map((e) => {
+          const entitledForTerm = visitsForTerm(e.visitsPerYear, termDays);
+          return {
+            id: e.id,
+            serviceSlug: e.serviceSlug,
+            label: e.label,
+            visitsPerYear: e.visitsPerYear,
+            entitledForTerm,
+            consumedVisits: e.consumedVisits,
+            remaining: entitledForTerm - e.consumedVisits,
+          };
+        }),
+    };
+  });
 }
 
 export interface ContractEntitlementRow {

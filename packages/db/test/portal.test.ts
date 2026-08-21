@@ -27,7 +27,7 @@
  * Creates its own fixtures, prefixed `__PORTALTEST`, and removes them.
  */
 
-import { eq, inArray, like, sql } from "drizzle-orm";
+import { and, eq, inArray, like, sql } from "drizzle-orm";
 import {
   withTenant,
   withCustomerScope,
@@ -38,10 +38,18 @@ import {
   getPortalInvoiceRef,
   customerNotificationSettings,
   setCustomerNotificationPreference,
+  isCustomerNotificationEnabled,
+  customerNotificationRecipients,
+  customerAccountName,
+  recordSuppressedCustomerNotification,
   pendingCustomerNotifications,
+  getQuoteForNotification,
+  getInvoiceForNotification,
   schema,
   closeConnection,
+  type CustomerNotificationSubjectTable,
 } from "../src/index";
+import { CUSTOMER_NOTIFICATION_EVENTS, type CustomerNotificationEvent } from "@meridian/core";
 import { testTenantId } from "./_tenant";
 
 let fail = 0;
@@ -83,11 +91,24 @@ async function purge(tenantId: string): Promise<void> {
     const customerIds = await idsOf("customers", "code");
     const jobIds = await idsOf("jobs", "reference");
     const invoiceIds = await idsOf("invoices", "reference");
+    const quoteIds = await idsOf("quotes", "reference");
 
+    // Keyed on the subjects rather than on the recipient address, because the
+    // suppression rows this file now provokes carry the customer's own billing
+    // email — the address the message would have gone to — not a marker.
+    const subjectIds = [...jobIds, ...invoiceIds, ...quoteIds];
+    if (subjectIds.length > 0) {
+      await tx
+        .delete(schema.notifications)
+        .where(inArray(schema.notifications.subjectId, subjectIds));
+    }
     await tx
       .delete(schema.notifications)
       .where(eq(schema.notifications.recipientAddress, "ledger@portaltest.invalid"));
 
+    if (quoteIds.length > 0) {
+      await tx.delete(schema.quotes).where(inArray(schema.quotes.id, quoteIds));
+    }
     if (jobIds.length > 0) {
       await tx.delete(schema.jobReports).where(inArray(schema.jobReports.jobId, jobIds));
       await tx.delete(schema.jobAttachments).where(inArray(schema.jobAttachments.jobId, jobIds));
@@ -341,6 +362,56 @@ async function main(): Promise<void> {
       body: "INTERNAL: chased about the overdue invoice, they were rude",
     });
 
+    // Two contacts on B, one flagged for job notifications and one not. This is
+    // what makes the recipient assertions mean anything: with no contacts
+    // anywhere, every path falls back to the billing email and the four rules
+    // that used to disagree all look identical.
+    await tx.insert(schema.customerContacts).values([
+      {
+        tenantId,
+        customerId: customerB.id,
+        fullName: `${TAG} Facilities Manager`,
+        email: "facilities@portaltest.invalid",
+        notifyOnJobs: true,
+      },
+      {
+        tenantId,
+        customerId: customerB.id,
+        fullName: `${TAG} Accounts Clerk`,
+        email: "accounts@portaltest.invalid",
+        // Asked not to be told about jobs. The negative that proves the flag is
+        // read rather than every contact being swept up.
+        notifyOnJobs: false,
+      },
+    ]);
+
+    // A sent quote each, so `quote_awaiting_decision` — one of the three events
+    // the jobs screen also announces immediately — has something real to be
+    // routed for. Status `sent` because that is what `sendQuoteAction` leaves
+    // behind at the moment it enqueues.
+    const quote = async (customerId: string, jobId: string, suffix: string) => {
+      const [row] = await tx
+        .insert(schema.quotes)
+        .values({
+          tenantId,
+          reference: `${TAG}-Q-${suffix}`,
+          customerId,
+          jobId,
+          title: `${TAG} quotation ${suffix}`,
+          status: "sent",
+          subtotal: "2000.00",
+          total: "2100.00",
+          sentAt: new Date(),
+          validUntil: new Date(Date.now() + 14 * 86_400_000),
+        })
+        .returning({ id: schema.quotes.id });
+      if (!row) throw new Error("could not create a fixture quote");
+      return row.id;
+    };
+
+    const quoteA = await quote(customerA.id, jobA, "A1");
+    const quoteB = await quote(customerB.id, jobB, "B1");
+
     return {
       customerA: customerA.id,
       customerB: customerB.id,
@@ -350,6 +421,8 @@ async function main(): Promise<void> {
       invoiceA,
       invoiceAdraft,
       invoiceB,
+      quoteA,
+      quoteB,
       technicianId,
     };
   });
@@ -599,6 +672,308 @@ async function main(): Promise<void> {
   );
   check("and no row for B was written", leakedPref.length, 0);
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // POR-5 — the opt-out and the recipient rule, on BOTH paths
+  // ═══════════════════════════════════════════════════════════════════════
+  //
+  // WHY THIS BLOCK EXISTS. The opt-out was enforced in the sweep's SQL and only
+  // there, and the only test was a sweep test, so it passed while three of the
+  // seven events — request received, quote sent, invoice issued — went out from
+  // server actions that never read the preferences at all. Worse than
+  // redundant: the ledger row the immediate send wrote made the subject look
+  // settled, so the sweep never revisited it. An opted-out customer received
+  // every invoice email, permanently, and every test was green.
+  //
+  // The same three actions each had their own recipient rule too — billing
+  // email from the quote and invoice detail reads, the logged-in user's address
+  // from the portal form — while the sweep resolved the contacts flagged
+  // `notify_on_jobs`. Same class of defect, quieter.
+  //
+  // WHAT CAN AND CANNOT BE ASSERTED HERE. `sendCustomerNotification` and the
+  // three server actions are `apps/web` code: "server-only", above this package
+  // in the dependency graph, and with no test runner of their own. This file
+  // cannot import them and does not pretend to. What it asserts is every piece
+  // they are now built from — the row-level opt-out check, the shared recipient
+  // resolution, the customer id the actions feed into the check, and the fact
+  // that the sweep's set-based filter and the row-level check give the same
+  // answer. The gap that remains is the wiring itself, and it is stated plainly
+  // rather than papered over.
+
+  // ── The row-level check the immediate sends call ─────────────────────────
+  const enabled = (customerId: string, event: CustomerNotificationEvent) =>
+    withTenant(ctx, (tx) => isCustomerNotificationEnabled(tx, customerId, event));
+
+  /** Ledger rows for a subject. What went out, and what deliberately did not. */
+  const ledgerFor = (template: string, subjectId: string) =>
+    withTenant(ctx, (tx) =>
+      tx
+        .select({ status: schema.notifications.status, to: schema.notifications.recipientAddress })
+        .from(schema.notifications)
+        .where(
+          and(
+            eq(schema.notifications.template, template),
+            eq(schema.notifications.subjectId, subjectId),
+          ),
+        ),
+    );
+
+  check(
+    "a customer who has never chosen is opted IN, not out",
+    await enabled(ids.customerB, "invoice_issued"),
+    true,
+  );
+
+  await asA((tx) =>
+    setCustomerNotificationPreference(
+      tx,
+      { tenantId, customerId: ids.customerA },
+      { event: "invoice_issued", isEnabled: false },
+    ),
+  );
+
+  check(
+    "and the immediate send is told when they have opted out",
+    await enabled(ids.customerA, "invoice_issued"),
+    false,
+  );
+  check(
+    "one event at a time — muting invoices does not mute quotations",
+    await enabled(ids.customerA, "quote_awaiting_decision"),
+    true,
+  );
+  check(
+    "nor does it mute the same event for another customer",
+    await enabled(ids.customerB, "invoice_issued"),
+    true,
+  );
+
+  // ── THE ANTI-DRIFT ASSERTION ─────────────────────────────────────────────
+  //
+  // There are two readers of `customer_notification_preferences`: the muted CTE
+  // in `pendingCustomerNotifications`, which is the right shape for a sweep
+  // over many customers, and `isCustomerNotificationEnabled`, which is the
+  // right shape for one immediate send. Two readers is a standing invitation to
+  // disagree, and the thing most likely to make them disagree is the default —
+  // absence of a row means opted IN, and the first reader to treat it as "off"
+  // silently stops messages nobody asked to stop.
+  //
+  // So they are pinned to each other, in both directions: for every candidate
+  // the sweep returns, its `muted` flag must be exactly the negation of what
+  // the row check says. The sweep no longer drops muted rows — it flags them,
+  // so that the caller can record the refusal — which is what makes the
+  // stronger two-way assertion possible.
+  const sweepBefore = await withTenant(ctx, (tx) =>
+    pendingCustomerNotifications(tx, { limit: 500 }),
+  );
+
+  let drift = 0;
+  for (const item of sweepBefore) {
+    const rowSays = await enabled(item.customerId, item.event);
+    if (item.muted === rowSays) drift++;
+  }
+  check("the sweep's flag and the row check never disagree", drift, 0);
+  checkTrue(
+    "and the sweep is not trivially empty, which would make that vacuous",
+    sweepBefore.length > 0,
+  );
+  // The default, across the whole vocabulary rather than the one event in play.
+  // A customer who has never touched the switches must be opted IN to all seven
+  // — this is the assertion that catches somebody reading a missing row as off.
+  let wrongDefault = 0;
+  for (const event of CUSTOMER_NOTIFICATION_EVENTS) {
+    if (!(await enabled(ids.customerB, event))) wrongDefault++;
+  }
+  check("a customer with no preferences is opted in to all seven", wrongDefault, 0);
+
+  checkTrue(
+    "A's muted invoice is offered but flagged, not dropped",
+    sweepBefore.some(
+      (p) => p.customerId === ids.customerA && p.event === "invoice_issued" && p.muted,
+    ),
+  );
+  checkTrue(
+    "while B's, which nobody muted, is offered unflagged",
+    sweepBefore.some(
+      (p) => p.customerId === ids.customerB && p.event === "invoice_issued" && !p.muted,
+    ),
+  );
+
+  // ── THE RECIPIENT RULE, WHICH ALL FOUR PATHS NOW SHARE ───────────────────
+  //
+  // The quote and invoice actions emailed `customers.billing_email` straight
+  // from their detail reads, so this contact — flagged to be notified — was
+  // told about B's quotes by the cron sweep and never by the jobs screen that
+  // sent them. That is the bug the shared function closes.
+  const recipientsOf = async (customerId: string) =>
+    (await withTenant(ctx, (tx) => customerNotificationRecipients(tx, [customerId]))).get(
+      customerId,
+    ) ?? [];
+
+  const forBeta = await recipientsOf(ids.customerB);
+  check("a notify-flagged contact is a recipient", forBeta.length, 1);
+  check(
+    "and it is the flagged one, not the account's billing address",
+    forBeta[0]?.email,
+    "facilities@portaltest.invalid",
+  );
+  checkTrue(
+    "the contact who asked not to be notified is not one",
+    forBeta.every((r) => r.email !== "accounts@portaltest.invalid"),
+  );
+
+  const forAlpha = await recipientsOf(ids.customerA);
+  check(
+    "an account with no contacts at all falls back to its billing email",
+    forAlpha[0]?.email,
+    "alpha@portaltest.invalid",
+  );
+
+  // The sweep resolves the same list, in bulk, through the same function. If
+  // these ever diverge the two paths are emailing different people again.
+  const sweptForB = sweepBefore.find((p) => p.customerId === ids.customerB);
+  if (sweptForB) {
+    check(
+      "the sweep's bulk resolution matches the single-customer one",
+      JSON.stringify(sweptForB.recipients),
+      JSON.stringify(forBeta),
+    );
+  }
+
+  check("and the account name is the account's, not a contact's", await withTenant(ctx, (tx) =>
+    customerAccountName(tx, ids.customerB),
+  ), `${TAG} Beta Property Management`);
+
+  // ── THE CUSTOMER ID THE ACTIONS FEED INTO THE CHECK ──────────────────────
+  //
+  // `sendQuoteAction` and `raiseInvoiceAction` hold a quote or invoice id and
+  // nothing else; the customer whose preference is consulted comes from these
+  // two reads. A wrong id here would check the wrong customer's preference and
+  // the opt-out would silently fail — the same defect, one layer down — so it
+  // is asserted rather than assumed. Imported from `commerce` deliberately:
+  // this is a POR-5 claim about them, not a commerce claim.
+  const quoteDetail = await withTenant(ctx, (tx) => getQuoteForNotification(tx, ids.quoteB));
+  check(
+    "the quote read names the customer the quote belongs to",
+    quoteDetail?.customerId,
+    ids.customerB,
+  );
+  const invoiceDetail = await withTenant(ctx, (tx) =>
+    getInvoiceForNotification(tx, ids.invoiceA),
+  );
+  check(
+    "and the invoice read names the customer the invoice belongs to",
+    invoiceDetail?.customerId,
+    ids.customerA,
+  );
+
+  // ── A MUTE IS A REFUSAL, NOT A PAUSE ─────────────────────────────────────
+  //
+  // THE ASSERTION THIS SECTION EXISTS FOR, and it is the one that was decided
+  // the other way first and changed on purpose. An event raised while the
+  // customer was muted must NEVER be sent, not even if they opt back in the
+  // next day.
+  //
+  // Withholding the message by writing nothing does not achieve that. The sweep
+  // works out what is owed by asking what the ledger does not already name, so
+  // a message that leaves no trace is merely deferred: it stays owed for the
+  // whole lookback window, and lifting the mute on the Friday delivers the
+  // week's worth of invoices the customer said no to on the Monday. That burst
+  // of back-dated email is precisely the experience that teaches people their
+  // preference controls do not work.
+  //
+  // So a refusal is recorded, and this is what pins it. If anyone flips this
+  // back in either direction, these checks fail loudly.
+  const suppressAsTheCallerWould = (
+    event: CustomerNotificationEvent,
+    subjectTable: CustomerNotificationSubjectTable,
+    subjectId: string,
+    address: string,
+  ) =>
+    withTenant({ ...ctx, actorKind: "system" }, (tx) =>
+      recordSuppressedCustomerNotification(tx, ctx, { event, subjectTable, subjectId, address }),
+    );
+
+  await suppressAsTheCallerWould(
+    "invoice_issued",
+    "invoices",
+    ids.invoiceA,
+    "alpha@portaltest.invalid",
+  );
+
+  const suppression = await ledgerFor("invoice_issued", ids.invoiceA);
+  check("withholding a message writes exactly one ledger row", suppression.length, 1);
+  check(
+    "and it says suppressed — a status the dispatcher never claims",
+    suppression[0]?.status,
+    "suppressed",
+  );
+  check(
+    "recording the address it would have gone to, so the ledger can answer why",
+    suppression[0]?.to,
+    "alpha@portaltest.invalid",
+  );
+
+  const afterSuppression = await withTenant(ctx, (tx) =>
+    pendingCustomerNotifications(tx, { limit: 500 }),
+  );
+  check(
+    "the withheld invoice is no longer offered to the sweep",
+    afterSuppression.filter((p) => p.subjectId === ids.invoiceA).length,
+    0,
+  );
+
+  // THE POINT OF THE WHOLE EXERCISE.
+  await asA((tx) =>
+    setCustomerNotificationPreference(
+      tx,
+      { tenantId, customerId: ids.customerA },
+      { event: "invoice_issued", isEnabled: true },
+    ),
+  );
+  check(
+    "the row check agrees the customer wants invoices again",
+    await enabled(ids.customerA, "invoice_issued"),
+    true,
+  );
+
+  const afterOptingBackIn = await withTenant(ctx, (tx) =>
+    pendingCustomerNotifications(tx, { limit: 500 }),
+  );
+  check(
+    "but opting back in does NOT deliver what was withheld while muted",
+    afterOptingBackIn.filter((p) => p.subjectId === ids.invoiceA).length,
+    0,
+  );
+
+  // THE OPPOSITE BUG, WHICH THIS MUST NOT BE. A suppression settles the subject
+  // it names and nothing else. B's invoice shares the template and was never
+  // muted, so it must still be owed — a marker that quietly swallowed every
+  // invoice notification would pass every check above and fail this one.
+  checkTrue(
+    "a suppression for one subject does not block another under the same template",
+    afterOptingBackIn.some((p) => p.subjectId === ids.invoiceB && p.event === "invoice_issued"),
+  );
+  // And a genuinely new event for the same customer is unaffected: the key is
+  // (template, subject), so a different template over the same subject id is a
+  // different question. A's invoice is also the subject of its own payment.
+  checkTrue(
+    "nor a different event about the same customer",
+    afterOptingBackIn.some((p) => p.customerId === ids.customerA && p.event !== "invoice_issued"),
+  );
+
+  // Idempotent. Two sweeps racing, or a retry, must not stack up markers.
+  await suppressAsTheCallerWould(
+    "invoice_issued",
+    "invoices",
+    ids.invoiceA,
+    "alpha@portaltest.invalid",
+  );
+  check(
+    "recording the same refusal twice leaves one row, not two",
+    (await ledgerFor("invoice_issued", ids.invoiceA)).length,
+    1,
+  );
+
   // ── The sweep ────────────────────────────────────────────────────────────
   //
   // Run as the system, inside `withTenant`: it is a tenant-wide job, not a
@@ -616,20 +991,24 @@ async function main(): Promise<void> {
   const forB = pending.filter((p) => p.customerId === ids.customerB);
 
   checkTrue("the sweep finds work for both customers", forA.length > 0 && forB.length > 0);
+  // Honoured as a flag, not an omission. Every one of A's request candidates
+  // comes back muted, which is what lets the caller record the refusal instead
+  // of leaving the subject owed and deliverable on the next opt-in.
+  const aRequests = forA.filter((p) => p.event === "request_received");
+  checkTrue("A has request candidates to rule on at all", aRequests.length > 0);
   check(
-    "and honours A's opt-out from request_received",
-    forA.filter((p) => p.event === "request_received").length,
+    "and every one of them is flagged as A's opt-out",
+    aRequests.filter((p) => !p.muted).length,
     0,
   );
   checkTrue(
-    "while B, who has not opted out, still gets theirs",
-    forB.some((p) => p.event === "request_received"),
+    "while B, who has not opted out, still gets theirs unflagged",
+    forB.some((p) => p.event === "request_received" && !p.muted),
   );
   checkTrue(
     "the recipient resolves to the billing email when there are no contacts",
     forA.every((p) => p.recipients.every((r) => r.email.endsWith("@portaltest.invalid"))),
   );
-
   // Idempotency. Writing a ledger row for one of them must remove it from the
   // next sweep — this is what stops the customer being emailed twice when the
   // action that caused the change already enqueued its own notification.
