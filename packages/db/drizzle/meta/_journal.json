@@ -52,6 +52,20 @@
       "breakpoints": true
     },
     {
+      "idx": 7,
+      "version": "7",
+      "when": 1786350000000,
+      "tag": "0007_tax_invoice",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1786350000000,
+      "tag": "0008_reference_data",
+      "breakpoints": true
+    },
+    {
       "idx": 9,
       "version": "7",
       "when": 1786400000000,

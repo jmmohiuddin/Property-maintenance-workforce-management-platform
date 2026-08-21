@@ -9,6 +9,7 @@ import {
   uuid,
   jsonb,
   numeric,
+  date,
   index,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
@@ -222,9 +223,63 @@ export const invoices = pgTable(
     total: money("total").notNull().default("0"),
     amountPaid: money("amount_paid").notNull().default("0"),
     currency: currencyCol(),
-    /** Tax registration number captured at issue time, not read from the
-     *  customer record — a reissued invoice must show the historical TRN. */
-    customerTrn: varchar("customer_trn", { length: 32 }),
+
+    // ── Article 59 / PINT AE (INV-3, INV-9, DB-3) ──────────────────────────
+    //
+    // The supplier and recipient blocks are SNAPSHOTS taken at issue, not joins
+    // to the customer record or reads of `company.ts`. An invoice is a legal
+    // artefact: reprinting a 2026 document after the office moves or the TRN is
+    // reissued must still show what it showed in 2026, and deriving it from
+    // current configuration would rewrite history invisibly.
+
+    /** "tax_invoice". The words Article 59 requires on the face of the
+     *  document. Simplified is a rendering variant decided from the recipient's
+     *  TRN and the consideration (INV-6), never a stored second kind. */
+    documentType: varchar("document_type", { length: 24 }).notNull().default("tax_invoice"),
+    /** Date of supply. Required alongside the issue date where they differ, and
+     *  the date INV-5's 14-day clock runs from. ISO date string. */
+    supplyDate: date("supply_date"),
+
+    supplierName: varchar("supplier_name", { length: 200 }),
+    supplierTrn: varchar("supplier_trn", { length: 15 }),
+    supplierAddress: text("supplier_address"),
+    supplierLicenceNumber: varchar("supplier_licence_number", { length: 32 }),
+    supplierCrNumber: varchar("supplier_cr_number", { length: 32 }),
+    supplierPhone: varchar("supplier_phone", { length: 24 }),
+    supplierEmail: varchar("supplier_email", { length: 200 }),
+    supplierCountry: varchar("supplier_country", { length: 2 }).notNull().default("AE"),
+
+    recipientName: varchar("recipient_name", { length: 200 }),
+    /** Null means the recipient is not VAT-registered, which is what permits a
+     *  simplified invoice at any value under INV-6. */
+    recipientTrn: varchar("recipient_trn", { length: 15 }),
+    recipientAddress: text("recipient_address"),
+    recipientCountry: varchar("recipient_country", { length: 2 }).notNull().default("AE"),
+
+    /** Tax-exclusive amount after discount. Stored rather than derived for the
+     *  same reason the other totals are: it is what the document said. */
+    taxableAmount: money("taxable_amount").notNull().default("0"),
+
+    /** Article 59 requires the rate where any amount originates in another
+     *  currency. The rate that applied on the date of supply cannot be looked
+     *  up afterwards, so it is captured or it is lost. */
+    sourceCurrency: varchar("source_currency", { length: 3 }),
+    exchangeRate: numeric("exchange_rate", { precision: 18, scale: 6 }),
+    exchangeRateSource: varchar("exchange_rate_source", { length: 80 }),
+
+    /** UNCL5305. "S" standard-rated, "Z" zero-rated, "E" exempt. */
+    taxCategoryCode: varchar("tax_category_code", { length: 4 }).notNull().default("S"),
+    /** UNCL4461. "30" is credit transfer. PINT AE mandatory. */
+    paymentMeansCode: varchar("payment_means_code", { length: 4 }).notNull().default("30"),
+    paymentTermsDays: smallint("payment_terms_days"),
+
+    /** The customer's own reference. An owners association will not pay an
+     *  invoice that does not quote it back at them. */
+    buyerReference: varchar("buyer_reference", { length: 64 }),
+    purchaseOrderReference: varchar("purchase_order_reference", { length: 64 }),
+
+    issuedById: uuid("issued_by_id").references(() => users.id, { onDelete: "set null" }),
+
     pdfStorageKey: text("pdf_storage_key"),
     notes: text("notes"),
     sentAt: timestamp("sent_at", { withTimezone: true }),
@@ -239,6 +294,8 @@ export const invoices = pgTable(
     index("invoices_customer_idx").on(t.tenantId, t.customerId),
     // The overdue/AR ageing report.
     index("invoices_ageing_idx").on(t.tenantId, t.dueOn, t.status),
+    // INV-4's gap report reads the issued series in reference order.
+    index("invoices_series_idx").on(t.tenantId, t.documentType, t.reference),
   ],
 );
 
@@ -259,6 +316,26 @@ export const invoiceLines = pgTable(
     unit: varchar("unit", { length: 24 }).notNull().default("ea"),
     unitPrice: money("unit_price").notNull().default("0"),
     lineTotal: money("line_total").notNull().default("0"),
+
+    // Article 59 requires the tax rate and the tax amount IN AED on every line,
+    // which the original table omitted.
+    //
+    // Nullable on purpose. Lines written before 0007 have no per-line tax, and
+    // apportioning a document-level discount across them retrospectively would
+    // put numbers on a reprint that were never on the original. A null is
+    // refused by the render check in core, which is the honest outcome; a
+    // default of zero would instead assert that no tax was charged.
+    discountAmount: money("discount_amount"),
+    netAmount: money("net_amount"),
+    taxRateBasisPoints: integer("tax_rate_basis_points"),
+    taxAmount: money("tax_amount"),
+    taxCategoryCode: varchar("tax_category_code", { length: 4 }).notNull().default("S"),
+    /** UN/ECE Rec 20 code — "MTK", "HUR", "H87". PINT AE will not accept the
+     *  human-readable `unit`, and the customer will not read the code. */
+    unitCode: varchar("unit_code", { length: 8 }),
+    /** Which job this line billed, so a disputed line opens the job it came
+     *  from and the screen can group lines by job. */
+    jobId: uuid("job_id").references(() => jobs.id, { onDelete: "set null" }),
     ...timestamps,
   },
   (t) => [index("invoice_lines_invoice_idx").on(t.tenantId, t.invoiceId, t.position)],
@@ -290,4 +367,127 @@ export const payments = pgTable(
     // Gateway webhooks retry; this makes replay a no-op rather than a duplicate.
     uniqueIndex("payments_gateway_key").on(t.tenantId, t.gatewayProvider, t.gatewayPaymentId),
   ],
+);
+
+/**
+ * Tax credit notes (`INV-7`).
+ *
+ * Any reduction in output tax — a return, a post-issue discount, a cancellation
+ * or a correction — requires a credit note, issued within 14 days, referencing
+ * the original invoice, in its own sequential series.
+ *
+ * ── WHY THIS IS NOT A NEGATIVE ROW IN `invoices` ────────────────────────────
+ *
+ * Every query over `invoices` today assumes each row is money owed to the
+ * business: AR ageing, the overdue sweep, the reminder cron, the gap report
+ * over the INV series. A negative-signed second document type would change what
+ * all of them mean at once, and the first symptom would be an ageing report
+ * that quietly stopped reconciling.
+ *
+ * This does not contradict `INV-6`'s "never a second object". That rule is
+ * about the simplified invoice — the *same* document rendered with fewer
+ * fields, abolished in 2027. A credit note is a different legal document with
+ * its own mandatory series and its own 14-day clock. Both tables feed one
+ * document model in `@meridian/core`, so there is still one renderer and one
+ * validation schema.
+ */
+export const creditNotes = pgTable(
+  "credit_notes",
+  {
+    // tenant_id first, so the generic policy loop in sql/rls.sql covers this
+    // table the moment it is re-run rather than when somebody remembers.
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    id: idCol(),
+    /** Own series, "CRN". Sharing the INV series would put gaps in it, and a
+     *  gap in the invoice sequence is an FTA audit flag (`INV-4`). */
+    reference: varchar("reference", { length: 32 }).notNull(),
+    documentType: varchar("document_type", { length: 24 }).notNull().default("tax_credit_note"),
+    /** Article 60 requires the reference to the original invoice. */
+    invoiceId: uuid("invoice_id")
+      .notNull()
+      .references(() => invoices.id, { onDelete: "restrict" }),
+    customerId: uuid("customer_id")
+      .notNull()
+      .references(() => customers.id, { onDelete: "restrict" }),
+    status: varchar("status", { length: 16 }).notNull().default("issued"),
+    /** "return" | "discount" | "cancellation" | "correction". Mandatory —
+     *  output tax reduced without a recorded cause is exactly the entry an
+     *  auditor asks about, and reconstructing it two years later is guesswork. */
+    reason: varchar("reason", { length: 32 }).notNull(),
+    reasonDetail: text("reason_detail"),
+    issuedOn: timestamp("issued_on", { withTimezone: true }),
+    /** The date of the event being credited. The 14-day clock runs from here. */
+    supplyDate: date("supply_date"),
+
+    subtotal: money("subtotal").notNull().default("0"),
+    discountAmount: money("discount_amount").notNull().default("0"),
+    taxableAmount: money("taxable_amount").notNull().default("0"),
+    taxRateBasisPoints: integer("tax_rate_basis_points").notNull().default(500),
+    taxAmount: money("tax_amount").notNull().default("0"),
+    /** Positive, like the invoice it credits. The sign lives in the document
+     *  type, not in the number: a stored negative gets double-negated the first
+     *  time somebody writes `total - credited`, and it looks right. */
+    total: money("total").notNull().default("0"),
+    currency: currencyCol(),
+    sourceCurrency: varchar("source_currency", { length: 3 }),
+    exchangeRate: numeric("exchange_rate", { precision: 18, scale: 6 }),
+    exchangeRateSource: varchar("exchange_rate_source", { length: 80 }),
+    taxCategoryCode: varchar("tax_category_code", { length: 4 }).notNull().default("S"),
+
+    supplierName: varchar("supplier_name", { length: 200 }),
+    supplierTrn: varchar("supplier_trn", { length: 15 }),
+    supplierAddress: text("supplier_address"),
+    supplierLicenceNumber: varchar("supplier_licence_number", { length: 32 }),
+    supplierCrNumber: varchar("supplier_cr_number", { length: 32 }),
+    supplierPhone: varchar("supplier_phone", { length: 24 }),
+    supplierEmail: varchar("supplier_email", { length: 200 }),
+    supplierCountry: varchar("supplier_country", { length: 2 }).notNull().default("AE"),
+
+    recipientName: varchar("recipient_name", { length: 200 }),
+    recipientTrn: varchar("recipient_trn", { length: 15 }),
+    recipientAddress: text("recipient_address"),
+    recipientCountry: varchar("recipient_country", { length: 2 }).notNull().default("AE"),
+
+    pdfStorageKey: text("pdf_storage_key"),
+    issuedById: uuid("issued_by_id").references(() => users.id, { onDelete: "set null" }),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex("credit_notes_tenant_reference_key").on(t.tenantId, t.reference),
+    index("credit_notes_invoice_idx").on(t.tenantId, t.invoiceId),
+    index("credit_notes_customer_idx").on(t.tenantId, t.customerId, t.issuedOn),
+  ],
+);
+
+export const creditNoteLines = pgTable(
+  "credit_note_lines",
+  {
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    id: idCol(),
+    creditNoteId: uuid("credit_note_id")
+      .notNull()
+      .references(() => creditNotes.id, { onDelete: "cascade" }),
+    position: smallint("position").notNull().default(1),
+    serviceSlug: varchar("service_slug", { length: 64 }),
+    description: text("description").notNull(),
+    quantity: numeric("quantity", { precision: 12, scale: 3 }).notNull().default("1"),
+    unit: varchar("unit", { length: 24 }).notNull().default("ea"),
+    unitCode: varchar("unit_code", { length: 8 }),
+    unitPrice: money("unit_price").notNull().default("0"),
+    lineTotal: money("line_total").notNull().default("0"),
+    // Not nullable here, unlike invoice_lines: this table has no history to be
+    // honest about. Every row it will ever hold is written by code that knows
+    // the per-line tax.
+    discountAmount: money("discount_amount").notNull().default("0"),
+    netAmount: money("net_amount").notNull().default("0"),
+    taxRateBasisPoints: integer("tax_rate_basis_points").notNull().default(500),
+    taxAmount: money("tax_amount").notNull().default("0"),
+    taxCategoryCode: varchar("tax_category_code", { length: 4 }).notNull().default("S"),
+    ...timestamps,
+  },
+  (t) => [index("credit_note_lines_note_idx").on(t.tenantId, t.creditNoteId, t.position)],
 );

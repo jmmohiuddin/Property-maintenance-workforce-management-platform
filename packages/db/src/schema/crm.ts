@@ -31,8 +31,17 @@ export const customers = pgTable(
     name: varchar("name", { length: 200 }).notNull(),
     isCompany: boolean("is_company").notNull().default(true),
     industry: varchar("industry", { length: 80 }),
+    /** 15 digits. Null means not VAT-registered, which under `INV-6` permits a
+     *  simplified tax invoice at any value. */
     taxRegistrationNumber: varchar("trn", { length: 32 }),
     billingEmail: varchar("billing_email", { length: 200 }),
+    /** Article 59 requires the recipient's address on a full tax invoice, and
+     *  it is not the property address — for an owners association the site is
+     *  not the counterparty. Null until entered; the render check refuses the
+     *  full invoice rather than substituting a plausible address. */
+    billingAddress: text("billing_address"),
+    billingCity: varchar("billing_city", { length: 80 }),
+    billingCountry: varchar("billing_country", { length: 2 }).notNull().default("AE"),
     phone: varchar("phone", { length: 24 }),
     /** Days. Drives invoice due dates and the overdue report. */
     paymentTermsDays: integer("payment_terms_days").notNull().default(30),
