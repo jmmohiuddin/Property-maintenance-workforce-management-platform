@@ -286,40 +286,128 @@ export function whatsappHref(message: string, identity: CompanyIdentity = compan
 // ── Placeholder detection ────────────────────────────────────────────────────
 
 /**
- * Is this value an obvious placeholder rather than a real fact?
+ * How sure are we that a value is a placeholder rather than a fact?
  *
- * This exists because of what the previous build shipped: a live site carrying
- * a licence numbered `DED-000000`, a founding year nobody chose, and statistics
- * nobody measured. Nothing detected it because nothing was looking.
+ * ── WHY THIS IS TWO TIERS AND NOT A BOOLEAN ─────────────────────────────────
  *
- * Development needs *something* in these fields or half the site cannot be
- * rendered or reviewed. So placeholders are allowed — and made structurally
- * incapable of reaching production by `assertPublishableIdentity()` below.
+ * The first version of this returned a boolean, treated every signal as equally
+ * strong, and flagged any value containing four consecutive zeros. That rule
+ * rejects a real UAE TRN — they are 15 digits and commonly end `...00003` — and
+ * a perfectly ordinary Dubai landline, because businesses buy round numbers.
  *
- * The patterns are deliberately broad. A false positive costs one environment
- * variable being rewritten slightly; a false negative costs a false statement
- * on a public page, which is the exposure this whole module exists to close.
+ * `assertPublishableIdentity()` **throws in production**. So the guard built to
+ * stop placeholders reaching a live site would instead have blocked a
+ * legitimate deploy the first time somebody entered their real TRN, and the
+ * only way past it would have been `ALLOW_PLACEHOLDER_IDENTITY=1` — which
+ * switches off the checks that actually matter. A false positive here is not,
+ * as the original comment claimed, "one environment variable rewritten
+ * slightly". It is a broken deploy whose documented workaround is to disable
+ * the protection.
+ *
+ * So signals are graded:
+ *
+ *  * **`certain`** — the value cannot be real. An RFC 2606 reserved domain, a
+ *    literal placeholder word, an identifier that is one repeated digit, the
+ *    FTA's own worked-example TRN. These block a production deploy.
+ *  * **`suspected`** — the value looks like a stand-in but could be genuine.
+ *    A run of zeros in a phone number is the whole of this tier. These are
+ *    reported to an operator and never block anything.
+ *
+ * The asymmetry is deliberate: refusing to publish something true is a worse
+ * failure than surfacing a warning about something that turns out to be fine.
  */
-export function looksLikePlaceholder(value: string | null): boolean {
-  if (!value) return false;
-  const v = value.trim().toLowerCase();
+export type PlaceholderConfidence = "certain" | "suspected";
 
-  return (
-    // RFC 2606 reserved domains — guaranteed never to be real.
-    /\b(example|test|invalid|localhost)\.(com|org|net|ae|test)\b/.test(v) ||
-    // A run of four or more zeros: 000-0000, 0000000, +971 4 000 0000.
-    /0{4,}/.test(v.replace(/[\s()+-]/g, "")) ||
-    // Words nobody puts in a real address or company record.
-    /\b(placeholder|dummy|sample|lorem|changeme|tbd|xxx|your[-_ ]?company)\b/.test(v) ||
-    // The FTA's own worked-example TRN, which turns up in copied templates.
-    v === "100000000000003"
-  );
+/**
+ * What kind of value this is, because the tests differ.
+ *
+ * A registration identifier is checked structurally — it has a known shape and
+ * known worked examples. A phone number cannot be checked structurally at all,
+ * because every digit pattern is a real number somewhere.
+ */
+export type IdentityFieldKind = "identifier" | "phone" | "email" | "text";
+
+/** RFC 2606 and RFC 6761 reserve these. Nothing behind them is ever real. */
+const RESERVED_DOMAIN = /\b(example|test|invalid|localhost)\.(com|org|net|ae|test|local)\b/;
+
+/** Words nobody puts in a real company record. */
+const PLACEHOLDER_WORD =
+  /\b(placeholder|dummy|sample|lorem|ipsum|changeme|change[-_ ]?me|tbd|to[-_ ]?be[-_ ]?confirmed|your[-_ ]?company|acme|xxx+)\b/;
+
+/**
+ * The Federal Tax Authority's worked example, which turns up in copied
+ * templates and in every article explaining what a TRN looks like. A real
+ * registration will never be this.
+ */
+const FTA_EXAMPLE_TRN = "100000000000003";
+
+export function placeholderSignal(
+  value: string | null,
+  kind: IdentityFieldKind = "text",
+): PlaceholderConfidence | null {
+  if (!value) return null;
+  const v = value.trim().toLowerCase();
+  if (!v) return null;
+
+  if (RESERVED_DOMAIN.test(v)) return "certain";
+  if (PLACEHOLDER_WORD.test(v)) return "certain";
+
+  const digits = v.replace(/\D/g, "");
+
+  if (kind === "identifier") {
+    if (v === FTA_EXAMPLE_TRN) return "certain";
+    // One repeated digit — 0000000, 1111111, 9999999. A registration authority
+    // does not issue these, and they are what somebody types to get past a
+    // required field.
+    if (digits.length >= 4 && /^(\d)\1+$/.test(digits)) return "certain";
+    // Straight runs, ascending or descending: 12345678, 987654321.
+    if (digits.length >= 6 && (isRun(digits, 1) || isRun(digits, -1))) return "certain";
+    return null;
+  }
+
+  if (kind === "phone") {
+    // Deliberately never `certain`. +971 4 380 0000 is a real landline, and
+    // round numbers are exactly what an established business buys.
+    if (digits.length >= 6 && /^(\d)\1+$/.test(digits.slice(-7))) return "suspected";
+    if (/0{6,}/.test(digits)) return "suspected";
+    return null;
+  }
+
+  return null;
+}
+
+function isRun(digits: string, step: 1 | -1): boolean {
+  for (let i = 1; i < digits.length; i++) {
+    const previous = digits.charCodeAt(i - 1);
+    if (digits.charCodeAt(i) !== previous + step) return false;
+  }
+  return true;
+}
+
+/**
+ * Retained for callers that only want a yes/no.
+ *
+ * Answers "is this certainly a placeholder", not "does this look a bit odd" —
+ * so it cannot reintroduce the false positive that made a real TRN unpublishable.
+ */
+export function looksLikePlaceholder(
+  value: string | null,
+  kind: IdentityFieldKind = "text",
+): boolean {
+  return placeholderSignal(value, kind) === "certain";
 }
 
 export interface IdentityProblem {
   readonly field: string;
   readonly envVar: string;
   readonly reason: "missing" | "placeholder";
+  /**
+   * Only meaningful when `reason` is "placeholder".
+   *
+   * `certain` blocks a production deploy; `suspected` is reported and never
+   * blocks. See `placeholderSignal` for why that distinction exists.
+   */
+  readonly confidence?: PlaceholderConfidence;
   readonly blocks: string;
 }
 
@@ -341,27 +429,35 @@ export function identityProblems(identity: CompanyIdentity = company): readonly 
     blocks: m.blocks,
   }));
 
-  const checked: readonly (readonly [string, string, string | null])[] = [
-    ["Legal name", "COMPANY_LEGAL_NAME", identity.legalName],
-    ["Licence number", "COMPANY_LICENCE_NUMBER", identity.licenceNumber],
-    ["Commercial Register number", "COMPANY_CR_NUMBER", identity.crNumber],
-    ["TRN", "COMPANY_TRN", identity.trn],
-    ["Phone", "COMPANY_PHONE", identity.phone],
-    ["Emergency phone", "COMPANY_EMERGENCY_PHONE", identity.emergencyPhone],
-    ["WhatsApp", "COMPANY_WHATSAPP", identity.whatsapp],
-    ["Email", "COMPANY_EMAIL", identity.email],
-    ["Street address", "COMPANY_ADDRESS_STREET", identity.address.street],
+  // Each field is tested with the rules appropriate to its kind. A TRN is
+  // checked structurally; a phone number cannot be, because every digit pattern
+  // is somebody's real number.
+  const checked: readonly (readonly [string, string, string | null, IdentityFieldKind])[] = [
+    ["Legal name", "COMPANY_LEGAL_NAME", identity.legalName, "text"],
+    ["Licence number", "COMPANY_LICENCE_NUMBER", identity.licenceNumber, "identifier"],
+    ["Commercial Register number", "COMPANY_CR_NUMBER", identity.crNumber, "identifier"],
+    ["TRN", "COMPANY_TRN", identity.trn, "identifier"],
+    ["Phone", "COMPANY_PHONE", identity.phone, "phone"],
+    ["Emergency phone", "COMPANY_EMERGENCY_PHONE", identity.emergencyPhone, "phone"],
+    ["WhatsApp", "COMPANY_WHATSAPP", identity.whatsapp, "phone"],
+    ["Email", "COMPANY_EMAIL", identity.email, "email"],
+    ["Street address", "COMPANY_ADDRESS_STREET", identity.address.street, "text"],
   ];
 
-  for (const [field, envVar, value] of checked) {
-    if (looksLikePlaceholder(value)) {
-      problems.push({
-        field,
-        envVar,
-        reason: "placeholder",
-        blocks: `"${value}" is a placeholder and would be published as fact`,
-      });
-    }
+  for (const [field, envVar, value, kind] of checked) {
+    const confidence = placeholderSignal(value, kind);
+    if (!confidence) continue;
+
+    problems.push({
+      field,
+      envVar,
+      reason: "placeholder",
+      confidence,
+      blocks:
+        confidence === "certain"
+          ? `"${value}" cannot be a real value and would be published as fact`
+          : `"${value}" looks like a stand-in. Check it, but it may be genuine — round numbers are real.`,
+    });
   }
 
   return problems;
@@ -401,7 +497,13 @@ export function identityProblems(identity: CompanyIdentity = company): readonly 
  * published as a fact and is not one stops the deploy.
  */
 export function assertPublishableIdentity(identity: CompanyIdentity = company): void {
-  const placeholders = identityProblems(identity).filter((p) => p.reason === "placeholder");
+  // Only `certain` blocks. A `suspected` value — a phone number full of round
+  // digits, say — is reported by `identityProblems()` for an operator to check
+  // and must never stop a deploy: refusing to publish something true is a worse
+  // failure than warning about something that turns out to be fine.
+  const placeholders = identityProblems(identity).filter(
+    (p) => p.reason === "placeholder" && p.confidence === "certain",
+  );
   if (placeholders.length === 0) return;
 
   const detail = placeholders.map((p) => `  ${p.field} (${p.envVar}) — ${p.blocks}`).join("\n");

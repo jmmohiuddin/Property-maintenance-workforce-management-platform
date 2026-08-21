@@ -30,6 +30,9 @@ import {
   LICENSED_ACTIVITY_REGISTER,
   missingRequiredFields,
   legalIdentityLine,
+  placeholderSignal,
+  identityProblems,
+  assertPublishableIdentity,
 } from "../src/company";
 import { tenant } from "../src/tenant";
 import { areas, cities } from "../src/areas";
@@ -144,6 +147,94 @@ check("and omits the TRN when unset", line.includes("TRN"), company.trn !== null
 const missing = missingRequiredFields();
 console.log(`\n      ${missing.length} identity field(s) still unset:`);
 for (const m of missing) console.log(`        ${m.field} (${m.envVar}) — blocks ${m.blocks}`);
+
+console.log("\n— placeholder detection must not reject real values —");
+
+// THE regression this section exists for. The first version of
+// `looksLikePlaceholder` flagged any value containing four consecutive zeros,
+// which rejects a real UAE TRN (15 digits, commonly ending ...00003) and an
+// ordinary Dubai landline. Because `assertPublishableIdentity` throws in
+// production, that would have blocked a legitimate deploy — and the documented
+// workaround, ALLOW_PLACEHOLDER_IDENTITY=1, disables the checks that matter.
+for (const trn of ["100123456700003", "100474123400003", "100987654300003", "104123456789012"]) {
+  check(`a real TRN (${trn}) is accepted`, placeholderSignal(trn, "identifier"), null);
+}
+
+for (const phone of ["+971 4 380 0000", "+971 4 501 2000", "+971 50 123 4567", "+971 4 000 1234"]) {
+  checkTrue(
+    `a real number (${phone}) never blocks a deploy`,
+    placeholderSignal(phone, "phone") !== "certain",
+  );
+}
+
+console.log("\n— but it must still catch the real thing —");
+
+// Certain: blocks a production deploy.
+check("the FTA worked-example TRN", placeholderSignal("100000000000003", "identifier"), "certain");
+check("an all-zero registration number", placeholderSignal("0000000", "identifier"), "certain");
+check("an all-nine registration number", placeholderSignal("99999999", "identifier"), "certain");
+check("a sequential registration number", placeholderSignal("12345678", "identifier"), "certain");
+check("an RFC 2606 reserved domain", placeholderSignal("service@example.com", "email"), "certain");
+check("a literal placeholder word", placeholderSignal("Office 000, Placeholder Tower", "text"), "certain");
+check("changeme", placeholderSignal("changeme", "text"), "certain");
+
+// Suspected: reported to an operator, never blocks.
+check("an all-zero phone is suspected, not certain", placeholderSignal("+971 4 000 0000", "phone"), "suspected");
+
+// The dev placeholders in .env.example must still be caught, or the guard is
+// decorative in exactly the setup it was written for.
+const devIdentity = {
+  ...company,
+  crNumber: "0000000",
+  trn: "100000000000003",
+  email: "service@example.com",
+  address: { ...company.address, street: "Office 000, Placeholder Tower, Business Bay" },
+};
+const certain = identityProblems(devIdentity).filter((p) => p.confidence === "certain");
+checkTrue("the shipped dev placeholders are still caught", certain.length >= 4);
+
+let threw = false;
+const previousEnv = process.env["NODE_ENV"];
+const previousBypass = process.env["ALLOW_PLACEHOLDER_IDENTITY"];
+try {
+  process.env["NODE_ENV"] = "production";
+  delete process.env["ALLOW_PLACEHOLDER_IDENTITY"];
+  assertPublishableIdentity(devIdentity);
+} catch {
+  threw = true;
+} finally {
+  if (previousEnv === undefined) delete process.env["NODE_ENV"];
+  else process.env["NODE_ENV"] = previousEnv;
+  if (previousBypass !== undefined) process.env["ALLOW_PLACEHOLDER_IDENTITY"] = previousBypass;
+}
+checkTrue("and they still refuse a production deploy", threw);
+
+// The other direction, which is the whole point of the fix: a real identity
+// deploys, and is not held hostage by a heuristic.
+let realThrew = false;
+const realIdentity = {
+  ...company,
+  legalName: "Sumon Akon Technical Services",
+  crNumber: "1102345",
+  trn: "100474123400003",
+  email: "service@sats.ae",
+  phone: "+971 4 380 0000",
+  emergencyPhone: "+971 50 780 0000",
+  whatsapp: "971507800000",
+  address: { ...company.address, street: "Office 1204, Bay Square Building 3, Business Bay", lat: 25.18, lng: 55.27 },
+};
+try {
+  process.env["NODE_ENV"] = "production";
+  delete process.env["ALLOW_PLACEHOLDER_IDENTITY"];
+  assertPublishableIdentity(realIdentity);
+} catch {
+  realThrew = true;
+} finally {
+  if (previousEnv === undefined) delete process.env["NODE_ENV"];
+  else process.env["NODE_ENV"] = previousEnv;
+  if (previousBypass !== undefined) process.env["ALLOW_PLACEHOLDER_IDENTITY"] = previousBypass;
+}
+check("a real identity deploys without a bypass flag", realThrew, false);
 
 console.log(fail === 0 ? "\nAll catalogue checks passed.\n" : `\n${fail} check(s) failed.\n`);
 process.exit(fail === 0 ? 0 : 1);
