@@ -24,7 +24,22 @@
 import postgres from "postgres";
 import { sql } from "drizzle-orm";
 import { db, withTenant, closeConnection } from "../src/index";
-import { createLeadFromEnquiry, enquiryRecipients } from "../src/domain";
+import {
+  createLeadFromEnquiry,
+  enquiryRecipients,
+  findDuplicateMatches,
+  logCommunication,
+  listCommunications,
+  searchLeads,
+  searchCustomers,
+  encodeCursor,
+  decodeCursor,
+  setLeadStage,
+  setLeadFollowUp,
+  leadDispositionReport,
+  leadNurtureQueue,
+} from "../src/domain";
+import { localPhoneKey } from "@meridian/core";
 import { testTenantId } from "./_tenant";
 
 let fail = 0;
@@ -54,7 +69,14 @@ const admin = postgres(
 
 async function cleanup(): Promise<void> {
   await admin`delete from notifications where payload->>'customerName' = ${TAG}`;
-  await admin`delete from leads where name = ${TAG}`;
+  // `like`, not `=`. The duplicate-detection and pagination checks below create
+  // leads named `${TAG}-…`, and a cleanup keyed on the exact name would leave
+  // every one of them behind — where the next run would find them as duplicates
+  // and report a failure that is entirely the previous run's fault.
+  await admin`delete from communications where body like ${TAG + "%"}`;
+  await admin`delete from leads where name like ${TAG + "%"}`;
+  await admin`delete from lead_disposition_reasons where code like ${"__test_" + "%"}`;
+  await admin`delete from customers where code like ${TAG + "%"}`;
 }
 
 async function main(): Promise<void> {
@@ -188,6 +210,321 @@ async function main(): Promise<void> {
   checkTrue(
     "and is due for follow-up immediately",
     followUp !== undefined && followUp.next_follow_up_at.getTime() <= Date.now() + 1000,
+  );
+
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // LEAD-5 — duplicate detection
+  // ═════════════════════════════════════════════════════════════════════════
+
+  console.log("\n— duplicate detection (LEAD-5) —");
+
+  // The emergency enquiry above reused the first one's phone AND email, which
+  // is the strict tier. Nothing in that call asked for a duplicate check; it
+  // happens because `createLeadFromEnquiry` runs the matcher on every insert.
+  checkTrue(
+    "a repeat enquiry is auto-linked to the earlier lead",
+    urgent.duplicates.autoLinkLeadId === created.leadId,
+  );
+
+  const linkedRow = (await admin<{ duplicate_of_lead_id: string | null }[]>`
+    select duplicate_of_lead_id from leads where id = ${urgent.leadId}::uuid
+  `)[0];
+  check(
+    "and the pointer is written to the row, not only reported",
+    linkedRow?.duplicate_of_lead_id,
+    created.leadId,
+  );
+
+  // The SQL matcher and the TypeScript one must agree, because the index is
+  // built on the first and the lookup value comes from the second. A
+  // disagreement is a matcher that silently finds nothing.
+  const phoneForms = ["+971 50 000 0001", "050 000 0001", "00971500000001", "0500000001"];
+  const keys = await withTenant({ tenantId }, async (tx) => {
+    const out: (string | null)[] = [];
+    for (const form of phoneForms) {
+      const rows = (await tx.execute<{ k: string | null }>(
+        sql`select app_phone_key(${form}) as k`,
+      )) as unknown as { k: string | null }[];
+      out.push(rows[0]?.k ?? null);
+    }
+    return out;
+  });
+  checkTrue(
+    "app_phone_key normalises every way a UAE mobile is written",
+    keys.every((k) => k === keys[0] && k !== null),
+  );
+  checkTrue(
+    "and the TypeScript mirror agrees with it",
+    phoneForms.every((form) => localPhoneKey(form) === keys[0]),
+  );
+
+  const shortKey = await withTenant({ tenantId }, async (tx) => {
+    const rows = (await tx.execute<{ k: string | null }>(
+      sql`select app_phone_key('12345') as k`,
+    )) as unknown as { k: string | null }[];
+    return rows[0]?.k ?? null;
+  });
+  check("a fragment is not a phone key", shortKey, null);
+  check("and the mirror says the same", localPhoneKey("12345"), null);
+
+  // A loose match: same phone, different email. It must be reported and must
+  // NOT be auto-linked — a switchboard number is shared by everybody in the
+  // building, and linking on it alone merges unrelated enquiries.
+  const loose = await createLeadFromEnquiry(
+    tenantId,
+    {
+      ...enquiry,
+      name: `${TAG}-LOOSE`,
+      email: "someone-else@example.invalid",
+      details: "Same number, different person.",
+    },
+    { onCreated: async () => {} },
+  );
+
+  checkTrue("a phone-only match is reported", loose.duplicates.matches.length > 0);
+  check("but is not auto-linked", loose.duplicates.autoLinkLeadId, null);
+  checkTrue(
+    "and is not marked strict",
+    loose.duplicates.matches.every((m) => !m.isStrict),
+  );
+
+  const noSignal = await withTenant({ tenantId }, (tx) =>
+    findDuplicateMatches(tx, { phone: null, email: null }),
+  );
+  check("an enquiry with no contact details matches nothing", noSignal.matches.length, 0);
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // LEAD-9 — the communications log
+  // ═════════════════════════════════════════════════════════════════════════
+
+  console.log("\n— communications log (LEAD-9) —");
+
+  const before = (await admin<{ last_interaction_at: Date }[]>`
+    select last_interaction_at from leads where id = ${created.leadId}::uuid
+  `)[0];
+
+  await withTenant({ tenantId }, (tx) =>
+    logCommunication(
+      tx,
+      { tenantId },
+      {
+        leadId: created.leadId,
+        channel: "call",
+        body: `${TAG} called, no answer, trying again`,
+        outcome: "no_answer",
+      },
+    ),
+  );
+
+  const after = (await admin<{ last_interaction_at: Date; next_follow_up_at: Date | null }[]>`
+    select last_interaction_at, next_follow_up_at from leads where id = ${created.leadId}::uuid
+  `)[0];
+
+  checkTrue(
+    "logging a call winds the nurture clock",
+    Boolean(before && after && after.last_interaction_at.getTime() > before.last_interaction_at.getTime()),
+  );
+  // `no_answer` is worth one day, from FOLLOW_UP_DAYS_FOR_OUTCOME. The point is
+  // not the number but that the operator did not have to supply one: a call
+  // logged with no next step is a lead dropped by accident.
+  checkTrue(
+    "and sets a follow-up from the outcome without being asked",
+    Boolean(after?.next_follow_up_at && after.next_follow_up_at.getTime() > Date.now()),
+  );
+
+  const log = await withTenant({ tenantId }, (tx) =>
+    listCommunications(tx, { leadId: created.leadId }),
+  );
+  check("the log reads back", log.length, 1);
+  check("with its outcome", log[0]?.outcome, "no_answer");
+
+  // The duplicate carries the original's history. That is what makes linking
+  // worth anything: the second enquiry arrives knowing what was said the first
+  // time.
+  const inherited = await withTenant({ tenantId }, (tx) =>
+    listCommunications(tx, { leadId: urgent.leadId }),
+  );
+  check("and a linked duplicate inherits it", inherited.length, 1);
+
+  let refusedEmpty = false;
+  try {
+    await withTenant({ tenantId }, (tx) =>
+      logCommunication(tx, { tenantId }, { leadId: created.leadId, channel: "call", body: "   " }),
+    );
+  } catch {
+    refusedEmpty = true;
+  }
+  checkTrue("an empty sentence is refused", refusedEmpty);
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // LEAD-8 — search and keyset pagination
+  // ═════════════════════════════════════════════════════════════════════════
+
+  console.log("\n— search and pagination (LEAD-8) —");
+
+  // Six more leads, so paging has something to page.
+  const pageLeadIds: string[] = [];
+  for (let i = 0; i < 6; i++) {
+    pageLeadIds.push(
+      (await createLeadFromEnquiry(
+        tenantId,
+        {
+          ...enquiry,
+          name: `${TAG}-PAGE-${i}`,
+          phone: `+9715099900${i}0`,
+          email: `page-${i}@example.invalid`,
+        },
+        { onCreated: async () => {} },
+      )).leadId,
+    );
+  }
+
+  const roundTrip = decodeCursor(
+    encodeCursor({ createdAt: new Date("2026-03-04T05:06:07.000Z"), id: created.leadId }),
+  );
+  checkTrue(
+    "a cursor survives the round trip",
+    roundTrip?.id === created.leadId &&
+      roundTrip?.createdAt.toISOString() === "2026-03-04T05:06:07.000Z",
+  );
+  // Stale, bookmarked and hostile cursors all take the same path: the first
+  // page, not a 500.
+  check("a malformed cursor decodes to null", decodeCursor("not-a-cursor"), null);
+  check("and so does an empty one", decodeCursor(""), null);
+
+  const pages = await withTenant({ tenantId }, async (tx) => {
+    const collected: string[] = [];
+    let cursor: string | undefined;
+    let guard = 0;
+
+    do {
+      const page = await searchLeads(tx, { q: TAG, limit: 3, cursor });
+      collected.push(...page.rows.map((r) => r.id));
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor && ++guard < 20);
+
+    return collected;
+  });
+
+  checkTrue("paging returns every matching lead", pages.length >= 9);
+  check("and never the same row twice", new Set(pages).size, pages.length);
+
+  const byPhone = await withTenant({ tenantId }, (tx) =>
+    // Written the national way; stored the international way. This is the
+    // search that used to return nothing.
+    searchLeads(tx, { q: "050 000 0001", limit: 10 }),
+  );
+  checkTrue("searching a phone number in a different format finds it", byPhone.rows.length > 0);
+
+  const byEmail = await withTenant({ tenantId }, (tx) =>
+    searchLeads(tx, { q: "LEAD-TEST@EXAMPLE.INVALID", limit: 10 }),
+  );
+  checkTrue("searching an email ignores case", byEmail.rows.length > 0);
+
+  // The same box over the customer list. `LEAD-8` names both, and the value is
+  // that they behave identically — somebody who learns that a phone number
+  // works on one screen must not find it silently failing on the other.
+  const customerId = await withTenant({ tenantId }, async (tx) => {
+    const rows = (await tx.execute<{ id: string }>(sql`
+      insert into customers (tenant_id, code, name, phone, billing_email)
+      values (${tenantId}::uuid, ${TAG + "-C"}, ${TAG + " Search Target"},
+              '+971 4 555 0100', 'search-target@example.invalid')
+      returning id
+    `)) as unknown as { id: string }[];
+    return rows[0]?.id ?? "";
+  });
+
+  const customerByName = await withTenant({ tenantId }, (tx) =>
+    searchCustomers(tx, { q: "Search Target", limit: 10 }),
+  );
+  checkTrue(
+    "customers are searchable by a fragment of the name",
+    customerByName.rows.some((c) => c.id === customerId),
+  );
+
+  const customerByPhone = await withTenant({ tenantId }, (tx) =>
+    searchCustomers(tx, { q: "04 555 0100", limit: 10 }),
+  );
+  checkTrue(
+    "and by a phone number written another way",
+    customerByPhone.rows.some((c) => c.id === customerId),
+  );
+
+  const customerPaged = await withTenant({ tenantId }, (tx) =>
+    searchCustomers(tx, { limit: 1 }),
+  );
+  check("the customer list pages one at a time when asked", customerPaged.rows.length, 1);
+  checkTrue("and offers a cursor for the next page", customerPaged.nextCursor !== null);
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // The disposition report (LEAD-6, LEAD-9)
+  // ═════════════════════════════════════════════════════════════════════════
+
+  console.log("\n— disposition reporting —");
+
+  const reasonId = await withTenant({ tenantId }, async (tx) => {
+    const rows = (await tx.execute<{ id: string }>(sql`
+      insert into lead_disposition_reasons (tenant_id, code, label, applies_to, sort_order)
+      values (${tenantId}::uuid, '__test_price', 'Too expensive', 'lost', 10)
+      returning id
+    `)) as unknown as { id: string }[];
+    return rows[0]?.id ?? "";
+  });
+
+  let refusedFreeText = false;
+  try {
+    await withTenant({ tenantId }, (tx) => setLeadStage(tx, loose.leadId, "lost"));
+  } catch {
+    refusedFreeText = true;
+  }
+  checkTrue("closing a lead with no coded reason is refused", refusedFreeText);
+
+  await withTenant({ tenantId }, (tx) =>
+    setLeadStage(tx, loose.leadId, "lost", { dispositionReasonId: reasonId, note: "Went elsewhere" }),
+  );
+
+  const report = await withTenant({ tenantId }, (tx) => leadDispositionReport(tx, { days: 1 }));
+  const priceRow = report.lostReasons.find((r) => r.code === "__test_price");
+  checkTrue("the reason appears in the report", Boolean(priceRow));
+  check("with the lead counted against it", priceRow?.leads, 1);
+  check("no closure is missing its reason", report.unreasoned, 0);
+
+  // Both nurture buckets, set up explicitly. Every lead created above arrives
+  // with a follow-up 24 hours out, so with no arrangement the queue is
+  // correctly empty — and an assertion that passed against that would be
+  // asserting nothing.
+  const overdueLead = pageLeadIds[0];
+  const coldLead = pageLeadIds[1];
+  if (overdueLead && coldLead) {
+    await withTenant({ tenantId }, async (tx) => {
+      // A promise made and not kept.
+      await setLeadFollowUp(tx, overdueLead, new Date(Date.now() - 3 * 86_400_000));
+      // And the worse case: no promise at all, so nothing is ever overdue and
+      // the lead is invisible to every report that looks for a missed date.
+      await setLeadFollowUp(tx, coldLead, null);
+    });
+  }
+
+  const queue = await withTenant({ tenantId }, (tx) =>
+    // `now` a minute ahead so a lead whose last interaction is *this instant*
+    // is already past a zero-day threshold. Otherwise the comparison is
+    // `now < now`, which is false, and the check would depend on how long the
+    // preceding statements took.
+    leadNurtureQueue(tx, { coldAfterDays: 0, now: new Date(Date.now() + 60_000) }),
+  );
+
+  checkTrue(
+    "the nurture queue finds a lead whose follow-up date has passed",
+    queue.overdue.some((l) => l.id === overdueLead),
+  );
+  checkTrue(
+    "and one going cold with no follow-up set at all",
+    queue.goingCold.some((l) => l.id === coldLead),
+  );
+  checkTrue(
+    "and never lists a lead already linked as a duplicate",
+    [...queue.goingCold, ...queue.overdue].every((l) => l.id !== urgent.leadId),
   );
 
   await cleanup();

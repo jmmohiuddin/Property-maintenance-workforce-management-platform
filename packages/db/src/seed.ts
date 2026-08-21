@@ -18,7 +18,30 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import { hash } from "@node-rs/argon2";
 import * as schema from "./schema";
 import { STANDARD_JOB_OUTCOMES } from "./domain/reference";
-import { computeSlaDeadlines, company, type JobPriority } from "@meridian/core";
+import {
+  computeSlaDeadlines,
+  company,
+  planPpmVisits,
+  exclusionDefinition,
+  STANDARD_AMC_EXCLUSIONS,
+  DEFAULT_PIPELINE,
+  type JobPriority,
+} from "@meridian/core";
+
+// M10 (`HR-4`, `HR-6`, `HR-7`, `HR-8`, `HR-17`). A separate import statement
+// rather than extra names on the one above, deliberately: several streams are
+// editing this file, and a whole added line merges where an edited line inside
+// an existing list does not.
+import {
+  today,
+  addDays,
+  addMonths,
+  startOfMonth,
+  toDecimalString,
+  hourlyBasicMinor,
+  overtimeAmountMinor,
+  PAY_BAND_BASIS_POINTS,
+} from "@meridian/core";
 
 // The db package loads the root .env on first connect; do the same here so
 // `npm run db:seed` works without the caller sourcing it by hand.
@@ -61,11 +84,27 @@ async function main(): Promise<void> {
     // references this seed writes, which is harmless but makes the seeded
     // data confusing to read.
     schema.referenceCounters,
+    // Credit notes before invoices, because a credit note references the
+    // invoice it corrects (Article 60) and that reference is the whole point of
+    // the document. Omitting these two made `db:seed` fail on a foreign key for
+    // anyone whose database had ever had a credit note raised in it — which is
+    // to say, anyone who had exercised the feature.
+    schema.creditNoteLines,
+    schema.creditNotes,
     schema.payments,
     schema.invoiceLines,
     schema.invoices,
     schema.quoteLines,
     schema.quotes,
+    // M3. Children of `contracts` before it. They all cascade, so deleting the
+    // parent alone would work — but this file's own rule is that anything
+    // referencing a seeded row is listed, and relying on a cascade here would
+    // make the next addition that does not cascade fail confusingly.
+    schema.contractRenewalNotices,
+    schema.contractDocuments,
+    schema.contractExclusions,
+    schema.contractEntitlements,
+    schema.contractTerms,
     schema.contractVisits,
     schema.contractProperties,
     schema.contracts,
@@ -78,6 +117,25 @@ async function main(): Promise<void> {
     schema.jobAttachments,
     schema.jobSignoffs,
     schema.jobs,
+    // M10, children first. Every one of these cascades from `tenants`, which is
+    // last in this list — so the clear-down would work without them. They are
+    // named anyway, because this file's rule is that anything it writes is
+    // listed, and the next addition that does NOT cascade would otherwise fail
+    // here confusingly. `credit_notes` is the precedent: it was missing, it did
+    // not cascade, and `db:seed` broke for everyone who had ever raised one.
+    schema.salaryDeductions,
+    schema.wagePayments,
+    schema.wageCycles,
+    schema.overtimeRecords,
+    schema.leaveBalances,
+    schema.employmentContractTerms,
+    schema.employeeDocuments,
+    // Before `technicians`: `employees.technician_id` is ON DELETE SET NULL, so
+    // deleting technicians first would leave employment records behind with a
+    // null link — rows that no longer block a dispatch and are invisible to
+    // every query in `domain/compliance.ts`.
+    schema.employees,
+    schema.leaveRequests,
     schema.technicianSkills,
     schema.technicians,
     schema.assets,
@@ -134,6 +192,10 @@ async function main(): Promise<void> {
     { email: "yusuf@meridianfm.example", name: "Yusuf Karim", role: "dispatcher" as const },
     { email: "priya@meridianfm.example", name: "Priya Nair", role: "accountant" as const },
     { email: "bilal@meridianfm.example", name: "Bilal Chaudhry", role: "technician" as const },
+    // M9. The `hr` role existed in the RBAC table and had no account, which is
+    // why nobody noticed it had been left out of STAFF_ROLES and could not
+    // reach a single screen. It owns /recruitment and /workforce.
+    { email: "layla@meridianfm.example", name: "Layla Mansour", role: "hr" as const },
   ];
 
   const userIds = new Map<string, string>();
@@ -488,6 +550,801 @@ async function main(): Promise<void> {
       .onConflictDoNothing();
   }
   console.log(`  ${STANDARD_JOB_OUTCOMES.length} standard job outcomes per tenant`);
+
+
+  // ── M3: contracts and AMC (CON-1 … CON-10) ────────────────────────────────
+  //
+  // The `contracts` table has existed since migration 0000 and has never had a
+  // row in it — the TRD calls that "the largest single gap between the schema
+  // and the product". Two contracts are seeded, and the second one is the point:
+  //
+  //   * Bay Tower, mid-term and healthy, so the entitlement meters, the PPM
+  //     schedule and the completion figure all have something real to show.
+  //   * Marina Heights, expiring in 45 days, so the renewal pipeline (`CON-8`)
+  //     and the reminder ladder (`CON-9`) are exercised rather than rendered
+  //     empty. A renewal screen that is always empty is a screen nobody checks.
+  //
+  // The visit dates come from `planPpmVisits` — the same pure planner the
+  // domain layer uses — rather than from hand-written dates. Seeded data that
+  // was placed by a different rule than production data is seeded data that
+  // hides the bug it was supposed to reveal.
+  const contractSpecs = [
+    {
+      reference: `CON-${new Date().getFullYear()}-00001`,
+      customer: "BAYOA",
+      name: "Bay Tower — comprehensive AMC",
+      properties: ["bay-tower"],
+      coverageType: "comprehensive",
+      startsOn: ago(200 * DAY),
+      endsOn: ahead(165 * DAY),
+      annualValue: "42000.00",
+      billingFrequency: "quarterly",
+      discountBp: 1500,
+      calloutsPerYear: null,
+      entitlements: [
+        { serviceSlug: "hvac-installation-maintenance", label: "AC service", visitsPerYear: 4, consumed: 2 },
+        { serviceSlug: "plumbing-sanitary", label: "Plumbing inspection", visitsPerYear: 2, consumed: 1 },
+      ],
+    },
+    {
+      reference: `CON-${new Date().getFullYear()}-00002`,
+      customer: "ACME",
+      name: "Marina Heights — labour-only AMC",
+      properties: ["marina-heights", "jlt-office"],
+      coverageType: "labour_only",
+      startsOn: ago(320 * DAY),
+      endsOn: ahead(45 * DAY),
+      annualValue: "68500.00",
+      billingFrequency: "monthly",
+      discountBp: 1000,
+      calloutsPerYear: 12,
+      entitlements: [
+        { serviceSlug: "hvac-installation-maintenance", label: "AC service", visitsPerYear: 4, consumed: 3 },
+        { serviceSlug: "electrical-fittings-repair", label: "Electrical inspection", visitsPerYear: 2, consumed: 2 },
+      ],
+    },
+  ] as const;
+
+  let seededVisits = 0;
+  for (const spec of contractSpecs) {
+    const [contract] = await db
+      .insert(schema.contracts)
+      .values({
+        tenantId: T1,
+        reference: spec.reference,
+        customerId: customerIds.get(spec.customer)!,
+        name: spec.name,
+        kind: "amc",
+        status: "active",
+        startsOn: spec.startsOn,
+        endsOn: spec.endsOn,
+        annualValue: spec.annualValue,
+        billingFrequency: spec.billingFrequency,
+        visitsPerYear: spec.entitlements.reduce((sum, e) => sum + e.visitsPerYear, 0),
+        coveredServices: spec.entitlements.map((e) => e.serviceSlug),
+        exclusions: STANDARD_AMC_EXCLUSIONS.map((e) => ({
+          code: e.code,
+          label: e.label,
+          description: e.description,
+        })),
+        // A negotiated four-hour response on the AMC, which is the seam
+        // `computeSlaDeadlines` has always had and nothing was using: contract
+        // targets override the default per priority.
+        slaTargets: { p2_urgent: { respondMinutes: 240, resolveMinutes: 24 * 60 } },
+        autoRenew: false,
+        ownerId: userIds.get("rania@meridianfm.example") ?? null,
+      })
+      .returning({ id: schema.contracts.id });
+    if (!contract) throw new Error(`failed to insert contract ${spec.reference}`);
+
+    await db.insert(schema.contractTerms).values({
+      tenantId: T1,
+      contractId: contract.id,
+      coverageType: spec.coverageType,
+      paymentTermsDays: 30,
+      discountRateBasisPoints: spec.discountBp,
+      calloutsPerYear: spec.calloutsPerYear,
+      ppmLeadTimeDays: 21,
+      ppmWindowDays: 7,
+      ppmGeneratedThrough: spec.endsOn,
+      activatedAt: spec.startsOn,
+    });
+
+    await db.insert(schema.contractProperties).values(
+      spec.properties.map((key) => ({
+        tenantId: T1,
+        contractId: contract.id,
+        propertyId: propertyIds.get(key)!,
+      })),
+    );
+
+    await db.insert(schema.contractEntitlements).values(
+      spec.entitlements.map((e) => ({
+        tenantId: T1,
+        contractId: contract.id,
+        serviceSlug: e.serviceSlug,
+        label: e.label,
+        visitsPerYear: e.visitsPerYear,
+        consumedVisits: e.consumed,
+      })),
+    );
+
+    await db.insert(schema.contractExclusions).values(
+      STANDARD_AMC_EXCLUSIONS.map((e) => ({
+        tenantId: T1,
+        contractId: contract.id,
+        code: e.code,
+        label: e.label,
+        description: exclusionDefinition(e.code)?.description ?? null,
+        isStandard: true,
+      })),
+    );
+
+    // No calendar argument, so `DEFAULT_CALENDAR` applies — weekends and the
+    // summer midday ban, and an empty public-holiday list. That is honest for a
+    // seed: the holidays are `ADM-10` reference data an administrator enters,
+    // and inventing them here would produce a schedule the running system
+    // disagrees with the moment the real list is loaded.
+    const plan = planPpmVisits({
+      termStart: spec.startsOn,
+      termEnd: spec.endsOn,
+      properties: spec.properties.map((key) => propertyIds.get(key)!),
+      entitlements: spec.entitlements.map((e) => ({
+        serviceSlug: e.serviceSlug,
+        visitsPerYear: e.visitsPerYear,
+      })),
+      windowDays: 7,
+    });
+
+    if (plan.visits.length > 0) {
+      await db.insert(schema.contractVisits).values(
+        plan.visits.map((v) => ({
+          tenantId: T1,
+          contractId: contract.id,
+          propertyId: v.propertyId,
+          dueOn: v.dueOn,
+          serviceSlug: v.serviceSlug,
+          // Anything whose window closed before today reads as completed; the
+          // rest stay planned. A seed where every past visit is still "planned"
+          // would report 0% PPM completion on a healthy contract.
+          status: v.windowEnd < new Date() ? "completed" : "planned",
+        })),
+      );
+      seededVisits += plan.visits.length;
+    }
+  }
+  console.log(`  ${contractSpecs.length} contracts, ${seededVisits} planned visits`);
+
+  // ── M9 recruitment (ATS-1, ATS-7, ATS-16) ─────────────────────────────────
+  //
+  // One open vacancy with the standard pipeline, and five applicants spread
+  // across it — including, deliberately, one archived applicant who has NOT
+  // been told the outcome and is two days past the date they were promised one.
+  //
+  // That last row is the point of the seed. A recruitment board where everybody
+  // has been answered demonstrates nothing: `ATS-16`'s target is 100% and the
+  // whole module exists because the number is normally around 35%. The screen
+  // has to be seen with somebody on it.
+  {
+    const [requisition] = await db
+      .insert(schema.jobRequisitions)
+      .values({
+        tenantId: T1,
+        reference: `REQ-${new Date().getFullYear()}-00001`,
+        publicSlug: "ac-technician",
+        title: "AC Technician",
+        trade: "hvac-installation-maintenance",
+        grade: "technician",
+        headcount: 2,
+        contractType: "full_time",
+        locationCity: "Dubai",
+        locationArea: "Business Bay",
+        minExperienceYears: 2,
+        requiredCertifications: ["HVAC Level 2", "Working at height"],
+        salaryBandMinMinor: 320000,
+        salaryBandMaxMinor: 420000,
+        summary:
+          "Split units, FCUs and ducted systems across managed residential and commercial buildings. Direct employment on a UAE labour contract, salary paid through WPS, tools and PPE provided.",
+        responsibilities:
+          "Planned maintenance visits and reactive callouts. Fault diagnosis, gas charging, coil and filter work, and commissioning on fit-out projects.",
+        // ATS-6. Stated in the advert, which is what makes the single yes/no
+        // question on the application form legitimate.
+        physicalRequirements:
+          "Working at height, lifting to 25 kg, and outdoor work in summer conditions.",
+        status: "open",
+        approvedById: userIds.get("omar@meridianfm.example") ?? null,
+        approvedAt: ago(30 * DAY),
+        opensAt: ago(21 * DAY),
+        publishedAt: ago(21 * DAY),
+        closesAt: ahead(10 * DAY),
+        hiringManagerUserId: userIds.get("yusuf@meridianfm.example") ?? null,
+      })
+      .returning({ id: schema.jobRequisitions.id });
+
+    if (!requisition) throw new Error("failed to insert the seeded requisition");
+
+    const stageRows = await db
+      .insert(schema.requisitionStages)
+      .values(
+        DEFAULT_PIPELINE.map((stage, index) => ({
+          tenantId: T1,
+          requisitionId: requisition.id,
+          name: stage.name,
+          stageType: stage.stageType,
+          sequence: index + 1,
+        })),
+      )
+      .returning({ id: schema.requisitionStages.id, sequence: schema.requisitionStages.sequence });
+
+    const stageAt = (sequence: number): string => {
+      const found = stageRows.find((s) => s.sequence === sequence);
+      if (!found) throw new Error(`no seeded stage at sequence ${sequence}`);
+      return found.id;
+    };
+
+    const applicantSpecs = [
+      {
+        name: "Rajesh Kumar",
+        phone: "+971 50 411 8827",
+        email: "rajesh.kumar@example.com",
+        grade: "technician",
+        band: "5_to_10",
+        stage: 1,
+        stageDays: 1,
+        blockedOn: "none" as const,
+        blockedNote: null,
+        certificate: { scheme: "HVAC Level 2", expires: "2028-03-31" },
+      },
+      {
+        name: "Suresh Pillai",
+        phone: "+971 55 902 4471",
+        email: "suresh.p@example.com",
+        grade: "senior_technician",
+        band: "over_10",
+        stage: 2,
+        stageDays: 1,
+        blockedOn: "us" as const,
+        blockedNote: "Screening call not yet made",
+        certificate: { scheme: "HVAC Level 2", expires: "2029-06-30" },
+      },
+      {
+        // Red on the board: waiting on us, four days, nobody has acted. This is
+        // the card ATS-8 was written for.
+        name: "Imran Sheikh",
+        phone: "0503347781",
+        email: null,
+        grade: "technician",
+        band: "2_to_5",
+        stage: 3,
+        stageDays: 4,
+        blockedOn: "us" as const,
+        blockedNote: "Trade test not booked",
+        // Expired, on purpose. HR-9 blocks a dispatch to height work on this,
+        // and finding out here costs a phone call rather than a job.
+        certificate: { scheme: "Working at height", expires: "2026-06-30" },
+      },
+      {
+        name: "Mohammed Farid",
+        phone: "+971 52 118 6690",
+        email: "m.farid@example.com",
+        grade: "charge_hand",
+        band: "over_10",
+        stage: 4,
+        stageDays: 1,
+        blockedOn: "candidate" as const,
+        blockedNote: "Waiting on a photo of the height certificate",
+        certificate: { scheme: "HVAC Level 2", expires: "2027-11-30" },
+      },
+    ];
+
+    let applicationSeq = 0;
+    for (const spec of applicantSpecs) {
+      applicationSeq += 1;
+      const appliedAt = ago((spec.stageDays + 6) * DAY);
+
+      const [candidate] = await db
+        .insert(schema.candidates)
+        .values({
+          tenantId: T1,
+          fullName: spec.name,
+          phone: spec.phone,
+          email: spec.email,
+          primaryTrade: "hvac-installation-maintenance",
+          grade: spec.grade,
+          experienceBand: spec.band,
+          currentLocation: "in_uae",
+          hasDrivingLicence: true,
+          lastInteractionAt: ago(spec.stageDays * DAY),
+          retentionBasis: "pre_contractual",
+          // ATS-18. Six months from the last interaction.
+          deleteAfter: new Date(Date.now() + 180 * DAY).toISOString().slice(0, 10),
+        })
+        .returning({ id: schema.candidates.id });
+
+      if (!candidate) throw new Error(`failed to insert candidate ${spec.name}`);
+
+      await db.insert(schema.candidateCertifications).values({
+        tenantId: T1,
+        candidateId: candidate.id,
+        scheme: spec.certificate.scheme,
+        certificateNo: `HV-${4400 + applicationSeq}`,
+        issuingBody: "City & Guilds",
+        expiresOn: spec.certificate.expires,
+      });
+
+      const [application] = await db
+        .insert(schema.applications)
+        .values({
+          tenantId: T1,
+          reference: `APP-${new Date().getFullYear()}-${String(applicationSeq).padStart(5, "0")}`,
+          candidateId: candidate.id,
+          requisitionId: requisition.id,
+          currentStageId: stageAt(spec.stage),
+          stageEnteredAt: ago(spec.stageDays * DAY),
+          status: "active",
+          availability: "immediate",
+          essentialFunctions: "yes",
+          source: "careers_site",
+          appliedAt,
+          acknowledgedAt: appliedAt,
+          outcomeDueAt: new Date(appliedAt.getTime() + 3 * DAY),
+          blockedOn: spec.blockedOn,
+          blockedNote: spec.blockedNote,
+          blockedSince: spec.blockedOn === "none" ? null : ago(spec.stageDays * DAY),
+          statusToken: `seed${applicationSeq}`.padEnd(64, "0"),
+        })
+        .returning({ id: schema.applications.id });
+
+      if (!application) throw new Error(`failed to insert application for ${spec.name}`);
+
+      await db.insert(schema.applicationEvents).values({
+        tenantId: T1,
+        applicationId: application.id,
+        eventType: "applied",
+        toStageId: stageAt(1),
+        note: "Applied on the careers site",
+        actorKind: "candidate",
+        occurredAt: appliedAt,
+      });
+    }
+
+    // The one that matters: archived, with a reason, with the message composed
+    // — and never sent. Two days past the promise. This is what the "owed an
+    // outcome" panel on /recruitment exists to show, and a seed in which it is
+    // empty would let the panel ship untested and unread.
+    {
+      applicationSeq += 1;
+      const appliedAt = ago(12 * DAY);
+
+      const [candidate] = await db
+        .insert(schema.candidates)
+        .values({
+          tenantId: T1,
+          fullName: "Anwar Hossain",
+          phone: "+971 56 330 1145",
+          email: "anwar.h@example.com",
+          primaryTrade: "hvac-installation-maintenance",
+          grade: "helper",
+          experienceBand: "under_2",
+          currentLocation: "in_uae",
+          lastInteractionAt: ago(5 * DAY),
+          retentionBasis: "pre_contractual",
+          deleteAfter: new Date(Date.now() + 180 * DAY).toISOString().slice(0, 10),
+        })
+        .returning({ id: schema.candidates.id });
+
+      if (!candidate) throw new Error("failed to insert the owed-an-outcome candidate");
+
+      await db.insert(schema.applications).values({
+        tenantId: T1,
+        reference: `APP-${new Date().getFullYear()}-${String(applicationSeq).padStart(5, "0")}`,
+        candidateId: candidate.id,
+        requisitionId: requisition.id,
+        currentStageId: stageAt(2),
+        stageEnteredAt: ago(9 * DAY),
+        status: "archived",
+        dispositionReasonCode: "insufficient_experience",
+        archivedAtStageId: stageAt(2),
+        archivedAt: ago(5 * DAY),
+        availability: "immediate",
+        essentialFunctions: "yes",
+        source: "careers_site",
+        appliedAt,
+        acknowledgedAt: appliedAt,
+        outcomeDueAt: ago(2 * DAY),
+        outcomeMessage:
+          "Hi Anwar, thank you for applying for AC Technician. We are not moving forward this time — we are looking for more hands-on experience in this trade for this particular role. Please apply again as you build it up.",
+        // Deliberately null. The message exists; nobody has sent it.
+        outcomeScheduledAt: null,
+        outcomeSentAt: null,
+        statusToken: `seed${applicationSeq}`.padEnd(64, "0"),
+      });
+    }
+
+    console.log(`  1 open vacancy, ${applicationSeq} applicants (1 owed an outcome)`);
+  }
+  // ══════════════════════════════════════════════════════════════════════════
+  // M10 — the employment lifecycle
+  // `HR-4` contracts · `HR-5` documents · `HR-6` insurance · `HR-7` leave
+  // `HR-8` hours · `HR-17` wage protection
+  // ══════════════════════════════════════════════════════════════════════════
+  //
+  // ── WHY THIS EXISTS AT ALL ───────────────────────────────────────────────
+  //
+  // Without it a fresh seed has no employment records, and the compliance board
+  // then reports on an empty set. That is not a neutral state: "0 technicians
+  // blocked from dispatch" reads as safety when what it actually means is that
+  // nothing is being measured. `/workforce` says so in its own empty state —
+  // *"Nobody is blocked, because nobody is being checked"* — but a board that
+  // has to explain why it is empty is a board nobody trusts on the first day.
+  //
+  // ── NOBODY IS SEEDED INTO A VIOLATION ────────────────────────────────────
+  //
+  // Every blocking document below is in date, every health policy is the tier
+  // the wage requires, and the live wage cycle is transferred on time. A fresh
+  // install that opens on a red board teaches the reader that red is the normal
+  // colour, and the next real block is then invisible. What IS seeded is the
+  // band *before* a problem: one Emirates ID inside 30 days, one inside 90, one
+  // probation period ending. Those render every section populated without
+  // asserting that this company is in breach of anything.
+  {
+    // Calendar days, as strings. A permit expires on a *day*, not an instant;
+    // see the header of `packages/core/src/employment.ts` for why these never
+    // become `Date`s on the way to a `date` column.
+    const now = today();
+    const day = (offset: number) => addDays(now, offset);
+
+    // The live wage cycle is last month's wages, due on the 1st of this month —
+    // `wpsCycleFor()` computes exactly this, and the seed has to agree with it
+    // or the board opens a second cycle for the same month on first render.
+    const liveDueOn = startOfMonth(now);
+    const livePeriod = addMonths(liveDueOn, -1);
+    const priorDueOn = livePeriod;
+    const priorPeriod = addMonths(livePeriod, -1);
+
+    const employeeSpecs = [
+      {
+        no: "E-001",
+        tech: "T-001",
+        name: "Bilal Chaudhry",
+        basicMinor: 720_000,
+        allowances: { housing: "2000.00" },
+        serviceDays: 400,
+        // Well inside its term. `assessContract` reports `active`.
+        contractEndsInDays: 240,
+        probationEndsInDays: null,
+        // A senior technician on AED 9,200 total is above the AED 4,000
+        // Essential Benefits threshold, so a standard plan is what the law asks
+        // for. `requiredHealthPlan` is what decides this, not this comment.
+        plan: "standard" as const,
+        insurer: "Daman",
+        policyNo: "DHA-2026-114872",
+        premiumMinor: 420_000,
+        // Every one in date. Nobody starts blocked.
+        docs: {
+          work_permit: 400,
+          residence_visa: 500,
+          emirates_id: 600,
+          medical_fitness: 210,
+          health_insurance: 300,
+        },
+        // 90 minutes at +25% inside the live wage month, so the wage file has a
+        // non-zero overtime column. Deliberately under the two-hour daily cap —
+        // a breach on a fresh install is a false alarm.
+        overtimeMinutes: 90,
+        carriedOverLeaveDays: 5,
+      },
+      {
+        no: "E-002",
+        tech: "T-002",
+        name: "Ganesh Pillai",
+        basicMinor: 340_000,
+        allowances: { transport: "300.00" },
+        serviceDays: 120,
+        contractEndsInDays: 610,
+        // On probation. Six months maximum, non-extendable, 14 days' notice —
+        // a normal state with a deadline attached, which is what makes it worth
+        // rendering. 165 days from a start 120 days ago is inside the cap, and
+        // the CHECK constraint on the table enforces that independently.
+        probationEndsInDays: 45,
+        // AED 3,700 total is below the threshold, so this one legally requires
+        // an Essential Benefits Plan and not a standard one.
+        plan: "essential_benefits" as const,
+        insurer: "Daman",
+        policyNo: "DHA-2026-114873",
+        premiumMinor: 96_000,
+        docs: {
+          work_permit: 250,
+          residence_visa: 400,
+          // THE expiring document. Inside 30 days, so the "renew, or somebody
+          // stops being deployable" section has a row in it — and not expired,
+          // so nothing is blocked.
+          emirates_id: 21,
+          medical_fitness: 150,
+          health_insurance: 180,
+        },
+        overtimeMinutes: 0,
+        carriedOverLeaveDays: 0,
+      },
+      {
+        no: "E-003",
+        tech: "T-003",
+        name: "Arun Verma",
+        basicMinor: 600_000,
+        allowances: { housing: "1500.00" },
+        serviceDays: 400,
+        contractEndsInDays: 120,
+        probationEndsInDays: null,
+        plan: "standard" as const,
+        insurer: "Oman Insurance",
+        policyNo: "DHA-2026-114874",
+        premiumMinor: 390_000,
+        docs: {
+          work_permit: 350,
+          residence_visa: 450,
+          emirates_id: 550,
+          // Inside 90 but outside 30, so the "between 31 and 90 days" band is
+          // populated too. That band is where a renewal is still cheap and
+          // unhurried, and a board that only ever shows the urgent one trains
+          // people to act late.
+          medical_fitness: 75,
+          health_insurance: 250,
+        },
+        overtimeMinutes: 0,
+        carriedOverLeaveDays: 0,
+      },
+    ];
+
+    interface SeededLine {
+      readonly employeeId: string;
+      readonly basicMinor: number;
+      readonly allowancesMinor: number;
+      readonly overtimeMinor: number;
+      readonly deductionsMinor: number;
+      readonly netMinor: number;
+      readonly overtimeMinutes: number;
+    }
+    const lines: SeededLine[] = [];
+
+    for (const e of employeeSpecs) {
+      const technicianId = techIds.get(e.tech) ?? null;
+      const serviceStart = day(-e.serviceDays);
+
+      const [employee] = await db
+        .insert(schema.employees)
+        .values({
+          tenantId: T1,
+          technicianId,
+          employeeNo: e.no,
+          fullName: e.name,
+          contractType: "fixed_term",
+          contractStart: serviceStart,
+          contractEnd: day(e.contractEndsInDays),
+          probationEnd: e.probationEndsInDays === null ? null : day(e.probationEndsInDays),
+          noticePeriodDays: 30,
+          basicSalaryMinor: e.basicMinor,
+          allowances: e.allowances,
+          mohrePersonCode: `MOHRE-${e.no}`,
+          // Without an IBAN a wage line cannot be transferred, and
+          // `wageFileGaps` reports that as the failure that looks like
+          // compliance. Every seeded employee has one, so the board opens clean.
+          wpsIban: `AE07033123456789012345${e.no.slice(-1)}`,
+          status: "active",
+          healthPlan: e.plan,
+          healthInsurer: e.insurer,
+          healthPolicyNo: e.policyNo,
+          // An employer cost, recorded so the renewal is not reconstructed from
+          // memory. It is not a deduction and cannot become one:
+          // `salary_deductions.kind` has no insurance value in its positive list.
+          healthPremium: toDecimalString(e.premiumMinor),
+        })
+        .returning({ id: schema.employees.id });
+      if (!employee) throw new Error(`failed to insert employee ${e.no}`);
+
+      // ── HR-5: the five documents that decide deployability ──────────────
+      await db.insert(schema.employeeDocuments).values(
+        Object.entries(e.docs).map(([kind, inDays]) => ({
+          tenantId: T1,
+          employeeId: employee.id,
+          kind,
+          referenceNo: `${kind.toUpperCase().slice(0, 3)}-${e.no}`,
+          issuedAt: day(-720),
+          expiresAt: day(inDays),
+          // Derived from the kind, never an input — the same rule
+          // `recordEmployeeDocument` follows. A seed that flagged these by hand
+          // could quietly downgrade a work permit to a warning.
+          blocking: ["work_permit", "residence_visa", "emirates_id", "medical_fitness", "health_insurance"].includes(kind),
+          verifiedAt: ago(30 * DAY),
+        })),
+      );
+
+      // ── HR-4: the contract term as a row ────────────────────────────────
+      await db.insert(schema.employmentContractTerms).values({
+        tenantId: T1,
+        employeeId: employee.id,
+        sequence: 1,
+        startsOn: serviceStart,
+        endsOn: day(e.contractEndsInDays),
+        probationEndsOn: e.probationEndsInDays === null ? null : day(e.probationEndsInDays),
+        noticePeriodDays: 30,
+        basicSalary: toDecimalString(e.basicMinor),
+        allowances: e.allowances,
+        workingPattern: "Sun–Thu 08:00–17:00, 1h break",
+        origin: "signed",
+        status: "active",
+      });
+
+      // ── HR-8: overtime, by band, priced from the basic salary ───────────
+      let overtimeMinor = 0;
+      if (e.overtimeMinutes > 0) {
+        const hourly = hourlyBasicMinor(e.basicMinor);
+        overtimeMinor = overtimeAmountMinor(hourly, e.overtimeMinutes, "overtime");
+        await db.insert(schema.overtimeRecords).values({
+          tenantId: T1,
+          employeeId: employee.id,
+          // Inside the live wage month, so it lands in that cycle's file.
+          workedOn: addDays(livePeriod, 12),
+          band: "overtime",
+          minutes: e.overtimeMinutes,
+          // Stored on the row rather than looked up at read time: statutory
+          // rates change, and a historic entry must keep saying what it was
+          // actually paid at.
+          multiplierBasisPoints: PAY_BAND_BASIS_POINTS.overtime,
+          hourlyRate: toDecimalString(hourly),
+          amount: toDecimalString(overtimeMinor),
+          source: "manual",
+          approvedAt: ago(20 * DAY),
+        });
+      }
+
+      // ── HR-7: carry-over, which is the only thing a table can know ──────
+      if (e.carriedOverLeaveDays > 0) {
+        await db.insert(schema.leaveBalances).values({
+          tenantId: T1,
+          employeeId: employee.id,
+          // The service ANNIVERSARY, which is what `leaveSummary` measures
+          // against — not the service start. Writing against the wrong one
+          // saves a row nothing ever reads and the balance never moves.
+          leaveYearStart: addMonths(serviceStart, Math.floor(e.serviceDays / 365) * 12),
+          carriedOverDays: e.carriedOverLeaveDays,
+          adjustmentDays: 0,
+          reason: "Carried forward from the previous leave year under company policy.",
+        });
+      }
+
+      const allowancesMinor = Object.values(e.allowances).reduce(
+        (sum, v) => sum + Math.round(Number(v) * 100),
+        0,
+      );
+      const deductionsMinor = e.no === "E-003" ? 20_000 : 0;
+
+      // ── One lawful deduction, to show the closed list is not empty ──────
+      //
+      // A salary-advance repayment, which IS permitted. The point of seeding one
+      // is that the list it comes from contains no insurance premium and no visa
+      // cost — `HR-6` and `HR-16` are enforced by a CHECK constraint, and a
+      // reader who never sees a legitimate deduction cannot tell a closed list
+      // from an unused feature.
+      if (deductionsMinor > 0) {
+        await db.insert(schema.salaryDeductions).values({
+          tenantId: T1,
+          employeeId: employee.id,
+          kind: "salary_advance_repayment",
+          amount: toDecimalString(deductionsMinor),
+          reason: "Third instalment of a four-month salary advance agreed in writing.",
+          authorisedById: userIds.get("priya@meridianfm.example") ?? null,
+          appliesOn: addDays(livePeriod, 15),
+        });
+      }
+
+      lines.push({
+        employeeId: employee.id,
+        basicMinor: e.basicMinor,
+        allowancesMinor,
+        overtimeMinor,
+        deductionsMinor,
+        netMinor: e.basicMinor + allowancesMinor + overtimeMinor - deductionsMinor,
+        overtimeMinutes: e.overtimeMinutes,
+      });
+
+      // ── HR-7: approved leave, with more than a month's notice ───────────
+      if (technicianId && e.no === "E-001") {
+        await db.insert(schema.leaveRequests).values({
+          tenantId: T1,
+          technicianId,
+          kind: "annual",
+          // 45 days out. `checkLeaveNotice` needs 30, so this reads as
+          // sufficient — leave imposed at shorter notice is unlawful, and only
+          // the record of when it was asked for distinguishes the two.
+          startsOn: ahead(45 * DAY),
+          endsOn: ahead(54 * DAY),
+          status: "approved",
+          reason: "Annual leave, family travel.",
+          approvedById: userIds.get("rania@meridianfm.example") ?? null,
+          approvedAt: ago(2 * DAY),
+        });
+      }
+    }
+
+    const liveTotalMinor = lines.reduce((sum, l) => sum + l.netMinor, 0);
+
+    // ── HR-17: the wage cycles ────────────────────────────────────────────
+    //
+    // The live cycle is transferred **on the deadline**, at 100%. That is a
+    // choice and it is the whole reason this block is safe to ship: today's
+    // date decides how late an untransferred cycle is, so a seed that left it
+    // open would put a fresh install anywhere from "due in 5 days" to "day 21,
+    // executive orders" depending only on which day somebody ran `db:seed`.
+    // Confirming on `due_on` is day-of-month independent and always reads as
+    // compliant.
+    const priorTotalMinor = liveTotalMinor - 6_250;
+    const cycleRows = await db
+      .insert(schema.wageCycles)
+      .values([
+      {
+        tenantId: T1,
+        periodMonth: priorPeriod,
+        dueOn: priorDueOn,
+        totalDue: toDecimalString(priorTotalMinor),
+        totalTransferred: toDecimalString(priorTotalMinor),
+        employeeCount: lines.length,
+        paidEmployeeCount: lines.length,
+        filePreparedOn: addDays(priorDueOn, -3),
+        confirmedOn: priorDueOn,
+        transferReference: "SIF-2026-0001",
+        confirmedById: userIds.get("priya@meridianfm.example") ?? null,
+        status: "closed",
+        // Deliberately no `wage_payments` lines. History answers "have we ever
+        // been late", which is the question a MOHRE inspection asks; it does
+        // not need a per-person breakdown, and seeding one for every month back
+        // would be noise pretending to be data.
+        note: "Closed. Retained under the seven-year financial floor, not the two-year HR clock.",
+      },
+      {
+        tenantId: T1,
+        periodMonth: livePeriod,
+        dueOn: liveDueOn,
+        totalDue: toDecimalString(liveTotalMinor),
+        totalTransferred: toDecimalString(liveTotalMinor),
+        employeeCount: lines.length,
+        paidEmployeeCount: lines.length,
+        // Produced at T-3, which is what `HR-17` requires and what the cron
+        // does unattended.
+        filePreparedOn: addDays(liveDueOn, -3),
+        confirmedOn: liveDueOn,
+        transferReference: "SIF-2026-0002",
+        confirmedById: userIds.get("priya@meridianfm.example") ?? null,
+        status: "transferred",
+      },
+      ])
+      .returning({ id: schema.wageCycles.id, periodMonth: schema.wageCycles.periodMonth });
+
+    const liveCycle = cycleRows.find((c) => c.periodMonth === livePeriod);
+    if (!liveCycle) throw new Error("failed to read back the live wage cycle");
+
+    await db.insert(schema.wagePayments).values(
+      lines.map((l) => ({
+        tenantId: T1,
+        wageCycleId: liveCycle.id,
+        employeeId: l.employeeId,
+        basic: toDecimalString(l.basicMinor),
+        allowances: toDecimalString(l.allowancesMinor),
+        overtime: toDecimalString(l.overtimeMinor),
+        deductions: toDecimalString(l.deductionsMinor),
+        net: toDecimalString(l.netMinor),
+        overtimeMinutes: l.overtimeMinutes,
+        absenceDays: 0,
+        leaveDays: 0,
+        paid: true,
+        paidOn: liveDueOn,
+      })),
+    );
+
+    console.log(
+      `  ${employeeSpecs.length} employment records, ${employeeSpecs.length * 5} statutory documents, ` +
+        `2 wage cycles (live one transferred on time), 1 document expiring inside 30 days`,
+    );
+  }
 
   console.log(`\nDone. Sign in with any of:`);
   for (const s of staff) console.log(`  ${s.email.padEnd(32)} ${s.role}`);

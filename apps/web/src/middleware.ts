@@ -58,23 +58,63 @@ export const config = {
   ],
 };
 
+/**
+ * The statically generated marketing pages — and *only* those.
+ *
+ * ── WHY THIS LIST IS THE STATIC ONE AND NOT THE DYNAMIC ONE ─────────────────
+ *
+ * This was written the other way round first: an allow-list of dynamic
+ * prefixes, with everything else falling through to the marketing policy. That
+ * is a fail-open default, and it failed. By the time it was noticed, nine
+ * authenticated surfaces had been added by five people and none of them were on
+ * the list — `/workforce`, `/amc`, `/reports`, `/hr`, `/quotes`,
+ * `/recruitment`, and, worst of the set, `/forgot-password`, `/reset-password`
+ * and `/invite`, which are the three pages where a password is typed. Every one
+ * of them was silently being served `'unsafe-inline'`. Nobody did anything
+ * wrong; the default did.
+ *
+ * Inverted, the two failure modes swap places, and that is the entire point:
+ *
+ *   * Forget to add a new **app** route: it gets the strict nonce'd policy,
+ *     which is correct, and nothing happens.
+ *   * Forget to add a new **marketing** route: its build-time HTML meets a
+ *     per-request nonce, Next's bootstrap scripts are blocked, and the page
+ *     visibly breaks in development the first time anyone loads it.
+ *
+ * A CSP hole is invisible until it is exploited. A broken marketing page is
+ * obvious in thirty seconds. Fail towards the one you will notice.
+ *
+ * The root `/` is matched exactly rather than by prefix — a `startsWith("/")`
+ * test is true of every path on the site.
+ */
+const STATIC_MARKETING_PREFIXES = [
+  "/about",
+  "/areas",
+  "/careers",
+  "/contact",
+  "/contracts",
+  "/emergency",
+  "/privacy",
+  "/quote",
+  "/services",
+  "/terms",
+] as const;
+
+function isStaticMarketing(pathname: string): boolean {
+  if (pathname === "/") return true;
+
+  return STATIC_MARKETING_PREFIXES.some(
+    // Exact match or a real path segment. A bare `startsWith` would hand the
+    // marketing policy to `/quotes/{id}/document`, because `/quote` is a
+    // prefix of `/quotes` — which is precisely the staff quotation surface
+    // this function exists to keep on the strict policy.
+    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
+  );
+}
+
 /** Paths whose HTML is produced per request and can therefore carry a nonce. */
 function isDynamicSurface(pathname: string): boolean {
-  return (
-    pathname.startsWith("/api/") ||
-    pathname.startsWith("/portal") ||
-    pathname === "/login" ||
-    pathname.startsWith("/login/") ||
-    pathname.startsWith("/dispatch") ||
-    pathname.startsWith("/jobs") ||
-    pathname.startsWith("/leads") ||
-    pathname.startsWith("/customers") ||
-    pathname.startsWith("/invoices") ||
-    pathname.startsWith("/technicians") ||
-    pathname.startsWith("/security") ||
-    pathname.startsWith("/denied") ||
-    pathname.startsWith("/admin")
-  );
+  return !isStaticMarketing(pathname);
 }
 
 function buildPolicy(options: { nonce: string | null; isDev: boolean }): string {

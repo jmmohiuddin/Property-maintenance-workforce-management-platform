@@ -74,7 +74,7 @@ for f in rls auth-functions public-functions customer-scope reference mfa-functi
   psql -d meridian_dev -v ON_ERROR_STOP=1 -f "packages/db/sql/$f.sql"; done
 ```
 
-That last file runs twelve isolation checks and exits non-zero if any fail. It now runs in CI on
+That last file runs thirteen isolation checks and exits non-zero if any fail. It now runs in CI on
 every push (`.github/workflows/ci.yml`) — it is the gate that matters most in this repo.
 
 **The order of the `sql/` files is load-bearing, not stylistic.** `rls.sql` ends with a blanket
@@ -146,6 +146,60 @@ Many AI crawlers do not execute JavaScript. Anything an answer engine needs to r
 the HTML response, so structured data, FAQ answers and the per-page answer paragraph are all
 server-rendered. The FAQ uses native `<details>` rather than a JS accordion for the same reason.
 
+## Two traps that have each caught more than one person
+
+Both are silent, both compile, and neither is a mistake you make once and learn from — three
+different people hit the first independently before it was written down.
+
+**1. A backtick inside a SQL comment terminates the template.**
+
+```ts
+tx.execute(sql`
+  -- Joined to invoices rather than read alone. `payments` has no customer_id
+  select ...
+`);
+```
+
+That is valid JavaScript. The backtick before `payments` closes the template literal early, and
+TypeScript then reports something like `TS1005: ',' expected` **tens of lines further down**, at a
+character that is not the problem. The error never points at the backtick.
+
+Write identifiers in SQL comments as bare prose — `payments has no customer_id`. To check a file:
+
+```bash
+grep -n -- "--.*\`" path/to/file.ts
+```
+
+Because it is a parse error, it breaks the **whole workspace** for everyone, not just the file's
+owner. If you are about to leave one broken for more than a moment, say so.
+
+**2. `tx.execute<T>()`'s type parameter is an assertion, not a check — and timestamps come back as
+strings.**
+
+```ts
+// Compiles cleanly. Throws "getTime is not a function" at runtime.
+const rows = await tx.execute<{ x: Date }>(sql`select now() as x`);
+rows[0].x.getTime();
+```
+
+The driver returns `timestamptz` as a string; the angle brackets only tell the compiler what to
+believe. A comparison against an ISO string does not throw — it silently returns false, which is
+worse. Declare timestamp columns as `string` and convert through `rowDate` / `requiredRowDate` in
+`packages/db/src/domain/_rows.ts`.
+
+The returned string is **space-separated, not ISO** — `2026-08-21 20:01:34.899379+06`, not
+`2026-08-21T20:01:34Z`. `new Date()` happens to parse that in V8, which is why the bug survives
+casual testing, but it is not a format to rely on. That accidental success is the reason this one is
+worth sweeping for deliberately rather than waiting for it to fail.
+
+Where a column is a *day* rather than an instant — a permit expiry, a wage due date — prefer keeping
+it a `YYYY-MM-DD` string end to end. Round-tripping a date through a JS `Date` shifts it by the
+local offset, and it shifts in the direction that reports a lapsed permit as still valid.
+
+This one is invisible unless a fixture exercises the branch, so it survives exactly on the paths the
+tests do not reach. When you add raw SQL with a date in it, sweep for it rather than waiting for a
+failure.
+
 ## Documentation
 
 | Document | Read it when |
@@ -170,7 +224,7 @@ Claims in this README that have been executed rather than asserted:
 - `npm run typecheck` passes across all six workspaces; `npm run test` passes 216 checks across ten suites
 - `npm run check:contrast` passes 36/36 token pairings at WCAG AA
 - `next build` produces 66 routes: 24 prerendered service pages, 19 area pages, the rest static or dynamic
-- Schema applied to PostgreSQL 16; all 12 RLS isolation checks pass
+- Schema applied to PostgreSQL 16; all 13 RLS isolation checks pass
 - JSON-LD parsed and validated across 10 blocks on 9 pages, 0 invalid
 - Quote form submitted end to end in a browser: success path and validation-failure path both confirmed
 - Full internal link crawl from `/`: 59 URLs, zero dead links

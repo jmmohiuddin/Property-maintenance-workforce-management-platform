@@ -17,15 +17,38 @@ import { SignOut } from "@phosphor-icons/react/dist/ssr";
  * is there and then breaks. Add each entry here as its route lands.
  */
 const NAV = [
+  // KPI-3. First, because it is the owner's screen and the owner reads it
+  // first. `reports:read` keeps it off a dispatcher's and a technician's nav —
+  // the card stack carries cash position, revenue against a tax threshold and
+  // headcount, and those are not figures every role should meet on the way to
+  // the dispatch board.
+  { href: "/reports", label: "Reports", permission: "reports:read" },
   { href: "/dispatch", label: "Dispatch", permission: "jobs:read" },
   { href: "/jobs", label: "Jobs", permission: "jobs:read" },
   { href: "/leads", label: "Leads", permission: "customers:read" },
   { href: "/customers", label: "Customers", permission: "customers:read" },
   { href: "/invoices", label: "Invoices", permission: "invoices:read" },
+  // M3. The URL is `/amc`, not `/contracts`, and the label is "Contracts".
+  // `(marketing)/contracts` already owns `/contracts` — it is a statically
+  // generated public page with a canonical URL and a sitemap entry — and two
+  // route groups resolving to the same path is a Next build error, not a
+  // precedence rule. AMC is what the business calls the thing anyway.
+  { href: "/amc", label: "Contracts", permission: "contracts:read" },
   { href: "/technicians", label: "Technicians", permission: "technicians:read" },
   { href: "/workforce", label: "Workforce", permission: "workforce:read" },
+  { href: "/recruitment", label: "Recruitment", permission: "recruitment:read" },
+  // M10. Beside Workforce and not inside it, because the two answer different
+  // questions: `/workforce` is "may this person legally be sent to work today",
+  // which is documents and hard blocks; `/hr` is "what does the employment
+  // relationship owe, and by when" — wages due on the 1st, contract terms,
+  // leave, hours, health cover. One screen holding both would put a leave
+  // balance under a lapsed work permit.
+  { href: "/hr", label: "HR", permission: "workforce:read" },
   { href: "/admin/users", label: "Users", permission: "users:manage" },
   { href: "/admin/company", label: "Company", permission: "settings:write" },
+  // ADM-7. `audit:read`, which `readonly` also holds — this is the screen that
+  // gives that role a reason to exist (and what ADM-8 builds on).
+  { href: "/admin/audit", label: "Audit", permission: "audit:read" },
 ] as const;
 
 export function AppShell({

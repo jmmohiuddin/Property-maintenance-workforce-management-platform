@@ -5,11 +5,29 @@ import {
   withTenant,
   getEmployeeRecord,
   blockForTechnician,
+  employmentContract,
+  leaveSummary,
+  healthInsuranceFor,
+  listOvertime,
+  listSalaryDeductions,
   EMPLOYEE_DOCUMENT_KINDS,
   EMPLOYEE_DOCUMENT_LABEL,
   BLOCKING_DOCUMENT_KINDS,
 } from "@meridian/db";
 import { can } from "@meridian/auth";
+import {
+  formatMoney,
+  today,
+  addDays,
+  startOfMonth,
+  formatDay as formatCalendarDay,
+  HEALTH_PLANS,
+  HEALTH_PLAN_LABEL,
+  PAY_BAND_LABEL,
+  LAWFUL_DEDUCTION_KINDS,
+  DEDUCTION_KIND_LABEL,
+  PROBATION_NOTICE_DAYS,
+} from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 import {
@@ -21,6 +39,13 @@ import {
   tradeLabel,
 } from "../compliance-ui";
 import { DocumentPanel, WithdrawDocument } from "./document-panel";
+import {
+  ContractPanel,
+  LeavePanel,
+  OvertimePanel,
+  InsurancePanel,
+  DeductionPanel,
+} from "./employment-panel";
 
 export const metadata: Metadata = { title: "Employment record" };
 export const dynamic = "force-dynamic";
@@ -42,13 +67,36 @@ export default async function EmployeeRecordPage({
   const canWrite = can(session.principal, "workforce:write");
   const { employeeId } = await params;
 
-  const { record, block } = await withTenant(
+  const { record, block, contract, leave, insurance, overtime, deductions } = await withTenant(
     { tenantId: session.principal.tenantId, userId: session.principal.userId },
     async (tx) => {
       const found = await getEmployeeRecord(tx, employeeId);
+      if (!found) {
+        return {
+          record: null,
+          block: null,
+          contract: null,
+          leave: null,
+          insurance: null,
+          overtime: [],
+          deductions: [],
+        };
+      }
       return {
         record: found,
-        block: found?.technicianId ? await blockForTechnician(tx, found.technicianId) : null,
+        block: found.technicianId ? await blockForTechnician(tx, found.technicianId) : null,
+        // The employment lifecycle (`HR-4`, `HR-6`, `HR-7`, `HR-8`) alongside
+        // the document register (`HR-5`). One round trip, one transaction:
+        // seven sequential requests would each open their own and could each
+        // see a different moment.
+        contract: await employmentContract(tx, employeeId),
+        leave: await leaveSummary(tx, employeeId),
+        insurance: await healthInsuranceFor(tx, employeeId),
+        // A year back. Overtime is a payroll input and the wage cycle it feeds
+        // is monthly, but the question this page answers is "what has this
+        // person been asked to work", which is not a one-month question.
+        overtime: await listOvertime(tx, { from: addDays(today(), -365), to: today(), employeeId }),
+        deductions: await listSalaryDeductions(tx, employeeId),
       };
     },
   );
@@ -203,6 +251,300 @@ export default async function EmployeeRecordPage({
           )}
         </section>
 
+        {/* ── HR-4: the contract ────────────────────────────────────────── */}
+        <section aria-labelledby="contract-heading" className="mt-10">
+          <h2 id="contract-heading" className="text-lg font-semibold tracking-tight">
+            Contract
+          </h2>
+
+          {contract?.assessment ? (
+            <div className="mt-4">
+              {/* An auto-renewed term is rendered as a live contract, never as an
+                  expired one. That is the requirement: a fixed-term contract the
+                  worker kept working past IS renewed, by operation of law, and
+                  showing it as "expired" invites somebody to treat the person as
+                  unemployed or to backdate a new contract on different terms —
+                  which is the dispute the renewal rule exists to prevent. */}
+              <EmptyState
+                tone={
+                  contract.assessment.state === "auto_renewed"
+                    ? "critical"
+                    : contract.assessment.problems.length > 0
+                      ? "critical"
+                      : contract.assessment.state === "probation" ||
+                          contract.assessment.state === "expiring"
+                        ? "warning"
+                        : "success"
+                }
+                title={contractTitle(contract.assessment.state)}
+              >
+                <p>{contract.assessment.summary}</p>
+                {contract.assessment.state === "probation" ? (
+                  <p className="mt-2">
+                    Termination by the employer during probation takes {PROBATION_NOTICE_DAYS}{" "}
+                    days&rsquo; notice. Once probation ends it becomes the contractual notice period,
+                    so the decision has a deadline whether or not anybody has made it.
+                  </p>
+                ) : null}
+                {contract.assessment.problems.length > 0 ? (
+                  <ul className="mt-2 space-y-1" style={{ color: "var(--status-critical-text)" }}>
+                    {contract.assessment.problems.map((problem) => (
+                      <li key={problem}>{problem}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </EmptyState>
+            </div>
+          ) : (
+            <div className="mt-4">
+              <EmptyState tone="warning" title="No contract recorded.">
+                <p>
+                  Nothing knows when this contract ends, so nothing can tell you it has renewed. A
+                  fixed-term contract that runs past its end date renews on the same terms by
+                  operation of law &mdash; the only question is whether the system knows.
+                </p>
+              </EmptyState>
+            </div>
+          )}
+
+          {contract && contract.terms.length > 0 ? (
+            <ul className="mt-4 divide-y rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>
+              {contract.terms.map((term) => (
+                <li key={term.id} className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2 p-4">
+                  <div>
+                    <p className="text-[14px] font-medium">
+                      Term {term.sequence}
+                      <span className="font-normal" style={{ color: "var(--text-secondary)" }}>
+                        {" "}
+                        &middot; {term.origin === "auto_renewed" ? "renewed by operation of law" : humanise(term.origin)}
+                      </span>
+                    </p>
+                    <p className="tnum mt-1 text-[12px]" style={{ color: "var(--text-muted)" }}>
+                      {formatCalendarDay(term.startsOn)}
+                      {term.endsOn ? ` — ${formatCalendarDay(term.endsOn)}` : " — no end date"}
+                      {term.probationEndsOn ? ` · probation to ${formatCalendarDay(term.probationEndsOn)}` : ""}
+                      {` · ${term.noticePeriodDays} days' notice`}
+                    </p>
+                  </div>
+                  <p className="tnum text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                    {term.basicSalaryMinor === null ? "No basic recorded" : `${formatMoney(term.basicSalaryMinor)} basic`}
+                    {term.status === "active" ? "" : ` · ${humanise(term.status)}`}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+
+          {canWrite ? (
+            <div className="mt-6">
+              <ContractPanel employeeId={record.id} />
+            </div>
+          ) : null}
+        </section>
+
+        {/* ── HR-6: health cover ────────────────────────────────────────── */}
+        <section aria-labelledby="insurance-heading" className="mt-10">
+          <h2 id="insurance-heading" className="text-lg font-semibold tracking-tight">
+            Health insurance
+          </h2>
+          <p className="prose-body mt-2 text-[14px]">
+            Mandatory in Dubai, employer-funded, and the premium may not be deducted from salary.
+            The expiry is not held here &mdash; it is on the health insurance document above, which
+            is one of the five that stop a dispatch when they lapse.
+          </p>
+
+          {insurance ? (
+            insurance.problems.length > 0 ? (
+              <div className="mt-4">
+                <EmptyState tone="critical" title="The cover on file is not what the law requires.">
+                  <ul className="space-y-1">
+                    {insurance.problems.map((problem) => (
+                      <li key={problem}>{problem}</li>
+                    ))}
+                  </ul>
+                </EmptyState>
+              </div>
+            ) : (
+              <p className="tnum mt-4 text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                {insurance.planLabel} &middot; {insurance.insurer}
+                {insurance.policyNo ? ` · ${insurance.policyNo}` : ""}
+                {insurance.premiumMinor === null
+                  ? ""
+                  : ` · ${formatMoney(insurance.premiumMinor)} employer-funded premium`}
+              </p>
+            )
+          ) : null}
+
+          {canWrite ? (
+            <InsurancePanel
+              employeeId={record.id}
+              plans={HEALTH_PLANS.map((plan) => ({ value: plan, label: HEALTH_PLAN_LABEL[plan] }))}
+              requiredPlan={insurance ? HEALTH_PLAN_LABEL[insurance.requiredPlan] : null}
+            />
+          ) : null}
+        </section>
+
+        {/* ── HR-7: leave ───────────────────────────────────────────────── */}
+        <section aria-labelledby="leave-heading" className="mt-10">
+          <h2 id="leave-heading" className="text-lg font-semibold tracking-tight">
+            Annual leave
+          </h2>
+
+          {leave?.entitlement ? (
+            <>
+              <p className="tnum mt-3 text-[14px]" style={{ color: "var(--text-secondary)" }}>
+                <strong style={{ color: "var(--text-primary)" }}>{leave.remainingDays}</strong> days
+                remaining &middot; {leave.accruedDays} accrued &middot; {leave.takenDays} taken
+                {leave.carriedOverDays > 0 ? ` · ${leave.carriedOverDays} carried over` : ""}
+                {leave.adjustmentDays !== 0 ? ` · ${leave.adjustmentDays} adjustment` : ""}
+              </p>
+              <p className="prose-body mt-1 text-[12px]">{leave.entitlement.explanation}</p>
+            </>
+          ) : (
+            <p className="prose-body mt-3 text-[13px]">
+              No service start date on the record, so no entitlement can be computed. Record the
+              contract start above &mdash; leave accrues from it, and a termination settlement is
+              computed against it.
+            </p>
+          )}
+
+          {leave && leave.requests.length > 0 ? (
+            <ul className="mt-4 divide-y rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>
+              {leave.requests.slice(0, 10).map((request) => (
+                <li key={request.id} className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2 p-4">
+                  <div>
+                    <p className="text-[14px] font-medium">
+                      {humanise(request.kind)} &middot; {request.days}{" "}
+                      {request.days === 1 ? "day" : "days"}
+                    </p>
+                    <p className="tnum mt-1 text-[12px]" style={{ color: "var(--text-muted)" }}>
+                      {formatCalendarDay(request.startsOn)} — {formatCalendarDay(request.endsOn)} &middot;{" "}
+                      {humanise(request.status)}
+                    </p>
+                  </div>
+                  {/* Short notice is flagged, never refused. Leave agreed at
+                      short notice by consent is lawful; leave imposed at short
+                      notice is not, and the only thing that distinguishes them
+                      is a record of who asked. */}
+                  <p
+                    className="text-[12px]"
+                    style={{
+                      color: request.noticeSufficient
+                        ? "var(--text-muted)"
+                        : "var(--status-warning-text)",
+                    }}
+                  >
+                    {request.noticeDetail}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+
+          {canWrite ? (
+            <LeavePanel
+              employeeId={record.id}
+              // The anniversary the summary is measured against, not the
+              // service start. Writing a carry-over against the wrong one saves
+              // a row nothing ever reads and the balance never moves.
+              leaveYearStart={leave?.leaveYearStart ?? startOfMonth(today())}
+            />
+          ) : null}
+        </section>
+
+        {/* ── HR-8: hours ───────────────────────────────────────────────── */}
+        <section aria-labelledby="hours-heading" className="mt-10">
+          <h2 id="hours-heading" className="text-lg font-semibold tracking-tight">
+            Overtime and rest-day work
+          </h2>
+          <p className="prose-body mt-2 text-[14px]">
+            Basic +25%, or +50% for overtime between 22:00 and 04:00 and for rest-day work. At most
+            two extra hours a day. The multiplier follows the band and the amount is computed from
+            the basic salary &mdash; neither is typed in, so a historic entry can always be
+            re-derived and checked.
+          </p>
+
+          {overtime.length > 0 ? (
+            <ul className="mt-4 divide-y rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>
+              {overtime.slice(0, 15).map((row) => (
+                <li key={row.id} className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2 p-4">
+                  <div>
+                    <p className="text-[14px] font-medium">
+                      {(row.minutes / 60).toFixed(1)} hours &middot; {PAY_BAND_LABEL[row.band] ?? row.bandLabel}
+                    </p>
+                    <p className="tnum mt-1 text-[12px]" style={{ color: "var(--text-muted)" }}>
+                      {formatCalendarDay(row.workedOn)} &middot; ×
+                      {(row.multiplierBasisPoints / 10000).toFixed(2)}
+                      {row.restDayCompensation
+                        ? ` · ${row.restDayCompensation === "substitute_day" ? `substitute day ${row.substituteDayOn ? formatCalendarDay(row.substituteDayOn) : ""}` : "paid at +50%"}`
+                        : ""}
+                    </p>
+                  </div>
+                  <p className="tnum text-[13px] font-medium">{formatMoney(row.amountMinor)}</p>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-3 text-[13px]" style={{ color: "var(--text-muted)" }}>
+              No overtime recorded in the last year.
+            </p>
+          )}
+
+          {canWrite ? (
+            <OvertimePanel
+              employeeId={record.id}
+              bands={(["overtime", "night", "rest_day"] as const).map((band) => ({
+                value: band,
+                label: PAY_BAND_LABEL[band],
+              }))}
+            />
+          ) : null}
+        </section>
+
+        {/* ── HR-6 / HR-16: deductions ──────────────────────────────────── */}
+        <section aria-labelledby="deductions-heading" className="mt-10">
+          <h2 id="deductions-heading" className="text-lg font-semibold tracking-tight">
+            Salary deductions
+          </h2>
+          <p className="prose-body mt-2 text-[14px]">
+            A closed list. The health insurance premium is not on it and cannot be added to it
+            &mdash; cover is employer-funded under Dubai Law No. 11 of 2013 &mdash; and neither are
+            visa costs, recruitment fees or permit fees, which Article 6 prohibits recovering from a
+            worker in any form.
+          </p>
+
+          {deductions.length > 0 ? (
+            <ul className="mt-4 divide-y rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>
+              {deductions.map((row) => (
+                <li key={row.id} className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2 p-4">
+                  <div>
+                    <p className="text-[14px] font-medium">{humanise(row.kind)}</p>
+                    <p className="mt-1 text-[12px]" style={{ color: "var(--text-secondary)" }}>
+                      {row.reason}
+                      {row.appliesOn ? ` · ${formatCalendarDay(row.appliesOn)}` : ""}
+                    </p>
+                  </div>
+                  <p className="tnum text-[13px] font-medium">{formatMoney(row.amountMinor)}</p>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-3 text-[13px]" style={{ color: "var(--text-muted)" }}>
+              Nothing deducted from this wage.
+            </p>
+          )}
+
+          {canWrite ? (
+            <DeductionPanel
+              employeeId={record.id}
+              kinds={LAWFUL_DEDUCTION_KINDS.map((kind) => ({
+                value: kind,
+                label: DEDUCTION_KIND_LABEL[kind],
+              }))}
+            />
+          ) : null}
+        </section>
+
         <div id="record-document" className="mt-8 scroll-mt-8">
           {canWrite ? (
             <DocumentPanel employeeId={record.id} kinds={documentKinds} />
@@ -216,4 +558,28 @@ export default async function EmployeeRecordPage({
       </div>
     </AppShell>
   );
+}
+
+/**
+ * The contract state, as the sentence somebody acts on.
+ *
+ * `auto_renewed` is the one that matters and the one a raw enum would ruin:
+ * "Auto renewed" reads as a system event, when what it means is "this person is
+ * employed on a term nobody signed, and the law says so".
+ */
+function contractTitle(state: string): string {
+  switch (state) {
+    case "auto_renewed":
+      return "Renewed by operation of law — record it or issue a new contract";
+    case "probation":
+      return "On probation";
+    case "expiring":
+      return "Ending soon";
+    case "ended":
+      return "Ended";
+    case "not_started":
+      return "Not yet started";
+    default:
+      return "Running";
+  }
 }

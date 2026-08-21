@@ -4,6 +4,7 @@ import { withTenant, listDispatchBoard } from "@meridian/db";
 import { getService, OPEN_STATUSES, STATUS_LABEL, PRIORITY_LABEL, SLA_STATE_LABEL, type JobStatus } from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
+import { EmptyState } from "@/components/empty-state";
 
 export const metadata: Metadata = { title: "Jobs" };
 export const dynamic = "force-dynamic";
@@ -86,11 +87,36 @@ export default async function JobsPage({
         </nav>
 
         {rows.length === 0 ? (
-          <div
-            className="mt-8 rounded border p-12 text-center"
-            style={{ backgroundColor: "var(--surface-raised)" }}
-          >
-            <h2 className="text-lg font-semibold">No jobs match this filter</h2>
+          /*
+           * ADM-12. Two different zeros, and the old copy told the same story
+           * for both.
+           *
+           * "No jobs match this filter" over a database with no jobs at all
+           * sends a new operations manager hunting through status chips for
+           * work that was never raised. The filter is known here, so the screen
+           * can say which of the two it is looking at — and in the second case
+           * it can say what creates a job, which is the requirement.
+           */
+          <div className="mt-8">
+            {filter === "all" ? (
+              <EmptyState kind="start" title="No job has been raised yet.">
+                <p>
+                  A job is created by converting a lead, by a customer raising a request in the
+                  portal, or directly from the dispatch board. Every one of them carries a reference
+                  and an SLA clock from the moment it exists.
+                </p>
+                <p className="mt-2">
+                  Nothing is misconfigured &mdash; this is what the screen looks like before the
+                  first week.
+                </p>
+              </EmptyState>
+            ) : (
+              <EmptyState kind="filtered" title="No job is in that state right now.">
+                <p>
+                  Other jobs exist; none are {(chips.find((c) => c.key === filter)?.label ?? filter).toLowerCase()}.
+                </p>
+              </EmptyState>
+            )}
           </div>
         ) : (
           <ul className="mt-8 divide-y rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>

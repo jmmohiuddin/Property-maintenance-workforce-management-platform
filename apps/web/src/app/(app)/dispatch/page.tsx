@@ -11,6 +11,7 @@ import {
 } from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
+import { EmptyState } from "@/components/empty-state";
 import { Warning, Clock, UserCircle } from "@phosphor-icons/react/dist/ssr";
 
 export const metadata: Metadata = { title: "Dispatch" };
@@ -77,14 +78,21 @@ export default async function DispatchPage() {
         </dl>
 
         {rows.length === 0 ? (
-          <div
-            className="mt-8 rounded border p-12 text-center"
-            style={{ backgroundColor: "var(--surface-raised)" }}
-          >
-            <h2 className="text-lg font-semibold">Nothing open</h2>
-            <p className="prose-body mx-auto mt-2 text-[14px]">
-              Every job is closed or cancelled. Either it is a very good day, or the seed has not run.
-            </p>
+          /*
+           * ADM-12. The previous copy ended "…or the seed has not run", which
+           * is a sentence written for whoever built the screen. The first
+           * person to see this board empty is a dispatcher on a Monday, and
+           * being told about a seed script tells them the software is broken.
+           */
+          <div className="mt-8">
+            <EmptyState kind="good" title="Nothing is waiting on a dispatcher.">
+              <p>
+                Every job is signed off, closed or cancelled &mdash; there is nothing to assign,
+                nothing en route and no SLA clock running. New work lands here the moment a lead is
+                converted, a customer raises a request in the portal, or somebody rings the
+                emergency line.
+              </p>
+            </EmptyState>
           </div>
         ) : (
           <div className="mt-8 overflow-x-auto rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>

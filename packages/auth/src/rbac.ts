@@ -48,6 +48,13 @@ export const PERMISSIONS = [
   // skill list has no business reading it.
   "workforce:read",
   "workforce:write",
+  // ADM-1 / M9. The recruitment pipeline. Separate from workforce:* because an
+  // applicant is not an employee: the lawful basis for holding their data is
+  // pre-contractual negotiation and it expires with the vacancy (`ATS-18`), so
+  // the set of people who may read it is deliberately not the same set that may
+  // read a serving employee's statutory documents.
+  "recruitment:read",
+  "recruitment:write",
   "contracts:read",
   "contracts:write",
   "reports:read",
@@ -86,6 +93,9 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
 
   operations_manager: [
     "workforce:read",
+    // Reads the pipeline because a vacancy is an operational fact — the reason
+    // a rota does not cover next month. Cannot move a candidate through it.
+    "recruitment:read",
     "jobs:read",
     "jobs:create",
     "jobs:update",
@@ -167,6 +177,10 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
     "technicians:write",
     "workforce:read",
     "workforce:write",
+    // The screens this role alone owns end to end (§5.2's rule that every role
+    // must have at least one). M9 is the module; ATS-16 is the obligation.
+    "recruitment:read",
+    "recruitment:write",
     "reports:read",
   ],
 
@@ -245,6 +259,13 @@ export const STAFF_ROLES: readonly Role[] = [
   "technician",
   "accountant",
   "sales",
+  // `hr` was missing from this list, which made the role unusable rather than
+  // merely limited: `requireStaffSession` sent an hr user to /portal, and
+  // `requirePortalSession` then bounced them to /denied because they have no
+  // customer_id. Every staff screen was unreachable, including the two the
+  // role was created for. Found while building M9, whose whole point is that
+  // this role has screens of its own.
+  "hr",
   "readonly",
 ];
 

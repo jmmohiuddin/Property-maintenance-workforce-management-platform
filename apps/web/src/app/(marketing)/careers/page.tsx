@@ -9,8 +9,11 @@ import {
   webPageSchema,
   faqSchema,
   breadcrumbSchema,
+  jobPostingSchema,
 } from "@meridian/core";
 import { Section, Eyebrow, AnswerBlock } from "@/components/ui";
+import { OpenRoles } from "./open-roles";
+import { openRoles } from "./roles";
 import { FaqList } from "@/components/faq";
 import { JsonLd } from "@/components/json-ld";
 import { EnvelopeSimple, WhatsappLogo } from "@phosphor-icons/react/dist/ssr";
@@ -23,11 +26,14 @@ const careersEmail = `careers@${tenant.domain.replace(/^https?:\/\//, "")}`;
  * are things the company controls and can be held to — and which are what a
  * tradesperson deciding where to apply actually wants to know.
  *
- * This page is a static holding page. M9 replaces it with real requisitions,
- * `JobPosting` JSON-LD per open role, and an application form that takes under
- * three minutes on a phone (`ATS-3`). Until then it must not promise a process
- * that does not exist, so it points at email and WhatsApp — the channels that
- * are actually answered today.
+ * M9 has now replaced the holding page: real requisitions, `JobPosting` JSON-LD
+ * per open role (`ATS-2`, `WEB-7`), and an application form that takes under
+ * three minutes on a phone (`ATS-3`).
+ *
+ * The email and WhatsApp routes stay, and that is deliberate rather than
+ * leftover. A careers page with no open vacancy today still needs a way for a
+ * good plumber to reach a person, and `ATS-13`'s talent pool is fed by exactly
+ * those conversations. The form is the fast path, not the only path.
  */
 const ANSWER = `${company.legalName} hires tradespeople directly onto UAE labour contracts across the ten activities on its Dubai trade licence — plumbing, HVAC, electrical fittings, carpentry, tiling, false ceilings, painting, wallpaper, electromechanical installation and building cleaning. Employment is direct: the labour contract, the visa, the medical insurance and the end-of-service accrual are the company's obligation, and salaries are paid through the Wage Protection System.`;
 
@@ -83,8 +89,18 @@ const FAQS = [
   },
 ] as const;
 
-export default function CareersPage() {
+/*
+ * Rendered per request, not at build time. A vacancy that closed this morning
+ * must not still be collecting applications from a statically generated page
+ * this afternoon — every one of those is an applicant nobody is reading, which
+ * is the silent-rejection failure arriving before anyone has even applied.
+ */
+export const dynamic = "force-dynamic";
+
+export default async function CareersPage() {
   const applyOnWhatsapp = whatsappLink("Hello, I would like to apply for a technician role.");
+  const roles = await openRoles();
+
   return (
     <>
       <JsonLd
@@ -100,6 +116,14 @@ export default function CareersPage() {
             { name: "Home", path: "/" },
             { name: "Careers", path: "/careers" },
           ]),
+          /*
+           * `ATS-2` / `WEB-7`. One `JobPosting` per open role, which is what
+           * puts these vacancies into Google Jobs and makes them citable by an
+           * assistant asked "who is hiring AC technicians in Dubai". Emitted
+           * from the same rows the list below renders, so an indexed posting
+           * and a visible one can never disagree.
+           */
+          ...roles.map((role) => jobPostingSchema(role)),
         )}
       />
 
@@ -127,6 +151,8 @@ export default function CareersPage() {
         </div>
       </section>
 
+      <OpenRoles roles={roles} />
+
       <Section tone="sunken">
         <div className="container-page">
           <h2 className="text-2xl font-semibold md:text-3xl">What you get</h2>
@@ -153,13 +179,20 @@ export default function CareersPage() {
           <div className="lg:col-span-5">
             <h2 className="text-2xl font-semibold md:text-3xl">How to apply</h2>
             <p className="prose-body mt-5">
-              There is no application portal. Send a CV, or message us on WhatsApp with your trade and
-              years of experience. If there is a fit we will arrange a trade test with a supervisor.
+              Pick a role above and fill in the form. It takes under three minutes on a phone, a CV is
+              optional, and you will get a reference and a link that shows you exactly where your
+              application has got to — no account, no password. If there is a fit we will arrange a
+              trade test with a supervisor.
             </p>
             <p className="prose-body mt-4 text-[15px]">
-              We reply to every application, including the ones we turn down. Being left waiting is the
-              most common complaint people have about applying for trade work, and it costs nothing to
-              fix.
+              We reply to every application, including the ones we turn down, and we tell you when by.
+              Being left waiting is the most common complaint people have about applying for trade
+              work, and it costs nothing to fix.
+            </p>
+            <p className="prose-body mt-4 text-[15px]">
+              We never ask you to pay anything. Recruitment, visa and permit costs are ours by law
+              and are never taken from your salary. If anyone asks you for a fee in connection with a
+              job here, tell us.
             </p>
             <a href={`mailto:${careersEmail}`} className="btn btn-primary mt-8">
               <EnvelopeSimple size={17} weight="fill" aria-hidden />

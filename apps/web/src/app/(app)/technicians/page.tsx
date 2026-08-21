@@ -4,6 +4,7 @@ import { withTenant, listTechnicians, skillCoverage } from "@meridian/db";
 import { services, getService } from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
+import { EmptyState } from "@/components/empty-state";
 import { WarningCircle, ShieldWarning } from "@phosphor-icons/react/dist/ssr";
 
 export const metadata: Metadata = { title: "Technicians" };
@@ -82,14 +83,29 @@ export default async function TechniciansPage() {
         ) : null}
 
         {technicians.length === 0 ? (
-          <div
-            className="mt-8 rounded border p-12 text-center"
-            style={{ backgroundColor: "var(--surface-raised)" }}
-          >
-            <h2 className="text-lg font-semibold">No technicians on the roster</h2>
-            <p className="prose-body mx-auto mt-2 text-[14px]">
-              Run the seed script, or add technicians through the workforce import.
-            </p>
+          /*
+           * ADM-12. "Run the seed script" was the old copy. It is an
+           * instruction to a developer, on the screen an operations manager
+           * reaches first when they want to know who can be sent to a job.
+           *
+           * Tone is `gap` rather than `start` on purpose: an empty roster is
+           * not a neutral day-one state. Nothing can be dispatched, the
+           * compliance board has nobody to check, and the skill-coverage
+           * warning above this list is silently measuring an empty set.
+           */
+          <div className="mt-8">
+            <EmptyState kind="gap" title="No technician is on the roster.">
+              <p>
+                Nothing can be assigned until somebody is. Every screen that depends on this one
+                &mdash; the dispatch board&rsquo;s technician column, skill coverage above, and the
+                workforce compliance board &mdash; is currently reporting on an empty set rather
+                than on a clean one.
+              </p>
+              <p className="mt-2">
+                Adding a technician here creates the roster entry. The employment record that holds
+                their permit and visa is separate, and lives on the workforce board.
+              </p>
+            </EmptyState>
           </div>
         ) : (
           <ul className="mt-8 divide-y rounded border" style={{ backgroundColor: "var(--surface-raised)" }}>

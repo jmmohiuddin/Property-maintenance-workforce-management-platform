@@ -138,6 +138,7 @@ DO $$
 DECLARE
   permissive_ones text;
   secdef_unpinned text;
+  unbounded_writes text;
 BEGIN
   -- 11. Every customer_scope policy must be RESTRICTIVE. A PERMISSIVE policy is
   -- OR-ed with the tenant policy, so getting this wrong WIDENS access instead of
@@ -167,6 +168,42 @@ BEGIN
     RAISE EXCEPTION
       'FAIL 12: SECURITY DEFINER without a pinned search_path: %', secdef_unpinned;
   END IF;
+
+  -- 13. An unbounded write check may only sit on a table that names no customer.
+  --
+  -- `customer-scope.sql` closes every unscoped table to portal reads, and lets
+  -- the write check stay `true` where the table has no `customer_id` — those are
+  -- the append-only ledgers a portal session must write but never read
+  -- (`audit_log`, `notifications`).
+  --
+  -- A table that *does* carry `customer_id` and still has an unbounded write
+  -- check is the dangerous combination: the database would accept a row naming
+  -- somebody else's customer, and only application code would be standing in the
+  -- way. The first run of this check found exactly that on `memberships` — the
+  -- table that grants portal access — and on `user_invitations`.
+  --
+  -- The reason this is a permanent check and not a one-off fix: the failure it
+  -- catches is a *future* one. Someone adds a portal feature that writes a
+  -- customer-owned table, the backstop covers the read side, and nothing at all
+  -- covers the write side. Nobody would see it. This will.
+  SELECT string_agg(c.relname, ', ') INTO unbounded_writes
+  FROM pg_policy p
+  JOIN pg_class c ON c.oid = p.polrelid
+  WHERE p.polname LIKE 'customer\_scope%'
+    AND pg_get_expr(p.polwithcheck, p.polrelid) = 'true'
+    AND EXISTS (
+      SELECT 1 FROM information_schema.columns col
+       WHERE col.table_schema = 'public'
+         AND col.table_name = c.relname
+         AND col.column_name = 'customer_id'
+    );
+
+  IF unbounded_writes IS NOT NULL THEN
+    RAISE EXCEPTION
+      'FAIL 13: customer_scope has WITH CHECK (true) on customer-owned table(s): %. '
+      'A portal session could write a row naming another customer.',
+      unbounded_writes;
+  END IF;
 END
 $$;
 
@@ -175,4 +212,4 @@ DELETE FROM public.customers
  WHERE tenant_id IN ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222');
 DELETE FROM public.tenants WHERE slug IN ('alpha-fm', 'beta-fm');
 
-\echo '── RLS verification: all 12 checks passed ──'
+\echo '── RLS verification: all 13 checks passed ──'

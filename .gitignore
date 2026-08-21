@@ -26,3 +26,11 @@ drizzle/meta/_journal.json.bak
 # Re-stated after the wildcard above: the negation has to come last to win, and
 # this file is the only record of which variables a deployment needs.
 !.env.example
+
+# Playwright MCP scratch output: console logs and page snapshots written during
+# browser verification. Evidence for one session, not a record worth keeping.
+.playwright-mcp/
+
+# Screenshots taken while verifying a screen by hand. Name them and move them
+# into docs/ if one is ever worth keeping; the root is not a scrapbook.
+/seeded-*.png

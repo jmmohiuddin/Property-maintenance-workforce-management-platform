@@ -91,6 +91,30 @@ export const RETENTION_PROTECTED_TABLES = [
   "job_signoffs",
   "job_reports",
   "job_materials",
+  // Payroll (M10). Added when the HR lifecycle landed, on request from the
+  // stream that built it — the tables were created knowing they needed this and
+  // could not add themselves to a file they did not own.
+  //
+  // These are wage records, and a wage record is a tax record: it substantiates
+  // a deduction against Corporate Tax, so the seven-year floor governs it and
+  // not the two-year HR clock. The distinction matters in one direction only —
+  // deleting an employee's personal data on the HR clock while keeping the
+  // payroll rows is lawful and expected; deleting the payroll rows because the
+  // employee left two years ago is destroying evidence for a return that can
+  // still be assessed.
+  //
+  // `employment_contract_terms` is here for the same reason and it is the one
+  // that looks least like money: the term sheet is what establishes the salary
+  // and notice a payment was made against, and a payment with no contract
+  // behind it is the unsupported assertion this list exists to prevent.
+  //
+  // `leave_balances` is deliberately absent. It is an operational balance, not a
+  // record of a payment, and it carries no figure a tax authority would assess.
+  "wage_cycles",
+  "wage_payments",
+  "salary_deductions",
+  "overtime_records",
+  "employment_contract_terms",
   // Append-only by construction; the application role has no DELETE on it.
   "audit_log",
 ] as const;

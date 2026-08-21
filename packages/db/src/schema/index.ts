@@ -8,3 +8,8 @@ export * from "./audit";
 export * from "./compliance";
 export * from "./ops";
 export * from "./reference";
+export * from "./contracts";
+export * from "./portal";
+export * from "./analytics";
+export * from "./recruitment";
+export * from "./hr";

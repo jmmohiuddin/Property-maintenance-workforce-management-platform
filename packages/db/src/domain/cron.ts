@@ -35,7 +35,26 @@ import * as schema from "../schema";
 
 export type CronOutcome = "ok" | "failed";
 
-export const CRON_JOBS = ["dispatch", "sweep", "sla", "compliance", "retention", "health"] as const;
+export const CRON_JOBS = [
+  "dispatch",
+  "sweep",
+  "sla",
+  "compliance",
+  "retention",
+  "contracts",
+  // KPI-5. Appended, not slotted in: this list is the health check's
+  // universe, and a job that is only in vercel.json is a job that can stop
+  // firing without /api/cron/health noticing.
+  "weekly-digest",
+  // M9 / ATS-14, ATS-15, ATS-16. Sends the acknowledgements and releases the
+  // outcome messages whose cancellable window has closed. It belongs in this
+  // list rather than only in vercel.json for the reason stated above, and with
+  // more force: if this job stops firing, applicants stop being told anything
+  // and the only symptom is silence — which is exactly what the module exists
+  // to prevent, arriving through the back door.
+  "recruitment",
+  "health",
+] as const;
 export type CronJob = (typeof CRON_JOBS)[number];
 
 /**
@@ -50,6 +69,15 @@ export const CRON_MAX_AGE_MINUTES: Readonly<Record<CronJob, number>> = {
   sla: 35, // every 10 minutes
   compliance: 26 * 60, // daily
   retention: 26 * 60, // daily
+  contracts: 26 * 60, // daily — CON-3..CON-7, the PPM engine
+  // Weekly, Sunday 09:00 Dubai. Eight days rather than seven and a bit: a
+  // weekly job that is an hour late is not a problem, and an allowance tight
+  // enough to fire on a scheduler hiccup is an allowance somebody mutes.
+  "weekly-digest": 8 * 24 * 60,
+  // Every 15 minutes. Tight, because the acknowledgement it sends is what an
+  // applicant reads as "they got it", and an hour of silence after tapping
+  // Submit is when people phone the office.
+  recruitment: 60,
   health: 20, // every 5 minutes
 };
 

@@ -5,6 +5,22 @@ import { SiteHeader } from "@/components/site-header";
 import { SiteFooter } from "@/components/site-footer";
 
 /**
+ * Rendered per request, unlike the rest of the public site.
+ *
+ * A 404 is reached by an arbitrary URL, so the middleware cannot recognise it
+ * by path and gives it the strict nonce'd policy along with every other
+ * unrecognised route — which is the fail-safe direction and deliberate. But a
+ * per-request nonce cannot match statically generated HTML: the browser would
+ * block Next's own bootstrap scripts and this page would arrive readable but
+ * dead, with a console full of violations.
+ *
+ * Rendering it dynamically costs nothing worth having. A 404 carries no
+ * content anyone needs prerendered and no crawler needs to index, which is the
+ * entire reason the marketing pages are static.
+ */
+export const dynamic = "force-dynamic";
+
+/**
  * A 404 on this site is disproportionately likely to be someone with an urgent
  * problem following a stale link or a mistyped URL. The priority is therefore
  * getting them to a phone number, not apologising decoratively.

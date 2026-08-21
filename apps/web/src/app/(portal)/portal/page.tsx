@@ -4,7 +4,7 @@ import {
   withCustomerScope,
   listDispatchBoard,
   listQuotes,
-  listInvoices,
+  listPortalInvoices,
   INVOICE_STATUS_LABEL,
 } from "@meridian/db";
 import { getService, STATUS_LABEL, formatMoney, toMinor, OPEN_STATUSES } from "@meridian/core";
@@ -36,16 +36,23 @@ export default async function PortalPage({
     async (tx) => ({
       jobs: await listDispatchBoard(tx, { statuses: OPEN_STATUSES, limit: 50 }),
       quotes: await listQuotes(tx, { limit: 20 }),
-      invoices: await listInvoices(tx, { limit: 20 }),
+      // `listPortalInvoices`, not `listInvoices`. The staff query returns
+      // drafts, and this page rendered them: a draft invoice is a working
+      // document whose amount can still change and which has no legal
+      // existence, so showing one publishes a figure the business has not
+      // committed to. Customer scope made the list safe across customers and
+      // did nothing about which of their own rows they should see.
+      invoices: await listPortalInvoices(tx, { limit: 20 }),
     }),
   );
 
   const awaitingDecision = quotes.filter((q) => q.status === "sent" || q.status === "viewed");
-  const unpaid = invoices.filter((i) => i.status !== "paid" && i.status !== "written_off");
-  const outstandingMinor = unpaid.reduce(
-    (sum, i) => sum + (toMinor(i.total) - toMinor(i.amountPaid)),
-    0,
-  );
+  const unpaid = invoices.filter((i) => i.outstandingMinor > 0);
+  // Summed from the row's own `outstandingMinor`, which already nets off credit
+  // notes. The previous arithmetic here was total minus paid, so a customer
+  // holding a credit note was shown a balance that included money they no
+  // longer owed.
+  const outstandingMinor = unpaid.reduce((sum, i) => sum + i.outstandingMinor, 0);
 
   return (
     <PortalShell session={session} active="portal">
@@ -134,6 +141,11 @@ export default async function PortalPage({
             <Clock size={18} weight="fill" aria-hidden style={{ color: "var(--accent)" }} />
             Work in progress
           </h2>
+          {/* POR-3. The dashboard shows open work; this is the way to the rest
+              of it, which is the question the phone call was about. */}
+          <Link href="/portal/requests" className="mt-2 inline-block text-[13px] font-medium" style={{ color: "var(--accent-text)" }}>
+            See every request, including completed ones
+          </Link>
           {jobs.length === 0 ? (
             <p className="prose-body mt-3 text-[14px]">Nothing open at the moment.</p>
           ) : (
@@ -164,6 +176,9 @@ export default async function PortalPage({
             <Receipt size={18} weight="fill" aria-hidden style={{ color: "var(--accent)" }} />
             Invoices
           </h2>
+          <Link href="/portal/invoices" className="mt-2 inline-block text-[13px] font-medium" style={{ color: "var(--accent-text)" }}>
+            All invoices, PDFs and your statement
+          </Link>
           {invoices.length === 0 ? (
             <p className="prose-body mt-3 text-[14px]">No invoices yet.</p>
           ) : (
@@ -177,12 +192,10 @@ export default async function PortalPage({
                       {i.dueOn
                         ? ` · due ${i.dueOn.toLocaleDateString("en-GB", { timeZone: "Asia/Dubai", dateStyle: "medium" })}`
                         : ""}
-                      {i.daysUntilDue !== null && i.daysUntilDue < 0 && i.status !== "paid"
-                        ? ` · ${Math.abs(i.daysUntilDue)} days overdue`
-                        : ""}
+                      {i.daysOverdue !== null ? ` · ${i.daysOverdue} days overdue` : ""}
                     </p>
                   </div>
-                  <p className="tnum text-[15px] font-semibold">{formatMoney(toMinor(i.total), i.currency)}</p>
+                  <p className="tnum text-[15px] font-semibold">{formatMoney(i.totalMinor, i.currency)}</p>
                 </li>
               ))}
             </ul>

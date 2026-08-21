@@ -136,3 +136,256 @@ CREATE POLICY customer_scope ON public.job_events
 --   FROM pg_policies
 --   WHERE schemaname = 'public' AND policyname = 'customer_scope'
 --     AND permissive <> 'RESTRICTIVE';
+
+-- =============================================================================
+-- Phase 2: the tables the portal reaches for `POR-3`, `POR-4` and `POR-5`.
+--
+-- ── EXCLUSION IS NOT DENIAL ─────────────────────────────────────────────────
+--
+-- The note above says `job_visits` is "deliberately excluded" because it
+-- carries technician identity. That reasoning is right about what the portal
+-- should *see* and wrong about what leaving the table out actually does: a
+-- table with no `customer_scope` policy is not closed to a portal session, it
+-- is open to it **tenant-wide**. The generic loop in rls.sql gives every table
+-- with a `tenant_id` its tenant policy and nothing narrower, so
+-- `SELECT * FROM job_visits` inside `withCustomerScope` returns every
+-- customer's visits, and the only thing standing between that and a leak is
+-- that no query happened to be written yet.
+--
+-- Two exactly this shape shipped and were caught by reading the code rather
+-- than by anything failing: `credit_notes` and `credit_note_lines` (above), and
+-- a staff download route gated on permission alone. So the rule applied from
+-- here is the opposite one — every table a portal session can name gets a
+-- policy, and the policy decides whether the answer is "your rows" or "none".
+--
+-- `job_visits` gets "your rows" and not "none", because `POR-3` requires the
+-- assigned visit window and the portal now legitimately needs it. What keeps
+-- the internal parts internal is the projection in `getPortalRequestDetail`, which
+-- selects the window and the technician's name and never the assignment score,
+-- the override reason or the geofence result. The policy is the boundary; the
+-- projection is the discretion. Both are needed and neither substitutes for the
+-- other.
+-- =============================================================================
+
+-- ── Job children, scoped through the parent job ─────────────────────────────
+DO $$
+DECLARE
+  t text;
+  -- Every table keyed by `job_id` that a portal session can name. `POR-3` and
+  -- `POR-9` put four of them on the request detail screen; `job_visits` is here
+  -- for the reason argued above.
+  via_job text[] := ARRAY[
+    'job_visits', 'job_reports', 'job_attachments', 'job_signoffs', 'job_materials'
+  ];
+BEGIN
+  FOREACH t IN ARRAY via_job LOOP
+    -- Skipped rather than failed if the table is absent, so this file stays
+    -- runnable against a database part-way through the migration set.
+    CONTINUE WHEN NOT EXISTS (
+      SELECT 1 FROM pg_class WHERE relname = t AND relkind = 'r'
+    );
+
+    EXECUTE format('DROP POLICY IF EXISTS customer_scope ON public.%I', t);
+    EXECUTE format($p$
+      CREATE POLICY customer_scope ON public.%1$I
+        AS RESTRICTIVE
+        USING (
+          app_current_customer() IS NULL
+          OR EXISTS (SELECT 1 FROM public.jobs j
+                      WHERE j.id = %1$I.job_id
+                        AND j.customer_id = app_current_customer())
+        )
+    $p$, t);
+  END LOOP;
+END
+$$;
+
+-- ── POR-5. Notification preferences ─────────────────────────────────────────
+-- Owned directly by the customer, and written by them: a portal user turning an
+-- event off is an INSERT or UPDATE from a portal session, so this one needs its
+-- WITH CHECK as much as its USING. Without the check a tampered `customerId`
+-- would let one customer switch off another's invoice notifications.
+DROP POLICY IF EXISTS customer_scope ON public.customer_notification_preferences;
+CREATE POLICY customer_scope ON public.customer_notification_preferences
+  AS RESTRICTIVE
+  USING (app_current_customer() IS NULL OR customer_id = app_current_customer())
+  WITH CHECK (app_current_customer() IS NULL OR customer_id = app_current_customer());
+
+-- ── Staff-only tables: closed to portal sessions entirely ───────────────────
+--
+-- These have no customer-facing reading at all, and "no policy" would leave
+-- them tenant-wide to a portal session for the reason set out at the top of
+-- this block. `app_current_customer() IS NULL` is the whole predicate: staff
+-- (GUC unset) are unaffected, and a portal session sees zero rows however the
+-- query is written.
+--
+--   * `leads` is the pre-sale pipeline — other people's enquiries, their phone
+--     numbers, what they were quoted and why they were lost.
+--   * `communications` is the internal record of what was said about a
+--     customer, including the sentence a salesperson wrote about them. `LEAD-9`
+--     asks for it to survive staff turnover, not to be published to the
+--     customer it is about.
+--   * `lead_disposition_reasons` is the vocabulary of why deals die.
+DO $$
+DECLARE
+  t text;
+  staff_only text[] := ARRAY['leads', 'communications', 'lead_disposition_reasons'];
+BEGIN
+  FOREACH t IN ARRAY staff_only LOOP
+    CONTINUE WHEN NOT EXISTS (
+      SELECT 1 FROM pg_class WHERE relname = t AND relkind = 'r'
+    );
+
+    EXECUTE format('DROP POLICY IF EXISTS customer_scope ON public.%I', t);
+    EXECUTE format($p$
+      CREATE POLICY customer_scope ON public.%I
+        AS RESTRICTIVE
+        USING (app_current_customer() IS NULL)
+        WITH CHECK (app_current_customer() IS NULL)
+    $p$, t);
+  END LOOP;
+END
+$$;
+
+-- ── The technician who came to your property ────────────────────────────────
+--
+-- `POR-3` shows "Yusuf is on his way" and names who attended, so a portal
+-- session has to read `technicians`. The generic backstop below would close it,
+-- and closing it does not merely hide a name — the visit query inner-joins this
+-- table, so an invisible technician silently removes the whole visit and the
+-- customer's appointment window disappears. That is how a blanket denial turns
+-- a privacy control into a missing feature.
+--
+-- The scope is therefore "a technician who has been sent to one of your jobs",
+-- not "any technician in the tenant". A customer cannot enumerate the workforce
+-- by asking; they can see the people who came to their own property.
+--
+-- Rows, not columns: this policy decides which technicians are visible, and the
+-- projection in `getPortalRequestDetail` is what keeps `assignment_score` and
+-- the geofence internal. Both are needed and they are not substitutes.
+DROP POLICY IF EXISTS customer_scope ON public.technicians;--> statement-breakpoint
+CREATE POLICY customer_scope ON public.technicians
+  AS RESTRICTIVE
+  USING (
+    app_current_customer() IS NULL
+    OR EXISTS (SELECT 1
+                 FROM job_visits v
+                 JOIN jobs j ON j.id = v.job_id
+                WHERE v.technician_id = technicians.id
+                  AND j.customer_id = app_current_customer())
+  )
+  WITH CHECK (app_current_customer() IS NULL);
+
+-- ── EVERYTHING ELSE IS CLOSED TO A PORTAL SESSION ───────────────────────────
+--
+-- The generic backstop, and the most important block in this file.
+--
+-- The rule this closes was found the expensive way. `job_visits` carried a
+-- comment saying it was "deliberately excluded" from customer scope because it
+-- holds technician identity — which was right about what the portal should see
+-- and wrong about what exclusion does. A table with no `customer_scope` policy
+-- is not closed to a portal session. It is open **tenant-wide**, because the
+-- generic loop in `rls.sql` gives it tenant isolation and nothing narrower. The
+-- omission that was meant to withhold a table was publishing it.
+--
+-- Seven more tables had the same hole. Fixing those seven fixed the instances
+-- and left the cause: a table is exposed unless somebody remembers, and the
+-- someone is a different person on a different stream every week. At the time
+-- this was written there were fifty tenant-scoped tables with no customer scope
+-- — `employees`, `wage_payments`, `salary_deductions`, `candidates`,
+-- `sessions`, `notifications`, `audit_log` among them. None of them had a
+-- portal query today. "No query today" is not an access control.
+--
+-- So the default is inverted here. Any tenant-scoped table that has not been
+-- given an explicit scope above is closed to a portal session outright, and a
+-- table added next month is closed before anyone has thought about it. Opening
+-- one is then a deliberate act: add it to a list above and say why.
+--
+-- ── THE WRITE SIDE, WHICH IS NOT UNIFORM ────────────────────────────────────
+--
+-- Reads are the disclosure risk and every table here is closed to them. Writes
+-- split in two, on whether the table names a customer:
+--
+--   * **No `customer_id` column** — the check is `true`. A portal session
+--     legitimately writes rows to tables it must never read: accepting a quote
+--     appends to `audit_log` and enqueues a `notification`. Repeating the USING
+--     expression there would break the portal, which is closing a hole by
+--     deleting the feature. RESTRICTIVE policies are ANDed, so a `true` check
+--     adds nothing and leaves `tenant_isolation`'s own check in force.
+--
+--   * **Has a `customer_id` column** — the check is the staff test. A table
+--     that names a customer and is not explicitly scoped above is one no portal
+--     session has any business writing, and leaving it at `true` means the
+--     database would accept a row naming *another* customer. `memberships` is
+--     the one that makes this concrete: it carries `customer_id` and it is how
+--     portal access is granted, so an unbounded write check is the difference
+--     between "no code path does that today" and "the database would refuse".
+--     Only the second survives the next feature.
+--
+-- The split was not designed. `WITH CHECK (true)` was applied uniformly first,
+-- and the invariant below — an unbounded write check may only sit on a table
+-- with no `customer_id` — was suggested as a way to detect the mistake. It
+-- found `memberships` and `user_invitations` on its first run.
+-- ── WHY THE BACKSTOP POLICY HAS ITS OWN NAME ────────────────────────────────
+--
+-- `customer_scope_default`, not `customer_scope`. The two names are what let
+-- this block be re-runnable without either clobbering the explicit policies
+-- above or being defeated by its own previous output.
+--
+-- Named the same, the loop had to skip any table that already had a policy —
+-- which meant it skipped tables carrying a *stale or wrong* one, and re-running
+-- the file could not repair them. That was found by mutation-testing check 13:
+-- a deliberately bad policy was written onto `memberships`, the check caught it
+-- correctly, and then re-applying this file did not put it back. A security file
+-- that cannot restore the state it declares is a file you cannot trust after an
+-- incident, which is the one moment you need to.
+--
+-- With separate names the loop owns its own policies outright: it drops and
+-- recreates `customer_scope_default` every run, and never touches a
+-- `customer_scope` written by hand above.
+DO $$
+DECLARE
+  t text;
+BEGIN
+  FOR t IN
+    SELECT c.relname
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND c.relkind = 'r'
+       AND EXISTS (
+         SELECT 1 FROM information_schema.columns col
+          WHERE col.table_schema = 'public'
+            AND col.table_name = c.relname
+            AND col.column_name = 'tenant_id')
+       AND NOT EXISTS (
+         SELECT 1 FROM pg_policy p
+          WHERE p.polrelid = c.oid
+            AND p.polname = 'customer_scope')
+     ORDER BY c.relname
+  LOOP
+    EXECUTE format('DROP POLICY IF EXISTS customer_scope_default ON public.%I', t);
+    -- Named-customer tables are closed to portal writes as well as reads.
+    IF EXISTS (SELECT 1 FROM information_schema.columns col
+                WHERE col.table_schema = 'public'
+                  AND col.table_name = t
+                  AND col.column_name = 'customer_id') THEN
+      EXECUTE format($p$
+        CREATE POLICY customer_scope_default ON public.%I
+          AS RESTRICTIVE
+          USING (app_current_customer() IS NULL)
+          WITH CHECK (app_current_customer() IS NULL)
+      $p$, t);
+      RAISE NOTICE 'customer scope: % closed to portal sessions (reads and writes)', t;
+    ELSE
+      EXECUTE format($p$
+        CREATE POLICY customer_scope_default ON public.%I
+          AS RESTRICTIVE
+          USING (app_current_customer() IS NULL)
+          WITH CHECK (true)
+      $p$, t);
+      RAISE NOTICE 'customer scope: % closed to portal reads', t;
+    END IF;
+  END LOOP;
+END
+$$;

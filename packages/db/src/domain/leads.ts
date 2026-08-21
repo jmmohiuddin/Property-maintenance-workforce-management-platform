@@ -1,15 +1,22 @@
-import { and, eq, desc, sql, isNull, inArray } from "drizzle-orm";
+import { and, eq, desc, sql, isNull, inArray, type SQL } from "drizzle-orm";
 import { db, withTenant, type TenantScopedTx, type TenantContext } from "../index";
 import * as schema from "../schema";
 import { loadWorkingCalendar, resolveDispositionReason } from "./reference";
 import {
   computeSlaDeadlines,
+  emailKey,
+  localPhoneKey,
+  FOLLOW_UP_DAYS_FOR_OUTCOME,
   OPEN_LEAD_STAGES,
+  type CommunicationChannel,
+  type CommunicationDirection,
+  type CommunicationOutcome,
   type JobPriority,
   type LeadStage,
   UserFacingError,
 } from "@meridian/core";
 import { nextJobReference } from "./jobs";
+import { rowDate, requiredRowDate } from "./_rows";
 
 /**
  * Leads.
@@ -184,7 +191,21 @@ export async function createLeadFromEnquiry(
       lead: { leadId: string; reference: string; isEmergency: boolean },
     ) => Promise<void>;
   },
-): Promise<{ leadId: string; reference: string; recipients: number }> {
+): Promise<{
+  leadId: string;
+  reference: string;
+  recipients: number;
+  /**
+   * `LEAD-5`. What this enquiry looks like it already is.
+   *
+   * Returned rather than acted on beyond the auto-link, because the caller here
+   * is the public quote form and the visitor must not be told "we already have
+   * you on file" — that is an account-existence oracle, and it is confirmable
+   * for any phone number somebody cares to try. The operator sees the matches
+   * on the lead screen; the visitor sees the same acknowledgement either way.
+   */
+  duplicates: DuplicateReport;
+}> {
   return withTenant({ tenantId, actorKind: "customer" }, async (tx) => {
     const [row] = await tx
       .insert(schema.leads)
@@ -240,9 +261,34 @@ export async function createLeadFromEnquiry(
       );
     }
 
+    // LEAD-5, closing PD-11. Run after the insert rather than before it, and
+    // deliberately: the enquiry is recorded whatever the matcher decides. A
+    // check that runs first and refuses is a form that silently drops the
+    // second call from a customer whose first one went unanswered, which is
+    // both the worst enquiry to lose and the one most likely to be a duplicate.
+    const duplicates = await findDuplicateMatches(tx, {
+      phone: enquiry.phone,
+      email: enquiry.email,
+      excludeLeadId: row.id,
+    });
+
+    // The strict tier's auto-link (phone AND email, exactly one match). It
+    // writes two pointers and nothing else: no field is copied, no row is
+    // merged, no stage is changed. An operator clearing a wrong link clears a
+    // column; an operator undoing a wrong merge restores a backup.
+    if (duplicates.autoLinkCustomerId || duplicates.autoLinkLeadId) {
+      await tx
+        .update(schema.leads)
+        .set({
+          matchedCustomerId: duplicates.autoLinkCustomerId,
+          duplicateOfLeadId: duplicates.autoLinkLeadId,
+        })
+        .where(eq(schema.leads.id, row.id));
+    }
+
     await hooks?.onCreated?.(tx, { leadId: row.id, reference, isEmergency });
 
-    return { leadId: row.id, reference, recipients: recipients.length };
+    return { leadId: row.id, reference, recipients: recipients.length, duplicates };
   });
 }
 
@@ -269,6 +315,11 @@ export interface LeadRow {
   readonly referrer: string | null;
   readonly calledNumber: string | null;
   readonly dispositionReasonId: string | null;
+  /** `LEAD-5`. Set by the strict matcher or by the link action. */
+  readonly matchedCustomerId: string | null;
+  readonly duplicateOfLeadId: string | null;
+  /** `LEAD-9`. The nurture clock, and what `LEAD-7`'s retention clock reads. */
+  readonly lastInteractionAt: Date;
 }
 
 export async function listLeads(
@@ -299,6 +350,9 @@ export async function listLeads(
       referrer: schema.leads.referrer,
       calledNumber: schema.leads.calledNumber,
       dispositionReasonId: schema.leads.dispositionReasonId,
+      matchedCustomerId: schema.leads.matchedCustomerId,
+      duplicateOfLeadId: schema.leads.duplicateOfLeadId,
+      lastInteractionAt: schema.leads.lastInteractionAt,
     })
     .from(schema.leads)
     // inArray, not a raw interpolated array literal. These values are internal
@@ -334,6 +388,9 @@ export async function getLead(tx: TenantScopedTx, leadId: string): Promise<LeadR
       referrer: schema.leads.referrer,
       calledNumber: schema.leads.calledNumber,
       dispositionReasonId: schema.leads.dispositionReasonId,
+      matchedCustomerId: schema.leads.matchedCustomerId,
+      duplicateOfLeadId: schema.leads.duplicateOfLeadId,
+      lastInteractionAt: schema.leads.lastInteractionAt,
     })
     .from(schema.leads)
     .where(eq(schema.leads.id, leadId))
@@ -617,4 +674,1047 @@ export async function leadAttributionSummary(
   ]);
 
   return { byChannel, byLandingPage, byCampaign, unattributed, days };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LEAD-5 · LEAD-8 · LEAD-9 — duplicates, search, and the communications log.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── LEAD-8. Keyset pagination ───────────────────────────────────────────────
+
+/**
+ * An opaque page cursor.
+ *
+ * ── WHY NOT OFFSET ─────────────────────────────────────────────────────────
+ *
+ * `TD-10` is "unbounded lists", and the reflex fix — `LIMIT 50 OFFSET 500` —
+ * fixes the symptom and keeps the bug. Two reasons, and the second is the one
+ * that actually costs somebody something:
+ *
+ *  1. `OFFSET 500` makes Postgres read and discard five hundred rows before it
+ *     returns anything, so page 11 costs eleven times page 1 and the list gets
+ *     slower the further anybody looks into it.
+ *  2. A lead recorded while somebody is paging shifts every subsequent row by
+ *     one. The record that was at the top of page 2 moves to the bottom of page
+ *     1, which the reader has already scrolled past — so it is never seen. A
+ *     sales queue that silently skips leads is worse than one that is slow.
+ *
+ * The cursor is `(created_at, id)`. `id` is in it because `created_at` is not
+ * unique: two leads recorded in the same millisecond make the boundary
+ * ambiguous and one of them is dropped or repeated forever.
+ *
+ * Base64url so it survives a query string without escaping, and opaque so that
+ * a caller cannot come to depend on its shape — this is a position in a result
+ * set, not an API.
+ */
+export interface Cursor {
+  readonly createdAt: Date;
+  readonly id: string;
+}
+
+export function encodeCursor(cursor: Cursor): string {
+  return Buffer.from(`${cursor.createdAt.toISOString()}|${cursor.id}`, "utf8").toString("base64url");
+}
+
+/**
+ * Decode a cursor, or null.
+ *
+ * Null rather than throwing, for every malformed input. This value arrives from
+ * a query string, so it is attacker-controlled and much more often simply
+ * stale — a bookmarked URL, a back button, a link somebody pasted into chat.
+ * The right behaviour for all of those is the first page, not a 500.
+ */
+export function decodeCursor(raw: string | null | undefined): Cursor | null {
+  if (!raw) return null;
+  try {
+    const [iso, id] = Buffer.from(raw, "base64url").toString("utf8").split("|");
+    if (!iso || !id) return null;
+    const createdAt = new Date(iso);
+    if (Number.isNaN(createdAt.getTime())) return null;
+    // Shape-checked, not merely non-empty: this id goes into a uuid comparison
+    // and a malformed one is an error from Postgres rather than an empty page.
+    if (!/^[0-9a-f-]{36}$/i.test(id)) return null;
+    return { createdAt, id };
+  } catch {
+    return null;
+  }
+}
+
+export interface Page<T> {
+  readonly rows: readonly T[];
+  /** Null on the last page. Present means there is more, definitively. */
+  readonly nextCursor: string | null;
+}
+
+/**
+ * The `LIMIT n + 1` trick, in one place.
+ *
+ * Asking for one more row than the page needs is how "is there a next page"
+ * becomes a fact rather than a guess. The alternative — a `count(*)` alongside
+ * every page — doubles the query cost to answer a question the extra row
+ * answers for free, and on a filtered search that count is the expensive half.
+ */
+function toPage<T extends { id: string; createdAt: Date }>(rows: T[], limit: number): Page<T> {
+  if (rows.length <= limit) return { rows, nextCursor: null };
+  const page = rows.slice(0, limit);
+  const last = page[page.length - 1];
+  return { rows: page, nextCursor: last ? encodeCursor({ createdAt: last.createdAt, id: last.id }) : null };
+}
+
+/** The largest page anybody may ask for. A limit a caller can set is not a limit. */
+const MAX_PAGE = 100;
+
+/**
+ * Build the text-search predicate (`LEAD-8`).
+ *
+ * ── ONE BOX, FOUR KINDS OF MATCH ───────────────────────────────────────────
+ *
+ * A person searching a lead list types one of four things and does not think of
+ * them as different: a name, a phone number, an email address, or a reference.
+ * Asking them which is a form; guessing from the shape is a search box.
+ *
+ * Phone goes through `app_phone_key` on both sides, the same comparison the
+ * duplicate matcher uses — so searching "050 123 4567" finds the lead stored as
+ * "+971501234567", and "04 555 0100" finds "+971 4 555 0100". Matching the raw
+ * strings finds neither.
+ *
+ * The name match is `ILIKE '%…%'`, which cannot use a btree index at all; that
+ * is why 0016 puts a trigram GIN index on `name`, and why this stays a plain
+ * ILIKE rather than becoming `to_tsvector` — full-text search stems words and
+ * would stop "Rash" matching "Rashid", which is the single most common way
+ * anybody uses this box.
+ */
+function searchPredicate(
+  q: string | undefined,
+  columns: { name: string; phone: string; email: string },
+): SQL | null {
+  const term = q?.trim();
+  if (!term) return null;
+
+  const like = `%${term.replace(/[%_\\]/g, (m) => `\\${m}`)}%`;
+  const phoneKey = localPhoneKey(term);
+  const email = emailKey(term);
+
+  // Every branch is a bound parameter. The column names come from the closed
+  // set the two callers pass, never from anything a user typed.
+  const clauses: SQL[] = [
+    sql`${sql.raw(columns.name)} ilike ${like}`,
+    sql`${sql.raw(columns.email)} is not null and lower(${sql.raw(columns.email)}) = ${email ?? ""}`,
+  ];
+
+  if (phoneKey) {
+    clauses.push(sql`app_phone_key(${sql.raw(columns.phone)}) = ${phoneKey}`);
+  }
+
+  return sql`(${sql.join(clauses, sql` or `)})`;
+}
+
+export interface LeadSearchRow extends LeadRow {
+  /** Resolved from `lead_disposition_reasons` so the list can show why. */
+  readonly dispositionLabel: string | null;
+}
+
+/**
+ * Search and page the lead list (`LEAD-8`, closing `TD-10` and `MB-016`).
+ *
+ * Server-side and indexed. The previous `listLeads` took a `limit` defaulting
+ * to 100 and had no second page at all, which is not "the first hundred leads",
+ * it is "every lead after the hundredth is invisible" — and nothing on the
+ * screen said so.
+ */
+export async function searchLeads(
+  tx: TenantScopedTx,
+  options?: {
+    q?: string | undefined;
+    stages?: readonly LeadStage[] | undefined;
+    cursor?: string | undefined;
+    limit?: number | undefined;
+    /** Only leads whose follow-up is due at or before this moment. */
+    followUpDueBy?: Date | undefined;
+  },
+): Promise<Page<LeadSearchRow>> {
+  const limit = Math.min(Math.max(options?.limit ?? 25, 1), MAX_PAGE);
+  const cursor = decodeCursor(options?.cursor);
+
+  const stages = options?.stages ? [...options.stages] : null;
+  const stageFilter =
+    stages && stages.length > 0
+      ? sql`and l.stage::text in (${sql.join(stages.map((s) => sql`${s}`), sql`, `)})`
+      : sql``;
+
+  const search = searchPredicate(options?.q, {
+    name: "l.name",
+    phone: "l.phone",
+    email: "l.email",
+  });
+
+  // Row-wise comparison, not `created_at < x OR (created_at = x AND id < y)`.
+  // Postgres can drive `(created_at, id) < (…, …)` straight off the
+  // `leads_keyset_idx` composite; the OR form usually cannot use it.
+  const keyset = cursor
+    ? sql`and (l.created_at, l.id) < (${cursor.createdAt.toISOString()}::timestamptz, ${cursor.id}::uuid)`
+    : sql``;
+
+  const followUp = options?.followUpDueBy
+    ? sql`and l.next_follow_up_at is not null and l.next_follow_up_at <= ${options.followUpDueBy.toISOString()}::timestamptz`
+    : sql``;
+
+  const rows = (await tx.execute<Record<string, never>>(sql`
+    select l.id, l.name, l.phone, l.email, l.service_slug, l.city, l.area,
+           l.stage::text as stage, l.message, l.created_at, l.next_follow_up_at,
+           l.converted_customer_id, l.channel, l.utm_source, l.utm_medium,
+           l.utm_campaign, l.landing_page, l.referrer, l.called_number,
+           l.disposition_reason_id, l.last_interaction_at, l.matched_customer_id,
+           l.duplicate_of_lead_id,
+           r.label as disposition_label
+      from leads l
+      left join lead_disposition_reasons r on r.id = l.disposition_reason_id
+     where l.deleted_at is null
+       ${stageFilter}
+       ${search ? sql`and ${search}` : sql``}
+       ${keyset}
+       ${followUp}
+     order by l.created_at desc, l.id desc
+     limit ${limit + 1}
+  `)) as unknown as {
+    id: string;
+    name: string;
+    phone: string | null;
+    email: string | null;
+    service_slug: string | null;
+    city: string | null;
+    area: string | null;
+    stage: string;
+    message: string | null;
+    created_at: string;
+    next_follow_up_at: string | null;
+    converted_customer_id: string | null;
+    channel: string;
+    utm_source: string | null;
+    utm_medium: string | null;
+    utm_campaign: string | null;
+    landing_page: string | null;
+    referrer: string | null;
+    called_number: string | null;
+    disposition_reason_id: string | null;
+    last_interaction_at: string;
+    matched_customer_id: string | null;
+    duplicate_of_lead_id: string | null;
+    disposition_label: string | null;
+  }[];
+
+  return toPage(
+    rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      phone: r.phone,
+      email: r.email,
+      serviceSlug: r.service_slug,
+      city: r.city,
+      area: r.area,
+      stage: r.stage as LeadStage,
+      message: r.message,
+      createdAt: requiredRowDate(r.created_at),
+      nextFollowUpAt: rowDate(r.next_follow_up_at),
+      convertedCustomerId: r.converted_customer_id,
+      channel: r.channel,
+      utmSource: r.utm_source,
+      utmMedium: r.utm_medium,
+      utmCampaign: r.utm_campaign,
+      landingPage: r.landing_page,
+      referrer: r.referrer,
+      calledNumber: r.called_number,
+      dispositionReasonId: r.disposition_reason_id,
+      lastInteractionAt: requiredRowDate(r.last_interaction_at),
+      matchedCustomerId: r.matched_customer_id,
+      duplicateOfLeadId: r.duplicate_of_lead_id,
+      dispositionLabel: r.disposition_label,
+    })),
+    limit,
+  );
+}
+
+export interface CustomerSearchRow {
+  readonly id: string;
+  readonly createdAt: Date;
+  readonly code: string;
+  readonly name: string;
+  readonly phone: string | null;
+  readonly billingEmail: string | null;
+  readonly isActive: boolean;
+  readonly propertyCount: number;
+}
+
+/**
+ * Search and page the customer list (`LEAD-8`).
+ *
+ * Here rather than in `domain/customers.ts` for a boring reason worth stating
+ * plainly: that file belongs to another workstream this week and appending to
+ * it would collide at integration. The search predicate and the cursor are
+ * shared with `searchLeads` above, so the two lists behave identically — the
+ * same box finds a phone number the same way in both, which is the property a
+ * user actually notices. Moving this next to the other customer queries is a
+ * one-line change whenever that file is free.
+ */
+export async function searchCustomers(
+  tx: TenantScopedTx,
+  options?: { q?: string | undefined; cursor?: string | undefined; limit?: number | undefined },
+): Promise<Page<CustomerSearchRow>> {
+  const limit = Math.min(Math.max(options?.limit ?? 25, 1), MAX_PAGE);
+  const cursor = decodeCursor(options?.cursor);
+
+  const search = searchPredicate(options?.q, {
+    name: "c.name",
+    phone: "c.phone",
+    email: "c.billing_email",
+  });
+
+  const keyset = cursor
+    ? sql`and (c.created_at, c.id) < (${cursor.createdAt.toISOString()}::timestamptz, ${cursor.id}::uuid)`
+    : sql``;
+
+  const rows = (await tx.execute<Record<string, never>>(sql`
+    select c.id, c.created_at, c.code, c.name, c.phone, c.billing_email, c.is_active,
+           (select count(*) from properties p
+             where p.customer_id = c.id and p.deleted_at is null) as property_count
+      from customers c
+     where c.deleted_at is null
+       ${search ? sql`and ${search}` : sql``}
+       ${keyset}
+     order by c.created_at desc, c.id desc
+     limit ${limit + 1}
+  `)) as unknown as {
+    id: string;
+    created_at: string;
+    code: string;
+    name: string;
+    phone: string | null;
+    billing_email: string | null;
+    is_active: boolean;
+    property_count: string;
+  }[];
+
+  return toPage(
+    rows.map((r) => ({
+      id: r.id,
+      createdAt: requiredRowDate(r.created_at),
+      code: r.code,
+      name: r.name,
+      phone: r.phone,
+      billingEmail: r.billing_email,
+      isActive: r.is_active,
+      propertyCount: Number(r.property_count),
+    })),
+    limit,
+  );
+}
+
+// ── LEAD-5. Duplicate detection ─────────────────────────────────────────────
+
+export type DuplicateKind = "lead" | "customer";
+
+export interface DuplicateMatch {
+  readonly kind: DuplicateKind;
+  readonly id: string;
+  readonly name: string;
+  readonly phone: string | null;
+  readonly email: string | null;
+  /** True when phone AND email both matched — the strict tier. */
+  readonly isStrict: boolean;
+  /** For a lead: which stage it is in. For a customer: null. */
+  readonly stage: LeadStage | null;
+  readonly lastSeenAt: Date;
+}
+
+export interface DuplicateReport {
+  readonly matches: readonly DuplicateMatch[];
+  /** The strict customer match, if there is exactly one. Safe to auto-link. */
+  readonly autoLinkCustomerId: string | null;
+  /** The strict lead match, if there is exactly one. Safe to auto-link. */
+  readonly autoLinkLeadId: string | null;
+}
+
+/**
+ * Find the leads and customers this enquiry might already be (`LEAD-5`,
+ * closing `PD-11` and `MB-015`).
+ *
+ * ── THE TWO TIERS, AND WHY THEY ARE DIFFERENT ACTIONS ──────────────────────
+ *
+ * The requirement asks for a loose matcher that *suggests* and a strict matcher
+ * that may *auto-link*, and the distinction is not fussiness — it is the
+ * difference between two acceptable failures.
+ *
+ *  * **Loose** is phone OR email. It is right often and wrong sometimes: an
+ *    office switchboard, a facilities manager who gives their own mobile for
+ *    three buildings, a family sharing an address. Being wrong costs somebody
+ *    dismissing a suggestion, so it suggests.
+ *  * **Strict** is phone AND email, both matching the same record. Being wrong
+ *    there costs two customers merged into one, and the amount of manual work
+ *    to unpick that is why it links rather than merges: `matched_customer_id`
+ *    is a pointer that can be cleared, not a write into the other record.
+ *
+ * Auto-link is refused when strict matches more than one record. Two records
+ * both carrying the same phone and the same email is itself a duplicate that
+ * somebody has to look at, and picking one arbitrarily would hide it.
+ *
+ * ── WHY THE PHONE COMPARISON IS NOT `=` ────────────────────────────────────
+ *
+ * "+971 50 123 4567", "050 123 4567" and "00971501234567" are one number
+ * written three ways, and every one of them appears in a real database. Both
+ * sides go through `app_phone_key`, which reduces a number to its national
+ * significant form — country code and trunk zero removed — and which the
+ * functional index in 0016 is built on, so this is an index lookup and not a
+ * scan. Note that it is not "the last nine digits": that works for mobiles and
+ * silently fails for the eight-digit landline an owners association answers on.
+ */
+export async function findDuplicateMatches(
+  tx: TenantScopedTx,
+  input: {
+    phone?: string | null | undefined;
+    email?: string | null | undefined;
+    /** The lead being checked, so it does not match itself on convert. */
+    excludeLeadId?: string | undefined;
+  },
+): Promise<DuplicateReport> {
+  const phoneKey = localPhoneKey(input.phone);
+  const email = emailKey(input.email);
+
+  // Nothing to match on is not an error and not an empty result to be
+  // interpreted: a walk-in with a name and no contact details genuinely has no
+  // duplicate signal, and reporting "no duplicates" for it would be a claim
+  // this function cannot make.
+  if (!phoneKey && !email) return { matches: [], autoLinkCustomerId: null, autoLinkLeadId: null };
+
+  const exclude = input.excludeLeadId ?? null;
+
+  const rows = (await tx.execute<{
+    kind: string;
+    id: string;
+    name: string;
+    phone: string | null;
+    email: string | null;
+    phone_hit: boolean;
+    email_hit: boolean;
+    stage: string | null;
+    last_seen_at: string;
+  }>(sql`
+      select 'lead'::text as kind,
+             l.id, l.name, l.phone, l.email,
+             (app_phone_key(l.phone) is not null and app_phone_key(l.phone) = ${phoneKey}) as phone_hit,
+             (l.email is not null and lower(l.email) = ${email}) as email_hit,
+             l.stage::text as stage,
+             greatest(l.created_at, l.last_interaction_at) as last_seen_at
+        from leads l
+       where l.deleted_at is null
+         and (${exclude}::uuid is null or l.id <> ${exclude}::uuid)
+         and (
+           (app_phone_key(l.phone) is not null and app_phone_key(l.phone) = ${phoneKey})
+           or (l.email is not null and lower(l.email) = ${email})
+         )
+
+       union all
+
+      -- Customers matched on the account's own phone and billing email, and
+      -- through their contacts. A building manager's mobile is on the contact
+      -- row far more often than on the customer row, so checking only the
+      -- customer record finds the enquiry is new when it is the third one from
+      -- the same person this year.
+      select 'customer',
+             cu.id, cu.name, cu.phone, cu.billing_email,
+             bool_or(app_phone_key(coalesce(ct.phone, cu.phone)) = ${phoneKey}),
+             bool_or(lower(coalesce(ct.email, cu.billing_email)) = ${email}),
+             null,
+             cu.created_at
+        from customers cu
+        left join customer_contacts ct
+               on ct.customer_id = cu.id and ct.deleted_at is null
+       where cu.deleted_at is null
+         and (
+           app_phone_key(cu.phone) = ${phoneKey}
+           or lower(cu.billing_email) = ${email}
+           or app_phone_key(ct.phone) = ${phoneKey}
+           or lower(ct.email) = ${email}
+         )
+       group by cu.id, cu.name, cu.phone, cu.billing_email, cu.created_at
+
+       order by last_seen_at desc
+       limit 20
+  `)) as unknown as {
+    kind: string;
+    id: string;
+    name: string;
+    phone: string | null;
+    email: string | null;
+    phone_hit: boolean;
+    email_hit: boolean;
+    stage: string | null;
+    last_seen_at: string;
+  }[];
+
+  const matches: DuplicateMatch[] = rows.map((r) => ({
+    kind: r.kind as DuplicateKind,
+    id: r.id,
+    name: r.name,
+    phone: r.phone,
+    email: r.email,
+    // Strict requires BOTH signals to have been available and both to have hit.
+    // An enquiry with no email cannot produce a strict match however well the
+    // phone matches, which is the point: one signal is a suggestion.
+    isStrict: Boolean(phoneKey && email && r.phone_hit && r.email_hit),
+    stage: (r.stage as LeadStage | null) ?? null,
+    lastSeenAt: requiredRowDate(r.last_seen_at),
+  }));
+
+  const strictCustomers = matches.filter((m) => m.isStrict && m.kind === "customer");
+  const strictLeads = matches.filter((m) => m.isStrict && m.kind === "lead");
+
+  return {
+    matches,
+    // Exactly one, or nothing. Ambiguity is escalated to a person rather than
+    // resolved by whichever row the planner returned first.
+    autoLinkCustomerId: strictCustomers.length === 1 ? (strictCustomers[0]?.id ?? null) : null,
+    autoLinkLeadId: strictLeads.length === 1 ? (strictLeads[0]?.id ?? null) : null,
+  };
+}
+
+/**
+ * Record the merge-or-link decision (`LEAD-5`).
+ *
+ * ── WHY THIS LINKS AND DOES NOT MERGE ──────────────────────────────────────
+ *
+ * "Merge" in a CRM usually means: copy the fields across, repoint the children,
+ * delete one row. Every part of that is irreversible and at least one part is
+ * always wrong — the older record has the better address, the newer one has the
+ * current phone, and whichever way the copy runs somebody loses the field they
+ * cared about.
+ *
+ * So both rows stay. The duplicate points at the original, the communications
+ * log follows the pointer, and the pipeline stops counting the same enquiry
+ * twice because a linked lead is closed with a reason. Nothing is destroyed, so
+ * a mistaken link is undone by clearing a column instead of by a restore.
+ *
+ * The disposition reason is required rather than defaulted, and it is required
+ * by the same CHECK that governs every other closure: a lead that leaves the
+ * pipeline without a coded reason is a hole in the funnel report, and
+ * "duplicate" is one of the more useful things that report can say.
+ */
+export async function linkDuplicateLead(
+  tx: TenantScopedTx,
+  input: {
+    leadId: string;
+    /** The earlier lead this repeats, if any. */
+    duplicateOfLeadId?: string | undefined;
+    /** The existing customer this enquiry is from, if any. */
+    matchedCustomerId?: string | undefined;
+    /** Required to close the duplicate. Omit to link without closing. */
+    dispositionReasonId?: string | undefined;
+  },
+): Promise<void> {
+  if (input.duplicateOfLeadId === input.leadId) {
+    throw new UserFacingError("A lead cannot be a duplicate of itself.");
+  }
+
+  // Resolved rather than trusted. Under RLS an id from another tenant returns
+  // nothing here, so this is also the cross-tenant check.
+  if (input.duplicateOfLeadId) {
+    const target = await getLead(tx, input.duplicateOfLeadId);
+    if (!target) throw new UserFacingError("That lead is not one this can be linked to.");
+  }
+
+  await tx
+    .update(schema.leads)
+    .set({
+      duplicateOfLeadId: input.duplicateOfLeadId ?? null,
+      matchedCustomerId: input.matchedCustomerId ?? null,
+      lastInteractionAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .where(eq(schema.leads.id, input.leadId));
+
+  if (input.dispositionReasonId) {
+    // Through `setLeadStage`, not a direct update, so the controlled-list check
+    // and the database CHECK both still apply. A second closure path that
+    // skipped them is how free text gets back into the reason field.
+    await setLeadStage(tx, input.leadId, "lost", {
+      dispositionReasonId: input.dispositionReasonId,
+      note: input.duplicateOfLeadId
+        ? `Duplicate of lead ${input.duplicateOfLeadId.slice(0, 8).toUpperCase()}`
+        : "Existing customer",
+    });
+  }
+}
+
+// ── LEAD-9. Communications log ──────────────────────────────────────────────
+
+export interface CommunicationRow {
+  readonly id: string;
+  readonly channel: string;
+  readonly direction: string;
+  readonly subject: string | null;
+  readonly body: string | null;
+  readonly outcome: string | null;
+  readonly authorName: string | null;
+  readonly isAutomated: boolean;
+  readonly occurredAt: Date;
+}
+
+/**
+ * Log one touch (`LEAD-9`).
+ *
+ * ── ONE CLICK AND ONE SENTENCE ─────────────────────────────────────────────
+ *
+ * The requirement is explicit about the interaction cost, and it is the whole
+ * design constraint: a log that takes longer than writing on a pad does not get
+ * written, and a communications table nobody writes to is what
+ * `communications` has been since it was created. So `channel`, `direction`
+ * and `occurredAt` all default, and the only thing the caller must supply is
+ * the sentence.
+ *
+ * ── THE SIDE EFFECT IS THE POINT ───────────────────────────────────────────
+ *
+ * Logging a call winds two clocks. `last_interaction_at` becomes true, which is
+ * what the nurture queue and `LEAD-7`'s retention clock both read; and the
+ * outcome sets a default follow-up, because "one click and one sentence" cannot
+ * also mean "and now pick a date". A call logged with no next step is a lead
+ * dropped by accident rather than by decision.
+ *
+ * An explicit `nextFollowUpAt` always wins over the outcome's default —
+ * including an explicit null, which means "no follow-up, deliberately".
+ */
+export async function logCommunication(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    leadId?: string | undefined;
+    customerId?: string | undefined;
+    jobId?: string | undefined;
+    channel: CommunicationChannel;
+    direction?: CommunicationDirection | undefined;
+    subject?: string | undefined;
+    /** The sentence. This is the required field. */
+    body: string;
+    outcome?: CommunicationOutcome | undefined;
+    occurredAt?: Date | undefined;
+    /** Explicit, including explicit null. Undefined means "use the default". */
+    nextFollowUpAt?: Date | null | undefined;
+  },
+): Promise<{ communicationId: string }> {
+  const body = input.body.trim();
+  if (!body) throw new UserFacingError("Say what happened, in a sentence.");
+  if (!input.leadId && !input.customerId && !input.jobId) {
+    throw new UserFacingError("A logged communication has to be about a lead, a customer or a job.");
+  }
+
+  const occurredAt = input.occurredAt ?? new Date();
+
+  const [row] = await tx
+    .insert(schema.communications)
+    .values({
+      tenantId: ctx.tenantId,
+      leadId: input.leadId ?? null,
+      customerId: input.customerId ?? null,
+      jobId: input.jobId ?? null,
+      channel: input.channel,
+      direction: input.direction ?? "outbound",
+      subject: input.subject?.trim() || null,
+      body,
+      outcome: input.outcome ?? null,
+      authorId: ctx.userId ?? null,
+      isAutomated: ctx.actorKind === "ai" || ctx.actorKind === "system",
+      occurredAt,
+    })
+    .returning({ id: schema.communications.id });
+
+  if (!row) throw new Error("Could not log the communication");
+
+  if (input.leadId) {
+    const defaultDays = input.outcome ? FOLLOW_UP_DAYS_FOR_OUTCOME[input.outcome] : null;
+    const nextFollowUpAt =
+      input.nextFollowUpAt !== undefined
+        ? input.nextFollowUpAt
+        : defaultDays === null
+          ? undefined // Leave whatever was already there.
+          : new Date(occurredAt.getTime() + defaultDays * 24 * 60 * 60 * 1000);
+
+    await tx
+      .update(schema.leads)
+      .set({
+        lastInteractionAt: occurredAt,
+        ...(nextFollowUpAt !== undefined ? { nextFollowUpAt } : {}),
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.leads.id, input.leadId));
+  }
+
+  return { communicationId: row.id };
+}
+
+/**
+ * The history for one lead or one customer (`LEAD-9`).
+ *
+ * A lead that has been linked to an earlier one shows the earlier one's log as
+ * well, through `duplicate_of_lead_id`. That is the reason linking is worth
+ * anything: the second enquiry from the same person is only useful if it
+ * arrives carrying what was said the first time.
+ */
+export async function listCommunications(
+  tx: TenantScopedTx,
+  input: { leadId?: string | undefined; customerId?: string | undefined; limit?: number | undefined },
+): Promise<readonly CommunicationRow[]> {
+  const limit = Math.min(input.limit ?? 50, 200);
+
+  const scope = input.leadId
+    ? sql`c.lead_id in (
+            select ${input.leadId}::uuid
+             union
+            select l.duplicate_of_lead_id from leads l where l.id = ${input.leadId}::uuid
+              and l.duplicate_of_lead_id is not null
+          )`
+    : input.customerId
+      ? sql`c.customer_id = ${input.customerId}::uuid`
+      : null;
+
+  if (!scope) return [];
+
+  const rows = (await tx.execute<{
+    id: string;
+    channel: string;
+    direction: string;
+    subject: string | null;
+    body: string | null;
+    outcome: string | null;
+    author_name: string | null;
+    is_automated: boolean;
+    occurred_at: string;
+  }>(sql`
+    select c.id, c.channel, c.direction, c.subject, c.body, c.outcome,
+           u.full_name as author_name, c.is_automated, c.occurred_at
+      from communications c
+      left join users u on u.id = c.author_id
+     where ${scope}
+       and c.deleted_at is null
+     order by c.occurred_at desc, c.created_at desc
+     limit ${limit}
+  `)) as unknown as {
+    id: string;
+    channel: string;
+    direction: string;
+    subject: string | null;
+    body: string | null;
+    outcome: string | null;
+    author_name: string | null;
+    is_automated: boolean;
+    occurred_at: string;
+  }[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    channel: r.channel,
+    direction: r.direction,
+    subject: r.subject,
+    body: r.body,
+    outcome: r.outcome,
+    authorName: r.author_name,
+    isAutomated: r.is_automated,
+    occurredAt: requiredRowDate(r.occurred_at),
+  }));
+}
+
+/**
+ * Set or clear a follow-up date by hand.
+ *
+ * Separate from `logCommunication` because deferring a lead is not the same
+ * event as talking to somebody, and recording "called, no answer" against a
+ * lead nobody called would corrupt the only metric the log produces.
+ */
+export async function setLeadFollowUp(
+  tx: TenantScopedTx,
+  leadId: string,
+  nextFollowUpAt: Date | null,
+): Promise<void> {
+  await tx
+    .update(schema.leads)
+    .set({ nextFollowUpAt, updatedAt: new Date() })
+    .where(eq(schema.leads.id, leadId));
+}
+
+// ── Nurture and the disposition report ──────────────────────────────────────
+
+export interface NurtureRow {
+  readonly id: string;
+  readonly name: string;
+  readonly phone: string | null;
+  readonly email: string | null;
+  readonly stage: LeadStage;
+  readonly nextFollowUpAt: Date | null;
+  readonly lastInteractionAt: Date;
+  readonly daysSinceInteraction: number;
+  readonly daysOverdue: number | null;
+  readonly channel: string;
+}
+
+export interface NurtureQueue {
+  /** Follow-up date has passed. Somebody said they would call and has not. */
+  readonly overdue: readonly NurtureRow[];
+  /** Open, no follow-up set, and nothing has happened for `coldAfterDays`. */
+  readonly goingCold: readonly NurtureRow[];
+  readonly coldAfterDays: number;
+}
+
+/**
+ * What needs chasing (`LEAD-9`'s reason for existing).
+ *
+ * ── TWO LISTS, BECAUSE THEY ARE TWO DIFFERENT FAILURES ─────────────────────
+ *
+ * **Overdue** is a promise not kept: a date was set and it has passed. Somebody
+ * decided to call on Sunday and did not.
+ *
+ * **Going cold** is worse and is invisible without this query: an open lead
+ * with no follow-up date at all. Nothing is overdue because nothing was ever
+ * promised, so it appears on no list, breaches no deadline, and sits in
+ * `contacted` until the quarter ends. `last_interaction_at` is what makes it
+ * findable — it is the difference between "no news" and "nobody has touched
+ * this in five weeks".
+ *
+ * Both are capped and ordered oldest-first, because a queue that shows the
+ * newest neglect first is a queue that never reaches the oldest.
+ */
+export async function leadNurtureQueue(
+  tx: TenantScopedTx,
+  options?: { now?: Date; coldAfterDays?: number; limit?: number },
+): Promise<NurtureQueue> {
+  const now = options?.now ?? new Date();
+  const coldAfterDays = options?.coldAfterDays ?? 14;
+  const limit = Math.min(options?.limit ?? 25, 100);
+
+  const openStages = sql.join(
+    OPEN_LEAD_STAGES.map((s) => sql`${s}`),
+    sql`, `,
+  );
+
+  const rows = (await tx.execute<{
+    bucket: string;
+    id: string;
+    name: string;
+    phone: string | null;
+    email: string | null;
+    stage: string;
+    next_follow_up_at: string | null;
+    last_interaction_at: string;
+    channel: string;
+  }>(sql`
+    with open_leads as (
+      select l.* from leads l
+       where l.deleted_at is null
+         and l.stage::text in (${openStages})
+         and l.converted_customer_id is null
+         -- A lead already linked to an earlier one is not a second thing to
+         -- chase. Chasing both is how somebody gets called twice about the
+         -- same enquiry by two different people.
+         and l.duplicate_of_lead_id is null
+    )
+    (select 'overdue'::text as bucket, id, name, phone, email, stage::text,
+            next_follow_up_at, last_interaction_at, channel
+       from open_leads
+      where next_follow_up_at is not null
+        and next_follow_up_at <= ${now.toISOString()}::timestamptz
+      order by next_follow_up_at asc
+      limit ${limit})
+
+    union all
+
+    (select 'cold', id, name, phone, email, stage::text,
+            next_follow_up_at, last_interaction_at, channel
+       from open_leads
+      where next_follow_up_at is null
+        and last_interaction_at < ${now.toISOString()}::timestamptz
+                                  - make_interval(days => ${coldAfterDays})
+      order by last_interaction_at asc
+      limit ${limit})
+  `)) as unknown as {
+    bucket: string;
+    id: string;
+    name: string;
+    phone: string | null;
+    email: string | null;
+    stage: string;
+    next_follow_up_at: string | null;
+    last_interaction_at: string;
+    channel: string;
+  }[];
+
+  const toRow = (r: (typeof rows)[number]): NurtureRow => {
+    const lastInteractionAt = requiredRowDate(r.last_interaction_at);
+    const nextFollowUpAt = rowDate(r.next_follow_up_at);
+
+    return {
+      id: r.id,
+      name: r.name,
+      phone: r.phone,
+      email: r.email,
+      stage: r.stage as LeadStage,
+      nextFollowUpAt,
+      lastInteractionAt,
+      daysSinceInteraction: Math.floor(
+        (now.getTime() - lastInteractionAt.getTime()) / 86_400_000,
+      ),
+      daysOverdue: nextFollowUpAt
+        ? Math.floor((now.getTime() - nextFollowUpAt.getTime()) / 86_400_000)
+        : null,
+      channel: r.channel,
+    };
+  };
+
+  return {
+    overdue: rows.filter((r) => r.bucket === "overdue").map(toRow),
+    goingCold: rows.filter((r) => r.bucket === "cold").map(toRow),
+    coldAfterDays,
+  };
+}
+
+export interface DispositionCount {
+  readonly reasonId: string | null;
+  readonly code: string;
+  readonly label: string;
+  readonly appliesTo: string;
+  readonly leads: number;
+  /** Share of closures in this scope, 0–1. Computed here so two screens agree. */
+  readonly share: number;
+}
+
+export interface LeadFunnelReport {
+  readonly days: number;
+  readonly byStage: readonly { readonly stage: LeadStage; readonly leads: number }[];
+  readonly total: number;
+  readonly won: number;
+  readonly lost: number;
+  readonly dormant: number;
+  /** Won as a share of everything that reached a terminal stage. */
+  readonly winRate: number;
+  readonly lostReasons: readonly DispositionCount[];
+  readonly dormantReasons: readonly DispositionCount[];
+  /** Closures with no reason attached. Should be zero; if it is not, say so. */
+  readonly unreasoned: number;
+  readonly medianDaysToClose: number | null;
+}
+
+/**
+ * The report `lead_disposition_reasons` was built for (`LEAD-6`, `LEAD-9`).
+ *
+ * 0012 created the controlled vocabulary, `setLeadStage` enforces it and a
+ * database CHECK backs that up — and until now nothing read it. A taxonomy
+ * that is collected and never reported is a form field that costs the operator
+ * three seconds a lead and returns nothing, which is exactly how a controlled
+ * list turns into a field everybody sets to the first option.
+ *
+ * ── WHY LOST AND DORMANT ARE REPORTED SEPARATELY ───────────────────────────
+ *
+ * `applies_to` exists because they are different questions. Lost is "this will
+ * not happen": price, competitor, scope we do not do — and the answer changes
+ * what is quoted. Dormant is "not now": budget year, tenant moving out, waiting
+ * on the landlord — and the answer changes *when to call back*. Adding them
+ * together produces a single "why we do not win" number that is wrong in both
+ * directions, understating the pipeline still available and overstating the
+ * losses.
+ *
+ * `unreasoned` is deliberately surfaced rather than filtered out. It should
+ * always be zero — the CHECK constraint sees to that for anything closed after
+ * 0012 — and a non-zero value means historical rows predate the constraint. A
+ * report that quietly drops them shows percentages that do not add up and
+ * nobody can see why.
+ */
+export async function leadDispositionReport(
+  tx: TenantScopedTx,
+  options?: { days?: number },
+): Promise<LeadFunnelReport> {
+  const days = options?.days ?? 90;
+
+  const stageRows = (await tx.execute<{ stage: string; leads: string }>(sql`
+    select stage::text as stage, count(*) as leads
+      from leads
+     where deleted_at is null
+       and created_at >= now() - make_interval(days => ${days})
+     group by 1
+  `)) as unknown as { stage: string; leads: string }[];
+
+  const reasonRows = (await tx.execute<{
+    stage: string;
+    reason_id: string | null;
+    code: string | null;
+    label: string | null;
+    applies_to: string | null;
+    leads: string;
+  }>(sql`
+    select l.stage::text as stage,
+           r.id as reason_id,
+           r.code,
+           r.label,
+           r.applies_to,
+           count(*) as leads
+      from leads l
+      left join lead_disposition_reasons r on r.id = l.disposition_reason_id
+     where l.deleted_at is null
+       and l.stage in ('lost', 'dormant')
+       and l.created_at >= now() - make_interval(days => ${days})
+     group by 1, 2, 3, 4, 5
+     order by count(*) desc, r.label
+  `)) as unknown as {
+    stage: string;
+    reason_id: string | null;
+    code: string | null;
+    label: string | null;
+    applies_to: string | null;
+    leads: string;
+  }[];
+
+  // Median rather than mean. One lead reopened after eight months drags an
+  // average past every real number in the set, and the figure is read as
+  // "how long does this normally take".
+  const cycleRows = (await tx.execute<{ median_days: string | null }>(sql`
+    select percentile_cont(0.5) within group (
+             order by extract(epoch from (updated_at - created_at)) / 86400
+           ) as median_days
+      from leads
+     where deleted_at is null
+       and stage in ('won', 'lost')
+       and created_at >= now() - make_interval(days => ${days})
+  `)) as unknown as { median_days: string | null }[];
+
+  const byStage = stageRows.map((r) => ({ stage: r.stage as LeadStage, leads: Number(r.leads) }));
+  const total = byStage.reduce((sum, r) => sum + r.leads, 0);
+  const countOf = (stage: LeadStage) => byStage.find((r) => r.stage === stage)?.leads ?? 0;
+
+  const won = countOf("won");
+  const lost = countOf("lost");
+  const dormant = countOf("dormant");
+  const closed = won + lost;
+
+  const bucket = (stage: "lost" | "dormant"): DispositionCount[] => {
+    const rows = reasonRows.filter((r) => r.stage === stage && r.reason_id);
+    const stageTotal = rows.reduce((sum, r) => sum + Number(r.leads), 0);
+    return rows.map((r) => ({
+      reasonId: r.reason_id,
+      code: r.code ?? "unknown",
+      label: r.label ?? "No reason recorded",
+      appliesTo: r.applies_to ?? "both",
+      leads: Number(r.leads),
+      share: stageTotal > 0 ? Number(r.leads) / stageTotal : 0,
+    }));
+  };
+
+  const medianDays = cycleRows[0]?.median_days;
+
+  return {
+    days,
+    byStage,
+    total,
+    won,
+    lost,
+    dormant,
+    winRate: closed > 0 ? won / closed : 0,
+    lostReasons: bucket("lost"),
+    dormantReasons: bucket("dormant"),
+    unreasoned: reasonRows.filter((r) => !r.reason_id).reduce((sum, r) => sum + Number(r.leads), 0),
+    medianDaysToClose: medianDays === null || medianDays === undefined ? null : Number(medianDays),
+  };
 }

@@ -11,3 +11,7 @@ export * from "./staff";
 export * from "./cron";
 export * from "./retention";
 export * from "./reference";
+export * from "./contracts";
+export * from "./reporting";
+export * from "./recruitment";
+export * from "./hr";

@@ -2,6 +2,7 @@ import { withTenant } from "@meridian/db";
 import { activeTenantIds } from "@meridian/db/domain";
 import { dispatchPending, stuckNotifications, selectTransport } from "@meridian/notify";
 import { runCron } from "@/lib/cron";
+import { queueCustomerNotifications } from "@/lib/customer-notifications";
 
 /**
  * Drain the notification queue. Every 5 minutes.
@@ -36,8 +37,20 @@ export async function GET(request: Request) {
     let abandonedTotal = 0;
     /** Claimed and never resolved — a dispatcher that died holding them. */
     let stranded = 0;
+    /** POR-5. Queued by the sweep just now, before anything is drained. */
+    let customerQueued = 0;
+    let customerUnreachable = 0;
 
     for (const tenantId of tenants) {
+      // POR-5, and it runs BEFORE the drain rather than after it, so a message
+      // the sweep discovers this minute goes out this minute instead of waiting
+      // five for the next tick. The sweep is idempotent — it queues only what
+      // the notifications ledger does not already name — so running it on every
+      // dispatch cycle costs one query and can never double-send.
+      const customer = await queueCustomerNotifications(tenantId);
+      customerQueued += customer.queued;
+      customerUnreachable += customer.withoutAddress;
+
       const summary = await dispatchPending(tenantId, { transport });
       attempted += summary.attempted;
       sent += summary.sent;
@@ -63,6 +76,12 @@ export async function GET(request: Request) {
           "Messages were written to the log and NOT delivered.",
       );
     }
+    if (customerUnreachable > 0) {
+      warnings.push(
+        `${customerUnreachable} customer notification(s) had nobody to send to — the customer has ` +
+          "no contact with an email address and no billing email.",
+      );
+    }
     if (stranded > 0) {
       warnings.push(`${stranded} notification(s) stranded in 'sending' — a dispatcher died mid-flight.`);
     }
@@ -82,6 +101,8 @@ export async function GET(request: Request) {
         abandonedNow,
         abandonedTotal,
         stranded,
+        customerQueued,
+        customerUnreachable,
       },
       warnings,
     };

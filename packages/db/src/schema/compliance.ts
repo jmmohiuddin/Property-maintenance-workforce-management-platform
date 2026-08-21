@@ -13,7 +13,7 @@ import {
   uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
-import { idCol, timestamps } from "./_shared";
+import { idCol, timestamps, money } from "./_shared";
 import { tenants, users } from "./tenancy";
 import { technicians } from "./workforce";
 
@@ -72,6 +72,33 @@ export const employees = pgTable(
     allowances: jsonb("allowances").notNull().default({}),
     mohrePersonCode: varchar("mohre_person_code", { length: 32 }),
     wpsIban: varchar("wps_iban", { length: 34 }),
+    /**
+     * Health insurance, the parts that are not an expiry date (`HR-6`).
+     *
+     * Cover is mandatory in Dubai under Law No. 11 of 2013, is employer-funded,
+     * and the premium may not be deducted from salary. Workers earning under
+     * AED 4,000 a month require an Essential Benefits Plan specifically, so the
+     * plan tier has to be knowable — a policy that exists but is the wrong tier
+     * is non-compliant in exactly the same way as no policy at all.
+     *
+     * ── WHY THERE IS NO EXPIRY COLUMN HERE ──────────────────────────────────
+     *
+     * `health_insurance` is already one of the five `HR-9` blocking document
+     * kinds in `employee_documents`, with an expiry date that hard-blocks
+     * dispatch when it lapses. A second expiry on this table would be a second
+     * source of truth, and the one that is wrong would inevitably be the one
+     * somebody reads. The document is the expiry; these columns are the cover.
+     */
+    healthPlan: varchar("health_plan", { length: 24 }),
+    healthInsurer: varchar("health_insurer", { length: 120 }),
+    healthPolicyNo: varchar("health_policy_no", { length: 64 }),
+    /**
+     * Annual premium, an **employer cost**. It exists so the cost is visible in
+     * one place and never has to be reconstructed at renewal. It is not, and
+     * must never become, a salary deduction: `salary_deductions.kind` has a
+     * CHECK constraint that makes recording it as one impossible.
+     */
+    healthPremium: money("health_premium"),
     status: varchar("status", { length: 24 }).notNull().default("active"),
     terminatedAt: timestamp("terminated_at", { withTimezone: true }),
     /** `HR-15` — 2 years post-termination minimum. Purged by a job, not a policy. */

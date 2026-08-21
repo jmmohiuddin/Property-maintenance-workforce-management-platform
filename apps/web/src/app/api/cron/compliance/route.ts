@@ -8,8 +8,29 @@ import {
   alertRecipients,
   recentlyNotified,
   uninvoicedSignedOffJobs,
+  findExpiringContracts,
+  renewalNoticeSent,
+  recordRenewalNotice,
+  // HR-17 and the employment lifecycle. Appended, not slotted in.
+  currentWageCycle,
+  unsettledWageCycles,
+  prepareWageFile,
+  wageFileGaps,
+  autoRenewExpiredContracts,
+  contractAlerts,
+  healthInsuranceGaps,
+  workingHoursExceptions,
+  hoursSourceWarning,
 } from "@meridian/db/domain";
 import { ISSUANCE_WINDOW_DAYS, LATE_ISSUANCE_PENALTY } from "@meridian/core";
+import {
+  today,
+  addDays,
+  toDecimalString,
+  WPS_MINIMUM_TRANSFER_PERCENT,
+  WPS_FILE_LEAD_DAYS,
+  tenant,
+} from "@meridian/core";
 import { enqueue } from "@meridian/notify";
 import { runCron } from "@/lib/cron";
 
@@ -33,12 +54,36 @@ import { runCron } from "@/lib/cron";
  *    day 10. TRD §10 names this route as the mechanism for it. The query lived
  *    in `commerce.ts` with nothing calling it, which is the same as not having
  *    it: a rule nothing evaluates is a rule written in a policy document.
+ *  * `CON-9` contract renewal reminders at T-90 / T-60 / T-30 / T-7, and any
+ *    AMC that has already expired unrenewed. The requirement's own sentence is
+ *    that "a silently expired AMC is the most expensive failure mode in this
+ *    business model", and until M3 this route said in its own response that the
+ *    tables did not exist. They do now, and this is the check.
  *
- * ── STILL MISSING, AND SAID OUT LOUD ────────────────────────────────────────
+ *  * `HR-17` the WPS payroll countdown. Wages for the previous month are due on
+ *    the **1st**, with at least 85% of total wages due transferred by then, and
+ *    the escalation past it is what this check exists for: day 5 new work
+ *    permits suspended, day 11 fines and a category downgrade, day 16 automatic
+ *    labour-dispute registration, day 21 executive orders and possible travel
+ *    bans. Alerts run from T-5 and the wage file is produced at T-3. This route
+ *    previously said in its own response that the tables did not exist; they do,
+ *    and this is the check that closes that sentence.
+ *  * `HR-4` contract auto-renewal. A fixed-term contract that ran past its end
+ *    date while the worker kept working **has renewed on the same terms**, by
+ *    operation of law. The sweep records the term the law has already created,
+ *    so the record says "renewed" rather than "expired" — which is the thing
+ *    the requirement says people get wrong.
+ *  * `HR-6`, `HR-7`, `HR-8` — health insurance gaps, probation and renewal
+ *    windows, and working-time breaches, as one weekly-shaped digest.
  *
- * The WPS payroll countdown (`HR-17`) and contract renewal reminders (`CON-9`)
- * need tables that do not exist yet. The route says so in its own response
- * rather than reporting a clean bill of health it has not earned.
+ * ── FOUR LADDERS, ONE ROUTE, THREE MESSAGES ─────────────────────────────────
+ *
+ * Documents, accreditations and certifications share one digest because they
+ * share a recipient (HR and the owner) and an action (renew a piece of paper).
+ * The issuance clock is its own message to the accountant. Renewals are their
+ * own message again, one per contract, because a renewal is a conversation with
+ * one named customer that gets forwarded to their account manager — and a
+ * digest of six contracts cannot be forwarded to anybody.
  */
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -67,6 +112,17 @@ export async function GET(request: Request) {
     let notified = 0;
     let suppliesApproaching = 0;
     let suppliesBreached = 0;
+    let renewalsDue = 0;
+    let renewalsExpired = 0;
+    let renewalNoticesSent = 0;
+    let wpsStage = "not_due";
+    let wpsDaysLate = 0;
+    let wpsFilesPrepared = 0;
+    let wpsUnsettled = 0;
+    let contractsAutoRenewed = 0;
+    let contractsNeedingAttention = 0;
+    let insuranceGaps = 0;
+    let hoursBreaches = 0;
 
     const warnings: string[] = [];
 
@@ -246,16 +302,353 @@ export async function GET(request: Request) {
             if (!("skipped" in result)) notified += 1;
           }
         }
+
+        // ── CON-9: contract renewal reminders ───────────────────────────────
+        //
+        // The requirement's own sentence: "a silently expired AMC is the most
+        // expensive failure mode in this business model." Until M3 this route
+        // reported in its own response that the tables did not exist. They do.
+        //
+        // One email per contract per rung, not a digest, and that is the
+        // opposite of the rule for everything above. A renewal is a
+        // conversation with one named customer about one number, and the way it
+        // gets actioned is by forwarding the email to that customer's account
+        // manager — a digest of six contracts cannot be forwarded to anybody.
+        //
+        // Idempotency is the notice ledger, not the notification queue's time
+        // window. `recentlyNotified` is a ceiling on frequency; it cannot tell
+        // a 60-day notice from a 30-day one, so a time-based gate would send
+        // the same rung twice or skip the next one depending only on timing.
+        // `renewalNoticeSent` records which rung was reached.
+        const renewals = await findExpiringContracts(tx);
+        renewalsDue += renewals.length;
+        renewalsExpired += renewals.filter((c) => c.daysRemaining < 0).length;
+
+        if (renewals.length > 0) {
+          // The owner carries the commercial consequence; sales does the
+          // renewing. Not routed to HR or operations — an alert that reaches
+          // someone who cannot act on it teaches everyone to skim these.
+          const renewalRecipients = await alertRecipients(tx, ["owner", "sales", "admin"]);
+          if (renewalRecipients.length === 0) {
+            console.warn(
+              `[cron:compliance] tenant ${tenantId} has ${renewals.length} contract(s) due ` +
+                `renewal and no owner, sales or admin to tell`,
+            );
+          }
+
+          for (const contract of renewals) {
+            // `band` is non-null for everything `findExpiringContracts`
+            // returns — it filters on exactly that — but the type does not know
+            // it, and asserting would be the one place this file lied.
+            const band = contract.band;
+            if (band === null) continue;
+
+            for (const recipient of renewalRecipients) {
+              const already = await renewalNoticeSent(tx, {
+                contractId: contract.contractId,
+                band,
+                recipientUserId: recipient.userId,
+              });
+              if (already) continue;
+
+              const result = await enqueue(tx, { tenantId, actorKind: "system" }, {
+                channel: "email",
+                template: "contract_renewal_due",
+                to: recipient.email,
+                recipientUserId: recipient.userId,
+                payload: {
+                  recipientName: recipient.fullName,
+                  contractReference: contract.reference,
+                  contractName: contract.name,
+                  customerName: contract.customerName,
+                  band,
+                  daysRemaining: contract.daysRemaining,
+                  endsOn: contract.endsOn,
+                  annualValue: contract.annualValue,
+                  currency: contract.currency,
+                  jobsInTerm: contract.jobsInTerm,
+                  entitledVisits: contract.entitledVisits,
+                  consumedVisits: contract.consumedVisits,
+                  utilisationPercent: contract.utilisationPercent,
+                  autoRenew: contract.autoRenew,
+                  contractId: contract.contractId,
+                },
+              });
+
+              // Recorded only when something was actually enqueued. Writing the
+              // ledger row on a skip would mark the rung sent and guarantee the
+              // customer is never chased at that distance again.
+              if (!("skipped" in result)) {
+                await recordRenewalNotice(tx, { tenantId }, {
+                  contractId: contract.contractId,
+                  band,
+                  recipientUserId: recipient.userId,
+                });
+                renewalNoticesSent += 1;
+                notified += 1;
+              }
+            }
+          }
+        }
+
+        // Reported every run while it holds, like the blocked technicians
+        // above. An expired AMC is a standing state — planned visits stopped
+        // generating the day the term ended — and it stays wrong until somebody
+        // renews or closes it. A warning, never a block: the three hard blocks
+        // in this system each have a statutory penalty behind them, and this
+        // one has a commercial consequence.
+        const lapsed = renewals.filter((c) => c.daysRemaining < 0);
+        if (lapsed.length > 0) {
+          warnings.push(
+            `${lapsed.length} contract(s) have EXPIRED without renewal and are generating no ` +
+              `planned visits: ` +
+              lapsed
+                .map((c) => `${c.reference} — ${c.customerName}, ${-c.daysRemaining} day(s) ago`)
+                .join("; "),
+          );
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // HR-17: the WPS payroll countdown
+        // ═══════════════════════════════════════════════════════════════════
+        //
+        // The highest-frequency compliance obligation in the business, and the
+        // one this route reported as unchecked until now.
+        //
+        // ── WHY THIS IS NOT A HARD BLOCK ──────────────────────────────────
+        //
+        // There are exactly three hard blocks in this system and each stops a
+        // dispatch: an expired blocking document, an expired work permit, the
+        // summer midday ban. Late wages do not become a fourth, and the reason
+        // is causal rather than squeamish. Those three stop an act that is
+        // itself unlawful at the moment it happens — sending someone to work
+        // who may not work, or at an hour when nobody may. Late wages make no
+        // worker unlawful to deploy. What day 5 suspends is *new work-permit
+        // issuance*, at MOHRE, not existing employment. Blocking dispatch on
+        // unpaid wages would stop lawful, already-permitted work in order to
+        // punish a payment failure — removing the revenue that pays the wages,
+        // which makes the violation worse — and it would be routed around
+        // inside a day, after which nothing would be recorded at all.
+        //
+        // So the escalation earns escalating ALERTS that name the specific
+        // consequence in force today, and a warning on the onboarding screen
+        // when permit issuance is actually suspended. `assessWpsCycle` carries
+        // the full argument.
+        const now = today();
+        const wages = await currentWageCycle(tx, { tenantId }, now);
+        const unsettled = await unsettledWageCycles(tx, now);
+        wpsUnsettled += unsettled.length;
+
+        // ── T-3: produce the wage file inputs ─────────────────────────────
+        //
+        // `HR-17` requires hours, overtime, absences and deductions by T-3 so
+        // the transfer can be instructed before the 1st. Done by the job rather
+        // than by a person pressing a button, because the failure mode of "a
+        // person presses a button" is that the person is on leave on the 29th.
+        // Idempotent: re-running upserts the same lines.
+        const gaps = await wageFileGaps(tx);
+        if (
+          wages.assessment.daysUntilDue <= WPS_FILE_LEAD_DAYS &&
+          wages.assessment.stage !== "settled" &&
+          wages.filePreparedOn === null
+        ) {
+          await prepareWageFile(tx, { tenantId }, wages.id, now);
+          wpsFilesPrepared += 1;
+        }
+
+        // Re-read AFTER any preparation, and assess from here on out. Reading
+        // the pre-preparation snapshot reported a tenant that owes nobody
+        // anything as twenty days late: with no wage file yet, "AED 0 due" is
+        // indistinguishable from "nothing worked out yet", and only the second
+        // of those is an alarm. Preparing the file is what tells them apart.
+        const cycle = await currentWageCycle(tx, { tenantId }, now);
+
+        // The worst live cycle, not the current one. On 3 September, August's
+        // wages being two days late matters less than June's being 64 — and a
+        // route that only ever looked at the current month would never mention
+        // June again after 1 July.
+        //
+        // Filtered on `alerting`, not on `daysLate`. A month nobody was owed
+        // anything for still has a days-past-the-deadline count; it is simply
+        // not a violation, and ranking on the raw number reports it as one.
+        const alertingCycles = [cycle, ...unsettled.filter((u) => u.id !== cycle.id)].filter(
+          (c) => c.assessment.alerting,
+        );
+        for (const c of alertingCycles) {
+          if (c.assessment.daysLate > wpsDaysLate) {
+            wpsDaysLate = c.assessment.daysLate;
+            wpsStage = c.assessment.stage;
+          }
+        }
+        if (wpsDaysLate === 0 && wpsStage === "not_due") wpsStage = cycle.assessment.stage;
+
+        for (const live of alertingCycles) {
+          // Owner and accountant. §12.1 routes the countdown to exactly those
+          // two: one instructs the transfer, the other carries the liability.
+          // Not HR — HR cannot move money, and an alert that reaches someone
+          // who cannot act on it teaches everyone to skim these.
+          const payrollRecipients = await alertRecipients(tx, ["owner", "accountant"]);
+          if (payrollRecipients.length === 0) {
+            console.warn(
+              `[cron:compliance] tenant ${tenantId} has a WPS deadline in ` +
+                `${live.assessment.daysUntilDue} day(s) and no owner or accountant to tell`,
+            );
+          }
+
+          for (const recipient of payrollRecipients) {
+            // One a day at the outer edge, but the alarm states get a much
+            // tighter ceiling: on the 2nd this is the message §12.1 describes
+            // as "alarm tone", and a six-hour window means it lands again the
+            // same day if the transfer still has not been confirmed.
+            const ceilingMinutes = live.assessment.severity === "alarm" ? 6 * 60 : 20 * 60;
+            const alreadyTold = await recentlyNotified(tx, {
+              template: "wps_payroll_countdown",
+              recipientUserId: recipient.userId,
+              withinMinutes: ceilingMinutes,
+            });
+            if (alreadyTold) continue;
+
+            const result = await enqueue(tx, { tenantId, actorKind: "system" }, {
+              channel: "email",
+              template: "wps_payroll_countdown",
+              to: recipient.email,
+              recipientUserId: recipient.userId,
+              payload: {
+                recipientName: recipient.fullName,
+                period: live.assessment.label,
+                dueOn: live.dueOn,
+                daysUntilDue: live.assessment.daysUntilDue,
+                daysLate: live.assessment.daysLate,
+                stage: live.assessment.stage,
+                severity: live.assessment.severity,
+                headline: live.assessment.headline,
+                consequence: live.assessment.consequence,
+                thresholdPercent: WPS_MINIMUM_TRANSFER_PERCENT,
+                transferredBasisPoints: live.assessment.transferredBasisPoints,
+                totalDue: toDecimalString(live.totalDueMinor),
+                totalTransferred: toDecimalString(live.totalTransferredMinor),
+                currency: tenant.currency,
+                employeeCount: live.employeeCount,
+                fileDue: live.assessment.fileDue,
+                gaps: gaps.map((g) => ({ name: g.fullName, reason: g.reason })),
+              },
+            });
+
+            if (!("skipped" in result)) notified += 1;
+          }
+        }
+
+        // Reported every run while it holds, like the blocked technicians. A
+        // wage cycle that went unpaid in June does not stop being unpaid
+        // because July's countdown started, and the ladder is still climbing.
+        for (const late of alertingCycles) {
+          if (late.assessment.daysLate === 0) continue;
+          warnings.push(
+            `WPS (HR-17): ${late.assessment.label} wages are ${late.assessment.daysLate} day(s) late — ` +
+              `day ${late.assessment.daysLate + 1} of the escalation. ${late.assessment.consequence}`,
+          );
+        }
+
+        if (gaps.length > 0) {
+          warnings.push(
+            `${gaps.length} active employee(s) would not be reached by a WPS transfer today: ` +
+              gaps.map((g) => g.fullName).join("; "),
+          );
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // HR-4: record the renewals the law has already performed
+        // ═══════════════════════════════════════════════════════════════════
+        //
+        // Before the digest, deliberately: the sweep writes the renewed terms,
+        // and `contractAlerts` below then reports the *current* state rather
+        // than reporting a lapse the same run has already resolved.
+        const autoRenewed = await autoRenewExpiredContracts(tx, { tenantId }, now);
+        contractsAutoRenewed += autoRenewed.length;
+
+        if (autoRenewed.length > 0) {
+          warnings.push(
+            `${autoRenewed.length} employment contract(s) auto-renewed on the same terms because work ` +
+              `continued past the end date (HR-4): ` +
+              autoRenewed.map((r) => `${r.fullName} — now to ${r.endsOn}`).join("; "),
+          );
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // HR-4 / HR-6 / HR-7 / HR-8: the employment lifecycle digest
+        // ═══════════════════════════════════════════════════════════════════
+        //
+        // Its own message, to HR and the owner. Deliberately not a section
+        // inside `compliance_expiry`: that one is about people who cannot
+        // legally be sent to work today, and merging a probation end date into
+        // it would put both behind one suppression window — after which
+        // whichever fired second would be silently dropped for the day.
+        const lifecycleContracts = await contractAlerts(tx, now);
+        const insurance = await healthInsuranceGaps(tx);
+        const hours = await workingHoursExceptions(tx, { from: addDays(now, -7), to: now });
+        const hoursWarning = await hoursSourceWarning(tx);
+
+        contractsNeedingAttention += lifecycleContracts.length;
+        insuranceGaps += insurance.length;
+        hoursBreaches += hours.length;
+
+        if (
+          autoRenewed.length > 0 ||
+          lifecycleContracts.length > 0 ||
+          insurance.length > 0 ||
+          hours.length > 0
+        ) {
+          const hrRecipients = await alertRecipients(tx, ["owner", "hr", "operations_manager"]);
+          for (const recipient of hrRecipients) {
+            const alreadyTold = await recentlyNotified(tx, {
+              template: "employment_lifecycle",
+              recipientUserId: recipient.userId,
+              withinMinutes: 20 * 60,
+            });
+            if (alreadyTold) continue;
+
+            const result = await enqueue(tx, { tenantId, actorKind: "system" }, {
+              channel: "email",
+              template: "employment_lifecycle",
+              to: recipient.email,
+              recipientUserId: recipient.userId,
+              payload: {
+                recipientName: recipient.fullName,
+                renewed: autoRenewed.map((r) => ({
+                  name: r.fullName,
+                  previousEnd: r.previousEnd,
+                  startsOn: r.startsOn,
+                  endsOn: r.endsOn,
+                })),
+                contracts: lifecycleContracts.map((c) => ({
+                  name: c.fullName,
+                  state: c.state,
+                  detail: c.detail,
+                  daysToEnd: c.daysToEnd,
+                  problems: c.problems,
+                })),
+                insurance: insurance.map((i) => ({ name: i.fullName, problems: i.problems })),
+                hours: hours.map((h) => ({
+                  name: h.fullName,
+                  workedOn: h.workedOn,
+                  detail: h.detail,
+                })),
+                hoursWarning,
+              },
+            });
+
+            if (!("skipped" in result)) notified += 1;
+          }
+        }
+
+        // Said out loud rather than left as a clean bill of health the check has
+        // not earned. `HR-8` computes the daily and weekly maxima from
+        // clock-in/out, which arrives with the field app; until then the only
+        // hours this route knows about are hand-entered overtime, so an empty
+        // exception list means nothing is being measured.
+        if (hoursWarning) warnings.push(`HR-8/HR-10: ${hoursWarning}`);
       });
     }
-
-    // Repeated every run on purpose. A gap that is announced once is a gap
-    // nobody remembers, and these are the checks with the largest penalties
-    // still attached to them.
-    warnings.push(
-      "Not yet checked: WPS payroll countdown (HR-17) and contract renewal reminders (CON-9). " +
-        "Those tables do not exist yet.",
-    );
 
     return {
       processed:
@@ -263,7 +656,12 @@ export async function GET(request: Request) {
         accreditationsExpiring +
         certificationsExpiring +
         suppliesApproaching +
-        suppliesBreached,
+        suppliesBreached +
+        renewalsDue +
+        contractsAutoRenewed +
+        contractsNeedingAttention +
+        insuranceGaps +
+        hoursBreaches,
       detail: {
         tenants: tenants.length,
         blocked: blockedNow,
@@ -273,6 +671,22 @@ export async function GET(request: Request) {
         certificationsExpiring,
         suppliesApproaching,
         suppliesBreached,
+        renewalsDue,
+        renewalsExpired,
+        renewalNoticesSent,
+        // HR-17. The stage is reported, not a boolean: "late" and "day 11,
+        // fines and a category downgrade" are different operational facts and
+        // the response is the only place a scheduler with alerting can read
+        // either of them.
+        wpsStage,
+        wpsDaysLate,
+        wpsUnsettled,
+        wpsFilesPrepared,
+        wpsThresholdPercent: WPS_MINIMUM_TRANSFER_PERCENT,
+        contractsAutoRenewed,
+        contractsNeedingAttention,
+        insuranceGaps,
+        hoursBreaches,
         notified,
         windowDays: ALERT_WINDOW_DAYS,
         issuanceWindowDays: ISSUANCE_WINDOW_DAYS,

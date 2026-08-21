@@ -73,6 +73,19 @@ jobs:
       # not shipping it. Without this the placeholder guard fails the build —
       # which is correct on a deploy and unhelpful here.
       ALLOW_PLACEHOLDER_IDENTITY: "1"
+      # Obviously-fake contact details, set so the notification templates render
+      # against a *configured* identity rather than an absent one.
+      #
+      # Leaving these unset does not make the tests stricter, it makes one of
+      # them meaningless: `dispatch.test.ts` asserts "every message carries the
+      # emergency number", and with no number configured the old signature still
+      # emitted the literal text `Emergencies, 24 hours: null`. The assertion
+      # passed on the label while the number it was checking for was the word
+      # "null". A test that cannot fail is worse than no test, because it is
+      # counted.
+      COMPANY_PHONE: "+971 4 000 0000"
+      COMPANY_EMAIL: "ci@example.invalid"
+      COMPANY_EMERGENCY_PHONE: "+971 55 000 0000"
 
     steps:
       - uses: actions/checkout@v4

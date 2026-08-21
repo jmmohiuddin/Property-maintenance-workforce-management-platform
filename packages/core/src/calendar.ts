@@ -527,14 +527,27 @@ export interface HoursCheck {
 export function checkStatutoryHours(
   input: { minutesToday: number; minutesThisWeek: number; longestStretchMinutes?: number },
   calendar: WorkingCalendar = DEFAULT_CALENDAR,
+  /**
+   * The day being checked, so the Ramadan reduction reaches the daily maximum.
+   *
+   * Optional, and absent it behaves exactly as before — the eight-hour limit
+   * flat. `HR-8` needs the other behaviour: during Ramadan the statutory day is
+   * two hours shorter, and a check that only shortens the *closing time* while
+   * leaving the *limit* at eight reports a nine-hour Ramadan day as one hour
+   * over when it is three. Every caller that knows the date should pass it.
+   */
+  options: { on?: Date } = {},
 ): HoursCheck {
   const warnings: string[] = [];
-  const dayLimit = calendar.maxHoursPerDay * 60;
+  const ramadan = options.on !== undefined && isRamadan(options.on, calendar);
+  const dayLimitMinutes = calendar.maxHoursPerDay * 60 - (ramadan ? calendar.ramadanReductionMinutes : 0);
+  const dayLimit = Math.max(0, dayLimitMinutes);
   const weekLimit = calendar.maxHoursPerWeek * 60;
 
   if (input.minutesToday > dayLimit) {
     warnings.push(
-      `${formatHours(input.minutesToday)} today exceeds the statutory maximum of ${calendar.maxHoursPerDay} hours per day.`,
+      `${formatHours(input.minutesToday)} today exceeds the statutory maximum of ${formatHours(dayLimit)} per day` +
+        `${ramadan ? " (Ramadan: reduced by two hours)" : ""}.`,
     );
   }
   if (input.minutesThisWeek > weekLimit) {

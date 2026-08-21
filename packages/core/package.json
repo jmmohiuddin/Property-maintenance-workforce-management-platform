@@ -11,7 +11,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx test/catalog.test.ts && tsx test/calendar.test.ts && tsx test/transitions.test.ts && tsx test/money.test.ts && tsx test/invoice.test.ts && tsx test/qr.test.ts",
+    "test": "tsx test/catalog.test.ts && tsx test/calendar.test.ts && tsx test/transitions.test.ts && tsx test/money.test.ts && tsx test/invoice.test.ts && tsx test/qr.test.ts && tsx test/employment.test.ts",
     "check": "npm run typecheck && npm run test"
   },
   "dependencies": {
