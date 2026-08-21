@@ -1,7 +1,7 @@
 import { and, eq, desc, sql, isNull, inArray } from "drizzle-orm";
 import { db, withTenant, type TenantScopedTx, type TenantContext } from "../index";
 import * as schema from "../schema";
-import { loadWorkingCalendar } from "./reference";
+import { loadWorkingCalendar, resolveDispositionReason } from "./reference";
 import {
   computeSlaDeadlines,
   OPEN_LEAD_STAGES,
@@ -26,6 +26,42 @@ import { nextJobReference } from "./jobs";
  * transaction.
  */
 
+/**
+ * Where a lead came from (`LEAD-4`, `DB-5`).
+ *
+ * Separated from the enquiry itself because the same shape has to serve the web
+ * form, the 30-second manual create form for phone and walk-in enquiries
+ * (`LEAD-1`) and whatever an aggregator integration eventually posts. A
+ * structure that only the web form can fill is a funnel that only measures the
+ * website.
+ *
+ * Every field is optional and stays null when unknown. Nothing here invents a
+ * plausible value — an enquiry with no campaign recorded must not become an
+ * enquiry attributed to the wrong campaign, because the whole reason these
+ * columns exist is to decide where money goes next.
+ */
+export interface LeadAttribution {
+  /** `LEAD-1`'s channel list. Defaults to `website` at the database. */
+  readonly channel?: string | undefined;
+  readonly utmSource?: string | undefined;
+  readonly utmMedium?: string | undefined;
+  readonly utmCampaign?: string | undefined;
+  /** The page the enquiry was sent from, path and query. */
+  readonly landingPage?: string | undefined;
+  /** Where the visitor arrived from, when the browser tells us. */
+  readonly referrer?: string | undefined;
+  /** Which advertised number was dialled. Phone leads only. */
+  readonly calledNumber?: string | undefined;
+  /**
+   * Anything unanticipated — `gclid`, user agent, an aggregator's own id.
+   *
+   * Kept alongside the columns rather than replaced by them. The columns are
+   * what a report groups by; this is what stops the next advertising platform
+   * from needing a migration before its leads can be recorded at all.
+   */
+  readonly extra?: Record<string, string> | undefined;
+}
+
 export interface PublicEnquiry {
   readonly name: string;
   readonly phone: string;
@@ -36,8 +72,17 @@ export interface PublicEnquiry {
   readonly city: string;
   readonly area?: string | undefined;
   readonly details?: string | undefined;
-  /** utm_source / medium / campaign / referrer, for attribution reporting. */
-  readonly attribution?: Record<string, string> | undefined;
+  readonly attribution?: LeadAttribution | undefined;
+}
+
+/** Trim, collapse empties to null, and cut to the column's width. */
+function attributionValue(value: string | undefined, maxLength: number): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  // Truncated rather than rejected. A referrer URL longer than the column is a
+  // real referrer, and losing the enquiry over its query string would be a far
+  // worse outcome than losing the tail of the string.
+  return trimmed.slice(0, maxLength);
 }
 
 /**
@@ -154,7 +199,18 @@ export async function createLeadFromEnquiry(
         propertyTypeGuess: enquiry.propertyType as never,
         stage: "new",
         source: "website",
-        attribution: enquiry.attribution ?? {},
+        // LEAD-4. Ten service pages, ten area pages and a pile of structured
+        // data exist to produce exactly this row, and until these columns were
+        // written nothing recorded which of them did — so the investment could
+        // only be defended on faith and could only be cut on faith.
+        channel: enquiry.attribution?.channel ?? "website",
+        utmSource: attributionValue(enquiry.attribution?.utmSource, 120),
+        utmMedium: attributionValue(enquiry.attribution?.utmMedium, 120),
+        utmCampaign: attributionValue(enquiry.attribution?.utmCampaign, 160),
+        landingPage: attributionValue(enquiry.attribution?.landingPage, 512),
+        referrer: attributionValue(enquiry.attribution?.referrer, 512),
+        calledNumber: attributionValue(enquiry.attribution?.calledNumber, 32),
+        attribution: enquiry.attribution?.extra ?? {},
         message: enquiry.details || null,
         // An emergency enquiry needs looking at now, not on the next follow-up
         // sweep. Everything else gets a next-working-day nudge.
@@ -203,6 +259,16 @@ export interface LeadRow {
   readonly createdAt: Date;
   readonly nextFollowUpAt: Date | null;
   readonly convertedCustomerId: string | null;
+  /** `LEAD-4`. Selected on the list, not only on the detail: attribution that
+   *  has to be clicked into is attribution nobody reads. */
+  readonly channel: string;
+  readonly utmSource: string | null;
+  readonly utmMedium: string | null;
+  readonly utmCampaign: string | null;
+  readonly landingPage: string | null;
+  readonly referrer: string | null;
+  readonly calledNumber: string | null;
+  readonly dispositionReasonId: string | null;
 }
 
 export async function listLeads(
@@ -225,6 +291,14 @@ export async function listLeads(
       createdAt: schema.leads.createdAt,
       nextFollowUpAt: schema.leads.nextFollowUpAt,
       convertedCustomerId: schema.leads.convertedCustomerId,
+      channel: schema.leads.channel,
+      utmSource: schema.leads.utmSource,
+      utmMedium: schema.leads.utmMedium,
+      utmCampaign: schema.leads.utmCampaign,
+      landingPage: schema.leads.landingPage,
+      referrer: schema.leads.referrer,
+      calledNumber: schema.leads.calledNumber,
+      dispositionReasonId: schema.leads.dispositionReasonId,
     })
     .from(schema.leads)
     // inArray, not a raw interpolated array literal. These values are internal
@@ -252,6 +326,14 @@ export async function getLead(tx: TenantScopedTx, leadId: string): Promise<LeadR
       createdAt: schema.leads.createdAt,
       nextFollowUpAt: schema.leads.nextFollowUpAt,
       convertedCustomerId: schema.leads.convertedCustomerId,
+      channel: schema.leads.channel,
+      utmSource: schema.leads.utmSource,
+      utmMedium: schema.leads.utmMedium,
+      utmCampaign: schema.leads.utmCampaign,
+      landingPage: schema.leads.landingPage,
+      referrer: schema.leads.referrer,
+      calledNumber: schema.leads.calledNumber,
+      dispositionReasonId: schema.leads.dispositionReasonId,
     })
     .from(schema.leads)
     .where(eq(schema.leads.id, leadId))
@@ -374,19 +456,165 @@ export async function convertLeadToJob(
   return { jobId: job.id, reference, customerId, propertyId: property.id };
 }
 
+/**
+ * Move a lead through the funnel (`LEAD-6`).
+ *
+ * ── WHY THIS FUNCTION REFUSES THINGS ────────────────────────────────────────
+ *
+ * `lost` and `dormant` require a reason from the controlled list, and free text
+ * is not an acceptable substitute for it. That is the requirement as written,
+ * and the reason it is written that way is that the reason field is the only
+ * output the question was asked for: "too expensive", "Price", "cost",
+ * "budget" and "too $$" are one category typed five ways, and the report they
+ * were collected for cannot group them back together afterwards.
+ *
+ * So the check happens here rather than in the form. A form check is a check
+ * the next form forgets — the field app, an importer and a bulk action are all
+ * coming — and `leads_disposition_required` in the database is the backstop
+ * behind this, not the message anybody should ever have to read.
+ *
+ * `note` is kept and is genuinely optional: the code says which category, the
+ * note says what actually happened. What it cannot do is replace the code.
+ */
 export async function setLeadStage(
   tx: TenantScopedTx,
   leadId: string,
   stage: LeadStage,
-  lostReason?: string,
+  options?: { dispositionReasonId?: string | undefined; note?: string | undefined },
 ): Promise<void> {
+  const needsReason = stage === "lost" || stage === "dormant";
+
+  if (needsReason) {
+    const reasonId = options?.dispositionReasonId?.trim();
+    if (!reasonId) {
+      throw new UserFacingError(
+        stage === "lost"
+          ? "Choose why this lead was lost. The reason is what makes the pipeline worth reporting on."
+          : "Choose why this lead is dormant, so it can be found again when that reason expires.",
+      );
+    }
+
+    // Resolved rather than trusted. The id arrives from a form post, so it can
+    // name a retired reason, a reason belonging to the other stage, or — if RLS
+    // were ever misconfigured — nothing at all in this tenant.
+    const reason = await resolveDispositionReason(tx, reasonId, stage);
+    if (!reason) {
+      throw new UserFacingError(
+        "That reason is not one this lead can be closed with. Pick one from the list.",
+      );
+    }
+
+    await tx
+      .update(schema.leads)
+      .set({
+        stage,
+        dispositionReasonId: reason.id,
+        lostReason: options?.note?.trim() || null,
+        // No follow-up on a lost lead. A dormant one keeps whatever it had:
+        // dormant means "not now", and a lead nobody ever looks at again is
+        // lost with extra steps.
+        nextFollowUpAt: stage === "lost" ? null : undefined,
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.leads.id, leadId));
+    return;
+  }
+
   await tx
     .update(schema.leads)
     .set({
       stage,
-      lostReason: stage === "lost" ? (lostReason ?? null) : null,
-      nextFollowUpAt: stage === "lost" || stage === "won" ? null : undefined,
+      // Reopening clears the closure. A lead back in `contacted` carrying last
+      // month's lost reason reads as lost to every person and every report that
+      // sees it.
+      dispositionReasonId: null,
+      lostReason: null,
+      nextFollowUpAt: stage === "won" ? null : undefined,
       updatedAt: new Date(),
     })
     .where(eq(schema.leads.id, leadId));
+}
+
+/**
+ * Which sources actually produced leads (`LEAD-4`).
+ *
+ * The reason `DB-5` exists, made visible. Ten service pages, ten area pages,
+ * JSON-LD on all of them and an llms.txt are an investment that can only be
+ * defended or cut on evidence, and this is the smallest query that produces
+ * any: how many enquiries each channel and each landing page brought in over a
+ * window, and how many of them were won.
+ *
+ * Won-rate rather than volume alone, because they disagree often enough to
+ * matter. A channel producing forty enquiries and one job is not the channel to
+ * spend more on, and a report showing only the forty says it is.
+ */
+export interface AttributionRow {
+  readonly label: string;
+  readonly leads: number;
+  readonly won: number;
+}
+
+export async function leadAttributionSummary(
+  tx: TenantScopedTx,
+  options?: { days?: number },
+): Promise<{
+  readonly byChannel: readonly AttributionRow[];
+  readonly byLandingPage: readonly AttributionRow[];
+  readonly byCampaign: readonly AttributionRow[];
+  /** Leads in the window with no source recorded at all. The honest denominator. */
+  readonly unattributed: number;
+  readonly days: number;
+}> {
+  const days = options?.days ?? 90;
+
+  const query = async (dimension: "channel" | "landing_page" | "utm_campaign") => {
+    // The dimension is chosen from a closed set here rather than interpolated,
+    // because a column name cannot be a bind parameter and the alternative is
+    // string-built SQL. Three explicit branches are duller and cannot be turned
+    // into an injection by a future caller that passes a query-string value.
+    const column =
+      dimension === "channel"
+        ? sql`channel`
+        : dimension === "landing_page"
+          ? sql`landing_page`
+          : sql`utm_campaign`;
+
+    const rows = (await tx.execute<{ label: string; leads: string; won: string }>(sql`
+      select ${column}::text as label,
+             count(*) as leads,
+             count(*) filter (where stage = 'won') as won
+        from leads
+       where deleted_at is null
+         and created_at >= now() - make_interval(days => ${days})
+         and ${column} is not null
+       group by 1
+       order by 2 desc, 1
+       limit 25
+    `)) as unknown as { label: string; leads: string; won: string }[];
+
+    return rows.map((r) => ({ label: r.label, leads: Number(r.leads), won: Number(r.won) }));
+  };
+
+  const gapQuery = async (): Promise<number> => {
+    const rows = (await tx.execute<{ unattributed: string }>(sql`
+      select count(*) as unattributed
+        from leads
+       where deleted_at is null
+         and created_at >= now() - make_interval(days => ${days})
+         and landing_page is null
+         and referrer is null
+         and utm_source is null
+         and called_number is null
+    `)) as unknown as { unattributed: string }[];
+    return Number(rows[0]?.unattributed ?? 0);
+  };
+
+  const [byChannel, byLandingPage, byCampaign, unattributed] = await Promise.all([
+    query("channel"),
+    query("landing_page"),
+    query("utm_campaign"),
+    gapQuery(),
+  ]);
+
+  return { byChannel, byLandingPage, byCampaign, unattributed, days };
 }

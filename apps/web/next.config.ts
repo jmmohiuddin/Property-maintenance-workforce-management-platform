@@ -34,7 +34,14 @@ const config: NextConfig = {
   // The marketing site is statically rendered. AI crawlers frequently do not
   // execute JavaScript, so anything they need to read has to exist in the HTML
   // response, not be hydrated in.
-  transpilePackages: ["@meridian/core", "@meridian/auth", "@meridian/db", "@meridian/notify"],
+  transpilePackages: [
+    "@meridian/core",
+    "@meridian/auth",
+    "@meridian/db",
+    "@meridian/notify",
+    "@meridian/files",
+    "@meridian/docs",
+  ],
   // Native module; must not be bundled into the server build.
   serverExternalPackages: ["@node-rs/argon2", "postgres"],
   images: {

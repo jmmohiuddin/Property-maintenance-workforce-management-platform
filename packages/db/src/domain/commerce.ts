@@ -1103,11 +1103,6 @@ function addDubaiDays(date: string, days: number): string {
   return new Date(Date.parse(`${date}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
 }
 
-// TODO(INV-5): call `uninvoicedSignedOffJobs` from the daily compliance sweep in
-// `apps/web/src/app/api/cron/compliance/route.ts` and alert on anything at or
-// past `ISSUANCE_ALERT_DAYS`. Left unwired here only because that route is being
-// edited concurrently; the query and its thresholds are finished.
-
 // ── Sequence gap detection (INV-4) ───────────────────────────────────────────
 
 export interface SequenceGap {

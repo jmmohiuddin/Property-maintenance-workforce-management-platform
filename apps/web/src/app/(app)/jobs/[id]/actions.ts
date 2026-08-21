@@ -14,10 +14,47 @@ import {
   type DraftLine,
 } from "@meridian/db";
 import { enqueue, dispatchPending } from "@meridian/notify";
-import { InvalidTransitionError, type JobStatus } from "@meridian/core";
+import { materialiseInvoiceDocument, materialiseQuoteDocument } from "@meridian/docs";
+import { InvalidTransitionError, absoluteUrl, type JobStatus } from "@meridian/core";
 import { requirePermission } from "@meridian/auth";
 import { requireSession } from "@/lib/session";
 import { userMessage } from "@/lib/errors";
+
+/**
+ * Render and store the document a just-issued record stands for (`TRD §7.6`).
+ *
+ * ── WHY THIS IS OUTSIDE THE BUSINESS TRANSACTION, AND CANNOT FAIL THE ACTION ─
+ *
+ * The invoice is the legal event; the PDF is a copy of it. Rendering inside the
+ * transaction would mean a missing Commercial Register number rolling back an
+ * invoice for work that was genuinely supplied — which would leave the job
+ * uninvoiced, the 14-day clock (`INV-5`) still running, and the AED 2,500 still
+ * accruing. So the artefact is produced afterwards and a failure is reported
+ * rather than thrown.
+ *
+ * Not producing it is a real gap, not a silent one: the reason comes back as a
+ * sentence appended to the operator's confirmation, and it is the same list
+ * `assertRenderable` would give them. And nothing is lost by the delay — the
+ * download route materialises on first request, so the document appears as soon
+ * as whatever was missing is configured.
+ */
+async function materialise(
+  tenantId: string,
+  userId: string,
+  render: (tx: Parameters<Parameters<typeof withTenant>[1]>[0]) => Promise<unknown>,
+  context: string,
+): Promise<string | null> {
+  try {
+    await withTenant({ tenantId, userId, actorKind: "user" }, render);
+    return null;
+  } catch (error) {
+    return userMessage(
+      error,
+      "The document could not be produced; it will be generated the next time somebody downloads it.",
+      context,
+    );
+  }
+}
 
 export interface ActionState {
   error?: string;
@@ -252,14 +289,27 @@ export async function sendQuoteAction(_prev: ActionState, formData: FormData): P
   // roll back the quote it was announcing.
   await dispatchPending(session.principal.tenantId);
 
+  // QTE-3. Rendered at the moment of sending, because from here on the customer
+  // can accept it — and what they accepted has to be the document that was in
+  // front of them, not a re-render from whatever the price list says later.
+  const documentProblem = await materialise(
+    session.principal.tenantId,
+    session.principal.userId,
+    (tx) =>
+      materialiseQuoteDocument(tx, quoteId, {
+        acceptUrl: absoluteUrl(`/portal/quotes/${quoteId}`),
+      }),
+    "quote-document",
+  );
+
   revalidatePath("/jobs");
   revalidatePath(`/jobs/${String(formData.get("jobId") ?? "")}`);
 
-  return {
-    ok: queuedWithoutAddress
-      ? "Sent. It is visible in the customer portal, but no email went out because this customer has no billing email on file."
-      : "Sent. The customer has been emailed and can approve or decline it in their portal.",
-  };
+  const sent = queuedWithoutAddress
+    ? "Sent. It is visible in the customer portal, but no email went out because this customer has no billing email on file."
+    : "Sent. The customer has been emailed and can approve or decline it in their portal.";
+
+  return { ok: documentProblem ? `${sent} ${documentProblem}` : sent };
 }
 
 /**
@@ -301,6 +351,7 @@ export async function raiseInvoiceAction(
   if (lines.length === 0) return { error: "Add at least one line with a description." };
 
   let reference = "";
+  let invoiceId = "";
   let unreachable = false;
 
   try {
@@ -313,6 +364,7 @@ export async function raiseInvoiceAction(
           { jobId, lines },
         );
         reference = invoice.reference;
+        invoiceId = invoice.invoiceId;
 
         // The invoice is created already issued, so the customer must hear about
         // it in the same transaction that created it.
@@ -345,12 +397,25 @@ export async function raiseInvoiceAction(
 
   await dispatchPending(session.principal.tenantId);
 
+  // INV-3. The tax invoice is created already issued, so the artefact is
+  // produced now rather than left until somebody asks for it — the document is
+  // what the customer's accounts department files, and the SHA-256 recorded
+  // against it is what makes a reprint two years from now provably the same
+  // document.
+  const documentProblem = await materialise(
+    session.principal.tenantId,
+    session.principal.userId,
+    (tx) => materialiseInvoiceDocument(tx, invoiceId),
+    "invoice-document",
+  );
+
   revalidatePath(`/jobs/${jobId}`);
   revalidatePath("/invoices");
   revalidatePath("/portal");
-  return {
-    ok: unreachable
-      ? `${reference} raised. No email went out — this customer has no billing email on file.`
-      : `${reference} raised and emailed to the customer.`,
-  };
+
+  const raised = unreachable
+    ? `${reference} raised. No email went out — this customer has no billing email on file.`
+    : `${reference} raised and emailed to the customer.`;
+
+  return { ok: documentProblem ? `${raised} ${documentProblem}` : raised };
 }

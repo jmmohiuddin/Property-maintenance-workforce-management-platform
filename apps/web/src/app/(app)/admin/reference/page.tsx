@@ -16,6 +16,7 @@ import {
   RemoveButton,
   WorkingWeekForm,
 } from "./reference-forms";
+import { ReferenceTabs } from "./tabs";
 
 export const metadata: Metadata = {
   title: "Reference data",
@@ -71,7 +72,9 @@ export default async function AdminReferencePage() {
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Reference data</h1>
             <p className="prose-body mt-2 text-[15px]">
-              The working calendar the scheduler, the SLA clock and the field app all read.{" "}
+              The working calendar the scheduler, the SLA clock and the field app all read — and,
+              on the tabs below, the controlled lists a lead, a visit and a quotation have to be
+              recorded against.{" "}
               <Link
                 href="/admin/company"
                 className="underline underline-offset-2"
@@ -86,6 +89,8 @@ export default async function AdminReferencePage() {
             Changes are audited
           </p>
         </header>
+
+        <ReferenceTabs active="/admin/reference" />
 
         {warnings.length > 0 ? (
           <ul

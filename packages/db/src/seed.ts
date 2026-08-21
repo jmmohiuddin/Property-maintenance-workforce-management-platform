@@ -17,6 +17,7 @@ import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { hash } from "@node-rs/argon2";
 import * as schema from "./schema";
+import { STANDARD_JOB_OUTCOMES } from "./domain/reference";
 import { computeSlaDeadlines, company, type JobPriority } from "@meridian/core";
 
 // The db package loads the root .env on first connect; do the same here so
@@ -455,6 +456,38 @@ async function main(): Promise<void> {
     resolveByAt: otherSla.resolveByAt,
   });
   console.log("  tenant 2: 1 customer, 1 property, 1 job");
+
+  // ── The controlled vocabulary every tenant starts with (JOB-13) ───────────
+  //
+  // Seeded rather than left to the administrator, because this one list is not
+  // a matter of local preference: `no_access` and `parts_required` are the
+  // outcomes worth counting, and a tenant whose picker is empty on day one gets
+  // a free-text note instead — which is the exact failure the table exists to
+  // prevent, and it cannot be retrofitted once the history is written.
+  //
+  // The other three vocabularies (disposition reasons, fault codes, rate card)
+  // have no standard list on purpose: they are genuinely per-business, and
+  // inventing one would be putting words in an operator's mouth.
+  //
+  // `do nothing` on conflict so re-seeding an existing database is a no-op and
+  // an administrator's edits to a label survive it.
+  for (const tenantId of [T1, T2]) {
+    await db
+      .insert(schema.jobOutcomeCodes)
+      .values(
+        STANDARD_JOB_OUTCOMES.map((o) => ({
+          tenantId,
+          code: o.code,
+          label: o.label,
+          description: o.description,
+          isTerminal: o.isTerminal,
+          requiresReturnVisit: o.requiresReturnVisit,
+          sortOrder: o.sortOrder,
+        })),
+      )
+      .onConflictDoNothing();
+  }
+  console.log(`  ${STANDARD_JOB_OUTCOMES.length} standard job outcomes per tenant`);
 
   console.log(`\nDone. Sign in with any of:`);
   for (const s of staff) console.log(`  ${s.email.padEnd(32)} ${s.role}`);

@@ -35,7 +35,7 @@ import * as schema from "../schema";
 
 export type CronOutcome = "ok" | "failed";
 
-export const CRON_JOBS = ["dispatch", "sweep", "sla", "compliance", "health"] as const;
+export const CRON_JOBS = ["dispatch", "sweep", "sla", "compliance", "retention", "health"] as const;
 export type CronJob = (typeof CRON_JOBS)[number];
 
 /**
@@ -49,6 +49,7 @@ export const CRON_MAX_AGE_MINUTES: Readonly<Record<CronJob, number>> = {
   sweep: 200, // hourly
   sla: 35, // every 10 minutes
   compliance: 26 * 60, // daily
+  retention: 26 * 60, // daily
   health: 20, // every 5 minutes
 };
 

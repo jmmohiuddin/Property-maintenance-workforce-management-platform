@@ -2,6 +2,9 @@ import { sql } from "drizzle-orm";
 import {
   company,
   DEFAULT_CALENDAR,
+  toDecimalString,
+  toMinor,
+  UserFacingError,
   type CompanyIdentity,
   type WorkingCalendar,
 } from "@meridian/core";
@@ -445,4 +448,808 @@ export async function addRamadanPeriod(
 
 export async function deleteRamadanPeriod(tx: TenantScopedTx, id: string): Promise<void> {
   await tx.execute(sql`delete from ramadan_periods where id = ${id}::uuid`);
+}
+
+// ── Controlled vocabularies (ADM-10) ────────────────────────────────────────
+//
+// The calendar above decides when work may happen. Everything below decides
+// what an operator is allowed to *say* happened, which is the same problem one
+// layer up. Two rules hold across all of it:
+//
+//   1. **Retire, never delete.** Every code here is cited by rows that are
+//      already history — a lost lead, a completed visit, an issued quotation.
+//      Deleting one either fails on a foreign key or, worse, succeeds and
+//      rewrites the past. `isActive` takes it out of the picker and leaves it
+//      in the data.
+//   2. **The list is enforced where it is used, not where it is displayed.**
+//      A vocabulary the code does not check is a suggestion; see
+//      `resolveDispositionReason`, which is what `setLeadStage` calls before it
+//      will move a lead to `lost`.
+
+// ── Lead disposition reasons (LEAD-6) ───────────────────────────────────────
+
+/** Which stage a reason may be given for. `both` covers either. */
+export type DispositionScope = "lost" | "dormant" | "both";
+
+export interface DispositionReasonRow {
+  readonly id: string;
+  readonly code: string;
+  readonly label: string;
+  readonly appliesTo: DispositionScope;
+  readonly guidance: string | null;
+  readonly sortOrder: number;
+  readonly isActive: boolean;
+  /** How many leads cite it. Retiring a reason nobody used is free; retiring
+   *  one behind two hundred leads changes what a report means, so the screen
+   *  says the number rather than making the operator guess. */
+  readonly leadCount: number;
+}
+
+export async function listDispositionReasons(
+  tx: TenantScopedTx,
+  options?: { stage?: "lost" | "dormant"; activeOnly?: boolean },
+): Promise<readonly DispositionReasonRow[]> {
+  // Both filters are applied in SQL rather than in JavaScript because the
+  // picker on the field side will read this with an index behind it, and a
+  // filter that exists only in the caller is a filter the next caller forgets.
+  const stage = options?.stage ?? null;
+  const activeOnly = options?.activeOnly ?? false;
+
+  const rows = (await tx.execute<{
+    id: string;
+    code: string;
+    label: string;
+    applies_to: string;
+    guidance: string | null;
+    sort_order: number;
+    is_active: boolean;
+    lead_count: string;
+  }>(sql`
+    select r.id,
+           r.code,
+           r.label,
+           r.applies_to,
+           r.guidance,
+           r.sort_order,
+           r.is_active,
+           (select count(*) from leads l where l.disposition_reason_id = r.id) as lead_count
+      from lead_disposition_reasons r
+     where (${stage}::text is null or r.applies_to in (${stage}, 'both'))
+       and (${activeOnly} = false or r.is_active)
+     order by r.sort_order, r.label
+  `)) as unknown as {
+    id: string;
+    code: string;
+    label: string;
+    applies_to: string;
+    guidance: string | null;
+    sort_order: number;
+    is_active: boolean;
+    lead_count: string;
+  }[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    code: r.code,
+    label: r.label,
+    appliesTo: r.applies_to as DispositionScope,
+    guidance: r.guidance,
+    sortOrder: Number(r.sort_order),
+    isActive: r.is_active,
+    leadCount: Number(r.lead_count),
+  }));
+}
+
+/**
+ * The reason a lead may actually be closed with, or nothing.
+ *
+ * `setLeadStage` calls this before it will write `lost` or `dormant`, and
+ * refuses when it returns null. That is `LEAD-6` taken literally: a controlled
+ * vocabulary the application does not check is a suggestion, and the reason
+ * field is the entire reason the funnel is analytically useful.
+ *
+ * Three ways to return null, and they are deliberately indistinguishable to the
+ * caller: no such reason, retired, or belongs to the other stage. All three
+ * mean the same thing at the point of use — this is not a valid answer to this
+ * question — and the message the operator sees is better written once by the
+ * caller than assembled from a failure code here.
+ */
+export async function resolveDispositionReason(
+  tx: TenantScopedTx,
+  reasonId: string,
+  stage: "lost" | "dormant",
+): Promise<{ id: string; code: string; label: string } | null> {
+  const rows = (await tx.execute<{ id: string; code: string; label: string }>(sql`
+    select id, code, label
+      from lead_disposition_reasons
+     where id = ${reasonId}::uuid
+       and is_active
+       and applies_to in (${stage}, 'both')
+     limit 1
+  `)) as unknown as { id: string; code: string; label: string }[];
+
+  return rows[0] ?? null;
+}
+
+export async function addDispositionReason(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    code: string;
+    label: string;
+    appliesTo: DispositionScope;
+    guidance?: string | null;
+    sortOrder?: number;
+  },
+): Promise<void> {
+  // Re-entering an existing code updates it, matching the holiday form above.
+  // A silently discarded edit looks identical to a broken form, and the code is
+  // the identity here precisely so the label can be corrected.
+  await tx.execute(sql`
+    insert into lead_disposition_reasons (tenant_id, code, label, applies_to, guidance, sort_order)
+    values (
+      ${ctx.tenantId}::uuid,
+      ${input.code},
+      ${input.label},
+      ${input.appliesTo},
+      ${input.guidance ?? null},
+      ${input.sortOrder ?? 100}
+    )
+    on conflict (tenant_id, code) do update
+      set label = excluded.label,
+          applies_to = excluded.applies_to,
+          guidance = excluded.guidance,
+          sort_order = excluded.sort_order,
+          is_active = true
+  `);
+}
+
+/**
+ * Take a reason out of the picker, or put it back.
+ *
+ * There is no delete. A reason cited by a lost lead is part of what that lead
+ * means, and the foreign key is `ON DELETE restrict` so the database agrees.
+ */
+export async function setDispositionReasonActive(
+  tx: TenantScopedTx,
+  reasonId: string,
+  isActive: boolean,
+): Promise<void> {
+  await tx.execute(sql`
+    update lead_disposition_reasons set is_active = ${isActive} where id = ${reasonId}::uuid
+  `);
+}
+
+// ── Fault codes (JOB-14) ────────────────────────────────────────────────────
+
+export type FaultCodeKind = "symptom" | "cause" | "remedy";
+
+export const FAULT_CODE_KINDS: readonly FaultCodeKind[] = ["symptom", "cause", "remedy"];
+
+export interface FaultCodeRow {
+  readonly id: string;
+  readonly kind: FaultCodeKind;
+  readonly code: string;
+  readonly label: string;
+  readonly description: string | null;
+  /** Null means every service. */
+  readonly serviceSlug: string | null;
+  readonly sortOrder: number;
+  readonly isActive: boolean;
+}
+
+export async function listFaultCodes(
+  tx: TenantScopedTx,
+  options?: { kind?: FaultCodeKind; serviceSlug?: string; activeOnly?: boolean },
+): Promise<readonly FaultCodeRow[]> {
+  const kind = options?.kind ?? null;
+  const serviceSlug = options?.serviceSlug ?? null;
+  const activeOnly = options?.activeOnly ?? false;
+
+  const rows = (await tx.execute<{
+    id: string;
+    kind: string;
+    code: string;
+    label: string;
+    description: string | null;
+    service_slug: string | null;
+    sort_order: number;
+    is_active: boolean;
+  }>(sql`
+    select id, kind, code, label, description, service_slug, sort_order, is_active
+      from fault_codes
+     where (${kind}::text is null or kind = ${kind})
+       -- A code with no service applies to every service, so a service filter
+       -- has to keep the unscoped ones. Dropping them is how a technician on an
+       -- AC job loses "no power at the isolator".
+       and (${serviceSlug}::text is null or service_slug is null or service_slug = ${serviceSlug})
+       and (${activeOnly} = false or is_active)
+     order by kind, sort_order, label
+  `)) as unknown as {
+    id: string;
+    kind: string;
+    code: string;
+    label: string;
+    description: string | null;
+    service_slug: string | null;
+    sort_order: number;
+    is_active: boolean;
+  }[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    kind: r.kind as FaultCodeKind,
+    code: r.code,
+    label: r.label,
+    description: r.description,
+    serviceSlug: r.service_slug,
+    sortOrder: Number(r.sort_order),
+    isActive: r.is_active,
+  }));
+}
+
+export async function addFaultCode(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    kind: FaultCodeKind;
+    code: string;
+    label: string;
+    description?: string | null;
+    serviceSlug?: string | null;
+    sortOrder?: number;
+  },
+): Promise<void> {
+  await tx.execute(sql`
+    insert into fault_codes (tenant_id, kind, code, label, description, service_slug, sort_order)
+    values (
+      ${ctx.tenantId}::uuid,
+      ${input.kind},
+      ${input.code},
+      ${input.label},
+      ${input.description ?? null},
+      ${input.serviceSlug ?? null},
+      ${input.sortOrder ?? 100}
+    )
+    on conflict (tenant_id, kind, code) do update
+      set label = excluded.label,
+          description = excluded.description,
+          service_slug = excluded.service_slug,
+          sort_order = excluded.sort_order,
+          is_active = true
+  `);
+}
+
+export async function setFaultCodeActive(
+  tx: TenantScopedTx,
+  faultCodeId: string,
+  isActive: boolean,
+): Promise<void> {
+  await tx.execute(sql`
+    update fault_codes set is_active = ${isActive} where id = ${faultCodeId}::uuid
+  `);
+}
+
+// ── Job outcome codes (JOB-13) ──────────────────────────────────────────────
+
+export interface JobOutcomeRow {
+  readonly id: string;
+  readonly code: string;
+  readonly label: string;
+  readonly description: string | null;
+  readonly isTerminal: boolean;
+  readonly requiresReturnVisit: boolean;
+  readonly sortOrder: number;
+  readonly isActive: boolean;
+}
+
+/**
+ * The seven `JOB-13` names, as data.
+ *
+ * Prescribed by the requirement rather than chosen by the operator, so a tenant
+ * starts with them rather than with an empty list — an empty list would mean
+ * the first completed job has nothing valid to record, and "nothing valid to
+ * record" is how a free-text field gets added back.
+ *
+ * `no_access` and `customer_not_home` carry `requiresReturnVisit`, which is the
+ * requirement's actual point: they are a large share of real visits, they are
+ * not failures to be tidied away, and the work is still owed afterwards.
+ */
+export const STANDARD_JOB_OUTCOMES: readonly {
+  code: string;
+  label: string;
+  description: string;
+  isTerminal: boolean;
+  requiresReturnVisit: boolean;
+  sortOrder: number;
+}[] = [
+  {
+    code: "completed",
+    label: "Completed",
+    description: "Work finished on this visit. Nothing outstanding.",
+    isTerminal: true,
+    requiresReturnVisit: false,
+    sortOrder: 10,
+  },
+  {
+    code: "partial",
+    label: "Partially complete",
+    description: "Some of the scope was done; the rest is still owed.",
+    isTerminal: false,
+    requiresReturnVisit: true,
+    sortOrder: 20,
+  },
+  {
+    code: "return_visit_required",
+    label: "Return visit required",
+    description: "Parts on order, another trade needed, or the work does not fit one visit.",
+    isTerminal: false,
+    requiresReturnVisit: true,
+    sortOrder: 30,
+  },
+  {
+    code: "no_access",
+    label: "No access",
+    description: "Could not reach the work: no key, no permit, blocked area.",
+    isTerminal: false,
+    requiresReturnVisit: true,
+    sortOrder: 40,
+  },
+  {
+    code: "customer_not_home",
+    label: "Customer not home",
+    description: "Nobody on site at the agreed time.",
+    isTerminal: false,
+    requiresReturnVisit: true,
+    sortOrder: 50,
+  },
+  {
+    code: "aborted_unsafe",
+    label: "Aborted — unsafe",
+    description: "Stopped on safety grounds. Records why the visit produced no work.",
+    isTerminal: false,
+    requiresReturnVisit: true,
+    sortOrder: 60,
+  },
+  {
+    code: "quote_required",
+    label: "Quote required",
+    description: "Scope is larger than the visit; priced rather than carried out.",
+    isTerminal: true,
+    requiresReturnVisit: false,
+    sortOrder: 70,
+  },
+];
+
+export async function listJobOutcomeCodes(
+  tx: TenantScopedTx,
+  options?: { activeOnly?: boolean },
+): Promise<readonly JobOutcomeRow[]> {
+  const activeOnly = options?.activeOnly ?? false;
+
+  const rows = (await tx.execute<{
+    id: string;
+    code: string;
+    label: string;
+    description: string | null;
+    is_terminal: boolean;
+    requires_return_visit: boolean;
+    sort_order: number;
+    is_active: boolean;
+  }>(sql`
+    select id, code, label, description, is_terminal, requires_return_visit, sort_order, is_active
+      from job_outcome_codes
+     where (${activeOnly} = false or is_active)
+     order by sort_order, label
+  `)) as unknown as {
+    id: string;
+    code: string;
+    label: string;
+    description: string | null;
+    is_terminal: boolean;
+    requires_return_visit: boolean;
+    sort_order: number;
+    is_active: boolean;
+  }[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    code: r.code,
+    label: r.label,
+    description: r.description,
+    isTerminal: r.is_terminal,
+    requiresReturnVisit: r.requires_return_visit,
+    sortOrder: Number(r.sort_order),
+    isActive: r.is_active,
+  }));
+}
+
+/**
+ * Put the seven standard outcomes in place, leaving any local edits alone.
+ *
+ * `do nothing` rather than `do update`: an operator who has reworded "Customer
+ * not home" for their own dispatchers should not have that undone by somebody
+ * clicking a restore button, and the codes — which is what reports group on —
+ * are identical either way.
+ */
+export async function installStandardJobOutcomes(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+): Promise<number> {
+  let added = 0;
+  for (const outcome of STANDARD_JOB_OUTCOMES) {
+    // `returning` rather than a row count, because how a driver reports "rows
+    // affected" varies and a wrong number here would tell the operator seven
+    // outcomes were installed when none were.
+    const inserted = (await tx.execute<{ id: string }>(sql`
+      insert into job_outcome_codes
+        (tenant_id, code, label, description, is_terminal, requires_return_visit, sort_order)
+      values (
+        ${ctx.tenantId}::uuid,
+        ${outcome.code},
+        ${outcome.label},
+        ${outcome.description},
+        ${outcome.isTerminal},
+        ${outcome.requiresReturnVisit},
+        ${outcome.sortOrder}
+      )
+      on conflict (tenant_id, code) do nothing
+      returning id
+    `)) as unknown as { id: string }[];
+    if (inserted.length > 0) added += 1;
+  }
+  return added;
+}
+
+export async function addJobOutcomeCode(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    code: string;
+    label: string;
+    description?: string | null;
+    isTerminal: boolean;
+    requiresReturnVisit: boolean;
+    sortOrder?: number;
+  },
+): Promise<void> {
+  await tx.execute(sql`
+    insert into job_outcome_codes
+      (tenant_id, code, label, description, is_terminal, requires_return_visit, sort_order)
+    values (
+      ${ctx.tenantId}::uuid,
+      ${input.code},
+      ${input.label},
+      ${input.description ?? null},
+      ${input.isTerminal},
+      ${input.requiresReturnVisit},
+      ${input.sortOrder ?? 100}
+    )
+    on conflict (tenant_id, code) do update
+      set label = excluded.label,
+          description = excluded.description,
+          is_terminal = excluded.is_terminal,
+          requires_return_visit = excluded.requires_return_visit,
+          sort_order = excluded.sort_order,
+          is_active = true
+  `);
+}
+
+export async function setJobOutcomeActive(
+  tx: TenantScopedTx,
+  outcomeId: string,
+  isActive: boolean,
+): Promise<void> {
+  await tx.execute(sql`
+    update job_outcome_codes set is_active = ${isActive} where id = ${outcomeId}::uuid
+  `);
+}
+
+// ── Rate card (QTE-4, WEB-16) ───────────────────────────────────────────────
+
+export type RateBand = "standard" | "after_hours" | "emergency" | "weekend";
+
+export const RATE_BANDS: readonly RateBand[] = [
+  "standard",
+  "after_hours",
+  "emergency",
+  "weekend",
+];
+
+export const RATE_BAND_LABEL: Readonly<Record<RateBand, string>> = {
+  standard: "Standard",
+  after_hours: "After hours",
+  emergency: "Emergency",
+  weekend: "Weekend",
+};
+
+/** The units a rate may be quoted in. Closed, because the quote builder
+ *  multiplies by them and "hr" beside "hour" is both an arithmetic hazard and a
+ *  published rate card that reads as though nobody checked it. */
+export const RATE_UNITS = [
+  "hour",
+  "visit",
+  "point",
+  "item",
+  "m2",
+  "metre",
+  "day",
+  "month",
+] as const;
+
+export type RateUnit = (typeof RATE_UNITS)[number];
+
+export const RATE_UNIT_LABEL: Readonly<Record<RateUnit, string>> = {
+  hour: "per hour",
+  visit: "per visit",
+  point: "per point",
+  item: "per item",
+  m2: "per m²",
+  metre: "per metre",
+  day: "per day",
+  month: "per month",
+};
+
+export interface RateCardRow {
+  readonly id: string;
+  readonly code: string;
+  readonly serviceSlug: string;
+  readonly label: string;
+  readonly unit: RateUnit;
+  readonly rateBand: RateBand;
+  /** Integer minor units — fils. Never a float, never a decimal number. */
+  readonly unitPriceMinor: number;
+  readonly currency: string;
+  /** Minor units are wrong for a quantity; this is a decimal string or null. */
+  readonly minQuantity: string | null;
+  readonly notes: string | null;
+  readonly isPublished: boolean;
+  readonly effectiveFrom: string;
+  readonly effectiveTo: string | null;
+}
+
+function toRateRow(r: {
+  id: string;
+  code: string;
+  service_slug: string;
+  label: string;
+  unit: string;
+  rate_band: string;
+  unit_price: string;
+  currency: string;
+  min_quantity: string | null;
+  notes: string | null;
+  is_published: boolean;
+  effective_from: string;
+  effective_to: string | null;
+}): RateCardRow {
+  return {
+    id: r.id,
+    code: r.code,
+    serviceSlug: r.service_slug,
+    label: r.label,
+    unit: r.unit as RateUnit,
+    rateBand: r.rate_band as RateBand,
+    // The one conversion that matters. `numeric` arrives as a string and is
+    // parsed to integer fils here, at the edge, so nothing downstream is ever
+    // handed a float to add up. See packages/core/src/money.ts.
+    unitPriceMinor: toMinor(r.unit_price),
+    currency: r.currency,
+    minQuantity: r.min_quantity,
+    notes: r.notes,
+    isPublished: r.is_published,
+    effectiveFrom: r.effective_from,
+    effectiveTo: r.effective_to,
+  };
+}
+
+type RateCardSqlRow = Parameters<typeof toRateRow>[0];
+
+/**
+ * The rate card as it stood on a given day.
+ *
+ * `onDate` defaults to today, and passing a past date is the whole point of the
+ * table: "what did we charge for this in March" has to be answerable in July,
+ * or a quotation cannot be defended once a price has moved. The half-open
+ * period means a rate ending on the day the next one starts applies to neither
+ * day twice.
+ */
+export async function listRateCard(
+  tx: TenantScopedTx,
+  options?: { onDate?: string; publishedOnly?: boolean; serviceSlug?: string },
+): Promise<readonly RateCardRow[]> {
+  const onDate = options?.onDate ?? null;
+  const publishedOnly = options?.publishedOnly ?? false;
+  const serviceSlug = options?.serviceSlug ?? null;
+
+  const rows = (await tx.execute<RateCardSqlRow>(sql`
+    with as_of as (select coalesce(${onDate}::date, current_date) as d)
+    select r.id,
+           r.code,
+           r.service_slug,
+           r.label,
+           r.unit,
+           r.rate_band,
+           r.unit_price,
+           r.currency,
+           r.min_quantity,
+           r.notes,
+           r.is_published,
+           to_char(r.effective_from, 'YYYY-MM-DD') as effective_from,
+           to_char(r.effective_to, 'YYYY-MM-DD') as effective_to
+      from rate_card_items r, as_of
+     where r.effective_from <= as_of.d
+       and (r.effective_to is null or r.effective_to > as_of.d)
+       and (${publishedOnly} = false or r.is_published)
+       and (${serviceSlug}::text is null or r.service_slug = ${serviceSlug})
+     order by r.service_slug, r.code, r.rate_band
+  `)) as unknown as RateCardSqlRow[];
+
+  return rows.map(toRateRow);
+}
+
+/** Every version of one priced thing, newest first. The audit answer. */
+export async function listRateHistory(
+  tx: TenantScopedTx,
+  code: string,
+): Promise<readonly RateCardRow[]> {
+  const rows = (await tx.execute<RateCardSqlRow>(sql`
+    select id,
+           code,
+           service_slug,
+           label,
+           unit,
+           rate_band,
+           unit_price,
+           currency,
+           min_quantity,
+           notes,
+           is_published,
+           to_char(effective_from, 'YYYY-MM-DD') as effective_from,
+           to_char(effective_to, 'YYYY-MM-DD') as effective_to
+      from rate_card_items
+     where code = ${code}
+     order by rate_band, effective_from desc
+  `)) as unknown as RateCardSqlRow[];
+
+  return rows.map(toRateRow);
+}
+
+/**
+ * Price one thing on one day, in minor units.
+ *
+ * What the quote builder will call. Returns null rather than zero when nothing
+ * was priced then — a missing rate and a free line are different facts, and
+ * collapsing them puts a zero on a quotation nobody meant to give away.
+ */
+export async function rateOn(
+  tx: TenantScopedTx,
+  code: string,
+  rateBand: RateBand,
+  onDate?: string,
+): Promise<RateCardRow | null> {
+  const rows = (await tx.execute<RateCardSqlRow>(sql`
+    with as_of as (select coalesce(${onDate ?? null}::date, current_date) as d)
+    select r.id,
+           r.code,
+           r.service_slug,
+           r.label,
+           r.unit,
+           r.rate_band,
+           r.unit_price,
+           r.currency,
+           r.min_quantity,
+           r.notes,
+           r.is_published,
+           to_char(r.effective_from, 'YYYY-MM-DD') as effective_from,
+           to_char(r.effective_to, 'YYYY-MM-DD') as effective_to
+      from rate_card_items r, as_of
+     where r.code = ${code}
+       and r.rate_band = ${rateBand}
+       and r.effective_from <= as_of.d
+       and (r.effective_to is null or r.effective_to > as_of.d)
+     limit 1
+  `)) as unknown as RateCardSqlRow[];
+
+  const row = rows[0];
+  return row ? toRateRow(row) : null;
+}
+
+/**
+ * Add a price, closing the one it replaces.
+ *
+ * ── WHY THE CLOSE AND THE INSERT ARE ONE CALL ───────────────────────────────
+ *
+ * Because the alternative is a screen that lets somebody insert the new price
+ * and forget to end the old one, and the gist exclusion constraint would then
+ * refuse the insert with a message about `daterange` that means nothing to a
+ * person putting up their hourly rate. Doing both here means the constraint is
+ * a safety net rather than the user interface.
+ *
+ * A backdated version is refused rather than fitted in. Slotting a price in
+ * behind one that has already been quoted from would silently change what past
+ * quotations claim to be based on, and there is no correct answer to "which
+ * one did we actually use" once two of them cover the same day.
+ */
+export async function addRateVersion(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    code: string;
+    serviceSlug: string;
+    label: string;
+    unit: RateUnit;
+    rateBand: RateBand;
+    unitPriceMinor: number;
+    minQuantity?: string | null;
+    notes?: string | null;
+    isPublished: boolean;
+    effectiveFrom: string;
+  },
+): Promise<void> {
+  const current = (await tx.execute<{ id: string; effective_from: string }>(sql`
+    select id, to_char(effective_from, 'YYYY-MM-DD') as effective_from
+      from rate_card_items
+     where code = ${input.code}
+       and rate_band = ${input.rateBand}
+       and effective_to is null
+     limit 1
+  `)) as unknown as { id: string; effective_from: string }[];
+
+  const open = current[0];
+  if (open) {
+    if (open.effective_from >= input.effectiveFrom) {
+      throw new UserFacingError(
+        `The current ${RATE_BAND_LABEL[input.rateBand].toLowerCase()} price for ${input.code} ` +
+          `already runs from ${open.effective_from}. A new price has to start after that — ` +
+          `correct the existing one instead if the date was wrong.`,
+      );
+    }
+    await tx.execute(sql`
+      update rate_card_items
+         set effective_to = ${input.effectiveFrom}::date
+       where id = ${open.id}::uuid
+    `);
+  }
+
+  await tx.execute(sql`
+    insert into rate_card_items
+      (tenant_id, code, service_slug, label, unit, rate_band, unit_price,
+       min_quantity, notes, is_published, effective_from)
+    values (
+      ${ctx.tenantId}::uuid,
+      ${input.code},
+      ${input.serviceSlug},
+      ${input.label},
+      ${input.unit},
+      ${input.rateBand},
+      ${toDecimalString(input.unitPriceMinor)}::numeric,
+      ${input.minQuantity ?? null},
+      ${input.notes ?? null},
+      ${input.isPublished},
+      ${input.effectiveFrom}::date
+    )
+  `);
+}
+
+/**
+ * Stop charging for something from a given date.
+ *
+ * An end date, not a delete: the quotations issued while it was live still cite
+ * it, and a rate card with a hole where a line used to be cannot explain them.
+ */
+export async function endRate(
+  tx: TenantScopedTx,
+  code: string,
+  rateBand: RateBand,
+  endsOn: string,
+): Promise<void> {
+  await tx.execute(sql`
+    update rate_card_items
+       set effective_to = ${endsOn}::date
+     where code = ${code}
+       and rate_band = ${rateBand}
+       and effective_to is null
+       and effective_from < ${endsOn}::date
+  `);
 }

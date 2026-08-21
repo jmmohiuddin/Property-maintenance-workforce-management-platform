@@ -7,7 +7,13 @@ import {
   uninvoicedSignedOffJobs,
   INVOICE_STATUS_LABEL,
 } from "@meridian/db";
-import { formatMoney, toMinor, ISSUANCE_ALERT_DAYS, LATE_ISSUANCE_PENALTY } from "@meridian/core";
+import {
+  formatMoney,
+  toMinor,
+  ISSUANCE_ALERT_DAYS,
+  ISSUANCE_WINDOW_DAYS,
+  LATE_ISSUANCE_PENALTY,
+} from "@meridian/core";
 import { Warning } from "@phosphor-icons/react/dist/ssr";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
@@ -28,12 +34,27 @@ export default async function InvoicesPage() {
     }),
   );
 
-  // INV-5. Signed-off work has 14 days before the AED 2,500 applies, and the
-  // alert fires at day 10 — four days of margin, because raising an invoice
-  // needs a person and that person takes leave. The banner leads the page
-  // because it is the only thing here with a statutory deadline on it.
+  // INV-5, wireframes §7.2. Signed-off work has 14 days before the AED 2,500
+  // applies, and the alert fires at day 10 — four days of margin, because
+  // raising an invoice needs a person and that person takes leave.
+  //
+  // The banner leads the page, above AR ageing, because consequence order puts
+  // money at risk first: an unpaid invoice is money that is late, an un-issued
+  // one is money plus a penalty. Ordered oldest-first, which is the order the
+  // query returns and also the order they must be dealt with.
   const overdueToInvoice = awaitingInvoice.filter((j) => j.daysSinceSupply >= ISSUANCE_ALERT_DAYS);
+  const breached = overdueToInvoice.filter((j) => j.state === "breached");
   const oldest = overdueToInvoice[0];
+
+  // The clock is computed on plain calendar dates in Dubai, so the deadline
+  // arrives as an ISO string rather than a Date. Rendered the way every other
+  // date on this page is, because "2026-08-31" in a sentence reads as a serial
+  // number and a reader has to stop and parse it.
+  const deadlineDate = (iso: string): string =>
+    new Date(`${iso}T00:00:00Z`).toLocaleDateString("en-GB", {
+      timeZone: "UTC",
+      dateStyle: "medium",
+    });
 
   const buckets = [
     { label: "Current", value: ageing.currentMinor, tone: false },
@@ -62,26 +83,47 @@ export default async function InvoicesPage() {
             }}
           >
             <Warning size={16} weight="fill" aria-hidden className="mt-0.5 shrink-0" />
-            <div>
-              <p className="text-[14px] font-medium">
+            <div className="min-w-0">
+              <p className="text-[11px] font-semibold uppercase tracking-wide">Action needed</p>
+              <p className="mt-1 text-[14px] font-medium">
                 {overdueToInvoice.length} signed-off job
-                {overdueToInvoice.length === 1 ? " has" : "s have"} not been invoiced — the oldest is{" "}
-                {oldest.daysSinceSupply} days past supply
+                {overdueToInvoice.length === 1 ? " has" : "s have"} not been invoiced — the oldest is
+                day {oldest.daysSinceSupply} of {ISSUANCE_WINDOW_DAYS}
+                {breached.length > 0
+                  ? `, and ${breached.length} ${breached.length === 1 ? "is" : "are"} already past the limit`
+                  : ""}
               </p>
-              <p className="mt-1 text-[13px]">
-                {LATE_ISSUANCE_PENALTY} {oldest.jobReference} ({oldest.customerName}) must be
-                invoiced by {oldest.deadline}.
-              </p>
+              {/* The rule and the number, in that order and in one sentence.
+                  A compliance banner that says "action needed" without naming
+                  the statute or the amount is asking for a favour. */}
+              <p className="mt-1 text-[13px]">{LATE_ISSUANCE_PENALTY}</p>
               <ul className="mt-2 space-y-0.5 text-[13px]">
                 {overdueToInvoice.slice(0, 5).map((j) => (
                   <li key={j.jobId}>
-                    <Link href={`/jobs/${j.jobId}`} className="tnum hover:underline">
+                    <Link href={`/jobs/${j.jobId}`} className="tnum font-medium hover:underline">
                       {j.jobReference}
                     </Link>{" "}
-                    — {j.customerName}, day {j.daysSinceSupply} of 14
+                    — {j.customerName} · day {j.daysSinceSupply} of {ISSUANCE_WINDOW_DAYS} ·{" "}
+                    {j.state === "breached"
+                      ? `deadline was ${deadlineDate(j.deadline)}`
+                      : `invoice by ${deadlineDate(j.deadline)}`}
                   </li>
                 ))}
               </ul>
+              {overdueToInvoice.length > 5 ? (
+                <p className="mt-1 text-[13px]">
+                  … and {overdueToInvoice.length - 5} more.
+                </p>
+              ) : null}
+              {/* Deliberately the oldest job rather than a "raise invoices"
+                  bulk action. There is no bulk flow, and a button that opens a
+                  list the reader is already looking at is a button that teaches
+                  them the banner does nothing. */}
+              <p className="mt-3 text-[13px]">
+                <Link href={`/jobs/${oldest.jobId}`} className="font-medium underline">
+                  Raise the invoice for {oldest.jobReference} →
+                </Link>
+              </p>
             </div>
           </div>
         ) : null}

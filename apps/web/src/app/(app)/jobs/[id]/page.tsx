@@ -16,7 +16,7 @@ import { can } from "@meridian/auth";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 import { StatusActions, AssignPanel } from "./job-actions";
-import { QuotePanel, SendQuoteButton } from "./quote-panel";
+import { QuotePanel, SendQuoteButton, QuoteDocumentLink } from "./quote-panel";
 import { InvoicePanel } from "./invoice-panel";
 import { MapPin, Key, Clock } from "@phosphor-icons/react/dist/ssr";
 
@@ -256,11 +256,12 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
                         <p className="mt-0.5 text-[12px]" style={{ color: "var(--text-muted)" }}>
                           {QUOTE_STATUS_LABEL[q.status]}
                         </p>
-                        {q.status === "draft" && can(session.principal, "quotes:send") ? (
-                          <div className="mt-1.5">
+                        <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1">
+                          {q.status === "draft" && can(session.principal, "quotes:send") ? (
                             <SendQuoteButton quoteId={q.id} reference={q.reference} />
-                          </div>
-                        ) : null}
+                          ) : null}
+                          <QuoteDocumentLink quoteId={q.id} reference={q.reference} />
+                        </div>
                       </li>
                     ))}
                   </ul>

@@ -9,4 +9,5 @@ export * from "./ratelimit";
 export * from "./compliance";
 export * from "./staff";
 export * from "./cron";
+export * from "./retention";
 export * from "./reference";

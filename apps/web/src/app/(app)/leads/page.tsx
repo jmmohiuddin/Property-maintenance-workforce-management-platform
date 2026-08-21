@@ -1,19 +1,39 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 import { withTenant, listLeads } from "@meridian/db";
+import { leadAttributionSummary, listDispositionReasons } from "@meridian/db/domain";
 import { getService, LEAD_STAGE_LABEL } from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 import { ConvertLeadForm } from "./convert-form";
+import { StageForm } from "./stage-form";
+import { AttributionPanel } from "./attribution-panel";
 
 export const metadata: Metadata = { title: "Leads" };
 export const dynamic = "force-dynamic";
 
+const CHANNEL_LABEL: Record<string, string> = {
+  website: "Website",
+  phone: "Phone",
+  whatsapp: "WhatsApp",
+  walk_in: "Walk-in",
+  referral: "Referral",
+  contract_enquiry: "Contract enquiry",
+  aggregator: "Aggregator",
+  portal: "Customer portal",
+  other: "Other",
+};
+
 export default async function LeadsPage() {
   const session = await requireSessionWith("customers:read");
 
-  const leads = await withTenant(
+  const { leads, reasons, attribution } = await withTenant(
     { tenantId: session.principal.tenantId, userId: session.principal.userId },
-    (tx) => listLeads(tx),
+    async (tx) => ({
+      leads: await listLeads(tx),
+      reasons: await listDispositionReasons(tx, { activeOnly: true }),
+      attribution: await leadAttributionSummary(tx),
+    }),
   );
 
   const canConvert = ["owner", "admin", "operations_manager", "sales", "dispatcher"].includes(
@@ -25,9 +45,11 @@ export default async function LeadsPage() {
       <div className="container-page py-8">
         <h1 className="text-2xl font-semibold tracking-tight md:text-3xl">Leads</h1>
         <p className="prose-body mt-2 text-[14px]">
-          Enquiries from the website and phone, newest first. Converting a lead creates the customer,
-          the property and the job together.
+          Enquiries from every channel, newest first. Converting a lead creates the customer, the
+          property and the job together.
         </p>
+
+        <AttributionPanel summary={attribution} />
 
         {leads.length === 0 ? (
           <div
@@ -70,6 +92,24 @@ export default async function LeadsPage() {
                     {lead.message ? (
                       <p className="prose-body mt-3 text-[14px]">{lead.message}</p>
                     ) : null}
+
+                    {/*
+                      Attribution on the row rather than behind a click (`LEAD-4`).
+                      A number nobody sees while doing the work is a number nobody
+                      checks, and this is the line that says whether the answer-engine
+                      pages are earning anything.
+                    */}
+                    <p className="mt-3 text-[12px]" style={{ color: "var(--text-muted)" }}>
+                      {CHANNEL_LABEL[lead.channel] ?? lead.channel}
+                      {lead.calledNumber ? ` · called ${lead.calledNumber}` : ""}
+                      {lead.utmCampaign ? ` · campaign ${lead.utmCampaign}` : ""}
+                      {lead.utmSource ? ` · ${lead.utmSource}` : ""}
+                      {lead.landingPage ? ` · from ${lead.landingPage}` : ""}
+                      {lead.referrer ? ` · referred by ${shortHost(lead.referrer)}` : ""}
+                      {!lead.utmSource && !lead.landingPage && !lead.referrer && !lead.calledNumber
+                        ? " · no source recorded"
+                        : ""}
+                    </p>
                   </div>
                   <p className="tnum shrink-0 text-[13px]" style={{ color: "var(--text-muted)" }}>
                     {lead.createdAt.toLocaleString("en-GB", {
@@ -81,7 +121,7 @@ export default async function LeadsPage() {
                 </div>
 
                 {canConvert ? (
-                  <div className="mt-5 border-t pt-5">
+                  <div className="mt-5 flex flex-wrap gap-3 border-t pt-5">
                     <ConvertLeadForm
                       leadId={lead.id}
                       defaultTitle={
@@ -90,13 +130,46 @@ export default async function LeadsPage() {
                       }
                       defaultProperty={`${lead.name} - ${lead.area ?? lead.city ?? "site"}`}
                     />
+                    <StageForm
+                      leadId={lead.id}
+                      currentStage={lead.stage}
+                      reasons={reasons.map((reason) => ({
+                        id: reason.id,
+                        label: reason.label,
+                        appliesTo: reason.appliesTo,
+                      }))}
+                    />
                   </div>
                 ) : null}
               </li>
             ))}
           </ul>
         )}
+
+        {canConvert && reasons.length === 0 ? (
+          <p className="mt-6 text-[13px]" style={{ color: "var(--text-muted)" }}>
+            No lost or dormant reasons are configured, so leads that are dead cannot be closed and
+            will sit here looking live.{" "}
+            <Link
+              href="/admin/reference/dispositions"
+              className="underline underline-offset-2"
+              style={{ color: "var(--accent-text)" }}
+            >
+              Add them in reference data
+            </Link>
+            .
+          </p>
+        ) : null}
       </div>
     </AppShell>
   );
+}
+
+/** "https://www.google.com/search?q=…" → "google.com". The bit worth reading. */
+function shortHost(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url.slice(0, 60);
+  }
 }

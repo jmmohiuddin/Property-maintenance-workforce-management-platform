@@ -35,6 +35,7 @@ export type TemplateId =
   | "sla_breached"
   | "certification_expiring"
   | "compliance_expiry"
+  | "invoice_issuance_due"
   | "password_reset"
   | "staff_invitation"
   | "cron_unhealthy";
@@ -136,6 +137,36 @@ export interface TemplatePayloads {
     }[];
     accreditations: readonly { name: string; reference: string | null; daysRemaining: number }[];
     certifications: readonly { name: string; certification: string; daysRemaining: number }[];
+  };
+  /**
+   * The 14-day issuance clock (`INV-5`).
+   *
+   * Separate from `compliance_expiry` on purpose, and not an extra section
+   * inside it. That digest goes to HR and the owner about people who cannot be
+   * sent to work; this one goes to the accountant and the owner about AED 2,500
+   * per un-issued invoice. Different recipient, different money, different
+   * action — folding them together would bury one inside the other, and the
+   * suppression window would then silence whichever arrived second.
+   */
+  invoice_issuance_due: {
+    recipientName: string;
+    /** 14. Passed in rather than hard-coded so the rule lives in `core` only. */
+    windowDays: number;
+    /** The statutory penalty, stated as a number. See `LATE_ISSUANCE_PENALTY`. */
+    penalty: string;
+    supplies: readonly {
+      jobId: string;
+      jobReference: string;
+      jobTitle: string;
+      customerName: string;
+      /** ISO date, in Dubai. The customer's signature is the moment of supply. */
+      supplyDate: string;
+      daysSinceSupply: number;
+      /** ISO date. The last day an invoice may lawfully be issued. */
+      deadline: string;
+      /** `breached` means the penalty already applies. */
+      state: "approaching" | "breached";
+    }[];
   };
   certification_expiring: {
     recipientName: string;
@@ -365,6 +396,52 @@ export const TEMPLATES: {
       `\n${absoluteUrl("/workforce")}` +
       sign,
   }),
+
+  invoice_issuance_due: (p) => {
+    // Consequence order, same rule as `compliance_expiry`: the supplies where
+    // the penalty has already been incurred go first, and the ones still inside
+    // the window follow. A list sorted by date alone puts a job that is one day
+    // late above one that is three weeks late whenever it was signed off
+    // earlier, which is the wrong thing to read first.
+    const breached = p.supplies.filter((s) => s.state === "breached");
+    const approaching = p.supplies.filter((s) => s.state === "approaching");
+
+    const line = (s: TemplatePayloads["invoice_issuance_due"]["supplies"][number]): string =>
+      `  ${s.jobReference}  ${s.jobTitle}\n` +
+      `    ${s.customerName} · supplied ${date(s.supplyDate)} · ` +
+      `day ${s.daysSinceSupply} of ${p.windowDays}\n` +
+      `    ${s.state === "breached" ? "deadline was" : "invoice by"} ${date(s.deadline)}`;
+
+    return {
+      subject:
+        breached.length > 0
+          ? `URGENT: ${breached.length} supply${breached.length === 1 ? "" : "s"} past the ` +
+            `${p.windowDays}-day invoice deadline`
+          : `${approaching.length} signed-off job${approaching.length === 1 ? "" : "s"} must be ` +
+            `invoiced within ${p.windowDays} days`,
+      body:
+        `${p.recipientName},\n` +
+        (breached.length > 0
+          ? `\nPAST THE ${p.windowDays}-DAY LIMIT (${breached.length}) — the penalty already applies\n` +
+            breached.map(line).join("\n") +
+            `\n  Issue these today. A late tax invoice is still the invoice that must be issued, ` +
+            `and the penalty does not increase by waiting — but a second missed month does.\n`
+          : "") +
+        (approaching.length > 0
+          ? `\nSTILL INSIDE THE WINDOW (${approaching.length})\n` +
+            approaching.map(line).join("\n") +
+            "\n"
+          : "") +
+        `\n${p.penalty}\n` +
+        // The date of supply is the customer's signature, not the day accounts
+        // got round to the paperwork. Said here because the recipient will
+        // otherwise count from the wrong day and think there is more time.
+        `The clock runs from the date of supply — the customer's sign-off — not from when the ` +
+        `invoice is raised.\n\n` +
+        `${absoluteUrl("/invoices")}` +
+        sign,
+    };
+  },
 
   certification_expiring: (p) => ({
     subject: `${p.certifications.length} technician certification${p.certifications.length === 1 ? "" : "s"} expiring`,

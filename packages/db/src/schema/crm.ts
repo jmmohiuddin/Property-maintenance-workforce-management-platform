@@ -13,6 +13,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { idCol, timestamps, money, currencyCol, propertyType, leadStage, assetCondition } from "./_shared";
 import { tenants, users } from "./tenancy";
+import { leadDispositionReasons } from "./reference";
 
 /**
  * A customer is the paying entity — a developer, an owners association, a
@@ -199,11 +200,42 @@ export const leads = pgTable(
     estimatedValue: money("estimated_value"),
     currency: currencyCol(),
     source: varchar("source", { length: 64 }).notNull().default("website"),
-    /** utm_source / medium / campaign / gclid, kept for attribution reporting. */
+    /**
+     * Attribution (`LEAD-4`, `DB-5`).
+     *
+     * `channel` is the constrained one — `LEAD-1`'s list, checked in the
+     * database — and it covers the manual paths as well as the web form,
+     * because an enquiry that arrives by phone or WhatsApp is a lead like any
+     * other and a funnel missing them is a funnel measuring the website rather
+     * than the business.
+     *
+     * `attribution` below stays. These columns are what a report can group by;
+     * the blob is where the unanticipated goes — `gclid`, a user agent, the
+     * next platform's identifier — and dropping it would trade one gap for
+     * another.
+     */
+    channel: varchar("channel", { length: 24 }).notNull().default("website"),
+    utmSource: varchar("utm_source", { length: 120 }),
+    utmMedium: varchar("utm_medium", { length: 120 }),
+    utmCampaign: varchar("utm_campaign", { length: 160 }),
+    landingPage: varchar("landing_page", { length: 512 }),
+    referrer: varchar("referrer", { length: 512 }),
+    /** Which advertised number was dialled, so a tracked number is separable. */
+    calledNumber: varchar("called_number", { length: 32 }),
     attribution: jsonb("attribution").notNull().default({}),
     message: text("message"),
     ownerId: uuid("owner_id").references(() => users.id, { onDelete: "set null" }),
     convertedCustomerId: uuid("converted_customer_id").references(() => customers.id, { onDelete: "set null" }),
+    /**
+     * `LEAD-6`. Required by a CHECK whenever the stage is `lost` or `dormant`,
+     * and `ON DELETE restrict` so a reason cannot be deleted out from under the
+     * leads that cite it — the admin screen deactivates instead.
+     */
+    dispositionReasonId: uuid("disposition_reason_id").references(
+      () => leadDispositionReasons.id,
+      { onDelete: "restrict" },
+    ),
+    /** Optional colour *alongside* the coded reason, never instead of it. */
     lostReason: text("lost_reason"),
     nextFollowUpAt: timestamp("next_follow_up_at", { withTimezone: true }),
     ...timestamps,
@@ -212,6 +244,8 @@ export const leads = pgTable(
     index("leads_tenant_stage_idx").on(t.tenantId, t.stage),
     index("leads_followup_idx").on(t.tenantId, t.nextFollowUpAt),
     index("leads_tenant_created_idx").on(t.tenantId, t.createdAt),
+    // The index the attribution report reads: leads by channel over a period.
+    index("leads_channel_idx").on(t.tenantId, t.channel, t.createdAt),
   ],
 );
 

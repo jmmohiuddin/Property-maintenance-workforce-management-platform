@@ -3,7 +3,7 @@
 import { useActionState, useState } from "react";
 import { formatMoney, toMinor, computeTotals, UAE_VAT_BASIS_POINTS } from "@meridian/core";
 import { createQuoteAction, sendQuoteAction, type ActionState } from "./actions";
-import { Warning, CheckCircle, Plus, Trash } from "@phosphor-icons/react/dist/ssr";
+import { Warning, CheckCircle, Plus, Trash, DownloadSimple } from "@phosphor-icons/react/dist/ssr";
 
 const INITIAL: ActionState = {};
 
@@ -199,5 +199,37 @@ export function SendQuoteButton({ quoteId, reference }: { quoteId: string; refer
         </span>
       ) : null}
     </form>
+  );
+}
+
+/**
+ * Download the quotation (`QTE-3`).
+ *
+ * A plain link rather than an action, because the artefact is a file and the
+ * browser already knows how to save one. The route serves it with
+ * `Content-Disposition: attachment` (`SEC-8`), so this does not open a tab.
+ *
+ * The first person to follow it for a given quote causes the document to be
+ * rendered and stored; everybody after that gets the same bytes. That is why
+ * the link is offered on every quotation rather than only on ones already
+ * rendered — there is no state here worth showing, and a link that appears
+ * later would just read as something being broken now.
+ *
+ * If the render is refused — a quote whose totals do not add up — the route
+ * answers 409 with the reasons in plain text rather than serving a file. That
+ * is deliberately visible: the alternative is a PDF that states a total the
+ * customer can disprove with a calculator.
+ */
+export function QuoteDocumentLink({ quoteId, reference }: { quoteId: string; reference: string }) {
+  return (
+    <a
+      href={`/quotes/${quoteId}/document`}
+      className="inline-flex items-center gap-1.5 text-[13px] font-medium"
+      style={{ color: "var(--accent-text)" }}
+      aria-label={`Download quotation ${reference}`}
+    >
+      <DownloadSimple size={13} aria-hidden />
+      Download PDF
+    </a>
   );
 }

@@ -61,6 +61,18 @@ export const quotes = pgTable(
     supersedesQuoteId: uuid("supersedes_quote_id"),
     /** Provenance when a draft was AI-generated: model, prompt hash, confidence. */
     aiGeneration: jsonb("ai_generation"),
+
+    // QTE-3 / DB-2. The rendered quotation and the hash of its bytes.
+    //
+    // Stored rather than re-rendered, for the reason TRD §7.6 gives: the
+    // customer accepted a specific document, and a template change six months
+    // later must not alter what they can be shown to have agreed to. Both
+    // columns are set together and neither can be changed afterwards — the
+    // 0010 migration holds both rules.
+    pdfStorageKey: text("pdf_storage_key"),
+    pdfSha256: varchar("pdf_sha256", { length: 64 }),
+    pdfRenderedAt: timestamp("pdf_rendered_at", { withTimezone: true }),
+
     preparedById: uuid("prepared_by_id").references(() => users.id, { onDelete: "set null" }),
     ...timestamps,
   },
@@ -280,7 +292,13 @@ export const invoices = pgTable(
 
     issuedById: uuid("issued_by_id").references(() => users.id, { onDelete: "set null" }),
 
+    // INV-3 / DB-2. `pdf_storage_key` has existed since 0000 and nothing wrote
+    // to it (`TD-14`); 0010 gives it the hash that makes the artefact
+    // evidential and the trigger that makes both write-once.
     pdfStorageKey: text("pdf_storage_key"),
+    pdfSha256: varchar("pdf_sha256", { length: 64 }),
+    pdfRenderedAt: timestamp("pdf_rendered_at", { withTimezone: true }),
+
     notes: text("notes"),
     sentAt: timestamp("sent_at", { withTimezone: true }),
     lastReminderAt: timestamp("last_reminder_at", { withTimezone: true }),
@@ -450,7 +468,12 @@ export const creditNotes = pgTable(
     recipientAddress: text("recipient_address"),
     recipientCountry: varchar("recipient_country", { length: 2 }).notNull().default("AE"),
 
+    // INV-7. Same pair as the invoice: a credit note is a tax document in its
+    // own right and carries its own artefact.
     pdfStorageKey: text("pdf_storage_key"),
+    pdfSha256: varchar("pdf_sha256", { length: 64 }),
+    pdfRenderedAt: timestamp("pdf_rendered_at", { withTimezone: true }),
+
     issuedById: uuid("issued_by_id").references(() => users.id, { onDelete: "set null" }),
     ...timestamps,
   },
