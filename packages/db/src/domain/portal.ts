@@ -1,6 +1,7 @@
 import { and, eq, isNull, asc } from "drizzle-orm";
 import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
+import { loadWorkingCalendar } from "./reference";
 import { computeSlaDeadlines, UserFacingError, type JobPriority } from "@meridian/core";
 import { nextJobReference } from "./jobs";
 
@@ -63,7 +64,16 @@ export async function createPortalRequest(
   if (!properties[0]) throw new UserFacingError("That property is not on your account");
 
   const now = new Date();
-  const { respondByAt, resolveByAt } = computeSlaDeadlines(input.requestedPriority, now);
+  // ADM-10. The stored calendar, not DEFAULT_CALENDAR.
+  //
+  // computeSlaDeadlines takes a calendar as its fourth argument and falls back
+  // to the default when none is given — and the default ships with an EMPTY
+  // holiday list, deliberately, because a hardcoded one goes stale in January.
+  // Taking that fallback silently here would mean an administrator could enter
+  // every UAE public holiday and every deadline computed afterwards would still
+  // ignore them. The seam existed; nothing was using it.
+  const calendar = await loadWorkingCalendar(tx);
+  const { respondByAt, resolveByAt } = computeSlaDeadlines(input.requestedPriority, now, undefined, calendar);
   const reference = await nextJobReference(tx);
 
   const [job] = await tx

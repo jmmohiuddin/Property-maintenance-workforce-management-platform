@@ -1,6 +1,7 @@
 import { and, eq, desc, sql, isNull, inArray } from "drizzle-orm";
 import { db, withTenant, type TenantScopedTx, type TenantContext } from "../index";
 import * as schema from "../schema";
+import { loadWorkingCalendar } from "./reference";
 import {
   computeSlaDeadlines,
   OPEN_LEAD_STAGES,
@@ -323,7 +324,16 @@ export async function convertLeadToJob(
   if (!property) throw new Error("Failed to create property");
 
   const now = new Date();
-  const { respondByAt, resolveByAt } = computeSlaDeadlines(input.priority, now);
+  // ADM-10. The stored calendar, not DEFAULT_CALENDAR.
+  //
+  // computeSlaDeadlines takes a calendar as its fourth argument and falls back
+  // to the default when none is given — and the default ships with an EMPTY
+  // holiday list, deliberately, because a hardcoded one goes stale in January.
+  // Taking that fallback silently here would mean an administrator could enter
+  // every UAE public holiday and every deadline computed afterwards would still
+  // ignore them. The seam existed; nothing was using it.
+  const calendar = await loadWorkingCalendar(tx);
+  const { respondByAt, resolveByAt } = computeSlaDeadlines(input.priority, now, undefined, calendar);
   const reference = await nextJobReference(tx);
 
   const [job] = await tx
