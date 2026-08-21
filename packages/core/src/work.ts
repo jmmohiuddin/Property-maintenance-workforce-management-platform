@@ -13,6 +13,8 @@
 
 // ── Job status ───────────────────────────────────────────────────────────────
 
+import { workingDeadline, DEFAULT_CALENDAR, type WorkingCalendar } from "./calendar";
+
 export type JobStatus =
   | "draft"
   | "submitted"
@@ -184,21 +186,46 @@ export function slaTargetFor(
 }
 
 /**
+ * Priorities whose clock runs 24/7 rather than against the working calendar.
+ *
+ * `JOB-3`. Only P1. An active leak at 02:00 on a Saturday is still an
+ * emergency, the 24-hour line exists precisely to answer it, and a deadline
+ * that politely waited for Monday would describe a service the business does
+ * not offer.
+ */
+export const WALL_CLOCK_PRIORITIES: readonly JobPriority[] = ["p1_emergency"];
+
+/**
  * SLA deadlines are computed once at triage and stored, never recomputed on
  * read. A contract's targets can change mid-year, and a job raised under the
  * old terms must keep being judged by the old terms - deriving on read would
  * silently rewrite history every time a contract was renegotiated, which is
  * exactly the number a customer disputes.
+ *
+ * ── CHANGED BY `JOB-3` ──────────────────────────────────────────────────────
+ *
+ * Deadlines used to be wall-clock for every priority, which produced deadlines
+ * nobody could have met. A P3 job raised at 18:00 on a Thursday breached at
+ * 18:00 on Friday — overnight, then into a weekend the business does not work.
+ * The breach was real in the database and imaginary in the world, and a queue
+ * full of imaginary breaches is how people learn to ignore the real ones.
+ *
+ * P2-P4 now count **working minutes** from the calendar (`JOB-6`); P1 stays
+ * wall-clock. Passing no calendar keeps the default one, so existing callers
+ * get the corrected behaviour without changing.
  */
 export function computeSlaDeadlines(
   priority: JobPriority,
   from: Date,
   contractTargets?: Partial<Record<JobPriority, SlaTarget>>,
+  calendar: WorkingCalendar = DEFAULT_CALENDAR,
 ): { respondByAt: Date; resolveByAt: Date } {
   const target = slaTargetFor(priority, contractTargets);
+  const wallClock = WALL_CLOCK_PRIORITIES.includes(priority);
+
   return {
-    respondByAt: new Date(from.getTime() + target.respondMinutes * 60_000),
-    resolveByAt: new Date(from.getTime() + target.resolveMinutes * 60_000),
+    respondByAt: workingDeadline(from, target.respondMinutes, { wallClock, calendar }),
+    resolveByAt: workingDeadline(from, target.resolveMinutes, { wallClock, calendar }),
   };
 }
 
