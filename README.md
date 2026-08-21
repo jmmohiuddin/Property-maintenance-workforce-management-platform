@@ -68,11 +68,20 @@ Create the database, apply the schema, the security policies and the authenticat
 prove the tenant boundary holds:
 
 ```bash
-createdb meridian_dev && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/drizzle/0000_init.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/drizzle/0001_huge_stardust.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/drizzle/0002_futuristic_joshua_kane.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/rls.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/auth-functions.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/public-functions.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/customer-scope.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/reference.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/mfa-functions.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/verify-rls.sql
+createdb meridian_dev
+for f in packages/db/drizzle/*.sql; do psql -d meridian_dev -v ON_ERROR_STOP=1 -f "$f"; done
+for f in rls auth-functions public-functions customer-scope reference mfa-functions cron-functions reset-functions verify-rls; do \
+  psql -d meridian_dev -v ON_ERROR_STOP=1 -f "packages/db/sql/$f.sql"; done
 ```
 
-That last file runs twelve isolation checks and exits non-zero if any fail. **Run it in CI on every
-migration** — it is the gate that matters most in this repo.
+That last file runs twelve isolation checks and exits non-zero if any fail. It now runs in CI on
+every push (`.github/workflows/ci.yml`) — it is the gate that matters most in this repo.
+
+**The order of the `sql/` files is load-bearing, not stylistic.** `rls.sql` ends with a blanket
+`GRANT ... ON ALL TABLES`, so every `REVOKE` a later file depends on has to come after it. Applying
+`rls.sql` on its own re-opens direct access to `rate_limits`, which makes the rate limiter
+bypassable by the application role — `packages/db/test/ratelimit.test.ts` is what catches that, and
+it is how the trap was found. Apply the whole list, in this order, every time.
 
 Give the application role a password, then load demo data:
 
