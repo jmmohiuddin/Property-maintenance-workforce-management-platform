@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import {
   tenant,
+  responseCommitment,
   getService,
   graph,
   webPageSchema,
@@ -187,11 +188,11 @@ export default function ContractsPage() {
                   {s.name}
                 </h3>
                 <p className="prose-body mt-3 text-[15px]">{s.answer}</p>
-                <p className="tnum mt-5 text-[14px] font-semibold">
-                  From {tenant.currencySymbol} {s.priceFrom.amount}{" "}
-                  <span className="font-normal" style={{ color: "var(--text-muted)" }}>
-                    {s.priceFrom.unit}
-                  </span>
+                {/* Price removed with the rest of the invented figures; the
+                    published rate card (WEB-16) is generated from the system's
+                    own rate card so it cannot drift from what is quoted. */}
+                <p className="mt-5 text-[14px]" style={{ color: "var(--text-secondary)" }}>
+                  {responseCommitment(s)}
                 </p>
               </Link>
             ))}

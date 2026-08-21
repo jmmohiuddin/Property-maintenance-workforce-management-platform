@@ -12,7 +12,7 @@ import {
   howToSchema,
   breadcrumbSchema,
 } from "@meridian/core";
-import { Section, AnswerBlock } from "@/components/ui";
+import { Section, AnswerBlock, CallLink } from "@/components/ui";
 import { FaqList } from "@/components/faq";
 import { JsonLd } from "@/components/json-ld";
 import { PhoneCall, WhatsappLogo } from "@phosphor-icons/react/dist/ssr";
@@ -52,6 +52,7 @@ const WHILE_YOU_WAIT = [
 ] as const;
 
 export default function EmergencyPage() {
+  const urgentWhatsapp = whatsappLink("URGENT: I have a maintenance emergency and need help now.");
   if (!emergency) return null;
 
   return (
@@ -93,25 +94,27 @@ export default function EmergencyPage() {
               line is answered by a person.
             </p>
             <div className="mt-9 flex flex-wrap gap-3">
-              <a href={telLink(tenant.emergencyPhone)} className="btn btn-primary !text-[17px] !py-4 !px-7">
-                <PhoneCall size={19} weight="fill" aria-hidden />
-                {tenant.emergencyPhone}
-              </a>
-              <a
-                href={whatsappLink(`URGENT: I have a maintenance emergency and need help now.`)}
-                className="btn btn-inverse"
-              >
-                <WhatsappLogo size={17} weight="fill" aria-hidden />
-                WhatsApp
-              </a>
+              <CallLink phone={tenant.emergencyPhone} className="btn btn-primary !text-[17px] !py-4 !px-7" />
+              {urgentWhatsapp ? (
+                <a href={urgentWhatsapp} className="btn btn-inverse">
+                  <WhatsappLogo size={17} weight="fill" aria-hidden />
+                  WhatsApp
+                </a>
+              ) : null}
             </div>
           </div>
           <dl className="grid grid-cols-2 gap-6 lg:col-span-5">
+            {/*
+              The SLA tiers, which are commitments the system enforces (JOB-4),
+              replacing the previous block: an unmeasured Dubai median, coverage
+              promises for two emirates this Dubai mainland licence does not
+              cover, and an invented AED 250 callout fee.
+            */}
             {[
-              { t: tenant.address.city, v: `< ${tenant.emergencyResponseMinutes} min` },
-              { t: "Abu Dhabi", v: "< 90 min" },
-              { t: "Sharjah", v: "< 90 min" },
-              { t: "Call-out fee", v: `${tenant.currencySymbol} 250` },
+              { t: "P1 emergency response", v: "30–60 min" },
+              { t: "P1 resolution target", v: "2–4 hrs" },
+              { t: "P2 urgent response", v: "2–4 hrs" },
+              { t: "Coverage", v: "Dubai, 24/7" },
             ].map((row) => (
               <div key={row.t}>
                 <dt className="text-[14px]" style={{ color: "var(--color-ink-500)" }}>

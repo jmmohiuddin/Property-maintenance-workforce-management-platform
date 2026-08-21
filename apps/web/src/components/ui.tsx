@@ -1,6 +1,6 @@
 import Link from "next/link";
-import { tenant, type Service } from "@meridian/core";
-import { ArrowUpRight, Lightning } from "@phosphor-icons/react/dist/ssr";
+import { telLink, responseCommitment, type Service } from "@meridian/core";
+import { ArrowUpRight, Lightning, PhoneCall } from "@phosphor-icons/react/dist/ssr";
 
 export function Section({
   children,
@@ -66,11 +66,16 @@ export function ServiceCard({ service, image }: { service: Service; image?: stri
         </div>
         <p className="prose-body mt-2 text-[14px]">{service.tagline}</p>
       </div>
+      {/*
+        This used to read "From AED 150 · call-out". That number was invented,
+        along with every other price in the catalogue, so WEB-2 removed it. What
+        replaces it is a commitment the SLA clock is actually measured against
+        (JOB-4) rather than a price nobody had set. Real prices arrive with
+        WEB-16, generated from the rate card so they cannot drift from what is
+        quoted.
+      */}
       <div className="mt-5 flex flex-wrap items-center gap-x-4 gap-y-2 text-[13px]">
-        <span className="tnum" style={{ color: "var(--text-primary)" }}>
-          From {tenant.currencySymbol} {service.priceFrom.amount}
-        </span>
-        <span style={{ color: "var(--text-muted)" }}>{service.priceFrom.unit}</span>
+        <span style={{ color: "var(--text-secondary)" }}>{responseCommitment(service)}</span>
         {service.emergency ? (
           <span
             className="inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide"
@@ -103,5 +108,36 @@ export function AnswerBlock({ children }: { children: React.ReactNode }) {
     <div className="border-l-2 pl-5 md:pl-6" style={{ borderColor: "var(--accent)" }}>
       <p className="answer-lead">{children}</p>
     </div>
+  );
+}
+
+/**
+ * A phone call-to-action that renders nothing when there is no number.
+ *
+ * The alternative — an anchor with an empty `href` and an empty label — is a
+ * dead control that looks like a live one, which is the failure mode WEB-2
+ * exists to remove in copy and this component removes in markup. The number is
+ * required (`WEB-4`, and `missingRequiredFields()` reports it), so an absent
+ * button is a visible gap rather than a hidden one.
+ */
+export function CallLink({
+  phone,
+  label,
+  className = "btn btn-primary",
+  icon = true,
+}: {
+  phone: string | null;
+  label?: string;
+  className?: string;
+  icon?: boolean;
+}) {
+  const href = telLink(phone);
+  if (!href || !phone) return null;
+
+  return (
+    <a href={href} className={className}>
+      {icon ? <PhoneCall size={17} weight="fill" aria-hidden /> : null}
+      <span className="tabular-nums">{label ?? phone}</span>
+    </a>
   );
 }

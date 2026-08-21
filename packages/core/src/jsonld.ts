@@ -32,26 +32,34 @@ export function organizationSchema(): Json {
     legalName: tenant.legalName,
     description: tenant.elevatorAnswer,
     url: absoluteUrl("/"),
-    telephone: tenant.phone,
-    email: tenant.email,
-    foundingDate: String(tenant.foundedYear),
-    numberOfEmployees: { "@type": "QuantitativeValue", value: tenant.employeeCount },
-    priceRange: "$$",
+    // `?? undefined`, never `null` and never a placeholder. `graph()`
+    // serialises with JSON.stringify, which drops undefined properties
+    // entirely — so an unconfigured fact becomes an absent property rather than
+    // a null or an invented value. Structured data is a claim made to a search
+    // engine in machine-readable form; a wrong one is worse than a missing one.
+    telephone: tenant.phone ?? undefined,
+    email: tenant.email ?? undefined,
+    // `foundingDate` and `numberOfEmployees` are deliberately absent. The
+    // previous values — founded 2014, "180+" employees — were invented, and
+    // WEB-2 deletes an unevidenced claim rather than softening it.
     currenciesAccepted: tenant.currency,
-    paymentAccepted: "Cash, Credit Card, Bank Transfer, Online Payment",
+    paymentAccepted: "Cash, Bank Transfer, Cheque",
     address: {
       "@type": "PostalAddress",
-      streetAddress: tenant.address.street,
+      streetAddress: tenant.address.street ?? undefined,
       addressLocality: tenant.address.city,
       addressRegion: tenant.address.region,
-      postalCode: tenant.address.postalCode,
       addressCountry: tenant.address.countryCode,
     },
-    geo: {
-      "@type": "GeoCoordinates",
-      latitude: tenant.address.lat,
-      longitude: tenant.address.lng,
-    },
+    ...(tenant.address.lat !== null && tenant.address.lng !== null
+      ? {
+          geo: {
+            "@type": "GeoCoordinates",
+            latitude: tenant.address.lat,
+            longitude: tenant.address.lng,
+          },
+        }
+      : {}),
     openingHoursSpecification: tenant.hours.map((h) => ({
       "@type": "OpeningHoursSpecification",
       dayOfWeek: h.days,
@@ -120,12 +128,11 @@ export function serviceSchema(service: Service): Json {
     name: service.name,
     alternateName: service.aliases,
     serviceType: service.name,
-    category: service.category,
+    category: service.family,
     description: service.answer,
     url: absoluteUrl(`/services/${service.slug}`),
     provider: { "@id": ORG_ID },
     areaServed: tenant.serviceAreas.map((a) => ({ "@type": "City", name: a.name })),
-    audience: service.industries.map((i) => ({ "@type": "Audience", audienceType: i })),
     hoursAvailable: service.emergency
       ? {
           "@type": "OpeningHoursSpecification",
@@ -134,11 +141,17 @@ export function serviceSchema(service: Service): Json {
           closes: "23:59",
         }
       : undefined,
+    // An Offer with no `price`. The catalogue publishes no prices, because the
+    // ones it used to publish were invented (see catalog.ts). Emitting a made-up
+    // `price` here would be the same fabrication, made to Google in a format it
+    // treats as a factual assertion and may show in a result.
+    //
+    // WEB-16 adds a published AED schedule of rates generated from the system's
+    // own rate card; when that lands, `priceSpecification` belongs here and will
+    // be true by construction.
     offers: {
       "@type": "Offer",
       priceCurrency: tenant.currency,
-      price: service.priceFrom.amount,
-      description: `From ${tenant.currencySymbol} ${service.priceFrom.amount} ${service.priceFrom.unit}`,
       availability: "https://schema.org/InStock",
       url: absoluteUrl(`/quote?service=${service.slug}`),
     },
@@ -195,7 +208,6 @@ export function areaServiceSchema(area: Area, servicesOffered: readonly Service[
         "@type": "Offer",
         position: i + 1,
         priceCurrency: tenant.currency,
-        price: s.priceFrom.amount,
         itemOffered: {
           "@type": "Service",
           name: s.name,

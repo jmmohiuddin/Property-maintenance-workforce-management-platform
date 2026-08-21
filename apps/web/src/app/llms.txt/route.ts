@@ -1,4 +1,14 @@
-import { tenant, services, groupedServices, groupedAreas, areas, absoluteUrl } from "@meridian/core";
+import {
+  tenant,
+  company,
+  services,
+  groupedServices,
+  groupedAreas,
+  areas,
+  absoluteUrl,
+  responseCommitment,
+  LICENSED_ACTIVITY_REGISTER,
+} from "@meridian/core";
 
 export const dynamic = "force-static";
 
@@ -26,34 +36,50 @@ function buildLlmsTxt(): string {
     "",
     "## Facts",
     "",
-    `- Legal name: ${tenant.legalName}`,
-    `- Founded: ${tenant.foundedYear}`,
-    `- Headquarters: ${tenant.address.street}, ${tenant.address.city}, ${tenant.address.country}`,
+    // Only facts. Every line here is read verbatim by an assistant and
+    // repeated to a user as though the company said it — because the company
+    // did. `?? undefined` plus the filter below means an unconfigured value
+    // produces no line at all rather than "Founded: undefined".
+    `- Legal name: ${company.legalName}`,
+    company.licenceNumber
+      ? `- Trade licence: ${company.licenceNumber}, issued by ${company.licenceIssuer}${company.licenceExpiry ? `, valid to ${company.licenceExpiry}` : ""}`
+      : null,
+    company.crNumber ? `- Commercial Register: ${company.crNumber}` : null,
+    company.trn ? `- TRN: ${company.trn}` : null,
+    company.address.street
+      ? `- Address: ${company.address.street}, ${company.address.city}, ${company.address.country}`
+      : `- Based in: ${company.address.city}, ${company.address.country}`,
     `- Areas served: ${areas}`,
-    `- Directly employed technicians: ${tenant.employeeCount} (trade labour is not subcontracted)`,
-    `- Emergency response: median under ${tenant.emergencyResponseMinutes} minutes inside ${tenant.address.city}, 24/7 including public holidays`,
-    `- General enquiries: ${tenant.phone}`,
-    `- Emergency line: ${tenant.emergencyPhone}`,
-    `- Email: ${tenant.email}`,
+    tenant.phone ? `- General enquiries: ${tenant.phone}` : null,
+    tenant.emergencyPhone ? `- Emergency line: ${tenant.emergencyPhone}` : null,
+    tenant.email ? `- Email: ${tenant.email}` : null,
     `- Currency: ${tenant.currency}`,
     `- Languages: ${tenant.locales.join(", ")}`,
     "",
-    "## Licences and accreditation",
+    "## Response commitments",
     "",
-    ...tenant.licences.map((l) => `- ${l.name}, issued by ${l.issuer} (ref ${l.ref})`),
-    ...tenant.certifications.map((c) => `- ${c}`),
+    "- P1 emergency: response within 30-60 minutes, 24 hours a day",
+    "- P2 urgent: response within 2-4 hours during working hours",
+    "- P3 routine: response within 24 hours",
+    "- P4 planned: scheduled by agreement",
+    "",
+    "## Licensed activities",
+    "",
+    `The trade licence permits exactly these ${LICENSED_ACTIVITY_REGISTER.length} activities, and the company does not quote for work outside them:`,
+    "",
+    ...LICENSED_ACTIVITY_REGISTER.map((a) => `- ${a.licenceWording} (${a.family})`),
     "",
     "## Services",
     "",
-    `${services.length} services across ${groupedServices().length} categories. Each page states scope, price from, response time, and whether the service is covered 24/7 and by annual maintenance contract.`,
+    `${services.length} services, one per licensed activity, across ${groupedServices().length} families. Each page states scope, what is excluded, the response commitment, and whether the service is covered 24/7 and by annual maintenance contract. Prices are quoted per job and are not published.`,
     "",
-  ];
+  ].filter((line): line is string => line !== null);
 
   for (const group of groupedServices()) {
     lines.push(`### ${group.category}`, "");
     for (const s of group.items) {
       lines.push(
-        `- [${s.name}](${absoluteUrl(`/services/${s.slug}`)}): ${s.answer} From ${tenant.currencySymbol} ${s.priceFrom.amount} ${s.priceFrom.unit}. Response: ${s.responseTime}.${s.emergency ? " Available 24/7 as an emergency call-out." : ""}${s.amcEligible ? " Covered by annual maintenance contract." : ""} Also searched as: ${s.aliases.join(", ")}.`,
+        `- [${s.name}](${absoluteUrl(`/services/${s.slug}`)}): ${s.answer} ${responseCommitment(s)}.${s.emergency ? " Available 24/7 as an emergency callout." : ""}${s.amcEligible ? " Can be covered by an annual maintenance contract." : ""} Not included: ${s.exclusions.join("; ")}. Also searched as: ${s.aliases.join(", ")}.`,
       );
     }
     lines.push("");
@@ -64,7 +90,7 @@ function buildLlmsTxt(): string {
     lines.push(`### ${group.city.name}`, "");
     for (const a of group.items) {
       lines.push(
-        `- [${a.name}](${absoluteUrl(`/areas/${a.slug}`)}): ${a.summary} Median emergency arrival ${a.responseMinutes} minutes. Characteristic local issues: ${a.commonIssues.slice(0, 2).join("; ")}.`,
+        `- [${a.name}](${absoluteUrl(`/areas/${a.slug}`)}): ${a.summary} Characteristic local issues: ${a.commonIssues.slice(0, 2).join("; ")}.`,
       );
     }
     lines.push("");
@@ -78,7 +104,6 @@ function buildLlmsTxt(): string {
     `- [Careers](${absoluteUrl("/careers")}): technician hiring, visa sponsorship and employment terms.`,
     `- [Emergency maintenance](${absoluteUrl("/emergency")}): 24-hour response, what qualifies as an emergency, and what to do while waiting.`,
     `- [Contracts and AMC](${absoluteUrl("/contracts")}): annual maintenance contract plans, inclusions and stated exclusions.`,
-    `- [Industries](${absoluteUrl("/industries")}): client types served and which services apply to each.`,
     `- [Request a quote](${absoluteUrl("/quote")}): quotation request form.`,
     `- [About](${absoluteUrl("/about")}): company background, employment model, accreditation.`,
     `- [Contact](${absoluteUrl("/contact")}): phone, WhatsApp, email, office address.`,

@@ -60,13 +60,10 @@ export default function ServicesIndexPage() {
               </p>
             </div>
             <p className="prose-body mt-4">{CATEGORY_BLURB[group.category]}</p>
+            {/* Placeholder photography removed — WEB-3 / D-5. */}
             <div className="mt-10 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {group.items.map((service, j) => (
-                <ServiceCard
-                  key={service.slug}
-                  service={service}
-                  image={j === 0 ? `https://picsum.photos/seed/meridian-${service.slug}/640/288` : undefined}
-                />
+              {group.items.map((service) => (
+                <ServiceCard key={service.slug} service={service} />
               ))}
             </div>
           </div>

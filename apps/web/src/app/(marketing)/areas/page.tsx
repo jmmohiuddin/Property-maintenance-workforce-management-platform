@@ -100,7 +100,7 @@ export default function AreasIndexPage() {
                     <p className="prose-body mt-3 text-[14px]">{area.commonIssues[0]}</p>
                   </div>
                   <p className="tnum mt-5 text-[13px]" style={{ color: "var(--text-muted)" }}>
-                    Emergency response under {area.responseMinutes} min
+                    P1 emergency response 30&ndash;60 min
                   </p>
                 </Link>
               ))}

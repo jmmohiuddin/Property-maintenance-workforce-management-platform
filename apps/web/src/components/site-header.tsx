@@ -13,7 +13,6 @@ import { PhoneCall, List } from "@phosphor-icons/react/dist/ssr";
 const NAV = [
   { href: "/services", label: "Services" },
   { href: "/contracts", label: "Contracts & AMC" },
-  { href: "/industries", label: "Industries" },
   { href: "/emergency", label: "Emergency" },
   { href: "/about", label: "About" },
 ] as const;
@@ -31,7 +30,7 @@ export function SiteHeader() {
             className="grid h-8 w-8 place-items-center rounded-sm font-mono text-[15px] font-bold"
             style={{ backgroundColor: "var(--accent)", color: "var(--accent-contrast)" }}
           >
-            M
+            S
           </span>
           <span className="text-[15px] font-semibold tracking-tight">{tenant.brandName}</span>
         </Link>

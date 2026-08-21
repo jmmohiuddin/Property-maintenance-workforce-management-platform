@@ -3,9 +3,12 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
   tenant,
+  company,
   services,
   getService,
   relatedServices,
+  responseCommitment,
+  licensedActivity,
   telLink,
   whatsappLink,
   graph,
@@ -14,7 +17,7 @@ import {
   breadcrumbSchema,
   webPageSchema,
 } from "@meridian/core";
-import { Section, Eyebrow, ServiceCard, AnswerBlock } from "@/components/ui";
+import { Section, Eyebrow, ServiceCard, AnswerBlock, CallLink } from "@/components/ui";
 import { FaqList } from "@/components/faq";
 import { JsonLd } from "@/components/json-ld";
 import { PhoneCall, WhatsappLogo, Check, Warning } from "@phosphor-icons/react/dist/ssr";
@@ -52,8 +55,11 @@ export default async function ServicePage({ params }: { params: Promise<Params> 
   const service = getService(slug);
   if (!service) notFound();
 
-  const related = relatedServices(slug);
+  const related = relatedServices(service);
   const path = `/services/${service.slug}`;
+  const quoteOnWhatsapp = whatsappLink(
+    `Hello ${tenant.brandName}, I would like a quote for ${service.name}.`,
+  );
 
   return (
     <>
@@ -96,7 +102,7 @@ export default async function ServicePage({ params }: { params: Promise<Params> 
 
           <div className="mt-8 grid gap-12 lg:grid-cols-12 lg:gap-16">
             <div className="lg:col-span-7">
-              <Eyebrow>{service.category}</Eyebrow>
+              <Eyebrow>Licensed activity · {service.family}</Eyebrow>
               <h1 className="mt-4 text-4xl font-semibold md:text-5xl">
                 {service.name} in {tenant.address.city}
               </h1>
@@ -111,37 +117,55 @@ export default async function ServicePage({ params }: { params: Promise<Params> 
                   Get a quote
                 </Link>
                 {service.emergency ? (
-                  <a href={telLink(tenant.emergencyPhone)} className="btn btn-secondary">
-                    <PhoneCall size={17} weight="fill" aria-hidden />
-                    24/7 line
-                  </a>
-                ) : (
-                  <a
-                    href={whatsappLink(`Hello ${tenant.brandName}, I would like a quote for ${service.name}.`)}
+                  <CallLink
+                    phone={tenant.emergencyPhone}
+                    label="24/7 line"
                     className="btn btn-secondary"
-                  >
+                  />
+                ) : quoteOnWhatsapp ? (
+                  <a href={quoteOnWhatsapp} className="btn btn-secondary">
                     <WhatsappLogo size={17} weight="fill" aria-hidden />
                     WhatsApp
                   </a>
-                )}
+                ) : null}
               </div>
             </div>
 
             <aside className="rounded border p-6 lg:col-span-5" style={{ backgroundColor: "var(--surface-raised)" }}>
               <h2 className="text-[15px] font-semibold">At a glance</h2>
               <dl className="mt-5 space-y-4 text-[14px]">
+                {/*
+                  This slot held "Price from AED 150". Every price in the
+                  catalogue was invented, so WEB-2 removed them; WEB-16 brings
+                  real ones back, generated from the rate card so the published
+                  number and the quoted number cannot drift.
+
+                  What sits here instead is the licence line — the single
+                  strongest trust signal on the page, and the one Cabinet
+                  Resolution 107/2022 Art. 7 requires to be displayed anyway.
+                */}
+                {company.licenceNumber ? (
+                  <div className="border-b pb-4">
+                    <dt style={{ color: "var(--text-secondary)" }}>Licensed for this work</dt>
+                    <dd className="mt-1 font-medium">
+                      {licensedActivity(service.licensedActivity).licenceWording}
+                    </dd>
+                    <dd className="tnum text-[13px]" style={{ color: "var(--text-muted)" }}>
+                      {company.licenceIssuer} licence {company.licenceNumber}
+                    </dd>
+                  </div>
+                ) : null}
                 <div className="border-b pb-4">
-                  <dt style={{ color: "var(--text-secondary)" }}>Price from</dt>
-                  <dd className="tnum mt-1 text-xl font-semibold">
-                    {tenant.currencySymbol} {service.priceFrom.amount}
-                  </dd>
-                  <dd className="text-[13px]" style={{ color: "var(--text-muted)" }}>
-                    {service.priceFrom.unit}
-                  </dd>
+                  <dt style={{ color: "var(--text-secondary)" }}>Response</dt>
+                  <dd className="mt-1 font-medium">{responseCommitment(service)}</dd>
                 </div>
                 <div className="border-b pb-4">
-                  <dt style={{ color: "var(--text-secondary)" }}>Response time</dt>
-                  <dd className="mt-1 font-medium">{service.responseTime}</dd>
+                  <dt style={{ color: "var(--text-secondary)" }}>Priced</dt>
+                  <dd className="mt-1 font-medium">
+                    {service.archetype === "project"
+                      ? "Fixed price, quoted against a written scope"
+                      : "Callout, labour and materials — quoted and approved before we proceed"}
+                  </dd>
                 </div>
                 <div className="border-b pb-4">
                   <dt style={{ color: "var(--text-secondary)" }}>Emergency cover</dt>
@@ -173,14 +197,23 @@ export default async function ServicePage({ params }: { params: Promise<Params> 
               The full scope we carry out under {service.shortName.toLowerCase()}. Anything outside this list
               is quoted separately rather than added to your invoice after the fact.
             </p>
-            <img
-              src={`https://picsum.photos/seed/meridian-scope-${service.slug}/800/560`}
-              alt=""
-              loading="lazy"
-              width={800}
-              height={560}
-              className="mt-8 hidden w-full rounded object-cover lg:block"
-            />
+            {/*
+              A picsum.photos placeholder stood here — a random stock image
+              presented as our work, fetched from a third party on every page
+              view. WEB-3 removes it. The exclusions list below is what the
+              space is worth more as: the thing a customer needs to know before
+              booking, said before they ask.
+            */}
+            {service.exclusions.length > 0 ? (
+              <div className="mt-8 rounded border p-5" style={{ backgroundColor: "var(--surface-raised)" }}>
+                <h3 className="text-[14px] font-semibold">Not included</h3>
+                <ul className="mt-3 space-y-2 text-[14px]" style={{ color: "var(--text-secondary)" }}>
+                  {service.exclusions.map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
           </div>
           <ul className="space-y-3 lg:col-span-7">
             {service.scope.map((item) => (

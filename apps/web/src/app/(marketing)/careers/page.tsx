@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import {
   tenant,
+  company,
   services,
   whatsappLink,
   graph,
@@ -16,7 +17,19 @@ import { EnvelopeSimple, WhatsappLogo } from "@phosphor-icons/react/dist/ssr";
 
 const careersEmail = `careers@${tenant.domain.replace(/^https?:\/\//, "")}`;
 
-const ANSWER = `${tenant.legalName} employs ${tenant.employeeCount} technicians directly on UAE labour contracts and visas, across ${services.length} trades including plumbing, electrical, HVAC, carpentry and cleaning. We do not subcontract trade labour, and we sponsor visas, provide medical insurance and pay through WPS.`;
+/*
+ * The headcount claim is gone (WEB-2): "employs 180+ technicians directly" was
+ * not a measured number. What is left describes the terms of employment, which
+ * are things the company controls and can be held to — and which are what a
+ * tradesperson deciding where to apply actually wants to know.
+ *
+ * This page is a static holding page. M9 replaces it with real requisitions,
+ * `JobPosting` JSON-LD per open role, and an application form that takes under
+ * three minutes on a phone (`ATS-3`). Until then it must not promise a process
+ * that does not exist, so it points at email and WhatsApp — the channels that
+ * are actually answered today.
+ */
+const ANSWER = `${company.legalName} hires tradespeople directly onto UAE labour contracts across the ten activities on its Dubai trade licence — plumbing, HVAC, electrical fittings, carpentry, tiling, false ceilings, painting, wallpaper, electromechanical installation and building cleaning. Employment is direct: the labour contract, the visa, the medical insurance and the end-of-service accrual are the company's obligation, and salaries are paid through the Wage Protection System.`;
 
 export const metadata: Metadata = {
   title: "Careers",
@@ -71,6 +84,7 @@ const FAQS = [
 ] as const;
 
 export default function CareersPage() {
+  const applyOnWhatsapp = whatsappLink("Hello, I would like to apply for a technician role.");
   return (
     <>
       <JsonLd
@@ -103,13 +117,12 @@ export default function CareersPage() {
               <EnvelopeSimple size={17} weight="fill" aria-hidden />
               Send your CV
             </a>
-            <a
-              href={whatsappLink("Hello, I would like to apply for a technician role.")}
-              className="btn btn-secondary"
-            >
-              <WhatsappLogo size={17} weight="fill" aria-hidden />
-              Apply on WhatsApp
-            </a>
+            {applyOnWhatsapp ? (
+              <a href={applyOnWhatsapp} className="btn btn-secondary">
+                <WhatsappLogo size={17} weight="fill" aria-hidden />
+                Apply on WhatsApp
+              </a>
+            ) : null}
           </div>
         </div>
       </section>
@@ -163,9 +176,8 @@ export default function CareersPage() {
         <div className="container-page">
           <h2 className="text-2xl font-semibold md:text-3xl">Trades we hire</h2>
           <ul className="mt-7 flex flex-wrap gap-2.5">
-            {services
-              .filter((s) => s.category === "MEP" || s.category === "Fit-out & Finishing" || s.category === "Cleaning & Hygiene")
-              .map((s) => (
+            {/* Every licensed activity is a trade we hire for, so no filter. */}
+            {services.map((s) => (
                 <li key={s.slug}>
                   <Link
                     href={`/services/${s.slug}`}
@@ -175,7 +187,7 @@ export default function CareersPage() {
                     {s.shortName}
                   </Link>
                 </li>
-              ))}
+            ))}
           </ul>
         </div>
       </Section>

@@ -1,6 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
-import { tenant, absoluteUrl } from "@meridian/core";
+import { tenant, absoluteUrl, assertPublishableIdentity } from "@meridian/core";
 import "./globals.css";
 
 /**
@@ -53,6 +53,15 @@ export const viewport: Viewport = {
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  // Refuses to boot in production while any identity value is still a
+  // placeholder, and warns loudly everywhere else. Placed in the root layout so
+  // it runs on the first render of any page, rather than waiting for someone to
+  // scroll to a footer and notice a licence number of all zeros.
+  //
+  // The previous build shipped exactly that and nothing caught it, because
+  // nothing was checking. See packages/core/src/company.ts.
+  assertPublishableIdentity();
+
   return (
     <html lang="en-AE" className={`${sans.variable} ${mono.variable}`}>
       <body>

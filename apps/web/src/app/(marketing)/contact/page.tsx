@@ -69,7 +69,11 @@ export default function ContactPage() {
           </p>
 
           <div className="mt-12 grid gap-4 md:grid-cols-2">
-            {CHANNELS.map((c) => (
+            {/*
+              A channel whose href is undefined has no number behind it yet, and
+              a card that looks clickable and is not is worse than an absent one.
+            */}
+            {CHANNELS.filter((c): c is typeof c & { href: string } => Boolean(c.href)).map((c) => (
               <a
                 key={c.label}
                 href={c.href}
@@ -98,9 +102,13 @@ export default function ContactPage() {
             <address className="prose-body mt-5 not-italic text-[16px]">
               {tenant.legalName}
               <br />
-              {tenant.address.street}
-              <br />
-              {tenant.address.city} {tenant.address.postalCode}
+              {tenant.address.street ? (
+                <>
+                  {tenant.address.street}
+                  <br />
+                </>
+              ) : null}
+              {tenant.address.city}
               <br />
               {tenant.address.country}
             </address>
