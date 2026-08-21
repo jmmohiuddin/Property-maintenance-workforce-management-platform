@@ -1,8 +1,20 @@
 "use server";
 
 import { headers } from "next/headers";
-import { quoteRequestSchema, getService, tenant } from "@meridian/core";
-import { resolvePublicTenantId, createLeadFromEnquiry, checkRateLimit } from "@meridian/db";
+import {
+  quoteRequestSchema,
+  getService,
+  tenant,
+  RESPONSE_COMMITMENT,
+  priorityForUrgency,
+} from "@meridian/core";
+import {
+  resolvePublicTenantId,
+  createLeadFromEnquiry,
+  enquiryRecipients,
+  checkRateLimit,
+} from "@meridian/db";
+import { enqueue, dispatchPending, selectTransport } from "@meridian/notify";
 
 /**
  * Five submissions per ten minutes from one address.
@@ -123,7 +135,7 @@ export async function submitQuoteRequest(
     const tenantId = await resolvePublicTenantId(slug);
     if (!tenantId) throw new Error(`No active tenant with slug "${slug}"`);
 
-    const { reference } = await createLeadFromEnquiry(tenantId, {
+    const { reference, recipients } = await createLeadFromEnquiry(tenantId, {
       name: parsed.data.name,
       phone: parsed.data.phone,
       email: parsed.data.email || undefined,
@@ -137,16 +149,62 @@ export async function submitQuoteRequest(
         referrer: h.get("referer") ?? "",
         userAgent: h.get("user-agent") ?? "",
       },
+    }, {
+      // LEAD-2 / LEAD-3, closing PD-3. Enqueued inside the same transaction as
+      // the lead, so the two commit together: a notification cannot promise an
+      // enquiry that rolled back, and an enquiry cannot be recorded without an
+      // alert queued for it.
+      //
+      // Done here rather than inside the domain function because notify imports
+      // db, so db importing notify would be a cycle. The transaction is handed
+      // out instead, which keeps atomicity and keeps the payload type-checked
+      // against the template.
+      onCreated: async (tx, lead) => {
+        const service = getService(parsed.data.serviceSlug);
+        const to = await enquiryRecipients(tx, lead.isEmergency);
+
+        for (const recipient of to) {
+          await enqueue(tx, { tenantId, actorKind: "system" }, {
+            channel: "email",
+            template: "lead_created",
+            to: recipient.email,
+            recipientUserId: recipient.userId,
+            subject: { table: "leads", id: lead.leadId },
+            payload: {
+              recipientName: recipient.fullName,
+              leadReference: lead.reference,
+              customerName: parsed.data.name,
+              phone: parsed.data.phone,
+              email: parsed.data.email || null,
+              serviceName: service?.name ?? parsed.data.serviceSlug,
+              area: parsed.data.area || null,
+              urgency: parsed.data.urgency,
+              isEmergency: lead.isEmergency,
+              details: parsed.data.details || null,
+              respondWithin: RESPONSE_COMMITMENT[priorityForUrgency(parsed.data.urgency)],
+            },
+          });
+        }
+      },
     });
 
     const isEmergency = parsed.data.urgency === "emergency";
-    const service = getService(parsed.data.serviceSlug);
 
     console.info("[quote] lead recorded", {
       reference,
-      service: service?.slug,
+      service: parsed.data.serviceSlug,
       urgency: parsed.data.urgency,
       city: parsed.data.city,
+      recipients,
+    });
+
+    // Drained now as well as by the five-minute cron. G2 measures response time
+    // from the moment the enquiry lands, and for an emergency the difference
+    // between "within five minutes" and "now" is the product.
+    void dispatchPending(tenantId, { transport: selectTransport() }).catch((error) => {
+      // Never surfaced. The lead is committed and the cron will drain it; the
+      // customer must not see an error about an email they did not ask for.
+      console.error("[quote] immediate dispatch failed; the cron will retry", error);
     });
 
     return {

@@ -53,11 +53,92 @@ export async function resolvePublicTenantId(slug: string): Promise<string | null
     ?.app_public_resolve_tenant ?? null;
 }
 
-/** Record a public enquiry as a lead. Runs inside the tenant boundary. */
+/**
+ * Who should be told about a new enquiry (`LEAD-2`, `LEAD-3`).
+ *
+ * Routed by role rather than by a configured address list, because an address
+ * list goes stale the first time somebody leaves and nobody notices until an
+ * enquiry emails a former employee.
+ *
+ * An emergency reaches the owner as well. That is the whole of `LEAD-3`: the
+ * distinction between "somebody will pick this up" and "somebody must pick this
+ * up now" has to exist in who is woken, not only in a flag on a row.
+ */
+export async function enquiryRecipients(
+  tx: TenantScopedTx,
+  isEmergency: boolean,
+): Promise<readonly { userId: string; email: string; fullName: string }[]> {
+  const roles: ("owner" | "operations_manager" | "dispatcher")[] = isEmergency
+    ? ["owner", "operations_manager", "dispatcher"]
+    : ["operations_manager", "dispatcher"];
+
+  // Query builder rather than raw SQL, and the reason is specific: drizzle's
+  // `sql` template expands a JavaScript array into separate placeholders, so
+  // `= any(${roles})` becomes `= any(($1, $2))` — which Postgres rejects with
+  // "op ANY/ALL (array) requires array on right side". Every lead would have
+  // thrown. Interpolating the list into the string instead would work and would
+  // be the first piece of string-built SQL in this codebase, which is not a
+  // trade worth making. `inArray` binds it properly.
+  return tx
+    .select({
+      userId: schema.users.id,
+      email: schema.users.email,
+      fullName: schema.users.fullName,
+    })
+    .from(schema.memberships)
+    .innerJoin(schema.users, eq(schema.users.id, schema.memberships.userId))
+    .where(
+      and(
+        eq(schema.memberships.isActive, true),
+        inArray(schema.memberships.role, roles),
+        isNull(schema.users.deletedAt),
+      ),
+    )
+    .orderBy(schema.users.fullName);
+}
+
+/**
+ * Record a public enquiry as a lead, and tell somebody about it.
+ *
+ * ── WHY THE NOTIFICATION IS INSIDE THIS TRANSACTION ─────────────────────────
+ *
+ * `LEAD-2`, closing `PD-3`. Until now this function wrote a row and the caller
+ * wrote a log line. The lead existed; nobody was told. An enquiry that arrives
+ * on a Thursday at 21:00 and reaches no one is revenue that never existed, and
+ * every answer-engine page on the public site exists to produce exactly these.
+ *
+ * Enqueued in the same transaction as the insert, which is the pattern already
+ * used everywhere else here and is the reason it can be trusted: a notification
+ * cannot promise an enquiry that rolled back, and an enquiry cannot be recorded
+ * without one being queued. The two facts commit together or not at all.
+ *
+ * Delivery is a separate step — `/api/cron/dispatch` drains the queue — so a
+ * provider outage delays the alert rather than losing the enquiry.
+ */
 export async function createLeadFromEnquiry(
   tenantId: string,
   enquiry: PublicEnquiry,
-): Promise<{ leadId: string; reference: string }> {
+  hooks?: {
+    /**
+     * Runs inside the same transaction as the insert, before it commits.
+     *
+     * This exists to invert a dependency rather than to be clever.
+     * `packages/notify` imports `packages/db`, so `db` importing `notify` to
+     * send the alert would be a cycle. Handing the caller the open transaction
+     * keeps both properties that matter: the notification is enqueued
+     * atomically with the lead, AND it goes through notify's typed `enqueue`,
+     * so a template payload that is missing a field is a compile error rather
+     * than an email that says "Hello undefined".
+     *
+     * Throwing from here rolls the lead back, which is the correct direction:
+     * an enquiry recorded with no alert is the exact failure being fixed.
+     */
+    onCreated?: (
+      tx: TenantScopedTx,
+      lead: { leadId: string; reference: string; isEmergency: boolean },
+    ) => Promise<void>;
+  },
+): Promise<{ leadId: string; reference: string; recipients: number }> {
   return withTenant({ tenantId, actorKind: "customer" }, async (tx) => {
     const [row] = await tx
       .insert(schema.leads)
@@ -88,7 +169,23 @@ export async function createLeadFromEnquiry(
     // Human-facing reference. Derived from the id rather than a counter so it
     // needs no extra round trip and cannot collide.
     const reference = `ENQ-${row.id.slice(0, 8).toUpperCase()}`;
-    return { leadId: row.id, reference };
+
+    const isEmergency = enquiry.urgency === "emergency";
+    const recipients = await enquiryRecipients(tx, isEmergency);
+
+    if (recipients.length === 0) {
+      // Loud, and worth its own line. A deployment with no operations manager
+      // and no dispatcher captures enquiries into a queue nobody is watching,
+      // which looks identical to working correctly right up until somebody asks
+      // why nothing was followed up.
+      console.error(
+        `[leads] ${reference} recorded but there is no operations manager or dispatcher to notify`,
+      );
+    }
+
+    await hooks?.onCreated?.(tx, { leadId: row.id, reference, isEmergency });
+
+    return { leadId: row.id, reference, recipients: recipients.length };
   });
 }
 

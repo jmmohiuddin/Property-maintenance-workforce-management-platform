@@ -31,6 +31,7 @@ export type TemplateId =
   | "job_completed"
   | "invoice_issued"
   | "request_received"
+  | "lead_created"
   | "sla_breached"
   | "certification_expiring"
   | "compliance_expiry"
@@ -79,6 +80,26 @@ export interface TemplatePayloads {
     customerName: string;
     jobReference: string;
     jobTitle: string;
+  };
+  /**
+   * LEAD-2 / LEAD-3, closing PD-3.
+   *
+   * The enquiry landed, the row was written, and nobody was told. An enquiry
+   * that arrives at 21:00 and reaches no one is revenue that never existed —
+   * and the whole answer-engine investment exists to produce these.
+   */
+  lead_created: {
+    recipientName: string;
+    leadReference: string;
+    customerName: string;
+    phone: string;
+    email: string | null;
+    serviceName: string;
+    area: string | null;
+    urgency: string;
+    isEmergency: boolean;
+    details: string | null;
+    respondWithin: string;
   };
   /**
    * JOB-5. The audit's phrase is worth keeping: *the clock exists; the alarm
@@ -248,6 +269,32 @@ export const TEMPLATES: {
   // These go to staff, not customers, so the register changes: no greeting
   // padding, the number first, and the action last. Somebody reads these on a
   // phone while doing something else.
+
+  lead_created: (p) => ({
+    // The subject carries the decision. Somebody glancing at a phone at 21:00
+    // should know whether to open it without opening it.
+    subject: p.isEmergency
+      ? `EMERGENCY enquiry — ${p.serviceName}${p.area ? `, ${p.area}` : ""} — ${p.phone}`
+      : `New enquiry — ${p.serviceName}${p.area ? `, ${p.area}` : ""} — ${p.customerName}`,
+    body:
+      `${p.recipientName},\n\n` +
+      (p.isEmergency
+        ? `EMERGENCY enquiry. Call them first and log the outcome afterwards.\n\n`
+        : "") +
+      // The phone number first, on its own line, before anything else. The
+      // action this email exists to cause is a phone call, and everything above
+      // the number is delay.
+      `  ${p.customerName}\n` +
+      `  ${p.phone}${p.email ? `  ·  ${p.email}` : ""}\n\n` +
+      `  ${p.serviceName}${p.area ? ` — ${p.area}` : ""}\n` +
+      `  ${p.respondWithin}\n` +
+      `  Reference ${p.leadReference}\n` +
+      (p.details ? `\n  "${p.details}"\n` : "") +
+      `\nTriage it here:\n${absoluteUrl("/leads")}\n\n` +
+      `Response time is measured from now (G2): under 30 minutes in working hours, ` +
+      `under 2 hours outside them.` +
+      sign,
+  }),
 
   sla_breached: (p) => ({
     subject:
