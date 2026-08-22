@@ -162,7 +162,13 @@ jobs:
           # how they appear inside a sql template. Matching `--` anywhere flags a
           # JSDoc mentioning a CSS custom property and an email signature
           # separator, both harmless -- checked, both exist in this repo.
-          if grep -rnE --include='*.ts' --include='*.tsx' '^[[:space:]]*--.*`' packages/*/src/ apps/web/src/; then
+          #
+          # Scoped to apps/*/src rather than apps/web/src so that a workspace
+          # which does not write SQL today is still covered on the day it
+          # starts. apps/field currently has none -- WatermelonDB declares its
+          # schema rather than writing DDL -- so this widening flags nothing
+          # now, which is exactly when it is cheapest to do.
+          if grep -rnE --include='*.ts' --include='*.tsx' '^[[:space:]]*--.*`' packages/*/src/ apps/*/src/; then
             echo
             echo "A backtick inside a SQL comment terminates the tagged template literal."
             echo "Write identifiers in SQL comments as bare prose."
