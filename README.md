@@ -147,10 +147,11 @@ Many AI crawlers do not execute JavaScript. Anything an answer engine needs to r
 the HTML response, so structured data, FAQ answers and the per-page answer paragraph are all
 server-rendered. The FAQ uses native `<details>` rather than a JS accordion for the same reason.
 
-## Three traps that have each caught more than one person
+## Four traps that have each caught more than one person
 
-Both are silent, both compile, and neither is a mistake you make once and learn from — three
-different people hit the first independently before it was written down.
+Each is silent, each survives a careless read, and none of them is a mistake you make once and
+learn from — three different people hit the first independently before it was written down, and the
+fourth caught two more the same night this list grew to hold it.
 
 **1. A backtick inside a SQL comment terminates the template.**
 
@@ -217,6 +218,20 @@ such a test fail for a reason unrelated to what it is testing. Walk the cause ch
 `packages/db/test/jobcard.test.ts` has a `messageChain()` helper that does it.
 
 Same family as trap 2: the type system says one thing, the runtime hands you another.
+
+**4. `db.execute<T>` takes a type alias, never an `interface`.**
+
+    interface RateRow { code: string }            // TS2344, every time
+    type RateRow = { code: string }               // fine
+    interface RateRow extends Record<string, unknown> { code: string }   // also fine
+
+`db.execute<T>` constrains `T` to `Record<string, unknown>`. TypeScript gives an object *type
+alias* an implicit index signature and a declared `interface` none — even when the two are
+structurally identical, character for character. The error names the constraint and never mentions
+that the alias-versus-interface distinction is what decides it, so the natural response is to stare
+at the fields. Two people hit this within ten minutes of each other, in different files, and each
+reached for a different one of the two valid fixes.
+
 
 ## Documentation
 
