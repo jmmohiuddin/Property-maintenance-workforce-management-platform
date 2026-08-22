@@ -135,6 +135,19 @@ const PAID_DUE = "2019-04-01";
 const LATE_PERIOD = "2019-01-01";
 
 /**
+ * A third 2019 month, for the transfer that did not reach everybody.
+ *
+ * Its own month rather than a reuse of `PAID_PERIOD`, because that cycle is
+ * confirmed twice above and this section asserts on the exact contents of
+ * `wage_payments` — sharing a cycle would make every count below depend on
+ * which assertions ran first. Not 2019-07 either: `payroll-audit.test.ts` owns
+ * that one, and two suites deleting each other's cycles on a shared database
+ * reads as a code bug for an hour.
+ */
+const PARTIAL_PERIOD = "2019-05-01";
+const PARTIAL_DUE = "2019-06-01";
+
+/**
  * Delete every row this file creates, in every tenant.
  *
  * ── WHY THIS RUNS BEFORE THE TEST AS WELL AS AFTER ──────────────────────────
@@ -180,7 +193,8 @@ async function purge(): Promise<void> {
       // Only the two 2019 cycles this file opens, named explicitly. NEVER a
       // structural predicate — see the note above.
       await tx.execute(sql`
-        delete from wage_cycles where period_month in (${PAID_PERIOD}::date, ${LATE_PERIOD}::date)
+        delete from wage_cycles
+         where period_month in (${PAID_PERIOD}::date, ${LATE_PERIOD}::date, ${PARTIAL_PERIOD}::date)
       `);
       await tx.execute(sql`
         delete from overtime_records where employee_id in (
@@ -413,6 +427,204 @@ async function main(): Promise<void> {
     checkTrue(
       "day 5 does",
       (await permitIssuanceWarning(tx, { tenantId }, "2019-02-05")) !== null,
+    );
+
+    // ── The transfer that did not reach everybody ────────────────────────
+    //
+    // `paid_employee_count` on the cycle and `paid` on each line are two
+    // answers to one question — which of these people has money this morning —
+    // and they used to be allowed to contradict each other, because the line
+    // update was unconditional. A cycle could record 85 of 100 paid while all
+    // one hundred lines said `paid = true`, so fifteen workers whose wages
+    // never moved each carried a row saying they had been paid. That row is
+    // what MOHRE, a labour court and the worker are all later shown.
+    //
+    // The order below is deliberate: the cycle is confirmed IN FULL first, so
+    // every line is genuinely `paid = true` before the partial confirmation
+    // arrives. The partial one therefore has to *un-mark* somebody, which is
+    // the case a version that only ever sets the flag forwards would pass.
+    console.log("\n— HR-17: a transfer that did not reach everybody —");
+
+    const partial = await ensureWageCycle(tx, { tenantId }, { periodMonth: PARTIAL_PERIOD });
+    const partialFile = await prepareWageFile(tx, { tenantId }, partial.id, addDays(PARTIAL_DUE, -3));
+    const lineCount = partialFile.lines.length;
+    checkTrue("the cycle has at least two lines to be partial about", lineCount >= 2);
+
+    /** Paid state for one named employee. By employee id, never by position. */
+    async function lineState(employee: string): Promise<{ paid: boolean; paidOn: string | null }> {
+      const rows = (await tx.execute<{ paid: boolean; paid_on: string | null }>(sql`
+        select paid, paid_on from wage_payments
+         where wage_cycle_id = ${partial.id}::uuid and employee_id = ${employee}::uuid
+           and deleted_at is null
+      `)) as unknown as { paid: boolean; paid_on: string | null }[];
+      const row = rows[0];
+      if (!row) throw new Error("The fixture employee has no line in the partial cycle.");
+      return { paid: row.paid, paidOn: row.paid_on };
+    }
+
+    /** How many lines in this cycle actually say paid. The invariant's rhs. */
+    async function paidLineCount(): Promise<number> {
+      const rows = (await tx.execute<{ n: number }>(sql`
+        select count(*)::int as n from wage_payments
+         where wage_cycle_id = ${partial.id}::uuid and deleted_at is null and paid
+      `)) as unknown as { n: number }[];
+      return Number(rows[0]?.n ?? 0);
+    }
+
+    // ── The ordinary case, which must keep working ─────────────────────────
+    //
+    // Load-bearing: a suite that only proves the partial case is refused would
+    // pass just as happily against a function that refuses everything, and
+    // against one that never marks anybody paid at all.
+    const everyone = await confirmWageTransfer(tx, { tenantId }, {
+      cycleId: partial.id,
+      transferredMinor: partialFile.totalDueMinor,
+      transferReference: `${TAG}-SIF-FULL`,
+      confirmedOn: PARTIAL_DUE,
+    });
+    check("a full transfer counts every employee as paid", everyone.paidEmployeeCount, lineCount);
+    check("and every line says so", await paidLineCount(), lineCount);
+    check("including the one with no IBAN", (await lineState(unpayableId)).paid, true);
+    check("dated the day the bank confirmed", (await lineState(employeeId)).paidOn, PARTIAL_DUE);
+    // The date is on the LINE, and reaches the payroll page from there rather
+    // than from the cycle: two transfers a fortnight apart give two different
+    // answers, and only the row knows which one is this person's.
+    check(
+      "and the line reports its own payment date, as a calendar-day string",
+      (await wageFileLines(tx, partial.id)).find((l) => l.employeeId === employeeId)?.paidOn,
+      PARTIAL_DUE,
+    );
+
+    // ── A short count with no names is refused ─────────────────────────────
+    let refusal = "";
+    try {
+      await confirmWageTransfer(tx, { tenantId }, {
+        cycleId: partial.id,
+        transferredMinor: partialFile.totalDueMinor,
+        transferReference: `${TAG}-SIF-SHORT`,
+        confirmedOn: PARTIAL_DUE,
+        paidEmployeeCount: lineCount - 1,
+      });
+    } catch (error) {
+      refusal = error instanceof Error ? error.message : String(error);
+    }
+    checkTrue(
+      "a partial count with nobody named is refused",
+      refusal.includes("Name the employees the transfer actually reached"),
+    );
+    checkTrue("and the refusal says the system will not guess", refusal.includes("will not guess"));
+    // The refusal has to be inert, not merely loud.
+    check("the refused call wrote nothing to the lines", await paidLineCount(), lineCount);
+
+    // ── Two ways of saying it that disagree are refused too ────────────────
+    let disagreement = "";
+    try {
+      await confirmWageTransfer(tx, { tenantId }, {
+        cycleId: partial.id,
+        transferredMinor: partialFile.totalDueMinor,
+        transferReference: `${TAG}-SIF-MISMATCH`,
+        confirmedOn: PARTIAL_DUE,
+        paidEmployeeCount: 1,
+        paidEmployeeIds: [employeeId, unpayableId],
+      });
+    } catch (error) {
+      disagreement = error instanceof Error ? error.message : String(error);
+    }
+    checkTrue(
+      "a count that disagrees with the names is refused",
+      disagreement.includes("two answers to the same question"),
+    );
+
+    let repeated = "";
+    try {
+      await confirmWageTransfer(tx, { tenantId }, {
+        cycleId: partial.id,
+        transferredMinor: partialFile.totalDueMinor,
+        transferReference: `${TAG}-SIF-DUP`,
+        confirmedOn: PARTIAL_DUE,
+        paidEmployeeIds: [employeeId, employeeId],
+      });
+    } catch (error) {
+      repeated = error instanceof Error ? error.message : String(error);
+    }
+    checkTrue("naming the same employee twice is refused", repeated.includes("named twice"));
+
+    let strangers = "";
+    try {
+      await confirmWageTransfer(tx, { tenantId }, {
+        cycleId: partial.id,
+        transferredMinor: partialFile.totalDueMinor,
+        transferReference: `${TAG}-SIF-STRANGER`,
+        confirmedOn: PARTIAL_DUE,
+        // A well-formed uuid belonging to nobody. The failure being guarded
+        // against is a name that quietly marks nobody paid, leaving the count
+        // one higher than the rows that back it.
+        paidEmployeeIds: [employeeId, "00000000-0000-0000-0000-0000000000ff"],
+      });
+    } catch (error) {
+      strangers = error instanceof Error ? error.message : String(error);
+    }
+    checkTrue(
+      "naming somebody with no line in the cycle is refused",
+      strangers.includes("no line in this wage cycle"),
+    );
+
+    let tooMany = "";
+    try {
+      await confirmWageTransfer(tx, { tenantId }, {
+        cycleId: partial.id,
+        transferredMinor: partialFile.totalDueMinor,
+        transferReference: `${TAG}-SIF-OVER`,
+        confirmedOn: PARTIAL_DUE,
+        paidEmployeeCount: lineCount + 1,
+      });
+    } catch (error) {
+      tooMany = error instanceof Error ? error.message : String(error);
+    }
+    checkTrue(
+      "claiming more people were paid than the cycle has lines is refused",
+      tooMany.includes("cannot"),
+    );
+
+    // ── The partial transfer that DOES name people ─────────────────────────
+    //
+    // Everybody except the employee with no IBAN — the one a WPS transfer
+    // cannot reach, which is why they are the right person to leave out.
+    const reached = partialFile.lines
+      .map((l) => l.employeeId)
+      .filter((id) => id !== unpayableId);
+    const unreachedNet = partialFile.lines.find((l) => l.employeeId === unpayableId)?.netMinor ?? 0;
+
+    const some = await confirmWageTransfer(tx, { tenantId }, {
+      cycleId: partial.id,
+      transferredMinor: partialFile.totalDueMinor - unreachedNet,
+      transferReference: `${TAG}-SIF-PARTIAL`,
+      confirmedOn: PARTIAL_DUE,
+      paidEmployeeCount: reached.length,
+      paidEmployeeIds: reached,
+    });
+
+    check("the cycle records the number actually reached", some.paidEmployeeCount, reached.length);
+    check("which is one short of the file", some.employeeCount - some.paidEmployeeCount, 1);
+
+    // THE assertion. Under the old unconditional `set paid = true` this reads
+    // `true` while the cycle above says one person was missed — the two answers
+    // that contradicted each other, on the row that belongs to the person the
+    // contradiction is about.
+    const missed = await lineState(unpayableId);
+    check("the employee the transfer did not reach is NOT marked paid", missed.paid, false);
+    check("and carries no payment date", missed.paidOn, null);
+
+    const got = await lineState(employeeId);
+    check("the employee it did reach is marked paid", got.paid, true);
+    check("dated the day of the transfer", got.paidOn, PARTIAL_DUE);
+
+    // The invariant itself, stated once: the count and the rows can never
+    // disagree, whichever of them somebody later changes.
+    check(
+      "exactly as many lines say paid as the cycle claims were paid",
+      await paidLineCount(),
+      some.paidEmployeeCount,
     );
 
     // ── The raw-SQL date contract, asserted rather than assumed ───────────

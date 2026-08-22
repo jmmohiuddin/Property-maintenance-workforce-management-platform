@@ -293,6 +293,12 @@ export interface WageLine {
   readonly overtimeMinutes: number;
   readonly leaveDays: number;
   readonly paid: boolean;
+  /**
+   * The day THIS line was paid, which is not always the cycle's `confirmed_on`.
+   * A cycle can be confirmed twice — a partial transfer and then the rest — and
+   * the second date belongs only to the people the second transfer reached.
+   */
+  readonly paidOn: CalendarDay | null;
   /** Missing an IBAN means this line cannot be transferred at all. */
   readonly wpsIban: string | null;
 }
@@ -425,6 +431,7 @@ export async function prepareWageFile(
       overtimeMinutes: r.overtime_minutes,
       leaveDays: r.leave_days,
       paid: false,
+      paidOn: null,
       wpsIban: r.wps_iban,
     };
   });
@@ -487,10 +494,11 @@ export async function wageFileLines(
     overtime_minutes: number;
     leave_days: number;
     paid: boolean;
+    paid_on: string | null;
     wps_iban: string | null;
   }>(sql`
     select p.employee_id, e.full_name, e.employee_no, p.basic, p.allowances, p.overtime,
-           p.deductions, p.net, p.overtime_minutes, p.leave_days, p.paid, e.wps_iban
+           p.deductions, p.net, p.overtime_minutes, p.leave_days, p.paid, p.paid_on, e.wps_iban
       from wage_payments p
       join employees e on e.id = p.employee_id
      where p.wage_cycle_id = ${cycleId} and p.deleted_at is null
@@ -507,6 +515,7 @@ export async function wageFileLines(
     overtime_minutes: number;
     leave_days: number;
     paid: boolean;
+    paid_on: string | null;
     wps_iban: string | null;
   }[];
 
@@ -522,6 +531,7 @@ export async function wageFileLines(
     overtimeMinutes: r.overtime_minutes,
     leaveDays: r.leave_days,
     paid: r.paid,
+    paidOn: r.paid_on,
     wpsIban: r.wps_iban,
   }));
 }
@@ -570,12 +580,63 @@ export async function wageFileGaps(tx: TenantScopedTx): Promise<readonly WageFil
 }
 
 /**
+ * A uuid[] literal for `= any(...)`.
+ *
+ * Drizzle expands a JavaScript array in a template into separate placeholders,
+ * so `any(${ids})` renders as `any(($1, $2))` and Postgres rejects it. Same
+ * idiom as `contracts.ts`. The empty case is spelled out because `array[]`
+ * with no elements and no cast has no type Postgres can infer.
+ */
+function employeeIdArray(ids: readonly string[]) {
+  if (ids.length === 0) return sql`array[]::uuid[]`;
+  return sql`array[${sql.join(
+    ids.map((id) => sql`${id}`),
+    sql`, `,
+  )}]::uuid[]`;
+}
+
+/**
  * Record the bank's confirmation of a WPS transfer.
  *
  * The amount is passed in rather than assumed equal to `total_due`, because a
  * partial transfer is a real and important state: 85% is the compliance line,
  * so "we paid most of it" has to be representable and has to be assessed
  * against the threshold rather than rounded up to "paid".
+ *
+ * ── WHY A PARTIAL TRANSFER HAS TO NAME PEOPLE ───────────────────────────────
+ *
+ * There are two different partialities here and they are not interchangeable.
+ * The one `assessWpsCycle` judges is **monetary** — how much of `total_due`
+ * actually moved, measured against the 85% floor. The one this function writes
+ * is **per person**: which of these employees has money in their account this
+ * morning. `paid_employee_count` answers the second in aggregate and
+ * `wage_payments.paid` answers it a row at a time.
+ *
+ * Those two used to be allowed to contradict each other. The line update was
+ * unconditional, so a cycle could record `paid_employee_count = 85` out of
+ * `employee_count = 100` while all one hundred lines said `paid = true`.
+ * Fifteen workers whose wages never left the account each had a row saying
+ * they had been paid — which is the most damaging sentence this table can
+ * utter, because MOHRE, a labour court and the worker are all shown that row
+ * as the answer.
+ *
+ * So they can no longer disagree. A transfer that did not reach everybody must
+ * NAME the employees it did reach; exactly those lines are marked paid and
+ * every other line in the cycle is marked unpaid. A short count with no names
+ * is refused outright. Refusing is the correct outcome and not a hedge: a
+ * blocked confirmation costs a phone call, and a wrongly recorded one costs a
+ * worker the only evidence that they were not paid.
+ *
+ * ── THE LIST IS THE WHOLE TRUTH, NOT A DELTA ────────────────────────────────
+ *
+ * Every other column written here is set rather than added to — `confirmed_on`,
+ * `transfer_reference` and `total_transferred` all describe the cycle as it now
+ * stands, and re-confirming overwrites them. The names follow the same rule, so
+ * a second transfer that clears the remaining fifteen names all one hundred and
+ * a correction that narrows the list actively un-marks whoever it dropped. The
+ * alternative — treating each call as an increment — would let an earlier full
+ * confirmation leave `paid = true` behind on somebody a later, truer partial
+ * confirmation excludes, which is the original bug wearing a different hat.
  */
 export async function confirmWageTransfer(
   tx: TenantScopedTx,
@@ -585,7 +646,17 @@ export async function confirmWageTransfer(
     transferredMinor: number;
     transferReference: string;
     confirmedOn?: CalendarDay;
+    /**
+     * How many employees the transfer reached. Below the cycle's
+     * `employee_count`, `paidEmployeeIds` stops being optional.
+     */
     paidEmployeeCount?: number;
+    /**
+     * Which employees the transfer reached. Authoritative when supplied:
+     * exactly these lines are marked paid and every other line is marked
+     * unpaid. Given alongside `paidEmployeeCount`, the two must agree.
+     */
+    paidEmployeeIds?: readonly string[];
   },
 ): Promise<WageCycleView> {
   const reference = input.transferReference.trim();
@@ -600,25 +671,133 @@ export async function confirmWageTransfer(
 
   const confirmedOn = input.confirmedOn ?? today();
 
+  // Read the cycle before writing to it. `employee_count` is the number
+  // "partial" is measured against, and a cycle id that matches nothing should
+  // be refused with a sentence rather than by an UPDATE that quietly affects
+  // no rows and a SELECT that fails four statements later.
+  const existing = (await tx.execute<{ employee_count: number }>(sql`
+    select employee_count from wage_cycles where id = ${input.cycleId} and deleted_at is null
+  `)) as unknown as { employee_count: number }[];
+  const cycleRow = existing[0];
+  if (!cycleRow) throw new UserFacingError("That wage cycle does not exist.");
+  const employeeCount = Number(cycleRow.employee_count);
+
+  const named = input.paidEmployeeIds ? [...input.paidEmployeeIds] : null;
+
+  if (input.paidEmployeeCount !== undefined) {
+    if (!Number.isInteger(input.paidEmployeeCount) || input.paidEmployeeCount < 0) {
+      throw new UserFacingError(
+        "The number of employees paid has to be a whole number of people, and it cannot be negative.",
+      );
+    }
+    if (input.paidEmployeeCount > employeeCount) {
+      throw new UserFacingError(
+        `This wage cycle has ${employeeCount} line${employeeCount === 1 ? "" : "s"} and the transfer claims ` +
+          `${input.paidEmployeeCount} employee${input.paidEmployeeCount === 1 ? "" : "s"} were paid. A cycle cannot ` +
+          `pay more people than it has lines for — if somebody is missing from it, rebuild the wage file rather than ` +
+          `raising the count.`,
+      );
+    }
+  }
+
+  let paidCount: number;
+
+  if (named) {
+    const unique = new Set(named);
+    if (unique.size !== named.length) {
+      throw new UserFacingError(
+        "The same employee is named twice in this transfer. Each employee has exactly one line in a wage cycle, so a repeated name would make the count claim more people were paid than actually were.",
+      );
+    }
+
+    if (input.paidEmployeeCount !== undefined && input.paidEmployeeCount !== named.length) {
+      throw new UserFacingError(
+        `You have named ${named.length} employee${named.length === 1 ? "" : "s"} but recorded ` +
+          `${input.paidEmployeeCount} as paid. Those are two answers to the same question, and a disagreement ` +
+          `between them is precisely what writes "paid" onto the record of somebody who was not. Correct one of them.`,
+      );
+    }
+
+    // Every name must have a line in THIS cycle. A name that does not marks
+    // nobody paid and would do it silently, leaving the count one higher than
+    // the rows that back it.
+    if (named.length > 0) {
+      const matched = (await tx.execute<{ n: number }>(sql`
+        select count(*)::int as n
+          from wage_payments p
+         where p.wage_cycle_id = ${input.cycleId}::uuid
+           and p.deleted_at is null
+           and p.employee_id = any(${employeeIdArray(named)})
+      `)) as unknown as { n: number }[];
+
+      const found = Number(matched[0]?.n ?? 0);
+      if (found !== named.length) {
+        const missing = named.length - found;
+        throw new UserFacingError(
+          `${missing} of the employees named have no line in this wage cycle, so there is nothing here to mark paid ` +
+            `for them. Build the wage file for this cycle first — somebody with no line is somebody the transfer ` +
+            `could not have reached through WPS.`,
+        );
+      }
+    }
+
+    paidCount = named.length;
+  } else {
+    const count = input.paidEmployeeCount ?? employeeCount;
+
+    if (count < employeeCount) {
+      const unpaid = employeeCount - count;
+      throw new UserFacingError(
+        `This transfer is recorded as reaching ${count} of ${employeeCount} employees, which leaves ${unpaid} ` +
+          `unpaid — and nothing here says which ${unpaid === 1 ? "one" : "ones"}. Name the employees the transfer ` +
+          `actually reached. The system will not guess: the only guess available to it writes "paid" against a ` +
+          `worker whose wage never left the account, and that row is what MOHRE, a labour court and the worker ` +
+          `themselves are later shown as proof.`,
+      );
+    }
+
+    paidCount = count;
+  }
+
   await tx.execute(sql`
     update wage_cycles
        set total_transferred = ${toDecimalString(input.transferredMinor)}::numeric,
            confirmed_on = ${confirmedOn}::date,
            transfer_reference = ${reference},
            confirmed_by_id = ${ctx.userId ?? null}::uuid,
-           paid_employee_count = coalesce(${input.paidEmployeeCount ?? null}::int, employee_count),
+           paid_employee_count = ${paidCount}::int,
            status = 'transferred',
            updated_at = now()
      where id = ${input.cycleId}
   `);
 
-  // The lines follow the cycle: a confirmed transfer marks every line paid, so
-  // "which of these people has been paid" has one answer and not two.
-  await tx.execute(sql`
-    update wage_payments
-       set paid = true, paid_on = ${confirmedOn}::date, updated_at = now()
-     where wage_cycle_id = ${input.cycleId} and deleted_at is null
-  `);
+  if (named) {
+    // Exactly the named lines are paid; every other line in the cycle is
+    // written back to unpaid in the same statement. Both halves matter — the
+    // second is what stops an earlier confirmation's `paid = true` surviving a
+    // later correction that drops somebody from the list.
+    //
+    // Rows whose state is unchanged produce no audit row: `app_audit_trigger`
+    // ignores `updated_at` and returns early when nothing else differs.
+    await tx.execute(sql`
+      update wage_payments
+         set paid = (employee_id = any(${employeeIdArray(named)})),
+             paid_on = case
+                         when employee_id = any(${employeeIdArray(named)}) then ${confirmedOn}::date
+                         else null
+                       end,
+             updated_at = now()
+       where wage_cycle_id = ${input.cycleId} and deleted_at is null
+    `);
+  } else {
+    // The ordinary case: the transfer reached everybody, which is what the
+    // count above already asserts, so every line follows the cycle.
+    await tx.execute(sql`
+      update wage_payments
+         set paid = true, paid_on = ${confirmedOn}::date, updated_at = now()
+       where wage_cycle_id = ${input.cycleId} and deleted_at is null
+    `);
+  }
 
   const rows = (await tx.execute<WageCycleDbRow>(sql`
     select id, period_month, due_on, total_due, total_transferred, employee_count,

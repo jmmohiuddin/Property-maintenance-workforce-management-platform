@@ -19,7 +19,7 @@ import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 import { SectionHeading, EmptyState } from "../../workforce/compliance-ui";
 import { WpsBanner, type WpsSeverity } from "../wps-banner";
-import { BuildWageFile, ConfirmTransfer } from "../payroll-forms";
+import { BuildWageFile, ConfirmTransfer, type TransferRosterEntry } from "../payroll-forms";
 
 export const metadata: Metadata = { title: "Wage protection" };
 export const dynamic = "force-dynamic";
@@ -58,6 +58,16 @@ export default async function PayrollPage() {
   );
 
   const totalNet = lines.reduce((sum, l) => sum + l.netMinor, 0);
+  // Preformatted here rather than in the client component: money formatting is
+  // a server concern in this codebase, and the roster only needs to display it.
+  const roster: readonly TransferRosterEntry[] = lines.map((l) => ({
+    employeeId: l.employeeId,
+    fullName: l.fullName,
+    amount: formatMoney(l.netMinor),
+    paid: l.paid,
+    payable: Boolean(l.wpsIban && l.wpsIban.trim() !== ""),
+  }));
+  const unpaidLines = lines.filter((l) => !l.paid);
   const totalOvertime = lines.reduce((sum, l) => sum + l.overtimeMinor, 0);
   const totalDeductions = lines.reduce((sum, l) => sum + l.deductionsMinor, 0);
   const past = history.filter((h) => h.id !== cycle.id);
@@ -135,6 +145,11 @@ export default async function PayrollPage() {
                       <th scope="col" className="p-3 text-right font-medium">Overtime</th>
                       <th scope="col" className="p-3 text-right font-medium">Deductions</th>
                       <th scope="col" className="p-3 text-right font-medium">Net</th>
+                      {/* Whether THIS person has been paid, per row. The cycle
+                          totals cannot answer it: a transfer that clears the
+                          85% test can still have missed somebody, and the row
+                          saying "paid" is what they are shown afterwards. */}
+                      <th scope="col" className="p-3 text-right font-medium">Paid</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -170,6 +185,20 @@ export default async function PayrollPage() {
                           {line.deductionsMinor === 0 ? "—" : formatMoney(line.deductionsMinor)}
                         </td>
                         <td className="tnum p-3 text-right font-medium">{formatMoney(line.netMinor)}</td>
+                        <td className="p-3 text-right text-[12px]">
+                          {line.paid ? (
+                            <span style={{ color: "var(--status-success-text)" }}>
+                              {/* This line's own date, not the cycle's. Two
+                                  transfers a fortnight apart give two different
+                                  answers, and the person's own row holds theirs. */}
+                              {line.paidOn ? formatDay(line.paidOn) : "paid"}
+                            </span>
+                          ) : (
+                            <span style={{ color: cycle.confirmedOn ? "var(--status-critical-text)" : "var(--text-muted)" }}>
+                              {cycle.confirmedOn ? "NOT PAID" : "—"}
+                            </span>
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -185,10 +214,31 @@ export default async function PayrollPage() {
                         {totalDeductions === 0 ? "—" : formatMoney(totalDeductions)}
                       </td>
                       <td className="tnum p-3 text-right font-semibold">{formatMoney(totalNet)}</td>
+                      <td className="p-3 text-right text-[12px] font-semibold">
+                        {cycle.confirmedOn ? `${cycle.paidEmployeeCount} of ${cycle.employeeCount}` : "—"}
+                      </td>
                     </tr>
                   </tfoot>
                 </table>
               </div>
+
+              {cycle.confirmedOn && unpaidLines.length > 0 ? (
+                <div className="mt-4">
+                  <EmptyState
+                    tone="critical"
+                    title={`${unpaidLines.length} ${unpaidLines.length === 1 ? "employee has" : "employees have"} not been paid for ${cycle.assessment.label}`}
+                  >
+                    <p>
+                      {unpaidLines.map((l) => l.fullName).join(", ")} &mdash; the transfer recorded
+                      against this cycle did not reach them. This stays here until a further
+                      transfer is recorded naming{" "}
+                      {unpaidLines.length === 1 ? "them" : "each of them"}. A wage cycle can pass the{" "}
+                      {WPS_MINIMUM_TRANSFER_PERCENT}% test and still contain this, because the test
+                      is a ratio of dirhams and not of workers.
+                    </p>
+                  </EmptyState>
+                </div>
+              ) : null}
 
               <p className="prose-body mt-3 text-[12px]">
                 Deductions here can never include a health insurance premium. Cover is
@@ -235,7 +285,14 @@ export default async function PayrollPage() {
         </section>
 
         {/* ── Record the transfer ───────────────────────────────────────── */}
-        {canWrite && cycle.assessment.stage !== "settled" && cycle.assessment.stage !== "nothing_due" ? (
+        {/* Shown while the cycle is unresolved — and ALSO while it is settled
+            but somebody on it is still unpaid. A cycle can transfer 100% of the
+            money on the 1st and settle, having missed a person whose line was
+            zero; hiding the form then would leave the only way to correct their
+            record behind a stage that will never change again. */}
+        {canWrite &&
+        cycle.assessment.stage !== "nothing_due" &&
+        (cycle.assessment.stage !== "settled" || unpaidLines.length > 0) ? (
           <section
             aria-labelledby="transfer-heading"
             className="mt-10 rounded border p-6"
@@ -255,6 +312,7 @@ export default async function PayrollPage() {
                 label={cycle.assessment.label}
                 suggestedAmount={formatMoney(cycle.totalDueMinor)}
                 today={today()}
+                roster={roster}
               />
             </div>
           </section>
@@ -288,6 +346,9 @@ export default async function PayrollPage() {
                       Due {formatDay(h.dueOn)}
                       {h.confirmedOn ? ` · transferred ${formatDay(h.confirmedOn)}` : " · not transferred"}
                       {h.transferReference ? ` · ${h.transferReference}` : ""}
+                      {h.confirmedOn && h.paidEmployeeCount < h.employeeCount
+                        ? ` · reached ${h.paidEmployeeCount} of ${h.employeeCount} employees`
+                        : ""}
                     </p>
                   </div>
                   <p

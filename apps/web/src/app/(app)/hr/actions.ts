@@ -25,6 +25,7 @@ import {
   addDays,
   HEALTH_PLANS,
   PAY_BAND_LABEL,
+  WPS_MINIMUM_TRANSFER_PERCENT,
   type HealthPlan,
   type PayBand,
 } from "@meridian/core";
@@ -131,13 +132,28 @@ export async function buildWageFile(
 }
 
 /**
- * Record that the WPS transfer happened, and for how much.
+ * Record that the WPS transfer happened, for how much, and to whom.
  *
  * The amount is asked for rather than assumed equal to the total due, because
  * 85% is the compliance line and a partial transfer is a real state that must
  * be assessed against it rather than rounded up to "paid". A cycle recorded as
  * settled when 60% went out is the one an establishment finds out about when
  * its work permits stop being issued.
+ *
+ * ── WHY THE NAMES ARE SUBMITTED EVEN WHEN NOBODY UNTICKED ANYTHING ──────────
+ *
+ * The form carries one checkbox per employee, ticked. A collapsed roster
+ * therefore submits every name, and the ordinary "everyone was paid" case is
+ * still the single click it was — the person only has to touch the list when
+ * the answer is not "everyone". The domain refuses a short count with no names
+ * outright, so the alternative would be a screen that can describe a partial
+ * transfer only by failing.
+ *
+ * `roster` distinguishes "the form showed the list and nobody was ticked" from
+ * "the form never showed a list at all". Without it an empty `getAll` would be
+ * indistinguishable from a missing field, and the safer-looking reading of a
+ * missing field — mark everybody paid — is the bug this whole path exists to
+ * prevent.
  */
 export async function confirmTransfer(
   _prev: HrFormState,
@@ -149,6 +165,10 @@ export async function confirmTransfer(
   const reference = text(formData, "transferReference");
   const transferred = amountMinor(formData.get("transferred"));
   const confirmedOn = calendarDate(formData.get("confirmedOn"));
+  const rosterShown = text(formData, "roster") === "named";
+  const paidEmployeeIds = rosterShown
+    ? formData.getAll("paidEmployeeIds").map((v) => String(v).trim()).filter(Boolean)
+    : null;
 
   if (!cycleId) return { error: "Missing wage cycle." };
   if (transferred === null) return { error: "Enter the amount transferred, as a number." };
@@ -172,6 +192,7 @@ export async function confirmTransfer(
             transferredMinor: transferred,
             transferReference: reference,
             ...(confirmedOn ? { confirmedOn } : {}),
+            ...(paidEmployeeIds ? { paidEmployeeIds } : {}),
           },
         ),
     );
@@ -182,13 +203,34 @@ export async function confirmTransfer(
     // The result is reported, not assumed. An 84% transfer is recorded and is
     // still a violation, and this message is where that gets said rather than
     // being discovered from an escalation email the next morning.
-    return cycle.assessment.meetsThreshold
-      ? { ok: `${cycle.assessment.label} recorded as transferred. ${cycle.assessment.headline}` }
-      : {
+    //
+    // The people are reported on the same footing as the money. A transfer can
+    // clear the 85% test and still have missed somebody — the threshold is a
+    // ratio of dirhams, not of workers — so "compliant" is never allowed to be
+    // the last word when a name went unpaid.
+    const unpaid = cycle.employeeCount - cycle.paidEmployeeCount;
+    const whoBy =
+      unpaid > 0
+        ? ` ${cycle.paidEmployeeCount} of ${cycle.employeeCount} employees are recorded as paid; ` +
+          `${unpaid} ${unpaid === 1 ? "line remains" : "lines remain"} unpaid and ${unpaid === 1 ? "is" : "are"} ` +
+          `marked as such on the wage file.`
+        : "";
+
+    if (!cycle.assessment.meetsThreshold) {
+      return {
+        error:
+          `Recorded — but this cycle is still non-compliant. ${cycle.assessment.consequence} ` +
+          `Transfer the shortfall of ${formatMoney(cycle.assessment.shortfallMinor)} and record it again.${whoBy}`,
+      };
+    }
+
+    return unpaid > 0
+      ? {
           error:
-            `Recorded — but this cycle is still non-compliant. ${cycle.assessment.consequence} ` +
-            `Transfer the shortfall of ${formatMoney(cycle.assessment.shortfallMinor)} and record it again.`,
-        };
+            `Recorded, and the ${WPS_MINIMUM_TRANSFER_PERCENT}% test is met — but not everybody was paid.${whoBy} ` +
+            `Transfer the rest and record it again naming them, so no line says "paid" against a wage that has not moved.`,
+        }
+      : { ok: `${cycle.assessment.label} recorded as transferred. ${cycle.assessment.headline}` };
   } catch (error) {
     return { error: userMessage(error, "Could not record the transfer.", "hr") };
   }
