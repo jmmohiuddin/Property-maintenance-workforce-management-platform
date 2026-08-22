@@ -687,6 +687,11 @@ export async function pullWorkingSet(
       from jobs j
       join job_visits v on v.job_id = j.id
      where v.technician_id = ${input.technicianId}::uuid
+       -- A visit a reassignment replaced (0040) is not this technician's work.
+       -- Without this the job stays on the handset of the person it was taken
+       -- off, for as long as it stays open -- and the sync is the only thing
+       -- that ever tells them what they are on, so they would go to it.
+       and v.status <> 'superseded'
        and j.deleted_at is null
        and (
          (
@@ -756,6 +761,13 @@ export async function pullWorkingSet(
           from job_visits v2
          where v2.job_id = j.id
            and v2.technician_id = ${input.technicianId}::uuid
+           -- Same exclusion as the scope above, and it has to be the same or
+           -- the two disagree: a technician still holding a job through a
+           -- second, live visit would otherwise be handed the retired one's id
+           -- as visitId, and every mutation the device sent would name it.
+           -- (No backticks in a comment inside a template literal -- one of
+           -- them terminates the string and breaks the workspace elsewhere.)
+           and v2.status <> 'superseded'
          order by v2.sequence desc
          limit 1
       ) v on true

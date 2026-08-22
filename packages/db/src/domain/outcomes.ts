@@ -216,11 +216,21 @@ export async function recordJobOutcome(
   // another job would file the diagnosis against the wrong work.
   if (input.visitId) {
     const visitRows = await tx
-      .select({ id: schema.jobVisits.id })
+      .select({ id: schema.jobVisits.id, status: schema.jobVisits.status })
       .from(schema.jobVisits)
       .where(and(eq(schema.jobVisits.id, input.visitId), eq(schema.jobVisits.jobId, input.jobId)))
       .limit(1);
-    if (!visitRows[0]) throw new UserFacingError("That visit does not belong to this job.");
+    const visit = visitRows[0];
+    if (!visit) throw new UserFacingError("That visit does not belong to this job.");
+    // And it has to be a visit that could have had an outcome. A `superseded`
+    // row (`0040`) is a plan a reassignment replaced before anybody set off, so
+    // a diagnosis filed against it is a statement about work nobody did — and
+    // `outcome_note` below would write the technician's words onto it.
+    if (visit.status === "superseded") {
+      throw new UserFacingError(
+        "That visit was replaced when the job was reassigned. Record the outcome against the visit that is current.",
+      );
+    }
   }
 
   const chosen: { kind: FaultCodeKind; id: string }[] = [];

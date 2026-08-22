@@ -1052,13 +1052,22 @@ export const DASHBOARD_GAPS: readonly DashboardGap[] = [
    * counted honestly:
    *
    *  1. A `job_visits` row is not an attendance. It is written at ASSIGNMENT
-   *     (`domain/assignment.ts`, status `assigned`, `dispatched_at` set), the
-   *     `visit_status` enum has no `cancelled` or `reassigned` member, and
-   *     `rescheduleVisit` refuses to change the technician — so reassigning a
-   *     job inserts a SECOND row and nothing ever retires the first. A job
-   *     fixed on the first attendance after two office reassignments carries
-   *     three visits. Counting visits would report a first-time-fix rate
-   *     depressed by dispatcher churn, which is not what G11 measures.
+   *     (`domain/assignment.ts`, status `assigned`, `dispatched_at` set).
+   *
+   *     PARTLY REPAIRED by `0040`. The enum now has `superseded` and
+   *     `assignTechnician` retires the visit a reassignment replaces, in the
+   *     same transaction, for the three states in which nobody has travelled.
+   *     So dispatcher churn no longer accumulates rows for ever, and the
+   *     denominator stops drifting upward with use.
+   *
+   *     It does not make a visit an attendance, which is what G11 needs. Two
+   *     gaps remain and both are real: a visit that WAS attended and then
+   *     reassigned is correctly left standing (retiring it would destroy the
+   *     record of the journey), so it still counts; and, more decisively,
+   *     nothing in the product writes `en_route_at` or `arrived_at` at all —
+   *     the only writers of either column are `seed.ts` and the test suites.
+   *     Until something records attendance, every visit row is a plan, and
+   *     counting plans is not counting attendances.
    *  2. The obvious repair — count only visits carrying recorded labour —
    *     fails in the flattering direction, which is worse. `assertJobCardComplete`
    *     requires labour on the JOB, not on every visit, so a genuine failed
@@ -1080,8 +1089,9 @@ export const DASHBOARD_GAPS: readonly DashboardGap[] = [
     requirement: "KPI-3 / G11 / MD-3",
     metric: "First-time fix rate",
     waitingOn:
-      "A per-visit outcome. `job_visits` records assignments, not attendances — a reassignment " +
-      "inserts a second row and nothing retires the first — and `jobs.outcome_code` is one " +
+      "A per-visit outcome. `job_visits` records assignments, not attendances: 0040 stopped a " +
+      "reassignment leaving a ghost row behind, but nothing in the product writes en_route_at or " +
+      "arrived_at, so no row anywhere says a technician turned up. `jobs.outcome_code` is one " +
       "job-level value overwritten on each call, so neither the numerator (closed on the first " +
       "attendance) nor the denominator (reactive jobs) can be counted. The return-visit rate on " +
       "the same card is what the recorded data does support.",
@@ -1544,6 +1554,7 @@ export async function utilisationPosition(
              count(*) filter (where v.work_minutes is not null)::text as labour_visits
         from job_visits v
        where v.deleted_at is null
+         and v.status <> 'superseded'
          and v.scheduled_start >= ${windowStart.toISOString()}::timestamptz
          and v.scheduled_start <  ${windowEnd.toISOString()}::timestamptz
        group by 1
@@ -1557,6 +1568,13 @@ export async function utilisationPosition(
         from job_visits v
         join jobs j on j.id = v.job_id
        where v.deleted_at is null
+         -- A visit a reassignment replaced (0040) is in the denominator of
+         -- labour coverage and can never be in the numerator: recording labour
+         -- against a retired visit is refused. Left in, it would drag the
+         -- coverage figure down once per historical reassignment -- and
+         -- coverage is precisely the number a reader consults to decide
+         -- whether to trust the utilisation figure beside it.
+         and v.status <> 'superseded'
          and j.deleted_at is null
          and j.status in ('work_complete', 'signed_off', 'invoiced', 'closed')
          and v.scheduled_start >= ${windowStart.toISOString()}::timestamptz

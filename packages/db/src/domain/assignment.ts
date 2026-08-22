@@ -4,6 +4,7 @@ import * as schema from "../schema";
 import { transitionJob } from "./jobs";
 import { blockForTechnician, blockedTechnicians, type DispatchBlock } from "./compliance";
 import { loadWorkingCalendar } from "./reference";
+import { writeAuditNote } from "./staff";
 import {
   checkOutdoorWindow,
   dubaiDateKey,
@@ -150,8 +151,46 @@ export const MIN_OVERRIDE_REASON_LENGTH = 10;
 /** `HR-9`: a trade certification warns from 30 days before it lapses. */
 const CERT_EXPIRY_WARNING_DAYS = 30;
 
-/** Visit statuses that occupy a technician's diary. */
-const OCCUPYING_VISIT_STATUSES = ["assigned", "accepted", "en_route", "arrived"] as const;
+/**
+ * Visit statuses that occupy a technician's diary.
+ *
+ * Exported because it had been copied out by hand into two other load queries —
+ * `findCandidates` below and `listTechnicians` in `workforce.ts` — and a list
+ * that exists three times is a list that will be updated twice. That is not
+ * hypothetical here: `superseded` (`0040`) had to be excluded from all three at
+ * once, and a copy left behind would have gone on counting retired visits in
+ * the roster while the dispatch panel stopped.
+ */
+export const OCCUPYING_VISIT_STATUSES = ["assigned", "accepted", "en_route", "arrived"] as const;
+
+/**
+ * The visit states that may be retired when a job is reassigned (`0040`).
+ *
+ * ── THE LINE THIS DRAWS, AND WHY IT IS DRAWN HERE ───────────────────────────
+ *
+ * A visit in one of these three states is a PLAN. `proposed` was offered,
+ * `assigned` was booked, `accepted` was acknowledged — in none of them has
+ * anybody travelled, and replacing the plan destroys no fact about the world.
+ *
+ * Everything else is excluded, and the two halves of "everything else" are
+ * excluded for different reasons:
+ *
+ *   * `en_route` and `arrived` are ATTENDANCE. The technician got in the van;
+ *     some of them stood outside the building. A dispatcher reassigning the
+ *     job an hour later does not unmake that, and silently rewriting the row
+ *     would erase the only record that the trip happened — along with the
+ *     travel time it will be costed on. Reassigning away from an attended
+ *     visit is legitimate (an emergency swap), so it is not refused; the
+ *     attended row is simply left standing as the fact it is. It then needs
+ *     closing out with a real outcome, which is the field app's job.
+ *   * `completed`, `no_access`, `aborted` and `declined` are recorded
+ *     OUTCOMES. Overwriting one with a reassignment would replace evidence
+ *     with an administrative act.
+ *
+ * `superseded` itself is absent so retirement is idempotent rather than
+ * repeatedly re-stamping rows that are already retired.
+ */
+export const RETIRABLE_VISIT_STATUSES = ["proposed", "assigned", "accepted"] as const;
 
 /** How long a visit is assumed to run when nobody says otherwise. */
 const DEFAULT_VISIT_MINUTES = 120;
@@ -619,7 +658,11 @@ export async function findCandidates(
     .where(
       and(
         inArray(schema.jobVisits.technicianId, ids),
-        inArray(schema.jobVisits.status, ["assigned", "accepted", "en_route", "arrived"]),
+        // The shared list, not a fourth hand-written copy. A retired visit
+        // (`superseded`, `0040`) is absent from it, which is the whole point:
+        // this count is the SOFT SCORING input that decides who looks busy, so
+        // a ghost row here passes over a technician who is actually free.
+        inArray(schema.jobVisits.status, [...OCCUPYING_VISIT_STATUSES]),
       ),
     )
     .groupBy(schema.jobVisits.technicianId);
@@ -729,6 +772,44 @@ export async function findCandidates(
  * records how the decision was made. `assignment_method` and
  * `assignment_score` exist so the optimiser can later be measured against the
  * dispatcher rather than simply trusted.
+ *
+ * ── REASSIGNMENT, AND WHY IT IS RESOLVED HERE (`0040`) ──────────────────────
+ *
+ * This function contains the ONLY `insert into job_visits` in
+ * `packages/db/src`. Every path that puts a technician on a job — the job page's
+ * `assign` action, anything the field API grows, a future auto-dispatcher —
+ * arrives at this statement, which makes it the transition every reassignment
+ * meets. That is the same argument that moved `JOB-15` out of
+ * `recordJobOutcome`: the rule lived in one caller while `transitionJob` stood
+ * open as a second, unguarded door into the same state, and the field sync API
+ * promptly drove through it. A retirement implemented in the dispatcher's
+ * server action would be one more affordance with the same shape.
+ *
+ * So retiring the visit being replaced happens HERE, in the same transaction
+ * as the insert that replaces it. A commit that creates the new visit and
+ * leaves the old one occupying somebody's diary is exactly the state this
+ * exists to make unreachable.
+ *
+ * ── WHY SUPERSEDING IS THE DEFAULT AND `additional` IS THE EXCEPTION ────────
+ *
+ * The server cannot infer intent from the request: "reassign this job to
+ * Rashid" and "put Rashid on it alongside Ahmed" arrive as the same call. One
+ * of the two has to be the default, so the question is which mistake is worse.
+ *
+ * Forgetting to supersede is invisible and cumulative — it is the bug this
+ * change closes, and it silently degrades every future dispatch decision.
+ * Superseding when the caller meant to add is visible within one screen (the
+ * board shows one name where the dispatcher expected two) and destroys nothing:
+ * only a never-attended plan can be retired at all, the row survives with its
+ * status, and the audit log names who did it. A loud, recoverable mistake beats
+ * a silent, accumulating one, so the safe behaviour sits at the door and the
+ * exception has to be asked for by name.
+ *
+ * `JOB-12` multi-visit work is mostly untouched by this either way: the
+ * "parts on order, returning Thursday" visit follows an ATTENDED first visit,
+ * and an attended visit is not retirable. `additional` is for the genuine case
+ * a return visit does not cover — a second person put on a job before the first
+ * has set off.
  */
 export async function assignTechnician(
   tx: TenantScopedTx,
@@ -755,10 +836,35 @@ export async function assignTechnician(
      */
     overrideWarningType?: string | undefined;
     overrideReason?: string | undefined;
+    /**
+     * `JOB-12`. This is an EXTRA visit standing alongside the ones already on
+     * the job, not a replacement for them — a second technician on work that
+     * needs two, booked before the first has set off.
+     *
+     * Default false, which supersedes. See the docstring above for why that
+     * asymmetry is deliberate. Passing true never retires anything, so a job
+     * genuinely needing two people keeps both diaries occupied.
+     */
+    additional?: boolean | undefined;
     /** Supplied so the midday-ban and availability checks use the configured calendar. */
     calendar?: WorkingCalendar | undefined;
   },
-): Promise<{ visitId: string; sequence: number; overrode: readonly AssignmentWarning[] }> {
+): Promise<{
+  visitId: string;
+  sequence: number;
+  overrode: readonly AssignmentWarning[];
+  /**
+   * The visits this assignment retired (`0040`). Empty on a first assignment,
+   * on `additional`, and when every existing visit was attended or settled.
+   *
+   * Returned rather than left silent so a caller can TELL the technician whose
+   * work was taken off them. Nothing does yet, and a reassignment that a
+   * technician learns about by the job vanishing from their handset is a real
+   * gap — but it is a notification decision with its own template and its own
+   * argument, and inventing one here would be the wrong place to make it.
+   */
+  superseded: readonly { visitId: string; technicianId: string; previousStatus: string }[];
+}> {
   const jobRows = await tx
     .select({
       status: schema.jobs.status,
@@ -855,11 +961,76 @@ export async function assignTechnician(
   }
 
   const existing = await tx
-    .select({ sequence: schema.jobVisits.sequence })
+    .select({
+      id: schema.jobVisits.id,
+      sequence: schema.jobVisits.sequence,
+      status: schema.jobVisits.status,
+      technicianId: schema.jobVisits.technicianId,
+    })
     .from(schema.jobVisits)
     .where(eq(schema.jobVisits.jobId, input.jobId));
 
   const sequence = existing.reduce((max, v) => Math.max(max, v.sequence), 0) + 1;
+
+  // ── `0040`: retire the plan this assignment replaces ─────────────────────
+  //
+  // Below every refusal above, so an assignment that is rejected retires
+  // nothing — a dispatcher who trips the `JOB-10` gate must not find the
+  // previous technician removed from a job that was never reassigned.
+  //
+  // The filter is `RETIRABLE_VISIT_STATUSES`, and its exclusions carry the
+  // weight: a visit that reached `en_route` or `arrived` is a fact about the
+  // world and is left exactly as it is, and a visit carrying a recorded
+  // outcome is evidence rather than a plan. Both keep occupying the diary
+  // afterwards, and that is correct — the technician really did spend that
+  // window. Closing an attended visit out belongs to whoever records what
+  // happened on it, not to the dispatcher who moved the job on.
+  //
+  // Not filtered on technician. Reassigning a job back to the SAME person at a
+  // different time goes through this function too, and leaving their old row
+  // standing would double-book them against themselves.
+  //
+  // One pre-existing wrinkle is deliberately left alone: `assignmentWarnings`
+  // ran further up, against a diary that still contained these rows, so a
+  // same-technician reassignment can raise `double_booked` against the very
+  // visit about to be retired. That is today's behaviour and it warns rather
+  // than lies; making the warning ignore a set of rows the caller has not yet
+  // asked to retire would weaken a `JOB-8` control to tidy up a message.
+  const retirable = input.additional
+    ? []
+    : existing.filter((v) => (RETIRABLE_VISIT_STATUSES as readonly string[]).includes(v.status));
+
+  if (retirable.length > 0) {
+    await tx
+      .update(schema.jobVisits)
+      .set({ status: "superseded", updatedAt: new Date() })
+      .where(
+        inArray(
+          schema.jobVisits.id,
+          retirable.map((v) => v.id),
+        ),
+      );
+
+    // One note per retired visit, keyed to that visit, because the question
+    // asked later is "what happened to MY visit" and an aggregate note filed
+    // against the job cannot answer it. `audit_log.action` is varchar(16);
+    // "superseded" is ten.
+    for (const v of retirable) {
+      await writeAuditNote(tx, ctx, {
+        tableName: "job_visits",
+        recordId: v.id,
+        action: "superseded",
+        detail: {
+          rule: "JOB-12",
+          jobId: input.jobId,
+          previousStatus: v.status,
+          previousTechnicianId: v.technicianId,
+          replacedByTechnicianId: input.technicianId,
+          sequence,
+        },
+      });
+    }
+  }
 
   const [visit] = await tx
     .insert(schema.jobVisits)
@@ -897,7 +1068,16 @@ export async function assignTechnician(
     });
   }
 
-  return { visitId: visit.id, sequence, overrode: gated };
+  return {
+    visitId: visit.id,
+    sequence,
+    overrode: gated,
+    superseded: retirable.map((v) => ({
+      visitId: v.id,
+      technicianId: v.technicianId,
+      previousStatus: v.status,
+    })),
+  };
 }
 
 /**

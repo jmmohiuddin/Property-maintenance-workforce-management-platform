@@ -2,6 +2,7 @@ import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import * as schema from "../schema";
 import type { TenantScopedTx } from "../index";
 import { certState, UserFacingError, type CertState } from "@meridian/core";
+import { OCCUPYING_VISIT_STATUSES } from "./assignment";
 
 export { certState, CERT_WARNING_DAYS, CERT_STATE_LABEL, type CertState } from "@meridian/core";
 
@@ -94,7 +95,12 @@ export async function listTechnicians(
       .where(
         and(
           inArray(schema.jobVisits.technicianId, ids),
-          inArray(schema.jobVisits.status, ["assigned", "accepted", "en_route", "arrived"]),
+          // The dispatch engine's own list rather than a copy of it. This
+          // count is shown on the roster as "how much is this person
+          // carrying", so it has to answer the same question `findCandidates`
+          // scores on — including agreeing that a `superseded` visit (`0040`)
+          // is nobody's work.
+          inArray(schema.jobVisits.status, [...OCCUPYING_VISIT_STATUSES]),
         ),
       )
       .groupBy(schema.jobVisits.technicianId),

@@ -1,0 +1,87 @@
+-- JOB-11 / JOB-12: give a reassigned visit somewhere to go.
+--
+-- ── THE BUG THIS CLOSES ────────────────────────────────────────────────────
+--
+-- `job_visits` rows were never retired. `assignTechnician` does a plain INSERT
+-- and `rescheduleVisit` refuses to change the technician on purpose -- moving a
+-- visit into somebody else's lane has to re-run skill matching, the HR-9
+-- compliance block and the JOB-8 availability rules, all of which live in
+-- assignment.ts -- so reassigning a job means calling `assignTechnician` again,
+-- which inserts a SECOND row. Nothing has ever updated or deleted the first:
+-- there is not one DELETE from `job_visits` anywhere in packages/db/src.
+--
+-- The abandoned row stays `assigned`, which is one of the four statuses in
+-- `OCCUPYING_VISIT_STATUSES`, so it occupies the original technician's diary
+-- for ever. Three consequences, in descending order of cost:
+--
+--   1. The dispatch board lies about who is free. `findCandidates` and
+--      `listTechnicians` both score on the count of open visits, so every
+--      historical reassignment permanently makes somebody look busier than
+--      they are. A genuinely available technician is passed over, and it gets
+--      monotonically worse the more the product is used.
+--   2. The job card renders a labour form per ghost visit, so a technician is
+--      asked how long a visit took that nobody ever went on.
+--   3. G11 (first-time-fix rate) cannot be counted over visit rows at all,
+--      because dispatcher churn inflates the denominator. See DASHBOARD_GAPS
+--      in domain/reporting.ts -- this migration is a precondition for that
+--      metric, not a delivery of it. G11 still needs a per-visit outcome.
+--
+-- ── WHY A NEW MEMBER RATHER THAN REUSING ONE ───────────────────────────────
+--
+-- `declined` means the TECHNICIAN refused the work. Recording the office's
+-- reassignment against the employee is a false statement about a person, and
+-- it would poison any "who declines work" report.
+--
+-- `aborted` means the visit started and was abandoned -- `job_outcome_codes`
+-- ships `aborted_unsafe` for precisely that -- so it asserts an attendance
+-- that never happened. It is also in `SETTLED_VISIT_STATUSES`, the set the
+-- schedule treats as "already happened, not movable".
+--
+-- `cancelled` was rejected as the new member's name, not as a concept: it is
+-- the obvious word for the customer calling the appointment off, which is a
+-- different real event this schema does not yet model. Spending the word here
+-- would leave that event without an honest name later.
+--
+-- `superseded` is what this schema already calls "a later record replaced this
+-- one, and the earlier one is kept rather than deleted": `quote_status`,
+-- `employment_contract_terms.status` and the field app's outcome versions all
+-- use it in that exact sense.
+--
+-- ── WHAT MAY BE RETIRED, AND WHAT MUST NEVER BE ────────────────────────────
+--
+-- Only `proposed`, `assigned` and `accepted` -- the states in which the visit
+-- is a PLAN and nobody has travelled. `en_route` and `arrived` are facts about
+-- the world: the technician got in the van, and no reassignment made in an
+-- office afterwards unmakes that. `completed`, `no_access`, `aborted` and
+-- `declined` are recorded outcomes, and overwriting a recorded outcome with a
+-- reassignment would destroy the only evidence of what happened. The
+-- enforcement is in `assignTechnician`, which refuses to touch any of them.
+--
+-- ── WHY THERE IS NO BACKFILL IN THIS FILE ──────────────────────────────────
+--
+-- The obvious backfill -- retire every `assigned` visit that carries no
+-- `arrived_at` and belongs to a finished job -- is unsound HERE, and the
+-- reason is specific to this repository rather than general caution: NOTHING
+-- IN PRODUCTION HAS EVER WRITTEN `arrived_at` OR `en_route_at`. The only
+-- writers of either column are `src/seed.ts` and the test suites; no domain
+-- function, no server action and no field-sync operation advances a visit past
+-- `assigned`. So in a real database every attended visit is ALSO sitting at
+-- `assigned` with null attendance timestamps, and is byte-for-byte
+-- indistinguishable from an abandoned one.
+--
+-- A backfill would therefore retire real attendances at an unknown rate, and
+-- once retired they could not be told apart from correct retirements. Nothing
+-- in the row -- not the timestamps, not `assignment_method`, not
+-- `dispatched_at` -- separates the two populations. The honest answer is that
+-- the data does not support the inference, so this migration changes no rows.
+-- Existing ghosts stop growing from today and drain as their jobs close.
+--
+-- ── TRANSACTION SAFETY ─────────────────────────────────────────────────────
+--
+-- `ALTER TYPE ... ADD VALUE` could not run inside a transaction block before
+-- PostgreSQL 12. From 12 it can, provided the new value is not USED in the
+-- same transaction -- this file only adds it, and the first write of
+-- 'superseded' is a later application statement in a later transaction. The
+-- deployment target is PostgreSQL 16. `IF NOT EXISTS` so re-running the file
+-- against an existing database is safe, matching `0005`.
+ALTER TYPE "visit_status" ADD VALUE IF NOT EXISTS 'superseded';

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, ne, sql } from "drizzle-orm";
 import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
 import { writeAuditNote } from "./staff";
@@ -458,6 +458,13 @@ export async function getJobCard(tx: TenantScopedTx, jobId: string): Promise<Job
   const exemptionRow = declarationRows.find((d) => d.kind === "photo_exempt");
   const materialsNoneRow = declarationRows.find((d) => d.kind === "materials_none");
 
+  // Retired visits are excluded, and this is the line that stops the job card
+  // asking a technician how long a visit took that nobody went on. A
+  // `superseded` row (`0040`) is a plan a reassignment replaced before it
+  // began: it has no labour to record, the panel renders one form per row here,
+  // and `JOB-15` reads `recorded` below to decide whether the card is complete
+  // — so a ghost row was both a phantom form and a permanent gap the
+  // dispatcher could not close.
   const visitRows = await tx
     .select({
       visitId: schema.jobVisits.id,
@@ -468,7 +475,7 @@ export async function getJobCard(tx: TenantScopedTx, jobId: string): Promise<Job
     })
     .from(schema.jobVisits)
     .innerJoin(schema.technicians, eq(schema.technicians.id, schema.jobVisits.technicianId))
-    .where(eq(schema.jobVisits.jobId, jobId))
+    .where(and(eq(schema.jobVisits.jobId, jobId), ne(schema.jobVisits.status, "superseded")))
     .orderBy(asc(schema.jobVisits.sequence));
 
   const labour: JobVisitLabour[] = visitRows.map((v) => ({
@@ -601,11 +608,35 @@ async function requireVisitOnJob(
 ): Promise<void> {
   if (!visitId) return;
   const rows = await tx
-    .select({ id: schema.jobVisits.id })
+    .select({ id: schema.jobVisits.id, status: schema.jobVisits.status })
     .from(schema.jobVisits)
     .where(and(eq(schema.jobVisits.id, visitId), eq(schema.jobVisits.jobId, jobId)))
     .limit(1);
-  if (!rows[0]) throw new UserFacingError("That visit does not belong to this job.");
+  const visit = rows[0];
+  if (!visit) throw new UserFacingError("That visit does not belong to this job.");
+
+  /*
+   * A retired visit is not a place to file evidence (`0040`).
+   *
+   * The check is HERE, in the shared guard, rather than in `recordVisitLabour`
+   * — every caller that names a visit (labour, a photograph, a part) meets this
+   * function, and putting it in one of them would leave the other two open in
+   * the way this file's own docstring warns about. Not rendering the labour
+   * form for a superseded visit is an affordance; this is the control.
+   *
+   * The message says what to do rather than only refusing, because the case
+   * that actually reaches it is a handset that was offline: the office
+   * reassigned the job while the technician was working, and the queue flushed
+   * afterwards. That is a genuine conflict between two people, and the useful
+   * thing is to surface it — filing the hour against the retired plan would
+   * hide it, and hide it in the record that gets invoiced.
+   */
+  if (visit.status === "superseded") {
+    throw new UserFacingError(
+      "That visit was replaced when the job was reassigned, so nothing can be recorded against it. " +
+        "Reload the job and record this against the visit that is current.",
+    );
+  }
 }
 
 /** The job exists in this tenant. RLS makes "missing" and "theirs" the same. */
@@ -1750,7 +1781,12 @@ export async function getJobSheetSource(
       sequence: schema.jobVisits.sequence,
     })
     .from(schema.jobVisits)
-    .where(eq(schema.jobVisits.jobId, jobId))
+    // A retired visit carries no attendance, so it would fall through to the
+    // job's own timestamps anyway — but it must not be the row consulted at
+    // all. `recordedAt` is what the sealed job sheet prints as when the work
+    // was done, and a document that derives its date from a visit nobody
+    // attended is wrong on the one field the seal exists to fix.
+    .where(and(eq(schema.jobVisits.jobId, jobId), ne(schema.jobVisits.status, "superseded")))
     .orderBy(desc(schema.jobVisits.sequence))
     .limit(1);
   const lastVisit = timingRows[0];

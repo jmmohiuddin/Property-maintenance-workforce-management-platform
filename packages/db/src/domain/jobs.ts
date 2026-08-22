@@ -1010,7 +1010,11 @@ export async function loadSchedule(
            and v.scheduled_start is not null
            and v.scheduled_start >= (${from}::date::timestamp at time zone 'Asia/Dubai')
            and v.scheduled_start < ((${toDate} + 1)::timestamp at time zone 'Asia/Dubai')
-           and v.status::text not in ('declined', 'aborted')
+           -- Retired plans are not on anyone's day. 'superseded' (0040) is a
+           -- visit a reassignment replaced before it began; leaving it here
+           -- would draw a block in the original technician's lane for work
+           -- somebody else is doing.
+           and v.status::text not in ('declined', 'aborted', 'superseded')
          order by v.scheduled_start asc, t.full_name asc
       `) as unknown as Promise<
         {
@@ -1233,8 +1237,16 @@ export async function loadSchedule(
   };
 }
 
-/** Visit states that have already happened, or been refused. Not movable. */
-const SETTLED_VISIT_STATUSES = ["completed", "no_access", "aborted", "declined"];
+/**
+ * Visit states that have already happened, been refused, or been retired.
+ * Not movable.
+ *
+ * `superseded` (`0040`) is the odd one out and belongs here anyway: it has not
+ * happened and never will. A dispatcher dragging it across the grid is moving a
+ * plan that was replaced, and the honest refusal is that there is nothing there
+ * to move rather than a silent reschedule of a visit nobody will attend.
+ */
+const SETTLED_VISIT_STATUSES = ["completed", "no_access", "aborted", "declined", "superseded"];
 
 /** Job states in which moving a visit still means anything. */
 const RESCHEDULABLE_JOB_STATUSES: readonly JobStatus[] = [
@@ -1326,6 +1338,17 @@ export async function rescheduleVisit(
   // here, which is the intended behaviour.
   if (!visit) throw new UserFacingError("That visit is not in this tenant.");
 
+  // Superseded gets its own sentence, because the shared one would be a small
+  // lie: nothing happened on a retired visit. The grid no longer draws them at
+  // all, so reaching this is a stale page rather than a misclick, and saying so
+  // is what stops the dispatcher dragging it again.
+  if (visit.visit_status === "superseded") {
+    throw new UserFacingError(
+      "This visit was replaced when the job was reassigned, so there is nothing here to move. " +
+        "Reload the schedule — the technician who has the job now is on it.",
+    );
+  }
+
   if (SETTLED_VISIT_STATUSES.includes(visit.visit_status)) {
     throw new UserFacingError(
       `This visit is already ${visit.visit_status.replace("_", " ")} — what happened cannot be rescheduled. ` +
@@ -1400,7 +1423,7 @@ export async function rescheduleVisit(
              select min(v.scheduled_start)
                from job_visits v
               where v.job_id = j.id
-                and v.status::text not in ('declined', 'aborted', 'no_access')
+                and v.status::text not in ('declined', 'aborted', 'no_access', 'superseded')
            ),
            updated_at = now()
      where j.id = ${visit.job_id}::uuid

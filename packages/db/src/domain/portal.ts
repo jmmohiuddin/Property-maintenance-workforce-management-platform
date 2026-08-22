@@ -298,6 +298,12 @@ export async function listPortalRequests(
           from job_visits vv
           join technicians t on t.id = vv.technician_id
          where vv.job_id = j.id
+           -- A visit a reassignment replaced (0040) was never attended and
+           -- never will be. Ordering it last is not enough: on a job whose
+           -- only other visit has no scheduled_start it can still win, and the
+           -- customer would then be told the name of a technician who is not
+           -- coming.
+           and vv.status <> 'superseded'
          order by (vv.status in ('assigned','accepted','en_route','arrived')) desc,
                   vv.scheduled_start desc nulls last,
                   vv.sequence desc
@@ -526,7 +532,11 @@ export async function getPortalRequestDetail(
     })
     .from(schema.jobVisits)
     .innerJoin(schema.technicians, eq(schema.technicians.id, schema.jobVisits.technicianId))
-    .where(eq(schema.jobVisits.jobId, jobId))
+    // A customer is shown attendances, not the dispatcher's working. A
+    // `superseded` visit (`0040`) would appear here as a named technician with
+    // a time and no arrival — indistinguishable, on a portal timeline, from
+    // somebody who was booked and never turned up.
+    .where(and(eq(schema.jobVisits.jobId, jobId), ne(schema.jobVisits.status, "superseded")))
     .orderBy(asc(schema.jobVisits.sequence));
 
   const reports = await tx
