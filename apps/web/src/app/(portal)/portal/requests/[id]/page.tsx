@@ -1,11 +1,17 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { withCustomerScope, getPortalRequestDetail, type PortalRequestDetail } from "@meridian/db";
+import {
+  withCustomerScope,
+  getPortalRequestDetail,
+  getPortalLiveTracking,
+  type PortalRequestDetail,
+} from "@meridian/db";
 import { getService, PORTAL_JOB_NARRATIVE, type JobStatus } from "@meridian/core";
 import { requirePortalSession } from "@/lib/session";
 import { PortalShell } from "@/components/portal-shell";
 import { ArrowLeft, CheckCircle, DownloadSimple } from "@phosphor-icons/react/dist/ssr";
+import { LiveTrackingPanel } from "./live-tracking";
 
 export const metadata: Metadata = { title: "Request" };
 export const dynamic = "force-dynamic";
@@ -53,14 +59,22 @@ export default async function PortalRequestPage({
   const session = await requirePortalSession();
   const { id } = await params;
 
-  const request = await withCustomerScope(
-    {
-      tenantId: session.principal.tenantId,
-      customerId: session.customerId,
-      userId: session.principal.userId,
-    },
-    (tx) => getPortalRequestDetail(tx, id),
-  );
+  const scope = {
+    tenantId: session.principal.tenantId,
+    customerId: session.customerId,
+    userId: session.principal.userId,
+  };
+
+  // `CUST-3`. Two transactions rather than one, and deliberately so: the
+  // tracking read runs on every thirty-second refresh and the detail read does
+  // not need to. Folding them together would mean re-running six queries and a
+  // job-card projection to find out whether a van has moved 400 metres.
+  //
+  // Both run inside `withCustomerScope`, which is where the boundary is. There
+  // is no customer filter in either call and there must not be — see the note
+  // at the head of `getPortalLiveTracking`.
+  const request = await withCustomerScope(scope, (tx) => getPortalRequestDetail(tx, id));
+  const tracking = await withCustomerScope(scope, (tx) => getPortalLiveTracking(tx, id));
 
   // 404 for another customer's request, exactly as for one that does not
   // exist. The row is invisible inside customer scope, so this branch is the
@@ -101,6 +115,24 @@ export default async function PortalRequestPage({
 
         {request.description ? (
           <p className="prose-body mt-4 text-[14px]">{request.description}</p>
+        ) : null}
+
+        {/* ── CUST-3 / EMG-5. Live tracking, while and only while it is live ──
+            Null whenever there is no visit on this job in `en_route` or
+            `arrived`, which means this panel is absent before the technician
+            sets off and absent again the moment they finish. Dates are passed
+            as ISO strings because a `Date` cannot cross the server/client
+            boundary; the component parses them back. */}
+        {tracking ? (
+          <LiveTrackingPanel
+            state={tracking.state}
+            technicianName={tracking.technicianName}
+            enRouteAt={tracking.enRouteAt.toISOString()}
+            distanceKm={tracking.distanceKm}
+            etaMinutes={tracking.etaMinutes}
+            lastSeenAt={tracking.lastSeenAt ? tracking.lastSeenAt.toISOString() : null}
+            stale={tracking.stale}
+          />
         ) : null}
 
         {/* ── Timeline ─────────────────────────────────────────────────────

@@ -6,12 +6,14 @@ import {
   apportionLines,
   blockingPermits,
   canTransitionProject,
+  canTransitionSubcontractApproval,
   canTransitionVariation,
   computeSlaDeadlines,
   criticalSnagsBlockingCompletion,
   defectsLiabilityEnd,
   dubaiDateKey,
   InvalidProjectTransitionError,
+  InvalidSubcontractApprovalTransitionError,
   InvalidVariationTransitionError,
   lineTotalMinor,
   milestoneTriggerMet,
@@ -35,6 +37,7 @@ import {
   type RetentionStatus,
   type SnagSeverity,
   type SnagStatus,
+  type SubcontractApproval,
   type VariationState,
 } from "@meridian/core";
 import { writeAuditNote } from "./staff";
@@ -314,6 +317,51 @@ export async function transitionProject(
           "programme far more than the wait for the approval does.",
       );
     }
+    // ── AND WHY THERE IS NO EQUIVALENT BLOCK FOR `PRJ-9` HERE ────────────────
+    //
+    // `listUnapprovedSubcontracts` reports engagements exactly as unlawful as
+    // an unapproved permit — Dubai Law No. 7 of 2025 requires the employer's
+    // PRIOR approval before subcontracting, and an engagement whose
+    // `starts_on` has passed while approval sits `pending` is already on the
+    // wrong side of that line. It was tempting to refuse this transition on
+    // the same grounds `blockingPermitsForProject` does above. It stays a
+    // chase, not a block, for three reasons that together are not close:
+    //
+    //  1. **The requirement itself distinguishes them.** `PRJ-6`'s row in the
+    //     spec reads "a project MAY NOT enter `on_site`..."; `PRJ-7`'s reads
+    //     "practical completion CANNOT be recorded...". `PRJ-9`'s row
+    //     describes the register and cites the law; it contains no such
+    //     instruction. The two hard blocks in this function are where the
+    //     spec used that language. This is not the third one by omission.
+    //  2. **Whether the law reaches this business at all is an open question
+    //     the spec itself has not answered.** `OPEN-3` — its own
+    //     highest-priority unknown — is exactly this: whether a small
+    //     technical-services/maintenance contractor is in scope, and whether
+    //     "technical personnel" reaches a tradesman or only an engineer. A
+    //     hard refusal that can stop dispatchable site work should not be
+    //     built on an inference the people who wrote the requirement have
+    //     flagged as unresolved.
+    //  3. **There is no point of action to put it at, the way there is for
+    //     `PRJ-6`.** A required permit is either approved or it is not, at the
+    //     moment this function is called, which is precisely when the project
+    //     record is asked to say "we are on site". A subcontractor starting
+    //     work without approval is a fact about the calendar, discovered by a
+    //     daily sweep long after the one call site that could have refused it
+    //     — `engageSubcontractor` — already ran, often with a future
+    //     `starts_on` that was entirely lawful at the time. Blocking
+    //     `engageSubcontractor` itself would not fix that; it would only make
+    //     the system unable to honestly *record* a violation that has already
+    //     happened in the physical world, which is the one thing a chase list
+    //     must never do to the state it is chasing.
+    //
+    // This is the same shape of argument `assessWpsCycle` makes in
+    // `@meridian/core` for why late wages do not become a fourth dispatch
+    // block: the one consequence in force today is not enforced through this
+    // system's own doors, so the refusal belongs where it can actually act —
+    // here, that is an operations manager reading the chase list and getting
+    // the letter signed, or standing the crew down, not a status transition
+    // refusing to save. `decideSubcontractApproval` exists so that, once they
+    // have the letter, there is finally somewhere to put it.
   }
 
   const patch: Record<string, unknown> = { status: input.to, updatedAt: new Date() };
@@ -3070,6 +3118,108 @@ export async function engageSubcontractor(
   });
 
   return { subcontractId: engagement.id, committedMinor: valueMinor };
+}
+
+export interface DecideSubcontractApprovalInput {
+  readonly subcontractId: string;
+  readonly to: SubcontractApproval;
+  /** Defaults to today, in Dubai, when moving to `approved`. Ignored otherwise. */
+  readonly approvedOn?: string | undefined;
+  readonly approvalReference?: string | undefined;
+}
+
+/**
+ * Record the employer's decision on an engagement's approval (`PRJ-9`).
+ *
+ * Until this function existed, `client_approval_state` could be set exactly
+ * once — at `engageSubcontractor`, on creation — and never again. That is not
+ * a subtlety: every row `listUnapprovedSubcontracts` returns is `pending` or
+ * `refused` by construction, which is also exactly the set of rows the chase
+ * sweep and the chase screen (`/projects/chase`) put in front of an operations
+ * manager every morning, and there was no way to *act* on any of them short of
+ * writing SQL by hand. A chase list nobody can resolve trains its reader to
+ * ignore it, the same failure `releaseRetention` exists to prevent for the
+ * retention half of this same sweep.
+ *
+ * ── THE GRAPH, AND WHY `refused → approved` IS THE ONLY WAY BACK ───────────
+ *
+ * `canTransitionSubcontractApproval` (`@meridian/core`) is the whole rule:
+ * `pending` resolves to `approved` or `refused`; a `refused` decision can still
+ * become `approved` later, because an operations manager who reads "no" today
+ * often goes back and gets a "yes" once the paperwork is fixed; and there is no
+ * route back to `pending` from either terminal state, because an approval or a
+ * refusal is a decision the employer made and dated, not a position that
+ * lapses on its own. `not_required` is not reachable from here at all — it is
+ * a classification made at engagement time about whether the law's approval
+ * regime applies, not an answer to a question that was ever asked of the
+ * employer, and this function only records the employer's answers.
+ *
+ * ── WHY THIS DOES NOT ALSO GATE `on_site` ───────────────────────────────────
+ *
+ * It was tempting to pair this with a block in `transitionProject`, mirroring
+ * `PRJ-6`'s required-permit gate exactly. It is not there, and the reasoning is
+ * written where that decision belongs: beside `transitionProject`'s `PRJ-6`
+ * block, and beside `assessWpsCycle` in `@meridian/core`, which declines a
+ * comparable block for the same shape of reason. This function's job is
+ * narrower and unconditional either way: make the state the chase list already
+ * reports resolvable, whatever the system ultimately does or does not refuse
+ * because of it.
+ */
+export async function decideSubcontractApproval(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: DecideSubcontractApprovalInput,
+): Promise<{ from: SubcontractApproval; to: SubcontractApproval }> {
+  const rows = await tx
+    .select({
+      id: schema.projectSubcontracts.id,
+      projectId: schema.projectSubcontracts.projectId,
+      clientApprovalState: schema.projectSubcontracts.clientApprovalState,
+    })
+    .from(schema.projectSubcontracts)
+    .where(
+      and(
+        eq(schema.projectSubcontracts.id, input.subcontractId),
+        isNull(schema.projectSubcontracts.deletedAt),
+      ),
+    )
+    .limit(1);
+
+  const engagement = rows[0];
+  if (!engagement) throw new UserFacingError("Subcontract engagement not found in this tenant.");
+
+  const from = engagement.clientApprovalState as SubcontractApproval;
+  if (!canTransitionSubcontractApproval(from, input.to)) {
+    throw new InvalidSubcontractApprovalTransitionError(from, input.to);
+  }
+
+  const patch: Record<string, unknown> = { clientApprovalState: input.to, updatedAt: new Date() };
+  // Only an approval carries a date and a reference forward. A refusal dates
+  // itself in the audit note, and `clientApprovedOn`/`clientApprovalReference`
+  // are specifically the employer's paperwork for saying yes.
+  if (input.to === "approved") {
+    patch["clientApprovedOn"] = input.approvedOn ?? today();
+    patch["clientApprovalReference"] = input.approvalReference || null;
+  }
+
+  await tx
+    .update(schema.projectSubcontracts)
+    .set(patch)
+    .where(eq(schema.projectSubcontracts.id, input.subcontractId));
+
+  await writeAuditNote(tx, ctx, {
+    tableName: "project_subs",
+    recordId: input.subcontractId,
+    action: "prj_subcon_appr",
+    detail: {
+      projectId: engagement.projectId,
+      from,
+      to: input.to,
+      approvalReference: input.approvalReference ?? null,
+    },
+  });
+
+  return { from, to: input.to };
 }
 
 // ── PRJ-8: cost and margin ───────────────────────────────────────────────────

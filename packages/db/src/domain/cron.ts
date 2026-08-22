@@ -72,6 +72,13 @@ export const CRON_JOBS = [
   // red-lighted forever. This job fails the same way and quieter: retention
   // stops being chased, and the first symptom is money that never arrives.
   "projects",
+  // `CUST-5`. The monthly property-manager pack. Registered here AND in
+  // vercel.json, in the same commit, for the reason `recruitment`'s and
+  // `scan`'s comments above both give: a job present in only one of the two
+  // either never runs in production (in vercel.json, absent here — nothing
+  // alerts when it stops) or is invisible to `/api/cron/health` (here, absent
+  // from vercel.json — `ATS-16` was zeroed exactly this way).
+  "monthly-pack",
 ] as const;
 export type CronJob = (typeof CRON_JOBS)[number];
 
@@ -105,6 +112,12 @@ export const CRON_MAX_AGE_MINUTES: Readonly<Record<CronJob, number>> = {
   // allowance tight enough to fire on one late invocation is an allowance
   // somebody mutes, and a chase list that is a day old is still the same list.
   projects: 26 * 60,
+  // Monthly, 1st of the month, 09:00 Dubai. A wide allowance — roughly five
+  // days — for the same reason `weekly-digest` is eight rather than seven: an
+  // allowance tight enough to fire on one scheduler hiccup is an allowance
+  // somebody mutes, and this job has a whole month before the next customer
+  // notices it did not arrive.
+  "monthly-pack": 5 * 24 * 60,
 };
 
 export async function startRun(job: CronJob): Promise<string> {

@@ -214,7 +214,20 @@ export const technicianLocations = pgTable(
     recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
-    index("tech_locations_latest_idx").on(t.tenantId, t.technicianId, t.recordedAt),
+    // UNIQUE, and that is the idempotency key for the handset's write path.
+    //
+    // `CUST-3`. The only writer is a technician's phone, which is offline half
+    // the time and flushes a queue when it comes back; a batch replayed after a
+    // dropped response would otherwise insert every ping in it twice, on the
+    // days the network was worst, into the one table the note below already
+    // flags as growing without bound. Two genuine pings from one technician
+    // cannot share a microsecond, so who-and-when IS the natural key, and
+    // `recordTechnicianPing` inserts ON CONFLICT DO NOTHING against it.
+    //
+    // It is the same three columns in the same order as the non-unique index
+    // this replaced (0039), so the "latest ping for this technician" scan is
+    // unchanged and the table pays for one index rather than two.
+    uniqueIndex("tech_locations_latest_idx").on(t.tenantId, t.technicianId, t.recordedAt),
     // High-churn table: partition or roll off to cold storage beyond 30 days.
     // See docs/architecture/04-data-lifecycle.md.
   ],

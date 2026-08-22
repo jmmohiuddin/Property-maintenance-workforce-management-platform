@@ -48,6 +48,7 @@ import { testTenantId, otherTenantId } from "./_tenant";
 import {
   addMilestone,
   createProject,
+  decideSubcontractApproval,
   engageSubcontractor,
   listExpiringPermits,
   listRetention,
@@ -61,7 +62,7 @@ import {
   recordPermit,
   transitionProject,
 } from "../src/domain";
-import { dubaiDateKey, toMinor } from "@meridian/core";
+import { dubaiDateKey, toMinor, UserFacingError } from "@meridian/core";
 
 let fail = 0;
 function check(label: string, got: unknown, expected: unknown): void {
@@ -71,6 +72,28 @@ function check(label: string, got: unknown, expected: unknown): void {
 }
 function checkTrue(label: string, got: boolean): void {
   check(label, got, true);
+}
+
+/**
+ * Assert that a call is refused, and refused with a message a human wrote.
+ *
+ * Same rule as `projects.test.ts`'s `refuses`: a gate that throws the driver's
+ * error rather than a `UserFacingError` is a gate whose message is a SQL
+ * statement with parameters in it.
+ */
+async function refuses(label: string, fn: () => Promise<unknown>): Promise<void> {
+  try {
+    await fn();
+    fail++;
+    console.log(`FAIL  ${label} — expected a refusal, the call succeeded`);
+  } catch (error) {
+    const userFacing = error instanceof UserFacingError;
+    if (!userFacing) fail++;
+    console.log(
+      `${userFacing ? "ok  " : "FAIL"}  ${label}` +
+        (userFacing ? "" : ` — threw ${(error as Error)?.name}, not a UserFacingError`),
+    );
+  }
 }
 
 const TAG = "PRJCHASE-TEST";
@@ -390,6 +413,69 @@ async function main(): Promise<void> {
         "least-recently-chased first, so the never-asked one leads",
         ordered[0]?.lastRemindedAt,
         null,
+      );
+
+      // ── PRJ-9: resolving what the chase list found ──────────────────────
+      //
+      // Until `decideSubcontractApproval` existed, nothing above this line
+      // could ever be acted on — `client_approval_state` could only be set
+      // once, at `engageSubcontractor`. This is the load-bearing half: a
+      // decision must actually take the row off the chase list, not just
+      // change a column nobody reads back.
+      console.log("\n— PRJ-9: recording the employer's decision —");
+
+      // `refusedRow` is the same fixture asserted above — still refused in the
+      // database; the object above is just a snapshot, and only its `id` is
+      // needed here. Narrowed again rather than trusting the `checkTrue` above,
+      // which does not narrow the type.
+      if (!refusedRow) throw new Error("the refused fixture did not take");
+
+      // The employer changes their mind after seeing the paperwork — the one
+      // route back from a terminal state.
+      const decided = await decideSubcontractApproval(tx, ctx, {
+        subcontractId: refusedRow.id,
+        to: "approved",
+        approvalReference: `${TAG}-APPROVAL-2`,
+      });
+      check("refused moves to approved", decided.to, "approved");
+      check("recorded as coming from refused", decided.from, "refused");
+
+      const afterDecision = (await listUnapprovedSubcontracts(tx, {})).filter((s) =>
+        s.projectName.startsWith(TAG),
+      );
+      check(
+        "resolving it takes it off the chase list — one left, not two",
+        afterDecision.length,
+        1,
+      );
+      checkTrue(
+        "and the one left is the engagement nobody has decided yet",
+        afterDecision[0]?.id === started.subcontractId,
+      );
+
+      // The still-pending engagement, refused outright — the ordinary forward
+      // move, exercised so "approved" is not the only target this test proves.
+      const refusedNow = await decideSubcontractApproval(tx, ctx, {
+        subcontractId: started.subcontractId,
+        to: "refused",
+      });
+      check("pending moves to refused directly", refusedNow.to, "refused");
+
+      // ── The guard: what an approval or a refusal may NOT become ──────────
+      await refuses("an approved decision is terminal, and cannot be moved again", () =>
+        decideSubcontractApproval(tx, ctx, { subcontractId: refusedRow.id, to: "refused" }),
+      );
+      await refuses("nor can it be pushed back to pending", () =>
+        decideSubcontractApproval(tx, ctx, { subcontractId: refusedRow.id, to: "pending" }),
+      );
+      await refuses("a refused decision cannot lapse back to pending either", () =>
+        decideSubcontractApproval(tx, ctx, { subcontractId: started.subcontractId, to: "pending" }),
+      );
+      await refuses("deciding an engagement that does not exist is refused, not a crash", () =>
+        decideSubcontractApproval(tx, ctx, {
+          subcontractId: "00000000-0000-0000-0000-000000000000",
+          to: "approved",
+        }),
       );
 
       // ── PRJ-6: permits about to lapse ───────────────────────────────────

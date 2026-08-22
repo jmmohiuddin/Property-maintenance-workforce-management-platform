@@ -5,6 +5,13 @@ import {
   DASHBOARD_HIRING_WINDOW_DAYS,
   DASHBOARD_HORIZON_DAYS,
   DASHBOARD_WEEK_DAYS,
+  DASHBOARD_REVENUE_MONTHS,
+  DASHBOARD_SERVICE_LINE_ROWS,
+  DASHBOARD_UTILISATION_WINDOW_DAYS,
+  DASHBOARD_AT_RISK_ROWS,
+  CUSTOMER_QUIET_AFTER_DAYS,
+  CUSTOMER_LAPSED_AFTER_DAYS,
+  workingMinutesBetween,
   gradeGoal,
   ppmCompletion,
   smallBusinessReliefPosition,
@@ -22,6 +29,7 @@ import {
   type ExportTable,
   type CsvValue,
   type JournalLine,
+  type WorkingCalendar,
 } from "@meridian/core";
 import { requiredRowDate } from "./_rows";
 import { arAgeing, openReceivables, uninvoicedSignedOffJobs, invoiceSequenceGaps } from "./commerce";
@@ -33,6 +41,12 @@ import {
 } from "./compliance";
 import { dispatchBoardCounts, dispatchBoardCountsByPriority } from "./jobs";
 import { findExpiringCertifications } from "./cron";
+// Read, never written. The utilisation denominator is the tenant's OWN working
+// calendar — its weekend, its opening hours, its public holidays, its Ramadan
+// reduction — and not a constant restated here. A second definition of "a
+// working day" is a second answer to "was this technician available", and the
+// scheduler already owns the first one.
+import { loadWorkingCalendar } from "./reference";
 import { listRequisitions } from "./recruitment";
 import { emiratisationPosition } from "./hr";
 import type { EmiratisationPosition } from "@meridian/core";
@@ -505,6 +519,284 @@ export interface ContractPosition {
   readonly ppmVisitsCompleted: number;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// MD-1 — where the money comes from: by service line and by month
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * One service line's contribution over the breakdown window.
+ *
+ * `revenueMinor` is tax-exclusive and net of credit notes, exactly like the
+ * headline it sits under — it is the same `net_amount` arithmetic read one
+ * level down, at the invoice LINE rather than the invoice, which is the only
+ * level at which the question "which trade earned this" has an answer.
+ */
+export interface ServiceLineRevenue {
+  /** Catalogue slug. Null where the line carries none — see `unattributedMinor`. */
+  readonly serviceSlug: string | null;
+  readonly revenueMinor: number;
+  /** Jobs COMPLETED on that slug in the window. Volume, beside value. */
+  readonly jobsCompleted: number;
+}
+
+/** One Dubai calendar month of the breakdown. */
+export interface MonthlyRevenue {
+  /** "YYYY-MM", Asia/Dubai. Computed in SQL, never from a JavaScript month. */
+  readonly month: string;
+  readonly revenueMinor: number;
+  readonly jobsCompleted: number;
+}
+
+/**
+ * `MD-1`: "revenue, margin and job volume by service line and by month".
+ *
+ * Two of the three. Margin is absent and is a declared `DashboardGap` rather
+ * than a zero — see the entry in `DASHBOARD_GAPS`, which names the exact table
+ * that does not exist.
+ *
+ * ── THE TWO NUMBERS THAT MAKE THIS HONEST ───────────────────────────────────
+ *
+ *  * `attributedMinor` is the sum of EVERY line in the window, not of the rows
+ *    in `byServiceLine`. `byServiceLine` is capped at
+ *    `DASHBOARD_SERVICE_LINE_ROWS` for display and `otherMinor` /
+ *    `serviceLinesTotal` carry what the cap hid, so a card can render
+ *    "8 of 41" instead of presenting a truncated list as the whole business.
+ *    Summing a headline from a capped list has been found five times in this
+ *    repository and never once looked wrong on the screen.
+ *  * `unattributedMinor` is the headline revenue MINUS `attributedMinor`. It
+ *    is normally zero — `apportionLines` in core guarantees that a document's
+ *    line nets sum exactly to its `taxable_amount` — and it is carried anyway
+ *    because `invoice_lines.net_amount` is nullable for rows written before
+ *    migration 0007. Those lines cannot be attributed to a service without
+ *    inventing a figure, so they are reported as unattributed rather than
+ *    dropped. A breakdown that silently fails to add up to the total above it
+ *    is the defect this field exists to make impossible.
+ */
+export interface RevenueBreakdown {
+  /** Whole Dubai months covered, including the current partial one. */
+  readonly months: number;
+  /** "YYYY-MM" of the first month in the window. */
+  readonly fromMonth: string;
+  /** Revenue over the window on the same definition as `RevenuePosition`. */
+  readonly windowRevenueMinor: number;
+  /** Sum of every attributable line in the window. */
+  readonly attributedMinor: number;
+  /** `windowRevenueMinor - attributedMinor`. Normally zero; see above. */
+  readonly unattributedMinor: number;
+  /** Highest-earning lines first, capped for display. */
+  readonly byServiceLine: readonly ServiceLineRevenue[];
+  /** Every line below the cap, summed. Zero when nothing was cut. */
+  readonly otherMinor: number;
+  /** Distinct service lines with revenue in the window. The "of 41". */
+  readonly serviceLinesTotal: number;
+  /** Oldest month first, so it reads left to right as a chart. */
+  readonly byMonth: readonly MonthlyRevenue[];
+  readonly currency: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MD-3 — technician utilisation, and what can honestly stand where
+//        first-time-fix was asked for
+// ═══════════════════════════════════════════════════════════════════════════
+
+export interface TechnicianUtilisation {
+  readonly technicianId: string;
+  readonly name: string;
+  readonly availableMinutes: number;
+  readonly workedMinutes: number;
+  /** Null when this technician has no available time in the window at all. */
+  readonly utilisationPercent: number | null;
+}
+
+/**
+ * `MD-3`, first half: technician utilisation.
+ *
+ * ── THE DEFINITION, WRITTEN DOWN BECAUSE IT IS A CHOICE ─────────────────────
+ *
+ * **Utilisation = recorded time on the tools ÷ available working time.**
+ *
+ * *Numerator* — `job_visits.work_minutes`, the figure a technician or a
+ * supervisor typed into the job card. Not scheduled duration: a visit booked
+ * for two hours that took forty minutes is forty minutes of utilisation, and
+ * measuring the booking measures the dispatcher's optimism. Travel is
+ * deliberately excluded and reported beside it as `travelMinutes` — travel is
+ * real time and it is not productive time, and folding it in is how a business
+ * with a routing problem reports 95% utilisation.
+ *
+ * *Denominator* — working minutes from the tenant's own `WorkingCalendar` via
+ * `workingMinutesBetween`, so the weekend it actually keeps, its public
+ * holidays and the statutory Ramadan reduction are all already handled by the
+ * same code the scheduler uses. Then, per technician: clipped at `joined_on`
+ * so somebody who started six weeks into a ninety-day window is not measured
+ * against ninety days, and less any APPROVED leave overlapping the window.
+ * Pending leave is somebody asking, not a fact about the diary — the same rule
+ * `assignmentWarnings` applies.
+ *
+ * Three denominators were available and this is the third: contracted hours do
+ * not exist on `technicians` at all (there is no hours or FTE column), rostered
+ * hours do not exist in practice (the `shifts` table has no writer anywhere in
+ * the product and is empty in every deployment), and calendar hours would
+ * charge every technician for Fridays and Eid. The working calendar is the only
+ * one of the three that is both populated and meaningful.
+ *
+ * ── AND WHY THE PERCENTAGE CAN BE NULL ──────────────────────────────────────
+ *
+ * `work_minutes` is written by exactly one production path — the web job-card
+ * form — so on a business that has not adopted the job card it is null
+ * everywhere. Utilisation computed over that is 0%, which reads as idle
+ * technicians and means unrecorded labour. Those are opposite conclusions from
+ * the same number, so the figure is null until at least one visit carries
+ * labour, and `labourCoveragePercent` is returned beside it always: a
+ * utilisation figure resting on 12% of visits is a figure whose reader has to
+ * know that.
+ */
+export interface UtilisationPosition {
+  readonly windowDays: number;
+  /** Active technicians. The denominator's population, uncapped. */
+  readonly technicians: number;
+  readonly availableMinutes: number;
+  readonly workedMinutes: number;
+  /** Recorded travelling. Reported, never folded into the numerator. */
+  readonly travelMinutes: number;
+  /** Whole percent. Null when no visit in the window carries labour. */
+  readonly utilisationPercent: number | null;
+  /** Visits in the window on jobs that reached a completed state. */
+  readonly visitsOnCompletedJobs: number;
+  /** How many of those carry recorded labour. */
+  readonly visitsWithLabour: number;
+  /** Whole percent. Null when no visit in the window sits on a completed job. */
+  readonly labourCoveragePercent: number | null;
+  /** Busiest first, capped for display. The counts above are not capped. */
+  readonly byTechnician: readonly TechnicianUtilisation[];
+  /** Minutes of approved leave removed from the denominator. */
+  readonly leaveMinutesExcluded: number;
+}
+
+export interface OutcomeTally {
+  readonly code: string;
+  readonly label: string;
+  readonly requiresReturnVisit: boolean;
+  readonly jobs: number;
+}
+
+/**
+ * `MD-3`, second half — and NOT first-time-fix. Read `DASHBOARD_GAPS`.
+ *
+ * G11 defines first-time fix as "jobs closed on first visit ÷ all reactive
+ * jobs" and this system cannot count either side of that honestly. What it CAN
+ * count is what somebody deliberately recorded when the work ended: the job's
+ * outcome code, and whether that outcome is one the tenant has marked as
+ * leaving a return visit owed.
+ *
+ * That is a different metric with a different meaning and it is named
+ * differently on purpose. A return-visit rate says "this proportion of finished
+ * work left something owing"; a first-time-fix rate says "this proportion was
+ * done in one attendance". They correlate and they are not the same, and
+ * putting the second label on the first number is exactly the plausible-looking
+ * lie this file exists to refuse.
+ *
+ * `outcomeCoveragePercent` is not decoration either. A return-visit rate over
+ * the 8% of jobs that happen to carry an outcome is not a rate, so the
+ * denominator's honesty is returned with the figure rather than assumed.
+ */
+export interface OutcomePosition {
+  readonly windowDays: number;
+  readonly jobsCompleted: number;
+  readonly outcomesRecorded: number;
+  /** Whole percent. Null when nothing completed in the window. */
+  readonly outcomeCoveragePercent: number | null;
+  /** Jobs whose recorded outcome requires a return visit. */
+  readonly returnVisitRequired: number;
+  /** Of jobs WITH an outcome, not of all jobs. Null when none carry one. */
+  readonly returnVisitRatePercent: number | null;
+  /** Every recorded outcome and its count. Uncapped; the vocabulary is small. */
+  readonly byOutcome: readonly OutcomeTally[];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MD-5 — which customers are at risk, before they leave
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type CustomerRiskReason = "gone_quiet" | "contract_lapsed";
+
+export interface AtRiskCustomer {
+  readonly id: string;
+  readonly code: string;
+  readonly name: string;
+  readonly state: "at_risk" | "lapsed";
+  readonly reason: CustomerRiskReason;
+  /** "YYYY-MM-DD" in Asia/Dubai, or null where there has never been activity. */
+  readonly lastActiveOn: string | null;
+  readonly daysQuiet: number | null;
+  /** Trailing twelve months, tax-exclusive, net of credit notes. What is at stake. */
+  readonly revenueMinor: number;
+}
+
+/**
+ * `MD-5`: "know which customers are at risk before they leave".
+ *
+ * ── THE DEFINITION, WRITTEN DOWN BECAUSE IT IS A JUDGEMENT ──────────────────
+ *
+ * Nothing in this system records that a customer left. There is no cancellation
+ * event, no closed-account status that anybody maintains — `customers.is_active`
+ * is written by nothing outside the seed — and a maintenance customer does not
+ * resign, they simply stop calling. So the only available signal is silence,
+ * and every choice below is about how to read it.
+ *
+ * **Activity** is the later of the customer's most recent job (by `created_at`)
+ * and their most recent non-draft invoice (by `issued_on`), taken as a
+ * *Dubai* calendar date. Jobs alone would miss a customer billed monthly under
+ * a facilities agreement; invoices alone would miss one whose work is all
+ * contract-covered and never separately invoiced.
+ *
+ * **Retained** — holds a live contract (`active`, not past its end date),
+ * whatever the silence. A contracted customer is contractually retained, and
+ * one who looks quiet is a PPM-generation fault to investigate, not churn to
+ * report. Otherwise: retained if they have been active inside
+ * `CUSTOMER_QUIET_AFTER_DAYS`.
+ *
+ * **At risk** — no live contract, and either quiet for longer than
+ * `CUSTOMER_QUIET_AFTER_DAYS` (but not yet `CUSTOMER_LAPSED_AFTER_DAYS`), or a
+ * contract that ended inside the last `CUSTOMER_LAPSED_AFTER_DAYS` with nothing
+ * signed since. The second is the leading indicator `MD-5` is actually asking
+ * for: the AMC ran out in March and nobody chased it, and the customer has not
+ * yet noticed they are no longer covered.
+ *
+ * **Lapsed** — quiet for longer than `CUSTOMER_LAPSED_AFTER_DAYS` with no live
+ * contract. Reported as churn.
+ *
+ * **Never active** — a customer record with no job and no invoice, ever. Held
+ * out of BOTH sides of the rate. A tenant that imported a customer list on
+ * Monday must not read 90% churn on Tuesday, and that is precisely what
+ * counting them as lapsed would produce.
+ *
+ * Both thresholds live in `@meridian/core` so a business that knows its own
+ * rhythm can move them in one place, and so that moving them moves the test
+ * with the dashboard.
+ */
+export interface RetentionPosition {
+  /** Customers with at least one job or invoice, ever. The rate's denominator. */
+  readonly everActive: number;
+  readonly retained: number;
+  readonly atRisk: number;
+  readonly lapsed: number;
+  /** Records with no activity at all. Excluded from the rate; reported so the zero is legible. */
+  readonly neverActive: number;
+  /** Lapsed / everActive as a whole percent. Null when nobody has ever been active. */
+  readonly churnRatePercent: number | null;
+  /**
+   * At-risk and lapsed customers, most revenue first, capped for display.
+   *
+   * The counts above are SQL aggregates over every customer and are NOT the
+   * length of this list. Compare `list.length` against `atRisk + lapsed` to see
+   * whether the card is showing everything.
+   */
+  readonly customers: readonly AtRiskCustomer[];
+  readonly quietAfterDays: number;
+  readonly lapsedAfterDays: number;
+  readonly currency: string;
+}
+
 export interface CompliancePosition {
   readonly headcount: number;
   readonly deployable: number;
@@ -579,6 +871,14 @@ export interface OwnerDashboard {
   readonly generatedAt: Date;
   readonly cash: CashPosition;
   readonly revenue: RevenuePosition;
+  /** `MD-1`. Where the revenue above came from, by service line and by month. */
+  readonly revenueBreakdown: RevenueBreakdown;
+  /** `MD-3`. Time on the tools against available working time. */
+  readonly utilisation: UtilisationPosition;
+  /** `MD-3`. What finished work was recorded as. NOT first-time-fix; see the type. */
+  readonly outcomes: OutcomePosition;
+  /** `MD-5`. Customers going quiet, before they have gone. */
+  readonly retention: RetentionPosition;
   readonly pipeline: PipelinePosition;
   readonly work: WorkPosition;
   readonly contracts: ContractPosition;
@@ -630,19 +930,37 @@ export async function ownerDashboard(
   const now = options?.now ?? new Date();
   const horizonDays = options?.horizonDays ?? DASHBOARD_HORIZON_DAYS;
 
-  const [ageing, revenue, pipeline, work, contracts, compliance, hiring, billing, tax, emiratisation] =
-    await Promise.all([
-      arAgeing(tx, now),
-      revenuePosition(tx, now),
-      pipelinePosition(tx, now),
-      workPosition(tx, now),
-      contractPosition(tx, now, horizonDays),
-      compliancePosition(tx, horizonDays, now),
-      hiringPosition(tx, now),
-      billingRisk(tx, now),
-      corporateTaxPack(tx, { now }),
-      emiratisationPosition(tx),
-    ]);
+  const [
+    ageing,
+    revenue,
+    pipeline,
+    work,
+    contracts,
+    compliance,
+    hiring,
+    billing,
+    tax,
+    emiratisation,
+    breakdown,
+    utilisation,
+    outcomes,
+    retention,
+  ] = await Promise.all([
+    arAgeing(tx, now),
+    revenuePosition(tx, now),
+    pipelinePosition(tx, now),
+    workPosition(tx, now),
+    contractPosition(tx, now, horizonDays),
+    compliancePosition(tx, horizonDays, now),
+    hiringPosition(tx, now),
+    billingRisk(tx, now),
+    corporateTaxPack(tx, { now }),
+    emiratisationPosition(tx),
+    revenueBreakdown(tx, now),
+    utilisationPosition(tx, now),
+    outcomePosition(tx, now),
+    retentionPosition(tx, now),
+  ]);
 
   const overdueMinor =
     ageing.days1to30Minor + ageing.days31to60Minor + ageing.days61PlusMinor;
@@ -680,6 +998,10 @@ export async function ownerDashboard(
     generatedAt: now,
     cash,
     revenue,
+    revenueBreakdown: breakdown,
+    utilisation,
+    outcomes,
+    retention,
     pipeline,
     work,
     contracts,
@@ -707,11 +1029,102 @@ export const DASHBOARD_GAPS: readonly DashboardGap[] = [
     metric: "WPS payroll countdown",
     waitingOn: "The HR stream — there is no payroll calendar table.",
   },
+  /*
+   * ── THIS ENTRY WAS WRONG, AND THE CORRECTION MATTERS ──────────────────────
+   *
+   * It used to read: "The field app (M11, Phase 3). It is computed from visit
+   * outcome codes, and no visit records one yet." Half of that is now stale and
+   * the half that survives is not the real blocker, so both halves were
+   * misleading in opposite directions: it implied the metric arrives with the
+   * field app, and it will not.
+   *
+   * What changed: `jobs.outcome_code` IS written now, by `recordJobOutcome`
+   * (`domain/outcomes.ts`), from the web job card, against the controlled
+   * `job_outcome_codes` vocabulary. The outcome capture the entry was waiting
+   * for exists.
+   *
+   * What did not change, and what actually blocks G11 — "jobs closed on first
+   * visit / all reactive jobs" — is that NEITHER side of that fraction can be
+   * counted honestly:
+   *
+   *  1. A `job_visits` row is not an attendance. It is written at ASSIGNMENT
+   *     (`domain/assignment.ts`, status `assigned`, `dispatched_at` set), the
+   *     `visit_status` enum has no `cancelled` or `reassigned` member, and
+   *     `rescheduleVisit` refuses to change the technician — so reassigning a
+   *     job inserts a SECOND row and nothing ever retires the first. A job
+   *     fixed on the first attendance after two office reassignments carries
+   *     three visits. Counting visits would report a first-time-fix rate
+   *     depressed by dispatcher churn, which is not what G11 measures.
+   *  2. The obvious repair — count only visits carrying recorded labour —
+   *     fails in the flattering direction, which is worse. `assertJobCardComplete`
+   *     requires labour on the JOB, not on every visit, so a genuine failed
+   *     first attendance where nobody typed minutes disappears and the job
+   *     scores as a first-time fix.
+   *  3. The outcome code cannot break the tie either. It is a JOB-level column
+   *     overwritten on each `recordJobOutcome` call, so a job whose first visit
+   *     was no-access and whose second was a fix records only the fix. The
+   *     evidence that would separate them is destroyed by design.
+   *  4. "Reactive" has no marker. `jobs.is_revisit` and `jobs.parent_job_id`
+   *     exist in the schema and nothing in the product has ever written either.
+   *
+   * So this is not a field-app dependency. It is a schema change: an outcome,
+   * or at minimum an attended flag, recorded PER VISIT and never overwritten.
+   * `outcomePosition` returns what the recorded data does support — a
+   * return-visit rate, under its own name.
+   */
   {
-    requirement: "KPI-3 / G11",
+    requirement: "KPI-3 / G11 / MD-3",
     metric: "First-time fix rate",
     waitingOn:
-      "The field app (M11, Phase 3). It is computed from visit outcome codes, and no visit records one yet.",
+      "A per-visit outcome. `job_visits` records assignments, not attendances — a reassignment " +
+      "inserts a second row and nothing retires the first — and `jobs.outcome_code` is one " +
+      "job-level value overwritten on each call, so neither the numerator (closed on the first " +
+      "attendance) nor the denominator (reactive jobs) can be counted. The return-visit rate on " +
+      "the same card is what the recorded data does support.",
+  },
+  /*
+   * ── MD-1's MARGIN, AND WHY IT IS STILL NOT A NUMBER ───────────────────────
+   *
+   * `CON-8` deferred margin at renewal on the ground that "the system records
+   * what a contract is worth and not what it costs to service", and the AMC
+   * screen still says so in as many words. `PRJ-8` has since built the other
+   * half — `labour_cost_rates` (fully loaded, effective-dated) and
+   * `project_costs` (captured at entry, never re-derived) — so the ground has
+   * genuinely moved, and it was re-examined rather than assumed before this
+   * entry was written.
+   *
+   * It has not moved far enough. `project_costs.project_id` is NOT NULL: cost
+   * exists only where a project exists, and the maintenance and AMC work this
+   * dashboard's revenue is almost entirely made of has no cost row at all.
+   *
+   * The two columns that look like a substitute are worse than nothing:
+   *
+   *  * `technicians.hourly_cost` is written by nothing in the product (the seed
+   *    sets a flat 45.00 and no screen edits it), is undated and edited in
+   *    place — the exact pattern `labour_cost_rates` was versioned to avoid,
+   *    where giving the electricians a rise silently rewrites the margin on
+   *    every job ever closed — and is not documented as fully loaded. The
+   *    `labour_cost_rates` schema puts the size of that error at about a third,
+   *    "worse than no margin at all because it is believed".
+   *  * `job_materials.unit_cost` is nullable and optional on the field sync
+   *    path, so a job whose parts were not costed reports a HIGHER margin than
+   *    reality. Wrong in the flattering direction is the one direction a margin
+   *    must never be wrong in, because somebody prices against it.
+   *
+   * A margin is therefore a gap and not a figure. What unblocks it is a cost
+   * ledger that reaches jobs — `project_costs.job_id` already exists and is
+   * nullable for exactly this — plus a rate table with the effective dating
+   * `labour_cost_rates` has and `technicians.hourly_cost` does not.
+   */
+  {
+    requirement: "MD-1",
+    metric: "Revenue margin, by service line and by month",
+    waitingOn:
+      "A cost ledger that reaches jobs. `project_costs` requires a project, so maintenance and AMC " +
+      "work — nearly all of this revenue — has no recorded cost. `technicians.hourly_cost` is " +
+      "written by nothing but the seed and is undated, so using it would rewrite history on every " +
+      "pay rise, and `job_materials.unit_cost` is optional, so an uncosted part would report a " +
+      "higher margin than reality. Revenue and job volume by service line and by month are shown.",
   },
   {
     requirement: "KPI-3 / G10",
@@ -860,6 +1273,649 @@ async function revenuePosition(tx: TenantScopedTx, now: Date): Promise<RevenuePo
     relief: smallBusinessReliefPosition(yearToDateMinor),
     invoicesThisMonth: Number(r?.invoices_this_month ?? 0),
     currency: r?.currency ?? "AED",
+  };
+}
+
+// ── MD-1: the breakdown ──────────────────────────────────────────────────────
+
+/**
+ * The window, the line-level revenue in it, and the job volume beside it.
+ *
+ * A shared fragment for the same reason `REVENUE_SOURCE` is one: the by-service
+ * query, the by-month query and the reconciliation query have to be measuring
+ * one window over one definition, and three similar CTE blocks are three
+ * windows that drift apart on the first edit.
+ *
+ * Every boundary is Asia/Dubai and computed in SQL. A by-month breakdown is
+ * precisely where the session timezone bites: an invoice issued at 01:30 Dubai
+ * on 1 July is 30 June in UTC, and a JavaScript month boundary would file it
+ * under the wrong month for about two hours of every day.
+ */
+function breakdownSource(nowIso: string, months: number): SQL {
+  return sql`
+    anchor as (
+      select (${nowIso}::timestamptz at time zone 'Asia/Dubai') as local_now
+    ),
+    bounds as (
+      select date_trunc('month', local_now) - make_interval(months => ${months - 1}) as window_start,
+             date_trunc('month', local_now)                                          as current_month_start,
+             local_now + interval '1 day'                                            as window_end
+        from anchor
+    ),
+    inv_line as (
+      select date_trunc('month', (i.issued_on at time zone 'Asia/Dubai')) as month_start,
+             il.service_slug                                              as slug,
+             (il.net_amount * 100)::bigint                                as net_minor
+        from invoice_lines il
+        join invoices i on i.id = il.invoice_id
+       cross join bounds b
+       where i.deleted_at is null
+         and i.status <> 'draft'
+         and i.issued_on is not null
+         and il.deleted_at is null
+         and il.net_amount is not null
+         and (i.issued_on at time zone 'Asia/Dubai') >= b.window_start
+         and (i.issued_on at time zone 'Asia/Dubai') <  b.window_end
+    ),
+    crn_line as (
+      select date_trunc('month', (c.issued_on at time zone 'Asia/Dubai')) as month_start,
+             cl.service_slug                                              as slug,
+             (cl.net_amount * 100)::bigint                                as net_minor
+        from credit_note_lines cl
+        join credit_notes c on c.id = cl.credit_note_id
+       cross join bounds b
+       where c.deleted_at is null
+         and c.issued_on is not null
+         and cl.deleted_at is null
+         and (c.issued_on at time zone 'Asia/Dubai') >= b.window_start
+         and (c.issued_on at time zone 'Asia/Dubai') <  b.window_end
+    ),
+    net_lines as (
+      select month_start, slug,  net_minor from inv_line
+      union all
+      select month_start, slug, -net_minor from crn_line
+    ),
+    job_volume as (
+      select date_trunc('month', (j.completed_at at time zone 'Asia/Dubai')) as month_start,
+             j.service_slug                                                  as slug,
+             count(*)                                                        as jobs
+        from jobs j
+       cross join bounds b
+       where j.deleted_at is null
+         and j.completed_at is not null
+         and (j.completed_at at time zone 'Asia/Dubai') >= b.window_start
+         and (j.completed_at at time zone 'Asia/Dubai') <  b.window_end
+       group by 1, 2
+    )`;
+}
+
+/**
+ * `MD-1`: revenue and job volume, by service line and by month.
+ *
+ * Every figure here is a Postgres aggregate over every matching row. Nothing is
+ * a reduction of a page of results, and the two display caps
+ * (`DASHBOARD_SERVICE_LINE_ROWS`, and nothing at all on the months) are applied
+ * after the totals are known, with what they hid returned beside them.
+ *
+ * Job volume is keyed on `jobs.completed_at`, not `created_at`: the question
+ * beside a revenue figure is how much work was DONE that month, and a job
+ * raised in June and finished in August belongs to August in both columns.
+ */
+export async function revenueBreakdown(
+  tx: TenantScopedTx,
+  now: Date,
+  options?: { months?: number; rows?: number },
+): Promise<RevenueBreakdown> {
+  const months = options?.months ?? DASHBOARD_REVENUE_MONTHS;
+  const rows = options?.rows ?? DASHBOARD_SERVICE_LINE_ROWS;
+  const iso = now.toISOString();
+  const source = breakdownSource(iso, months);
+
+  const [serviceRows, monthRows, totalRows] = await Promise.all([
+    tx.execute<{ slug: string | null; revenue_minor: string; jobs: string }>(sql`
+      with ${source},
+      slugs as (
+        select slug from net_lines
+        union
+        select slug from job_volume
+      ),
+      agg as (
+        select s.slug,
+               coalesce((select sum(net_minor) from net_lines l
+                          where l.slug is not distinct from s.slug), 0) as revenue_minor,
+               coalesce((select sum(jobs) from job_volume v
+                          where v.slug is not distinct from s.slug), 0) as jobs
+          from slugs s
+      )
+      select slug,
+             revenue_minor::text as revenue_minor,
+             jobs::text          as jobs
+        from agg
+       order by revenue_minor desc, slug asc
+    `) as unknown as Promise<{ slug: string | null; revenue_minor: string; jobs: string }[]>,
+
+    tx.execute<{ month: string; revenue_minor: string; jobs: string }>(sql`
+      with ${source},
+      grid as (
+        select generate_series(b.window_start, b.current_month_start, interval '1 month') as month_start
+          from bounds b
+      )
+      select to_char(g.month_start, 'YYYY-MM')                                        as month,
+             coalesce((select sum(net_minor) from net_lines l
+                        where l.month_start = g.month_start), 0)::text                as revenue_minor,
+             coalesce((select sum(jobs) from job_volume j
+                        where j.month_start = g.month_start), 0)::text                as jobs
+        from grid g
+       order by g.month_start asc
+    `) as unknown as Promise<{ month: string; revenue_minor: string; jobs: string }[]>,
+
+    tx.execute<{
+      window_revenue_minor: string;
+      attributed_minor: string;
+      from_month: string;
+      currency: string | null;
+    }>(sql`
+      with ${source}
+      select (
+          coalesce((select sum((i.taxable_amount * 100)::bigint)
+                      from invoices i cross join bounds b
+                     where i.deleted_at is null
+                       and i.status <> 'draft'
+                       and i.issued_on is not null
+                       and (i.issued_on at time zone 'Asia/Dubai') >= b.window_start
+                       and (i.issued_on at time zone 'Asia/Dubai') <  b.window_end), 0)
+        - coalesce((select sum((c.taxable_amount * 100)::bigint)
+                      from credit_notes c cross join bounds b
+                     where c.deleted_at is null
+                       and c.issued_on is not null
+                       and (c.issued_on at time zone 'Asia/Dubai') >= b.window_start
+                       and (c.issued_on at time zone 'Asia/Dubai') <  b.window_end), 0)
+        )::text as window_revenue_minor,
+        coalesce((select sum(net_minor) from net_lines), 0)::text as attributed_minor,
+        (select to_char(window_start, 'YYYY-MM') from bounds)     as from_month,
+        (select currency from invoices
+          where deleted_at is null and status <> 'draft' limit 1) as currency
+    `) as unknown as Promise<{
+      window_revenue_minor: string;
+      attributed_minor: string;
+      from_month: string;
+      currency: string | null;
+    }[]>,
+  ]);
+
+  const all: ServiceLineRevenue[] = serviceRows.map((r) => ({
+    serviceSlug: r.slug,
+    revenueMinor: Number(r.revenue_minor),
+    jobsCompleted: Number(r.jobs),
+  }));
+
+  const shown = all.slice(0, rows);
+  const otherMinor = all.slice(rows).reduce((sum, r) => sum + r.revenueMinor, 0);
+  const totals = totalRows[0];
+  const windowRevenueMinor = Number(totals?.window_revenue_minor ?? 0);
+  const attributedMinor = Number(totals?.attributed_minor ?? 0);
+
+  return {
+    months,
+    fromMonth: totals?.from_month ?? "",
+    windowRevenueMinor,
+    attributedMinor,
+    unattributedMinor: windowRevenueMinor - attributedMinor,
+    byServiceLine: shown,
+    otherMinor,
+    // Lines with revenue, not lines with a completed job and no money against
+    // them: "8 of 41" has to count the same things the eight rows are ranked by.
+    serviceLinesTotal: all.filter((r) => r.revenueMinor !== 0).length,
+    byMonth: monthRows.map((r) => ({
+      month: r.month,
+      revenueMinor: Number(r.revenue_minor),
+      jobsCompleted: Number(r.jobs),
+    })),
+    currency: totals?.currency ?? "AED",
+  };
+}
+
+// ── MD-3: utilisation ────────────────────────────────────────────────────────
+
+/**
+ * `MD-3`: time on the tools against available working time.
+ *
+ * The definition, the three denominators that were available and why this is
+ * the one, and why the percentage can be null, are all on
+ * `UtilisationPosition`. Read that before changing anything here.
+ *
+ * ── WHY THE DENOMINATOR IS COMPUTED IN TYPESCRIPT ───────────────────────────
+ *
+ * Every other figure on this dashboard is a SQL aggregate, and this one is not.
+ * The reason is that "a working minute" is not a fact in the database: it is
+ * `workingMinutesBetween` applied to the tenant's `WorkingCalendar`, which
+ * assembles a weekend array, opening minutes, a public-holiday table and a
+ * Ramadan period table into a rule with a two-hour statutory reduction in it.
+ * Restating that rule in SQL would be a second definition of the working day
+ * sitting beside the scheduler's, and the two would disagree the first time an
+ * administrator added a holiday.
+ *
+ * The capped-list trap is avoided the other way: the technician list is read
+ * WITHOUT a limit, so the denominator is over every active technician, and the
+ * numerator is a single SQL aggregate over every visit in the window.
+ * `byTechnician` is sliced for display only, after both totals exist.
+ */
+export async function utilisationPosition(
+  tx: TenantScopedTx,
+  now: Date,
+  options?: { windowDays?: number; rows?: number; calendar?: WorkingCalendar },
+): Promise<UtilisationPosition> {
+  const windowDays = options?.windowDays ?? DASHBOARD_UTILISATION_WINDOW_DAYS;
+  const rows = options?.rows ?? DASHBOARD_SERVICE_LINE_ROWS;
+  const windowEnd = now;
+  const windowStart = new Date(now.getTime() - windowDays * 24 * 60 * 60 * 1000);
+
+  const [calendar, techRows, leaveRows, workRows, coverRows] = await Promise.all([
+    options?.calendar ? Promise.resolve(options.calendar) : loadWorkingCalendar(tx),
+
+    // No limit. This list IS the denominator's population, and a page of it
+    // would be a plateau at the page size.
+    tx.execute<{ id: string; full_name: string; joined_on: Date | null }>(sql`
+      select id, full_name, joined_on
+        from technicians
+       where deleted_at is null and is_active
+       order by full_name
+    `) as unknown as Promise<{ id: string; full_name: string; joined_on: Date | null }[]>,
+
+    tx.execute<{ technician_id: string; starts_on: Date; ends_on: Date }>(sql`
+      select technician_id, starts_on, ends_on
+        from leave_requests
+       where deleted_at is null
+         and status = 'approved'
+         and starts_on <  ${windowEnd.toISOString()}::timestamptz
+         and ends_on   >= ${windowStart.toISOString()}::timestamptz
+    `) as unknown as Promise<{ technician_id: string; starts_on: Date; ends_on: Date }[]>,
+
+    tx.execute<{ technician_id: string; worked: string; travel: string; labour_visits: string }>(sql`
+      select v.technician_id,
+             coalesce(sum(v.work_minutes), 0)::text                   as worked,
+             coalesce(sum(v.travel_minutes), 0)::text                 as travel,
+             count(*) filter (where v.work_minutes is not null)::text as labour_visits
+        from job_visits v
+       where v.deleted_at is null
+         and v.scheduled_start >= ${windowStart.toISOString()}::timestamptz
+         and v.scheduled_start <  ${windowEnd.toISOString()}::timestamptz
+       group by 1
+    `) as unknown as Promise<
+      { technician_id: string; worked: string; travel: string; labour_visits: string }[]
+    >,
+
+    tx.execute<{ visits: string; with_labour: string }>(sql`
+      select count(*)::text                                            as visits,
+             count(*) filter (where v.work_minutes is not null)::text  as with_labour
+        from job_visits v
+        join jobs j on j.id = v.job_id
+       where v.deleted_at is null
+         and j.deleted_at is null
+         and j.status in ('work_complete', 'signed_off', 'invoiced', 'closed')
+         and v.scheduled_start >= ${windowStart.toISOString()}::timestamptz
+         and v.scheduled_start <  ${windowEnd.toISOString()}::timestamptz
+    `) as unknown as Promise<{ visits: string; with_labour: string }[]>,
+  ]);
+
+  const workedBy = new Map(workRows.map((r) => [r.technician_id, r]));
+  const leaveBy = new Map<string, { startsOn: Date; endsOn: Date }[]>();
+  for (const l of leaveRows) {
+    const list = leaveBy.get(l.technician_id) ?? [];
+    list.push({ startsOn: new Date(l.starts_on), endsOn: new Date(l.ends_on) });
+    leaveBy.set(l.technician_id, list);
+  }
+
+  let availableMinutes = 0;
+  let workedMinutes = 0;
+  let travelMinutes = 0;
+  let leaveMinutesExcluded = 0;
+  let labourVisitsTotal = 0;
+  const byTechnician: TechnicianUtilisation[] = [];
+
+  for (const t of techRows) {
+    // A technician who joined inside the window is measured from the day they
+    // joined. Charging them for the weeks before they existed reports a
+    // recruiting business as an idle one.
+    const joined = t.joined_on ? new Date(t.joined_on) : null;
+    const from = joined && joined > windowStart ? joined : windowStart;
+
+    let available = from < windowEnd ? workingMinutesBetween(from, windowEnd, calendar) : 0;
+
+    for (const l of leaveBy.get(t.id) ?? []) {
+      const start = l.startsOn > from ? l.startsOn : from;
+      const end = l.endsOn < windowEnd ? l.endsOn : windowEnd;
+      if (end <= start) continue;
+      const off = workingMinutesBetween(start, end, calendar);
+      available -= off;
+      leaveMinutesExcluded += off;
+    }
+    if (available < 0) available = 0;
+
+    const row = workedBy.get(t.id);
+    const worked = Number(row?.worked ?? 0);
+    const travel = Number(row?.travel ?? 0);
+    const labourVisits = Number(row?.labour_visits ?? 0);
+
+    availableMinutes += available;
+    workedMinutes += worked;
+    travelMinutes += travel;
+    labourVisitsTotal += labourVisits;
+
+    byTechnician.push({
+      technicianId: t.id,
+      name: t.full_name,
+      availableMinutes: available,
+      workedMinutes: worked,
+      // Null on the same rule as the headline: no visit of theirs carries
+      // labour, so nothing was measured. Zero here would name a specific person
+      // as idle on the strength of a form nobody filled in.
+      utilisationPercent:
+        labourVisits > 0 && available > 0 ? Math.round((worked / available) * 100) : null,
+    });
+  }
+
+  const cover = coverRows[0];
+  const visitsOnCompletedJobs = Number(cover?.visits ?? 0);
+  const visitsWithLabour = Number(cover?.with_labour ?? 0);
+
+  /*
+   * Null, not zero, and this is the whole point of the coverage pair.
+   *
+   * Nothing recorded means "not measured". Rendered as 0% it means "the
+   * technicians did nothing", and those are opposite conclusions drawn from the
+   * same absent data. The dashboard's standing rule is that an unmeasurable
+   * figure is null; the one below is the same rule applied to a metric whose
+   * source column has exactly one production writer.
+   */
+  const utilisationPercent =
+    labourVisitsTotal > 0 && availableMinutes > 0
+      ? Math.round((workedMinutes / availableMinutes) * 100)
+      : null;
+
+  byTechnician.sort((a, b) => b.workedMinutes - a.workedMinutes || a.name.localeCompare(b.name));
+
+  return {
+    windowDays,
+    technicians: techRows.length,
+    availableMinutes,
+    workedMinutes,
+    travelMinutes,
+    utilisationPercent,
+    visitsOnCompletedJobs,
+    visitsWithLabour,
+    labourCoveragePercent:
+      visitsOnCompletedJobs > 0
+        ? Math.round((visitsWithLabour / visitsOnCompletedJobs) * 100)
+        : null,
+    byTechnician: byTechnician.slice(0, rows),
+    leaveMinutesExcluded,
+  };
+}
+
+/**
+ * `MD-3`, and expressly NOT `G11`. The reasoning is on `OutcomePosition` and in
+ * the `DASHBOARD_GAPS` entry for first-time fix; both are worth reading before
+ * anybody is tempted to rename this.
+ *
+ * Jobs are counted by `completed_at`, in Dubai. One row per job — `outcome_code`
+ * is a single column on `jobs`, so this cannot double-count the way a join to a
+ * per-visit table would.
+ */
+export async function outcomePosition(
+  tx: TenantScopedTx,
+  now: Date,
+  options?: { windowDays?: number },
+): Promise<OutcomePosition> {
+  const windowDays = options?.windowDays ?? DASHBOARD_UTILISATION_WINDOW_DAYS;
+  const from = new Date(now.getTime() - windowDays * 24 * 60 * 60 * 1000).toISOString();
+  const to = now.toISOString();
+
+  const [tallyRows, totalRows] = await Promise.all([
+    tx.execute<{ code: string; label: string | null; requires_return: boolean; jobs: string }>(sql`
+      select j.outcome_code                                   as code,
+             o.label                                          as label,
+             coalesce(o.requires_return_visit, false)         as requires_return,
+             count(*)::text                                   as jobs
+        from jobs j
+        left join job_outcome_codes o
+               on o.tenant_id = j.tenant_id and o.code = j.outcome_code
+       where j.deleted_at is null
+         and j.outcome_code is not null
+         and j.completed_at is not null
+         and j.completed_at >= ${from}::timestamptz
+         and j.completed_at <  ${to}::timestamptz
+       group by 1, 2, 3
+       order by 4 desc, 1
+    `) as unknown as Promise<
+      { code: string; label: string | null; requires_return: boolean; jobs: string }[]
+    >,
+
+    tx.execute<{ completed: string; with_outcome: string }>(sql`
+      select count(*)::text                                            as completed,
+             count(*) filter (where j.outcome_code is not null)::text  as with_outcome
+        from jobs j
+       where j.deleted_at is null
+         and j.completed_at is not null
+         and j.completed_at >= ${from}::timestamptz
+         and j.completed_at <  ${to}::timestamptz
+    `) as unknown as Promise<{ completed: string; with_outcome: string }[]>,
+  ]);
+
+  const byOutcome: OutcomeTally[] = tallyRows.map((r) => ({
+    code: r.code,
+    // The code itself, never "Unknown": an outcome recorded before somebody
+    // retired the vocabulary entry still has to render as what was recorded.
+    label: r.label ?? r.code,
+    requiresReturnVisit: r.requires_return,
+    jobs: Number(r.jobs),
+  }));
+
+  const jobsCompleted = Number(totalRows[0]?.completed ?? 0);
+  // Taken from the rows it heads, not from a second count(*) with its own WHERE
+  // clause — the rule the rest of this file follows for the same reason.
+  const outcomesRecorded = byOutcome.reduce((sum, o) => sum + o.jobs, 0);
+  const returnVisitRequired = byOutcome
+    .filter((o) => o.requiresReturnVisit)
+    .reduce((sum, o) => sum + o.jobs, 0);
+
+  return {
+    windowDays,
+    jobsCompleted,
+    outcomesRecorded,
+    outcomeCoveragePercent:
+      jobsCompleted > 0 ? Math.round((outcomesRecorded / jobsCompleted) * 100) : null,
+    returnVisitRequired,
+    returnVisitRatePercent:
+      outcomesRecorded > 0 ? Math.round((returnVisitRequired / outcomesRecorded) * 100) : null,
+    byOutcome,
+  };
+}
+
+// ── MD-5: retention ──────────────────────────────────────────────────────────
+
+/**
+ * Every customer, classified once.
+ *
+ * A shared fragment, like `REVENUE_SOURCE` and for the same reason: the counts
+ * and the list are the SAME classification, so the card cannot show nine names
+ * under a headline of seven. The counts are aggregates over this CTE and the
+ * list is an ORDER BY and a LIMIT over it — never the other way round, which is
+ * how a headline ends up being the length of a page.
+ *
+ * Dates are Dubai calendar dates throughout, taken from the anchor rather than
+ * from current_date. The session timezone is not Asia/Dubai, so current_date is
+ * the wrong day for about two hours of every twenty-four, and a threshold at
+ * exactly 90 days flips on that boundary.
+ */
+function retentionSource(nowIso: string, quietDays: number, lapsedDays: number): SQL {
+  return sql`
+    anchor as (
+      select (${nowIso}::timestamptz at time zone 'Asia/Dubai')::date as today_dubai
+    ),
+    scored as (
+      select c.id,
+             c.code,
+             c.name,
+             a.today_dubai,
+             greatest(
+               (select max((j.created_at at time zone 'Asia/Dubai')::date)
+                  from jobs j
+                 where j.customer_id = c.id and j.deleted_at is null),
+               (select max((i.issued_on at time zone 'Asia/Dubai')::date)
+                  from invoices i
+                 where i.customer_id = c.id and i.deleted_at is null
+                   and i.status <> 'draft' and i.issued_on is not null)
+             ) as last_active_on,
+             exists (
+               select 1 from contracts k
+                where k.customer_id = c.id and k.deleted_at is null
+                  and k.status = 'active'
+                  and (k.ends_on at time zone 'Asia/Dubai')::date >= a.today_dubai
+             ) as has_active_contract,
+             (select max((k.ends_on at time zone 'Asia/Dubai')::date)
+                from contracts k
+               where k.customer_id = c.id and k.deleted_at is null
+                 and k.status in ('active', 'suspended', 'expired', 'cancelled')
+                 and (k.ends_on at time zone 'Asia/Dubai')::date < a.today_dubai
+             ) as contract_ended_on,
+             (
+               coalesce((select sum((i.taxable_amount * 100)::bigint)
+                           from invoices i
+                          where i.customer_id = c.id and i.deleted_at is null
+                            and i.status <> 'draft' and i.issued_on is not null
+                            and (i.issued_on at time zone 'Asia/Dubai')::date > a.today_dubai - 365), 0)
+             - coalesce((select sum((n.taxable_amount * 100)::bigint)
+                           from credit_notes n
+                          where n.customer_id = c.id and n.deleted_at is null
+                            and n.issued_on is not null
+                            and (n.issued_on at time zone 'Asia/Dubai')::date > a.today_dubai - 365), 0)
+             ) as revenue_minor
+        from customers c
+       cross join anchor a
+       where c.deleted_at is null
+    ),
+    classified as (
+      select s.*,
+             (s.today_dubai - s.last_active_on) as days_quiet,
+             (not s.has_active_contract
+              and s.contract_ended_on is not null
+              and (s.today_dubai - s.contract_ended_on) <= ${lapsedDays}) as contract_recently_lapsed,
+             case
+               when s.last_active_on is null then 'never_active'
+               when s.has_active_contract    then 'retained'
+               when (s.today_dubai - s.last_active_on) >= ${lapsedDays} then 'lapsed'
+               when s.contract_ended_on is not null
+                    and (s.today_dubai - s.contract_ended_on) <= ${lapsedDays} then 'at_risk'
+               when (s.today_dubai - s.last_active_on) >= ${quietDays} then 'at_risk'
+               else 'retained'
+             end as state
+        from scored s
+    )`;
+}
+
+/**
+ * `MD-5`: who is going quiet, and who has already gone.
+ *
+ * The definitions — activity, retained, at risk, lapsed, never active — are
+ * written out on `RetentionPosition`, because a metric whose definition is not
+ * written beside the code is one that gets redefined by accident six months
+ * later by somebody reading the SQL and guessing.
+ */
+export async function retentionPosition(
+  tx: TenantScopedTx,
+  now: Date,
+  options?: { quietAfterDays?: number; lapsedAfterDays?: number; rows?: number },
+): Promise<RetentionPosition> {
+  const quietAfterDays = options?.quietAfterDays ?? CUSTOMER_QUIET_AFTER_DAYS;
+  const lapsedAfterDays = options?.lapsedAfterDays ?? CUSTOMER_LAPSED_AFTER_DAYS;
+  const rows = options?.rows ?? DASHBOARD_AT_RISK_ROWS;
+  const iso = now.toISOString();
+
+  const [countRows, listRows] = await Promise.all([
+    tx.execute<{
+      ever_active: string;
+      retained: string;
+      at_risk: string;
+      lapsed: string;
+      never_active: string;
+      currency: string | null;
+    }>(sql`
+      with ${retentionSource(iso, quietAfterDays, lapsedAfterDays)}
+      select count(*) filter (where state <> 'never_active')::text as ever_active,
+             count(*) filter (where state = 'retained')::text      as retained,
+             count(*) filter (where state = 'at_risk')::text       as at_risk,
+             count(*) filter (where state = 'lapsed')::text        as lapsed,
+             count(*) filter (where state = 'never_active')::text  as never_active,
+             (select currency from customers where deleted_at is null limit 1) as currency
+        from classified
+    `) as unknown as Promise<{
+      ever_active: string;
+      retained: string;
+      at_risk: string;
+      lapsed: string;
+      never_active: string;
+      currency: string | null;
+    }[]>,
+
+    tx.execute<{
+      id: string;
+      code: string;
+      name: string;
+      state: string;
+      contract_recently_lapsed: boolean;
+      last_active_on: string | null;
+      days_quiet: number | null;
+      revenue_minor: string;
+    }>(sql`
+      with ${retentionSource(iso, quietAfterDays, lapsedAfterDays)}
+      select id, code, name, state, contract_recently_lapsed,
+             to_char(last_active_on, 'YYYY-MM-DD') as last_active_on,
+             days_quiet,
+             revenue_minor::text                   as revenue_minor
+        from classified
+       where state in ('at_risk', 'lapsed')
+       order by revenue_minor desc, days_quiet desc nulls last, name
+       limit ${rows}
+    `) as unknown as Promise<{
+      id: string;
+      code: string;
+      name: string;
+      state: string;
+      contract_recently_lapsed: boolean;
+      last_active_on: string | null;
+      days_quiet: number | null;
+      revenue_minor: string;
+    }[]>,
+  ]);
+
+  const c = countRows[0];
+  const everActive = Number(c?.ever_active ?? 0);
+  const lapsed = Number(c?.lapsed ?? 0);
+
+  return {
+    everActive,
+    retained: Number(c?.retained ?? 0),
+    atRisk: Number(c?.at_risk ?? 0),
+    lapsed,
+    neverActive: Number(c?.never_active ?? 0),
+    churnRatePercent: everActive > 0 ? Math.round((lapsed / everActive) * 100) : null,
+    customers: listRows.map((r) => ({
+      id: r.id,
+      code: r.code,
+      name: r.name,
+      state: r.state === "lapsed" ? "lapsed" : "at_risk",
+      // A contract that ran out is the more actionable of the two reasons and
+      // the one somebody can still do something about, so it wins the label
+      // wherever both are true.
+      reason: r.contract_recently_lapsed ? "contract_lapsed" : "gone_quiet",
+      lastActiveOn: r.last_active_on,
+      daysQuiet: r.days_quiet === null ? null : Number(r.days_quiet),
+      revenueMinor: Number(r.revenue_minor),
+    })),
+    quietAfterDays,
+    lapsedAfterDays,
+    currency: c?.currency ?? "AED",
   };
 }
 

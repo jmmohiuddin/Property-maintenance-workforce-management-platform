@@ -131,7 +131,13 @@ export type TemplateId =
   // behind one ledger row, so a customer who had merely been told the job was
   // done would count as having been sent what they signed. Those are different
   // claims and only one of them is evidential.
-  | "job_sheet_signed";
+  | "job_sheet_signed"
+  // `CUST-5`. The monthly reporting pack for property managers — sold on the
+  // contracts marketing page as a contract benefit, and this is what is
+  // actually behind it: jobs raised and closed, response and resolution
+  // against the SLA, PPM visits due against visits completed, outstanding
+  // recommendations, and spend, for the previous calendar month.
+  | "property_manager_monthly_pack";
 
 export interface RenderedMessage {
   readonly subject: string;
@@ -730,6 +736,61 @@ export interface TemplatePayloads {
       /** Negative means it has already lapsed and is blocking work today. */
       daysRemaining: number;
     }[];
+  };
+  /**
+   * `CUST-5`. Built by `propertyManagerMonthlyPack` in `packages/db`, which
+   * is where every figure below is sourced and documented — this payload only
+   * carries them across the queue, exactly as `weekly_owner_digest` does for
+   * the owner's dashboard.
+   *
+   * Every count is a primitive for the reason stated there: the payload is
+   * JSONB and comes back out of the queue as plain JSON, so nothing here
+   * should be a class instance or something a renderer has to re-derive.
+   * `outstanding.items` is deliberately the only list — it is the pack's one
+   * capped field, and `outstanding.truncated` says when it is not the whole
+   * list, matching `outstanding.total` on the source type.
+   */
+  property_manager_monthly_pack: {
+    recipientName: string;
+    /** The account name — `customerAccountName`, not the portal login's name. */
+    customerName: string;
+    currency: string;
+    /** "August 2026" — computed by the caller, in Dubai time. */
+    periodLabel: string;
+    jobs: {
+      raised: number;
+      closed: number;
+      cancelled: number;
+      raisedStillOpen: number;
+    };
+    sla: {
+      responseDeadlines: number;
+      responseMet: number;
+      responseMetPercent: number | null;
+      resolutionDeadlines: number;
+      resolutionMet: number;
+      resolutionMetPercent: number | null;
+    };
+    ppm: {
+      visitsDue: number;
+      visitsCompleted: number;
+      completionPercent: number | null;
+    };
+    outstanding: {
+      total: number;
+      truncated: boolean;
+      items: readonly {
+        jobReference: string;
+        jobTitle: string;
+        propertyName: string;
+        recommendation: string;
+        raisedAt: PayloadDate;
+      }[];
+    };
+    spend: {
+      invoicedMinor: number;
+      invoiceCount: number;
+    };
   };
 }
 
@@ -1781,6 +1842,90 @@ export const TEMPLATES: {
             `though it still reads as approved. Renew it before somebody finds out at the gate.\n`
           : "") +
         `\n${absoluteUrl("/projects")}` +
+        sign,
+    };
+  },
+
+  /**
+   * `CUST-5`. The monthly pack a property manager puts in front of a building
+   * owner: what was raised and closed, whether the SLA they pay for was met,
+   * whether the PPM schedule kept up, what is still outstanding, and what it
+   * cost.
+   *
+   * ── WHY A NULL PERCENT IS RENDERED AS "NOT MEASURED", NOT AS "0%" ─────────
+   *
+   * Same rule as `weekly_owner_digest`'s DSO line. A month with no response
+   * deadline in it is not a month at 0% — it is a month nothing can be said
+   * about, and printing 0% would tell an SLA-paying customer their contractor
+   * failed every call when in fact no call fell due.
+   */
+  property_manager_monthly_pack: (p) => {
+    const m = (minor: number): string => formatMoney(minor, p.currency);
+
+    const row = (label: string, value: string, note = ""): string =>
+      `  ${label.padEnd(22)}${value.padStart(14)}${note ? `  ${note}` : ""}`;
+
+    const pctLine = (met: number, total: number, percent: number | null): string =>
+      percent === null ? "not measured — nothing fell due this month" : `${percent}% (${met} of ${total})`;
+
+    const outstandingBlock =
+      p.outstanding.total === 0
+        ? `No open recommendation from a visit this month is still waiting on a decision.\n`
+        : `${p.outstanding.total} recommendation${p.outstanding.total === 1 ? "" : "s"} raised this month ` +
+          `${p.outstanding.total === 1 ? "is" : "are"} still open` +
+          (p.outstanding.truncated ? ` (showing ${p.outstanding.items.length} of ${p.outstanding.total})` : "") +
+          `:\n\n` +
+          p.outstanding.items
+            .map(
+              (i) =>
+                `  ${i.jobReference} — ${i.propertyName}\n` +
+                `    ${i.jobTitle}\n` +
+                `    "${i.recommendation}"\n` +
+                `    Raised ${date(i.raisedAt)}`,
+            )
+            .join("\n\n") +
+          "\n";
+
+    return {
+      subject:
+        p.outstanding.total > 0
+          ? `${p.periodLabel} report for ${p.customerName} — ${p.outstanding.total} recommendation` +
+            `${p.outstanding.total === 1 ? "" : "s"} still open`
+          : `${p.periodLabel} report for ${p.customerName}`,
+      body:
+        `${p.recipientName},\n\n` +
+        `${p.periodLabel}, for ${p.customerName}. This is the whole picture in one message; the same ` +
+        `figures are on your account at ${absoluteUrl("/portal/reports")}.\n\n` +
+        `JOBS\n` +
+        row("Raised", `${p.jobs.raised}`) +
+        "\n" +
+        row("Closed", `${p.jobs.closed}`) +
+        "\n" +
+        (p.jobs.cancelled > 0 ? row("Cancelled", `${p.jobs.cancelled}`) + "\n" : "") +
+        row("Still open", `${p.jobs.raisedStillOpen}`, "of the jobs raised this month") +
+        "\n\n" +
+        `RESPONSE AND RESOLUTION\n` +
+        row("Response SLA met", pctLine(p.sla.responseMet, p.sla.responseDeadlines, p.sla.responseMetPercent)) +
+        "\n" +
+        row(
+          "Resolution SLA met",
+          pctLine(p.sla.resolutionMet, p.sla.resolutionDeadlines, p.sla.resolutionMetPercent),
+        ) +
+        "\n\n" +
+        `PLANNED MAINTENANCE\n` +
+        row(
+          "PPM visits completed",
+          p.ppm.completionPercent === null
+            ? "not measured — none due this month"
+            : `${p.ppm.completionPercent}% (${p.ppm.visitsCompleted} of ${p.ppm.visitsDue})`,
+        ) +
+        "\n\n" +
+        `OUTSTANDING RECOMMENDATIONS\n` +
+        outstandingBlock +
+        "\n" +
+        `SPEND\n` +
+        row("Invoiced this month", m(p.spend.invoicedMinor), `${p.spend.invoiceCount} invoice${p.spend.invoiceCount === 1 ? "" : "s"}`) +
+        "\n" +
         sign,
     };
   },

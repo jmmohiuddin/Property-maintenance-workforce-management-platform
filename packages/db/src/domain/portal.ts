@@ -14,6 +14,10 @@ import {
 } from "@meridian/core";
 import { nextJobReference } from "./jobs";
 import { linkJobToAsset } from "./assets";
+// `CUST-3`. The great-circle helper dispatch already uses to rank technicians
+// by distance. Imported rather than restated: two haversines in one package is
+// two things to get right, and this one is proven against the dispatch board.
+import { distanceKm } from "./assignment";
 import { rowDate, requiredRowDate } from "./_rows";
 // Type-only, so this stays a compile-time reference and adds no import cycle:
 // the invoice status vocabulary belongs to commerce and is not restated here.
@@ -672,6 +676,283 @@ export async function getPortalRequestDetail(
     photos: photos.map((p) => ({ ...p, kind: p.kind as PortalPhotoKind })),
     signoff: signoffs[0] ?? null,
   };
+}
+
+// ── CUST-3 / EMG-5. Where the technician is, while they are coming to you ────
+
+/**
+ * How stale a position may be before it is withheld rather than shown.
+ *
+ * A handset in a basement plant room, a lift shaft or the Salik tunnels stops
+ * reporting, and the last thing it said goes on being true-looking forever. Six
+ * minutes is roughly a dozen missed samples at any sane capture interval, which
+ * is long enough that a red light or a dead spot does not blank the screen, and
+ * short enough that nobody is shown a van that has not moved in half an hour as
+ * though it were live.
+ *
+ * Past this the screen says contact was lost, and it says WHEN — which is a
+ * true and useful sentence. A position with no age on it is the dishonest one.
+ */
+export const TRACKING_STALE_AFTER_MINUTES = 6;
+
+/**
+ * ── NO COORDINATE IS EVER RETURNED, AND THAT IS THE DESIGN ──────────────────
+ *
+ * There is no latitude or longitude anywhere in `PortalLiveTracking`. The
+ * technician's position is read at full precision inside this function, used to
+ * compute one scalar — how far away they are — and then discarded. It is not
+ * rounded and passed on, not blurred, not put behind a zoom level.
+ *
+ * The first draft of this returned a position coarsened to about a kilometre,
+ * and coarsening was the wrong answer to the right question. Work out what the
+ * coordinate would be FOR. It is only renderable as a pin on a map, and a map
+ * pin carrying a named employee, refreshing every thirty seconds, is a live
+ * feed of where a person is — which is the thing this feature was asked not to
+ * become, arriving as a rendering decision rather than a stated one. Blurring
+ * it makes the feed less precise; it does not stop it being a feed.
+ *
+ * What the customer actually wants to know is how far away the technician is
+ * and how long they will be, and `distanceKm` and `etaMinutes` answer both from
+ * a position that never leaves this process. Watching the distance fall across
+ * two refreshes gives exactly the reassurance a moving dot would — they really
+ * are on their way — and gives it without publishing a point.
+ *
+ * The one thing lost is "roughly where", as in a place name, and it is lost on
+ * purpose rather than by oversight: turning a point into "near Business Bay"
+ * needs an area vocabulary with coordinates, `AREAS` in `@meridian/core` has
+ * none, and inventing ten centroids to fill the gap would be a guess rendered
+ * as a fact on a customer's screen.
+ */
+
+/**
+ * The speed an ETA is derived from, in km/h.
+ *
+ * ── WHY NOT THE SPEED IN THE PING ───────────────────────────────────────────
+ *
+ * `technician_locations.speed_kph` is an instantaneous reading. A van at a red
+ * light reports 0 and the ETA becomes infinite; a van on Emirates Road reports
+ * 110 and the ETA becomes four minutes for a journey that takes twenty-five.
+ * Neither is a better guess than a constant, and both are worse in the way that
+ * matters: they move, so the customer watches a number jump around and learns
+ * that it means nothing.
+ *
+ * 26 km/h is a conservative door-to-door average across Dubai traffic. Combined
+ * with the winding factor below it produces an estimate that is late more often
+ * than it is early, which is the correct direction to be wrong in — a customer
+ * told twenty-five minutes who waits fifteen is pleased, and one told ten who
+ * waits twenty-five is not.
+ */
+const TRACKING_ASSUMED_KPH = 26;
+
+/**
+ * Straight line to road distance. Roads do not go through buildings.
+ *
+ * `distanceKm` is a great-circle distance and a van cannot fly. 1.35 is the
+ * usual detour factor for a dense grid and it is applied before the ETA rather
+ * than after, so the distance the customer is shown is also the road-ish one
+ * rather than a number smaller than anything they could drive.
+ */
+const TRACKING_ROAD_FACTOR = 1.35;
+
+export interface PortalLiveTracking {
+  /**
+   * `travelling` while the visit is `en_route`; `on_site` once it is `arrived`.
+   *
+   * These are the only two states that exist here at all. There is no state for
+   * "assigned but not set off" and none for "finished", because in both of
+   * those the answer to "where is the technician" is not the customer's, and a
+   * value naming the state would still be telling them something about it.
+   */
+  readonly state: "travelling" | "on_site";
+  readonly technicianName: string;
+  /** When they set off. What makes "twenty minutes away" checkable. */
+  readonly enRouteAt: Date;
+  /**
+   * How far away they are, road-adjusted, to one decimal. Null on site.
+   *
+   * ── THE DELIBERATE OMISSION THIS FIELD RECORDS ──────────────────────────
+   *
+   * Null once the technician has ARRIVED, and that is a decision rather than a
+   * consequence of the maths. The distance is computable then — it is near
+   * zero — and it is withheld anyway, along with the ETA, because once somebody
+   * is at the building the customer owns, the customer knows where they are.
+   * Continuing to publish a distance from that point on says one thing they did
+   * not already know: whether the person is still there. How long in the car
+   * park, whether they stepped out at one o'clock, when they actually left.
+   *
+   * That is the line between tracking a visit and watching an employee, and it
+   * is drawn here rather than in the page, because a page is a thing somebody
+   * changes on a Tuesday.
+   *
+   * Also null when the property carries no coordinates — see `etaMinutes`.
+   */
+  readonly distanceKm: number | null;
+  /** Null whenever it would be a guess dressed as a number. See below. */
+  readonly etaMinutes: number | null;
+  /** When the position was captured, never when it was read. Null: no ping. */
+  readonly lastSeenAt: Date | null;
+  /**
+   * The handset has gone quiet. Position and ETA are withheld, not stale.
+   *
+   * Distinct from a null `lastSeenAt`, which means no ping has ever arrived for
+   * this visit — usually the first thirty seconds. "We are waiting for a signal"
+   * and "we have lost the signal" are different sentences and the screen says
+   * whichever is true.
+   */
+  readonly stale: boolean;
+}
+
+/**
+ * Live tracking for one request (`CUST-3`, `EMG-5`).
+ *
+ * ── WHERE THE SECURITY IN THIS FUNCTION IS, AND IT IS NOT IN THIS FUNCTION ──
+ *
+ * There is no customer filter in the SQL below, and there is no check that the
+ * technician belongs to this customer's visit. Both would be wrong to add, for
+ * exactly the reason `sql/customer-scope.sql` sets out at the top: a boundary
+ * that lives in a WHERE clause is a boundary somebody forgets one Tuesday.
+ *
+ * `technician_locations` carries a RESTRICTIVE `customer_scope` policy which
+ * makes a row visible to a portal session only while a visit on THAT
+ * customer's own job is `en_route` or `arrived`, and only for the interval
+ * between that visit setting off and it ending. Every other row in the table
+ * is ABSENT inside `withCustomerScope` — not refused, absent. So
+ * "the newest visible ping" is, by construction, a ping this customer is
+ * entitled to, and the query does not have to know that.
+ *
+ * The consequence worth stating: the moment the visit completes, this function
+ * starts returning null against unchanged data. Nothing is deleted and nothing
+ * is flagged; the rows simply stop existing for this session. That is the
+ * property the whole customer-scope model was built for, and this is the table
+ * where it earns its keep.
+ *
+ * ── AND WHERE THE DISCRETION IS, WHICH IS HERE ──────────────────────────────
+ *
+ * The policy grants raw positions for the window. This function decides that
+ * the customer gets a kilometre-grained point while the van is moving, no point
+ * at all once it has arrived, and no ETA it cannot stand behind. See the
+ * constants above; each says what it withholds and why.
+ *
+ * ── CONSISTENT WITH `FLD-16`, AND ASKING NOTHING OF IT ──────────────────────
+ *
+ * `purgeLocationTraces` deletes traces after `RETENTION_LOCATION_TRACE_DAYS`.
+ * This read never wants a ping older than `TRACKING_STALE_AFTER_MINUTES`, so
+ * the retention window is four orders of magnitude longer than anything this
+ * feature needs and shortening it would not break this screen. Nobody should
+ * ever lengthen it on account of tracking: there is no history here, by design,
+ * and a customer looking at a finished job is shown the timeline and the job
+ * card, which is the evidence that somebody came.
+ */
+export async function getPortalLiveTracking(
+  tx: TenantScopedTx,
+  jobId: string,
+): Promise<PortalLiveTracking | null> {
+  const visitRows = (await tx.execute<{
+    visit_id: string;
+    technician_id: string;
+    technician_name: string;
+    status: string;
+    en_route_at: string;
+    property_lat: number | null;
+    property_lng: number | null;
+  }>(sql`
+    select v.id as visit_id,
+           v.technician_id,
+           t.full_name as technician_name,
+           v.status::text as status,
+           v.en_route_at,
+           p.lat as property_lat,
+           p.lng as property_lng
+      from job_visits v
+      join jobs j on j.id = v.job_id
+      join properties p on p.id = j.property_id
+      join technicians t on t.id = v.technician_id
+     where v.job_id = ${jobId}
+       and j.deleted_at is null
+       and v.status in ('en_route', 'arrived')
+       and v.en_route_at is not null
+     order by v.en_route_at asc
+     limit 1
+  `)) as unknown as {
+    visit_id: string;
+    technician_id: string;
+    technician_name: string;
+    status: string;
+    en_route_at: string;
+    property_lat: number | null;
+    property_lng: number | null;
+  }[];
+
+  const visit = visitRows[0];
+  // No live visit on this job, or the job is not this customer's — the same
+  // answer, and it has to be. Inside customer scope the second case cannot be
+  // distinguished from the first, which is the point.
+  if (!visit) return null;
+
+  const state = visit.status === "arrived" ? "on_site" : "travelling";
+  const enRouteAt = requiredRowDate(visit.en_route_at);
+
+  const pingRows = (await tx.execute<{
+    lat: number;
+    lng: number;
+    recorded_at: string;
+  }>(sql`
+    select lat, lng, recorded_at
+      from technician_locations
+     where technician_id = ${visit.technician_id}
+     order by recorded_at desc
+     limit 1
+  `)) as unknown as { lat: number; lng: number; recorded_at: string }[];
+
+  const ping = pingRows[0];
+  const lastSeenAt = ping ? requiredRowDate(ping.recorded_at) : null;
+  const stale =
+    lastSeenAt !== null && Date.now() - lastSeenAt.getTime() > TRACKING_STALE_AFTER_MINUTES * 60_000;
+
+  // On site, or quiet, or never heard from: no distance and no ETA. Three
+  // different reasons arriving at the same projection, and the screen tells
+  // them apart from `state`, `stale` and `lastSeenAt` rather than from a
+  // position it was handed and told not to draw.
+  if (!ping || stale || state === "on_site") {
+    return {
+      state,
+      technicianName: visit.technician_name,
+      enRouteAt,
+      distanceKm: null,
+      etaMinutes: null,
+      lastSeenAt,
+      stale,
+    };
+  }
+
+  const hasPropertyPoint = visit.property_lat !== null && visit.property_lng !== null;
+  const roadKm = hasPropertyPoint
+    ? distanceKm(
+        { lat: ping.lat, lng: ping.lng },
+        { lat: visit.property_lat as number, lng: visit.property_lng as number },
+      ) * TRACKING_ROAD_FACTOR
+    : null;
+
+  return {
+    state,
+    technicianName: visit.technician_name,
+    enRouteAt,
+    distanceKm: roadKm === null ? null : round(roadKm, 1),
+    // Rounded up to a whole minute and floored at one. "0 minutes away" is not
+    // a thing anybody can act on, and "arriving now" is what one minute means
+    // on the screen. Null rather than a large number when the property has no
+    // coordinates: a property with no point on the map is a data problem, and
+    // inventing a duration from it would hide it behind a plausible answer.
+    etaMinutes: roadKm === null ? null : Math.max(1, Math.ceil((roadKm / TRACKING_ASSUMED_KPH) * 60)),
+    lastSeenAt,
+    stale: false,
+  };
+}
+
+/** Fixed-places rounding that returns a number rather than a string. */
+function round(value: number, places: number): number {
+  const factor = 10 ** places;
+  return Math.round(value * factor) / factor;
 }
 
 // ── POR-9. Job evidence, and the two rules it turns on ──────────────────────

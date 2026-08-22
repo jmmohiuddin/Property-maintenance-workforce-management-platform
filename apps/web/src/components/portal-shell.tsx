@@ -47,6 +47,7 @@ export function PortalShell({
               {[
                 { href: "/portal/requests", label: "Requests", key: "requests" },
                 { href: "/portal/invoices", label: "Invoices", key: "invoices" },
+                { href: "/portal/reports", label: "Monthly report", key: "reports" },
                 { href: "/portal/notifications", label: "Notifications", key: "notifications" },
                 { href: "/portal/request", label: "Raise a request", key: "request" },
               ].map((item) => (

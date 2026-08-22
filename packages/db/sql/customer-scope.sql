@@ -329,6 +329,37 @@ CREATE POLICY customer_scope ON public.contract_entitlements
                   AND c.customer_id = app_current_customer())
   );
 
+-- ── CUST-5. The PPM schedule, for the monthly property-manager pack ────────
+--
+-- `contract_visits` carries the planned and completed AMC visit dates that
+-- `ppmCompliance` reads for the internal `CON-7` board. It shipped with no
+-- `customer_scope` policy, which under the rule this file states above means
+-- it was not hidden from a portal session — it was open tenant-wide, exactly
+-- the `job_visits`-shaped hole this file exists to close. Nothing read it from
+-- a portal query before now, which is the same "no query today is not an
+-- access control" situation `credit_notes` and the seven other tables were
+-- found in.
+--
+-- `CUST-5`'s monthly pack is the first portal-reachable read of this table: it
+-- reports PPM visits due against visits completed for the calendar month, and
+-- that figure has to come from this table or it cannot be sourced honestly.
+-- Scoped through `contract_id` exactly like `contract_entitlements` above,
+-- because `contract_visits` carries no `customer_id` of its own.
+--
+-- USING only, no WITH CHECK. A portal session reads its own PPM schedule and
+-- never writes it — visits are materialised into jobs and reconciled by the
+-- contracts cron, both staff-scoped — so a WITH CHECK here would assert a
+-- write path that does not exist.
+DROP POLICY IF EXISTS customer_scope ON public.contract_visits;
+CREATE POLICY customer_scope ON public.contract_visits
+  AS RESTRICTIVE
+  USING (
+    app_current_customer() IS NULL
+    OR EXISTS (SELECT 1 FROM public.contracts c
+                WHERE c.id = contract_visits.contract_id
+                  AND c.customer_id = app_current_customer())
+  );
+
 -- ── POR-5. Notification preferences ─────────────────────────────────────────
 -- Owned directly by the customer, and written by them: a portal user turning an
 -- event off is an INSERT or UPDATE from a portal session, so this one needs its
@@ -402,6 +433,98 @@ CREATE POLICY customer_scope ON public.technicians
                  JOIN jobs j ON j.id = v.job_id
                 WHERE v.technician_id = technicians.id
                   AND j.customer_id = app_current_customer())
+  )
+  WITH CHECK (app_current_customer() IS NULL);
+
+-- ── CUST-3 / EMG-5. Where the technician is, while they are coming to YOU ────
+--
+-- This is the most invasive row in the schema: a point on a map showing where
+-- one identifiable person physically is, right now, shown to a different
+-- person. Every other policy in this file answers "whose row is this". This one
+-- has to answer a second question that no other table asks — "is this the
+-- moment at which that row is any of your business" — because the technician
+-- whose position this is has a life either side of your appointment, and a
+-- policy that only checked ownership would publish all of it.
+--
+-- The customer-scope model is what makes that expressible without a single
+-- WHERE clause in application code. Three predicates, all of them ANDed by
+-- virtue of the policy being RESTRICTIVE:
+--
+--   1. WHOSE.  The technician has a visit on a job belonging to this customer.
+--              This is the same shape as the `technicians` policy above.
+--   2. WHEN — the state.  That visit is `en_route` or `arrived`, and nothing
+--              else. `assigned` and `accepted` are before: the technician has
+--              been given the work and has not set off, and where they are in
+--              the meantime is not the customer's business. `completed`,
+--              `no_access`, `aborted` and `declined` are after, and they close
+--              the window RETROACTIVELY — the moment a visit completes, every
+--              ping it ever made becomes invisible to that customer, including
+--              the ones they could legitimately see a minute earlier. There is
+--              no archive of where the van went, because there is no hour at
+--              which reading it back serves the customer.
+--   3. WHEN — the interval.  The ping was recorded at or after `en_route_at`,
+--              and not after the visit ended. The state test alone is not
+--              enough: a technician who was at home at 06:00, at another
+--              customer's site at 09:00 and set off for you at 14:00 has a
+--              whole morning of rows in this table under the same
+--              `technician_id`, and predicate 2 is true of every one of them
+--              while the current visit is live. THIS is the predicate that
+--              makes the lunch break, the previous job and the drive home
+--              unreachable, and it is the one that would be easiest to leave
+--              out because the feature works perfectly without it.
+--
+-- ── THE TWELVE-HOUR CEILING ─────────────────────────────────────────────────
+--
+-- `en_route_at + interval '12 hours'` closes a failure that is not hypothetical
+-- and is not malicious: a technician finishes at 17:00 and never taps the
+-- button that moves the visit off `arrived`. Predicate 2 stays true forever,
+-- predicate 3's lower bound has long passed, and the customer is left holding a
+-- live feed of an employee's evening, weekend and following week. A feature
+-- that depends on somebody remembering to close a record is not a boundary.
+--
+-- Twelve hours is the outer edge of one shift, so it never truncates a real
+-- visit, and it means the worst case of a forgotten record is a day rather than
+-- an eternity. `LEAST` with `completed_at` because the two bounds are answering
+-- different questions and whichever arrives first is the one that matters.
+--
+-- `en_route_at IS NULL` fails closed and deliberately: a visit that says it is
+-- en route but never recorded when has no interval to check against, and the
+-- safe reading of an unanswerable question is no rows.
+--
+-- ── WHAT THIS POLICY DOES NOT DO ────────────────────────────────────────────
+--
+-- It does not decide precision. It grants a portal session the raw rows for the
+-- window, and `getPortalLiveTracking` is what coarsens the position, withholds
+-- it entirely once the technician is on site, and refuses to publish a stale
+-- one. That is the same division this file has made everywhere: the policy is
+-- the boundary, the projection is the discretion, and neither substitutes for
+-- the other. The difference here is that the projection is unusually load
+-- bearing, so it says so at the function.
+--
+-- The write check is the staff test. A portal session has no business writing a
+-- position at all — the only writer is a technician's own handset on a staff
+-- transaction — and this table carries no `customer_id`, so check 13 in
+-- `verify-rls.sql` would not have caught `WITH CHECK (true)` here.
+DROP POLICY IF EXISTS customer_scope ON public.technician_locations;
+CREATE POLICY customer_scope ON public.technician_locations
+  AS RESTRICTIVE
+  USING (
+    app_current_customer() IS NULL
+    OR EXISTS (
+      SELECT 1
+        FROM job_visits v
+        JOIN jobs j ON j.id = v.job_id
+       WHERE v.technician_id = technician_locations.technician_id
+         AND j.customer_id = app_current_customer()
+         AND j.deleted_at IS NULL
+         AND v.status IN ('en_route', 'arrived')
+         AND v.en_route_at IS NOT NULL
+         AND technician_locations.recorded_at >= v.en_route_at
+         AND technician_locations.recorded_at <= LEAST(
+               COALESCE(v.completed_at, 'infinity'::timestamptz),
+               v.en_route_at + interval '12 hours'
+             )
+    )
   )
   WITH CHECK (app_current_customer() IS NULL);
 
