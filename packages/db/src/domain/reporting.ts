@@ -1060,14 +1060,22 @@ export const DASHBOARD_GAPS: readonly DashboardGap[] = [
    *     So dispatcher churn no longer accumulates rows for ever, and the
    *     denominator stops drifting upward with use.
    *
-   *     It does not make a visit an attendance, which is what G11 needs. Two
-   *     gaps remain and both are real: a visit that WAS attended and then
-   *     reassigned is correctly left standing (retiring it would destroy the
-   *     record of the journey), so it still counts; and, more decisively,
-   *     nothing in the product writes `en_route_at` or `arrived_at` at all —
-   *     the only writers of either column are `seed.ts` and the test suites.
-   *     Until something records attendance, every visit row is a plan, and
-   *     counting plans is not counting attendances.
+   *     FURTHER REPAIRED since. `transitionJob` now advances the live visit
+   *     with the job — `en_route` stamps `en_route_at`, `on_site` stamps
+   *     `arrived_at`, `work_complete` settles the attended visit — so the
+   *     sentence that used to sit here, "nothing in the product writes
+   *     `en_route_at` or `arrived_at` at all", is no longer true. A visit
+   *     created from now on does say whether somebody turned up.
+   *
+   *     It still does not make G11 countable, and the reason is dates rather
+   *     than columns. The stamps exist only for visits transitioned after that
+   *     change: every historical row is `assigned` with null stamps, and an
+   *     attended one is byte-for-byte identical to an abandoned one, so no
+   *     backfill can separate them and none was attempted. A first-time-fix
+   *     rate computed across the boundary would read as a collapse and then a
+   *     recovery, both invented. It also does not fix the second gap: a visit
+   *     that WAS attended and then reassigned is correctly left standing
+   *     (retiring it would destroy the record of the journey), so it counts.
    *  2. The obvious repair — count only visits carrying recorded labour —
    *     fails in the flattering direction, which is worse. `assertJobCardComplete`
    *     requires labour on the JOB, not on every visit, so a genuine failed
@@ -1089,12 +1097,12 @@ export const DASHBOARD_GAPS: readonly DashboardGap[] = [
     requirement: "KPI-3 / G11 / MD-3",
     metric: "First-time fix rate",
     waitingOn:
-      "A per-visit outcome. `job_visits` records assignments, not attendances: 0040 stopped a " +
-      "reassignment leaving a ghost row behind, but nothing in the product writes en_route_at or " +
-      "arrived_at, so no row anywhere says a technician turned up. `jobs.outcome_code` is one " +
-      "job-level value overwritten on each call, so neither the numerator (closed on the first " +
-      "attendance) nor the denominator (reactive jobs) can be counted. The return-visit rate on " +
-      "the same card is what the recorded data does support.",
+      "A per-visit outcome, and enough history to use it. Attendance is now recorded — moving a " +
+      "job en route or on site stamps the visit — but only from the day that started, and no " +
+      "backfill is possible because an attended visit and an abandoned one look identical in the " +
+      "rows that already exist. `jobs.outcome_code` is also one job-level value overwritten on " +
+      "each call, so a job whose first visit was no-access and whose second was a fix records " +
+      "only the fix. The return-visit rate on the same card is what the recorded data supports.",
   },
   /*
    * ── MD-1's MARGIN, AND WHY IT IS STILL NOT A NUMBER ───────────────────────
@@ -3792,3 +3800,818 @@ const JOURNAL_EXPORT_COLUMNS = [
   "tax_code",
   "currency",
 ] as const;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INV-11 — the VAT return pack (FTA Form VAT 201)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * A VAT return period, as a pair of Dubai dates.
+ *
+ * The FTA assigns the filing frequency — quarterly below AED 150m of annual
+ * turnover, monthly above it — and it is assigned per taxable person in the
+ * registration certificate. This system has never seen that certificate, so it
+ * offers both shapes and labels which is which rather than picking one and
+ * being silently wrong for half its users.
+ */
+export interface VatPeriodOption {
+  readonly label: string;
+  readonly from: string;
+  readonly to: string;
+  readonly frequency: "monthly" | "quarterly";
+}
+
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+] as const;
+
+/** Days in a Gregorian month. Pure arithmetic; no Date, no timezone. */
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 29 : 28;
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
+}
+
+function iso(year: number, month: number, day: number): string {
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+/**
+ * The periods a preparer is plausibly filing right now, newest first.
+ *
+ * ── WHY THE DUBAI DAY AND NOT `new Date()`'S MONTH ──────────────────────────
+ *
+ * Because the server's clock is not the taxable person's clock. This repository
+ * runs with a session timezone AHEAD of Dubai, so at 01:00 on 1 April in the
+ * host zone it is still 31 March in Dubai — and a period list built from the
+ * host's month would offer Q2 as the current quarter while the business is
+ * still living in Q1, on the one screen where being one day out moves a figure
+ * from one return to the next. `dubaiDateKey` is the only clock this file
+ * consults, and every boundary below is string arithmetic on its output.
+ */
+export function vatPeriodOptions(now: Date = new Date()): readonly VatPeriodOption[] {
+  const key = dubaiDateKey(now);
+  const year = Number(key.slice(0, 4));
+  const month = Number(key.slice(5, 7));
+
+  const options: VatPeriodOption[] = [];
+
+  // Quarters: the current one and the seven before it — two years of history,
+  // which covers the five-year record-keeping obligation's live end and any
+  // voluntary disclosure a preparer is likely to be reconstructing.
+  const currentQuarterIndex = Math.floor((month - 1) / 3);
+  for (let back = 0; back < 8; back++) {
+    const absolute = year * 4 + currentQuarterIndex - back;
+    const qYear = Math.floor(absolute / 4);
+    const q = absolute - qYear * 4;
+    const startMonth = q * 3 + 1;
+    const endMonth = startMonth + 2;
+    options.push({
+      label: `Q${q + 1} ${qYear}`,
+      from: iso(qYear, startMonth, 1),
+      to: iso(qYear, endMonth, daysInMonth(qYear, endMonth)),
+      frequency: "quarterly",
+    });
+  }
+
+  // Months: the current one and the eleven before it.
+  for (let back = 0; back < 12; back++) {
+    const absolute = year * 12 + (month - 1) - back;
+    const mYear = Math.floor(absolute / 12);
+    const m = absolute - mYear * 12 + 1;
+    options.push({
+      label: `${MONTH_NAMES[m - 1]} ${mYear}`,
+      from: iso(mYear, m, 1),
+      to: iso(mYear, m, daysInMonth(mYear, m)),
+      frequency: "monthly",
+    });
+  }
+
+  return options;
+}
+
+/** One tax-category-and-rate combination, as it appeared in the period. */
+export interface VatSupplyGroup {
+  /** UNCL5305: "S" standard-rated, "Z" zero-rated, "E" exempt. */
+  readonly taxCategoryCode: string;
+  readonly taxRateBasisPoints: number;
+  /** Tax-exclusive, net of credit notes issued in the same period. */
+  readonly netTaxableMinor: number;
+  readonly netTaxMinor: number;
+  readonly invoicedTaxableMinor: number;
+  readonly invoicedTaxMinor: number;
+  readonly creditedTaxableMinor: number;
+  readonly creditedTaxMinor: number;
+  readonly invoices: number;
+  readonly creditNotes: number;
+}
+
+/** A working-paper exception: a document whose figures do not hold together. */
+export interface VatException {
+  readonly kind:
+    | "tax_not_at_the_stated_rate"
+    | "standard_rated_at_zero_percent"
+    | "tax_charged_on_an_exempt_or_zero_rated_supply"
+    | "no_supplier_trn"
+    | "line_category_differs_from_document";
+  readonly documentType: "invoice" | "credit_note";
+  readonly reference: string;
+  readonly issueDate: string;
+  readonly detail: string;
+}
+
+/**
+ * The input-tax verdict.
+ *
+ * A discriminated field rather than a nullable number, because "we did not
+ * compute it" and "it is zero" are opposite statements on a tax return and a
+ * null renders as the second one on any screen somebody writes in a hurry.
+ */
+export interface VatInputTaxPosition {
+  readonly available: false;
+  /** Named on the face of the pack. */
+  readonly reason: string;
+  /** What would have to exist in this system for the figure to be produced. */
+  readonly missing: readonly string[];
+}
+
+export interface VatReconciliationLine {
+  readonly label: string;
+  readonly amountMinor: number;
+  /** True for the two lines a preparer transcribes rather than checks. */
+  readonly declared?: boolean;
+  readonly note?: string;
+}
+
+export interface VatReturnPack {
+  /** Inclusive, `YYYY-MM-DD`, Asia/Dubai. */
+  readonly from: string;
+  readonly to: string;
+  readonly generatedAt: Date;
+  readonly currency: string;
+  /** More than one currency in the period. Every figure below is then a mix. */
+  readonly mixedCurrency: boolean;
+
+  readonly groups: readonly VatSupplyGroup[];
+
+  // ── The boxes on the return ──────────────────────────────────────────────
+  /** Box 1: standard-rated supplies, tax-exclusive, net of credit notes. */
+  readonly standardRatedMinor: number;
+  /** Box 1's tax column. */
+  readonly standardRatedTaxMinor: number;
+  /** Box 4: zero-rated supplies. */
+  readonly zeroRatedMinor: number;
+  /** Box 5: exempt supplies. */
+  readonly exemptMinor: number;
+  /** Box 8's tax column on the output side: total output tax due. */
+  readonly outputTaxMinor: number;
+  /** Box 8's value column: all supplies, tax-exclusive. */
+  readonly totalSuppliesMinor: number;
+
+  // ── Gross, before credits, so a credit is visible rather than folded in ──
+  readonly invoicedTaxableMinor: number;
+  readonly invoicedTaxMinor: number;
+  readonly creditedTaxableMinor: number;
+  readonly creditedTaxMinor: number;
+
+  readonly invoiceCount: number;
+  readonly creditNoteCount: number;
+  /** Every document in the period. The working papers hold this many rows. */
+  readonly documentCount: number;
+
+  /**
+   * Output tax as the documents recorded it, less output tax recomputed from
+   * each document's own taxable amount and rate. Zero on a healthy period.
+   */
+  readonly taxVarianceMinor: number;
+  readonly reconciliation: readonly VatReconciliationLine[];
+
+  readonly inputTax: VatInputTaxPosition;
+
+  /** Capped. `exceptionCount` is the real number; the screen says both. */
+  readonly exceptions: readonly VatException[];
+  readonly exceptionCount: number;
+}
+
+/** How many exceptions the pack carries. The count beside it is the true one. */
+export const VAT_EXCEPTION_ROWS = 20;
+
+/**
+ * The reason this pack has no input-tax side, stated once.
+ *
+ * ── THE EVIDENCE, NOT AN OPINION ────────────────────────────────────────────
+ *
+ * Input tax is VAT this business paid to ITS suppliers, and to declare it you
+ * need, per purchase: a supplier, that supplier's TRN, a tax invoice reference,
+ * the tax-exclusive amount, the tax amount, and whether the input is blocked
+ * (entertainment, most motor vehicles) or apportionable. This schema holds none
+ * of that. Every cost row in it — `project_costs`, `job_materials`,
+ * `project_subcontracts`, `recruitment_costs` — carries an AMOUNT and no tax
+ * column, no supplier TRN, and no statement of whether the amount is
+ * VAT-inclusive or VAT-exclusive. `project_costs.supplier_reference` is a free
+ * text box holding a delivery-note number. There is no suppliers table, no
+ * purchase-invoice table and no expense table anywhere in
+ * `packages/db/src/schema`.
+ *
+ * The figure could therefore only be *estimated* — 5% of some subset of costs
+ * — and an estimated input tax is not a number that belongs on a return.
+ * Overstating recoverable input tax is the single most common finding in an
+ * FTA assessment, it carries a penalty of 50% of the amount, and the person who
+ * transcribed it would have had no way to know the system guessed. So this pack
+ * produces the output side, in full, and says plainly that the input side has
+ * to come from the purchase ledger.
+ */
+export const VAT_INPUT_TAX_UNAVAILABLE: VatInputTaxPosition = {
+  available: false,
+  reason:
+    "This system is not the system of record for purchases. It records what the business " +
+    "invoices, not what it is invoiced, so it cannot produce boxes 9 to 11 — recoverable " +
+    "input tax. Take those from the purchase ledger your accountant keeps.",
+  missing: [
+    "Supplier tax invoices: no purchase-invoice, supplier or expense table exists in this schema.",
+    "Supplier TRNs: the only TRN columns here are the customer's and this company's own.",
+    "Tax on costs: project_costs, job_materials and project_subcontracts record an amount with " +
+      "no tax amount, no tax rate, and no statement of whether the amount includes VAT.",
+    "Blocked and apportioned input tax: nothing here records whether a purchase was for " +
+      "entertainment, a motor vehicle, or a partly exempt use.",
+    "Reverse-charge purchases (box 3 and box 10) and imports (boxes 6 and 7): no import, " +
+      "customs or overseas-supplier record exists.",
+  ],
+};
+
+/**
+ * The VAT return pack (`INV-11`).
+ *
+ * ── WHAT THIS IS FOR ────────────────────────────────────────────────────────
+ *
+ * A UAE VAT return is filed on FTA Form VAT 201 within 28 days of the end of
+ * each tax period, and the period is quarterly or monthly depending on
+ * turnover. This produces the output-tax half of that form — the figures a
+ * preparer transcribes — together with the working papers behind them, so the
+ * filing can be defended two years later against the documents it came from.
+ *
+ * ── THE PERIOD BOUNDARY IS THE WHOLE PROBLEM ────────────────────────────────
+ *
+ * An invoice issued at 23:30 Dubai on 31 March belongs in Q1. In UTC it is
+ * 19:30 on 31 March, which is still Q1 — but this repository's session timezone
+ * is Asia/Dhaka, four hours AHEAD of Dubai, and there the same instant is
+ * 01:30 on 1 April: Q2. A boundary taken from the session clock therefore moves
+ * revenue between two returns, understating one and overstating the next, and
+ * both are wrong in a way that is only discovered by an auditor. So every
+ * comparison below is `at time zone 'Asia/Dubai'` in SQL against a date the
+ * caller supplies, and nothing here reads `current_date`, `now()` or the host's
+ * month. `vatPeriodOptions` builds the dates from `dubaiDateKey` for the same
+ * reason.
+ *
+ * ── EVERY FIGURE IS AN AGGREGATE ────────────────────────────────────────────
+ *
+ * There is no list in this pack for a total to be summed from. The grouped
+ * figures come from one `group by` over every document in the period, the
+ * counts come from `count(*)` in the same pass, and the exception rows — the
+ * only capped thing here — carry `exceptionCount` beside them so a screen can
+ * say "showing 20 of 41". The document listing lives in `vatWorkingPapers`,
+ * which batches to exhaustion and states its own row count.
+ *
+ * ── WHY THE DOCUMENT-LEVEL CATEGORY IS AUTHORITATIVE ────────────────────────
+ *
+ * `invoices.tax_category_code` and `invoices.tax_rate_basis_points` are the
+ * document's own record of what it charged, and `createInvoiceFromJob` applies
+ * one rate to every line — there is no path in this system that produces a
+ * mixed-rate invoice. Reading the lines instead would therefore add a join and
+ * change nothing, except on a row written by hand. So the lines are not summed;
+ * they are CHECKED, and a line whose category differs from its document's is
+ * raised as an exception rather than silently reallocated between two boxes.
+ */
+export async function vatReturnPack(
+  tx: TenantScopedTx,
+  options: { from: string; to: string; now?: Date },
+): Promise<VatReturnPack> {
+  const { from, to } = options;
+  const generatedAt = options.now ?? new Date();
+
+  if (!ISO_DATE.test(from) || !ISO_DATE.test(to)) {
+    throw new UserFacingError("Give the tax period as two dates, each YYYY-MM-DD.");
+  }
+  if (from > to) {
+    throw new UserFacingError("That tax period starts after it ends.");
+  }
+
+  type GroupRow = {
+    kind: string;
+    tax_category_code: string;
+    tax_rate_basis_points: string;
+    taxable_minor: string;
+    tax_minor: string;
+    expected_tax_minor: string;
+    documents: string;
+  };
+
+  const rows = (await tx.execute<GroupRow>(sql`
+    with ${vatPeriodSource(from, to)}
+    select kind,
+           tax_category_code,
+           tax_rate_basis_points::text                as tax_rate_basis_points,
+           -- Never ::int. A quarter of a busy contractor's supplies in fils is
+           -- already nine figures, and int4 stops at 2,147,483,647 — which is
+           -- AED 21.4m, a number this business could reach in a year.
+           coalesce(sum(taxable_minor), 0)::text      as taxable_minor,
+           coalesce(sum(tax_minor), 0)::text          as tax_minor,
+           coalesce(sum(expected_tax_minor), 0)::text as expected_tax_minor,
+           count(*)::text                             as documents
+      from period_documents
+     group by kind, tax_category_code, tax_rate_basis_points
+     order by kind, tax_category_code, tax_rate_basis_points
+  `)) as unknown as GroupRow[];
+
+  type TotalRow = { document_count: string; currencies: string; currency: string | null };
+  const totalRows = (await tx.execute<TotalRow>(sql`
+    with ${vatPeriodSource(from, to)}
+    select count(*)::text                                         as document_count,
+           count(distinct currency)::text                         as currencies,
+           (select currency from period_documents order by issued_local, id limit 1) as currency
+      from period_documents
+  `)) as unknown as TotalRow[];
+
+  // ── Fold the groups into the boxes ────────────────────────────────────────
+  //
+  // In TypeScript over integers that arrived as strings, never as `::int` in
+  // SQL. Every one of these is a difference of two bigint sums.
+  const merged = new Map<string, {
+    taxCategoryCode: string;
+    taxRateBasisPoints: number;
+    invoicedTaxableMinor: number;
+    invoicedTaxMinor: number;
+    creditedTaxableMinor: number;
+    creditedTaxMinor: number;
+    invoices: number;
+    creditNotes: number;
+  }>();
+
+  let invoicedTaxableMinor = 0;
+  let invoicedTaxMinor = 0;
+  let creditedTaxableMinor = 0;
+  let creditedTaxMinor = 0;
+  let invoiceCount = 0;
+  let creditNoteCount = 0;
+  let expectedTaxMinor = 0;
+  let recordedTaxMinor = 0;
+
+  for (const r of rows) {
+    const rate = Number(r.tax_rate_basis_points);
+    const key = `${r.tax_category_code}/${rate}`;
+    const entry = merged.get(key) ?? {
+      taxCategoryCode: r.tax_category_code,
+      taxRateBasisPoints: rate,
+      invoicedTaxableMinor: 0,
+      invoicedTaxMinor: 0,
+      creditedTaxableMinor: 0,
+      creditedTaxMinor: 0,
+      invoices: 0,
+      creditNotes: 0,
+    };
+
+    const taxable = Number(r.taxable_minor);
+    const tax = Number(r.tax_minor);
+    const documents = Number(r.documents);
+
+    if (r.kind === "invoice") {
+      entry.invoicedTaxableMinor += taxable;
+      entry.invoicedTaxMinor += tax;
+      entry.invoices += documents;
+      invoicedTaxableMinor += taxable;
+      invoicedTaxMinor += tax;
+      invoiceCount += documents;
+      expectedTaxMinor += Number(r.expected_tax_minor);
+      recordedTaxMinor += tax;
+    } else {
+      entry.creditedTaxableMinor += taxable;
+      entry.creditedTaxMinor += tax;
+      entry.creditNotes += documents;
+      creditedTaxableMinor += taxable;
+      creditedTaxMinor += tax;
+      creditNoteCount += documents;
+      // A credit note reduces output tax, so its own arithmetic is checked in
+      // the same direction it will be applied.
+      expectedTaxMinor -= Number(r.expected_tax_minor);
+      recordedTaxMinor -= tax;
+    }
+
+    merged.set(key, entry);
+  }
+
+  const groups: VatSupplyGroup[] = [...merged.values()]
+    .sort((a, b) =>
+      a.taxCategoryCode === b.taxCategoryCode
+        ? b.taxRateBasisPoints - a.taxRateBasisPoints
+        : a.taxCategoryCode.localeCompare(b.taxCategoryCode),
+    )
+    .map((g) => ({
+      taxCategoryCode: g.taxCategoryCode,
+      taxRateBasisPoints: g.taxRateBasisPoints,
+      netTaxableMinor: g.invoicedTaxableMinor - g.creditedTaxableMinor,
+      netTaxMinor: g.invoicedTaxMinor - g.creditedTaxMinor,
+      invoicedTaxableMinor: g.invoicedTaxableMinor,
+      invoicedTaxMinor: g.invoicedTaxMinor,
+      creditedTaxableMinor: g.creditedTaxableMinor,
+      creditedTaxMinor: g.creditedTaxMinor,
+      invoices: g.invoices,
+      creditNotes: g.creditNotes,
+    }));
+
+  // "Standard-rated" is the category the document declares, not "rate above
+  // zero". A document marked exempt that nevertheless carries tax is an
+  // exception below, and adding it to box 1 here would hide the very thing the
+  // exception exists to surface.
+  const sumWhere = (predicate: (g: VatSupplyGroup) => boolean, pick: (g: VatSupplyGroup) => number) =>
+    groups.filter(predicate).reduce((total, g) => total + pick(g), 0);
+
+  const standardRatedMinor = sumWhere((g) => g.taxCategoryCode === "S", (g) => g.netTaxableMinor);
+  const standardRatedTaxMinor = sumWhere((g) => g.taxCategoryCode === "S", (g) => g.netTaxMinor);
+  const zeroRatedMinor = sumWhere((g) => g.taxCategoryCode === "Z", (g) => g.netTaxableMinor);
+  const exemptMinor = sumWhere((g) => g.taxCategoryCode === "E", (g) => g.netTaxableMinor);
+
+  const totalSuppliesMinor = invoicedTaxableMinor - creditedTaxableMinor;
+  const outputTaxMinor = invoicedTaxMinor - creditedTaxMinor;
+
+  const exceptions = await vatExceptions(tx, from, to);
+
+  return {
+    from,
+    to,
+    generatedAt,
+    currency: totalRows[0]?.currency ?? "AED",
+    mixedCurrency: Number(totalRows[0]?.currencies ?? 0) > 1,
+    groups,
+    standardRatedMinor,
+    standardRatedTaxMinor,
+    zeroRatedMinor,
+    exemptMinor,
+    outputTaxMinor,
+    totalSuppliesMinor,
+    invoicedTaxableMinor,
+    invoicedTaxMinor,
+    creditedTaxableMinor,
+    creditedTaxMinor,
+    invoiceCount,
+    creditNoteCount,
+    documentCount: Number(totalRows[0]?.document_count ?? 0),
+    taxVarianceMinor: recordedTaxMinor - expectedTaxMinor,
+    reconciliation: [
+      {
+        label: "Invoiced in the period, tax-exclusive",
+        amountMinor: invoicedTaxableMinor,
+        note: `${invoiceCount} issued invoice${invoiceCount === 1 ? "" : "s"}. Drafts excluded — a draft is not a document.`,
+      },
+      {
+        label: "Less credit notes issued in the period, tax-exclusive",
+        amountMinor: -creditedTaxableMinor,
+        note: `${creditNoteCount} credit note${creditNoteCount === 1 ? "" : "s"}, dated by their own issue date rather than the invoice's.`,
+      },
+      {
+        label: "Net supplies declared",
+        amountMinor: totalSuppliesMinor,
+        declared: true,
+        note: "Standard-rated, zero-rated and exempt together — box 8's value column.",
+      },
+      {
+        label: "Output tax recomputed from each document's own taxable amount and rate",
+        amountMinor: expectedTaxMinor,
+        note: "Rounded per document, the way the document itself rounded it.",
+      },
+      {
+        label: "Output tax as the documents recorded it",
+        amountMinor: recordedTaxMinor,
+        declared: true,
+        note: "What box 8's tax column must say. This, not the recomputation, is what was charged to customers.",
+      },
+      {
+        label: "Difference",
+        amountMinor: recordedTaxMinor - expectedTaxMinor,
+        note:
+          recordedTaxMinor === expectedTaxMinor
+            ? "Nil. Every document's tax equals its own taxable amount at its own rate."
+            : "Not nil. Some document carries a tax amount that is not its taxable amount at its stated rate — see the exceptions.",
+      },
+    ],
+    inputTax: VAT_INPUT_TAX_UNAVAILABLE,
+    exceptions: exceptions.rows,
+    exceptionCount: exceptions.total,
+  };
+}
+
+/**
+ * Every document in the period, tagged and cast to minor units.
+ *
+ * A CTE rather than a function returning rows, so the identical predicate — the
+ * same `at time zone 'Asia/Dubai'` half-open range on both sides of the union —
+ * is used by the aggregate query, the count query and the working papers. Three
+ * copies of a period boundary is three chances for one of them to drift, on the
+ * one comparison this whole module exists to get right.
+ *
+ * NO BACKTICKS IN ANY COMMENT BELOW. This is inside a tagged template literal
+ * and one backtick ends it, breaking the workspace's typecheck at a line far
+ * from the mistake.
+ */
+function vatPeriodSource(from: string, to: string): SQL {
+  return sql`
+    period_documents as (
+      select 'invoice'::text                                  as kind,
+             i.id                                             as id,
+             i.reference                                      as reference,
+             (i.issued_on at time zone 'Asia/Dubai')          as issued_local,
+             i.tax_category_code                              as tax_category_code,
+             i.tax_rate_basis_points                          as tax_rate_basis_points,
+             (i.taxable_amount * 100)::bigint                 as taxable_minor,
+             (i.tax_amount * 100)::bigint                     as tax_minor,
+             (i.total * 100)::bigint                          as total_minor,
+             -- Recomputed in numeric, never in float8. round() on numeric is
+             -- exact half-away-from-zero, which is what computeTotals does in
+             -- JavaScript on the same integers; a float here would disagree
+             -- with the document by a fil on values ending in .005.
+             round((i.taxable_amount * 100)::numeric * i.tax_rate_basis_points / 10000)::bigint
+                                                              as expected_tax_minor,
+             i.currency                                       as currency,
+             i.supplier_trn                                   as supplier_trn,
+             i.customer_id                                    as customer_id
+        from invoices i
+       where i.deleted_at is null
+         and i.status <> 'draft'
+         and i.issued_on is not null
+         and (i.issued_on at time zone 'Asia/Dubai') >= ${from}::date
+         and (i.issued_on at time zone 'Asia/Dubai') <  ${to}::date + interval '1 day'
+      union all
+      select 'credit_note'::text,
+             c.id,
+             c.reference,
+             (c.issued_on at time zone 'Asia/Dubai'),
+             c.tax_category_code,
+             c.tax_rate_basis_points,
+             (c.taxable_amount * 100)::bigint,
+             (c.tax_amount * 100)::bigint,
+             (c.total * 100)::bigint,
+             round((c.taxable_amount * 100)::numeric * c.tax_rate_basis_points / 10000)::bigint,
+             c.currency,
+             c.supplier_trn,
+             c.customer_id
+        from credit_notes c
+       where c.deleted_at is null
+         and c.issued_on is not null
+         and (c.issued_on at time zone 'Asia/Dubai') >= ${from}::date
+         and (c.issued_on at time zone 'Asia/Dubai') <  ${to}::date + interval '1 day'
+    )`;
+}
+
+/**
+ * The working-paper exceptions, and how many there really are.
+ *
+ * The rows are capped because a screen has to end somewhere; the count is a
+ * separate aggregate over the same predicate, so a period with 41 problems
+ * cannot render as a tidy list of 20.
+ */
+async function vatExceptions(
+  tx: TenantScopedTx,
+  from: string,
+  to: string,
+): Promise<{ rows: readonly VatException[]; total: number }> {
+  type Row = {
+    kind: string;
+    document_type: string;
+    reference: string;
+    issue_date: string;
+    detail: string;
+    total_count: string;
+  };
+
+  const rows = (await tx.execute<Row>(sql`
+    with ${vatPeriodSource(from, to)},
+    line_mismatch as (
+      select d.id
+        from period_documents d
+        join invoice_lines l on l.invoice_id = d.id
+       where d.kind = 'invoice'
+         and l.tax_category_code is distinct from d.tax_category_code
+       group by d.id
+    ),
+    problems as (
+      select 'tax_not_at_the_stated_rate'::text as kind, d.kind as document_type, d.reference,
+             to_char(d.issued_local, 'YYYY-MM-DD') as issue_date,
+             'Recorded tax is ' || to_char(d.tax_minor / 100.0, 'FM999999999990.00')
+               || ' where its taxable amount at its stated rate gives '
+               || to_char(d.expected_tax_minor / 100.0, 'FM999999999990.00') || '.' as detail,
+             d.issued_local, d.reference as sort_reference
+        from period_documents d
+       where d.tax_minor <> d.expected_tax_minor
+
+      union all
+
+      select 'standard_rated_at_zero_percent', d.kind, d.reference,
+             to_char(d.issued_local, 'YYYY-MM-DD'),
+             'Marked standard-rated but charged at 0%. Either it is zero-rated (category Z) '
+               || 'or the tax is missing.',
+             d.issued_local, d.reference
+        from period_documents d
+       where d.tax_category_code = 'S' and d.tax_rate_basis_points = 0
+
+      union all
+
+      select 'tax_charged_on_an_exempt_or_zero_rated_supply', d.kind, d.reference,
+             to_char(d.issued_local, 'YYYY-MM-DD'),
+             'Marked ' || d.tax_category_code || ' but carries tax of '
+               || to_char(d.tax_minor / 100.0, 'FM999999999990.00') || '.',
+             d.issued_local, d.reference
+        from period_documents d
+       where d.tax_category_code in ('Z', 'E') and d.tax_minor <> 0
+
+      union all
+
+      -- Article 59 requires the supplier's TRN on the face of a tax invoice.
+      -- A document issued without one is not a valid tax invoice, and its
+      -- output tax is still declarable — which is exactly why it has to be
+      -- seen before the return is filed rather than after.
+      select 'no_supplier_trn', d.kind, d.reference,
+             to_char(d.issued_local, 'YYYY-MM-DD'),
+             'Issued with no supplier TRN on it, so it is not a valid tax document.',
+             d.issued_local, d.reference
+        from period_documents d
+       where d.supplier_trn is null or btrim(d.supplier_trn) = ''
+
+      union all
+
+      select 'line_category_differs_from_document', d.kind, d.reference,
+             to_char(d.issued_local, 'YYYY-MM-DD'),
+             'A line on this invoice carries a different tax category from the invoice itself, '
+               || 'so its supplies may belong in more than one box.',
+             d.issued_local, d.reference
+        from period_documents d
+        join line_mismatch m on m.id = d.id
+    )
+    select kind, document_type, reference, issue_date, detail,
+           count(*) over ()::text as total_count
+      from problems
+     order by issued_local, sort_reference, kind
+     limit ${VAT_EXCEPTION_ROWS}
+  `)) as unknown as Row[];
+
+  return {
+    rows: rows.map((r) => ({
+      kind: r.kind as VatException["kind"],
+      documentType: r.document_type as "invoice" | "credit_note",
+      reference: r.reference,
+      issueDate: r.issue_date,
+      detail: r.detail,
+    })),
+    // The window function counts every problem the predicate matched, before
+    // the limit. Zero rows means zero problems, so the fallback is honest.
+    total: Number(rows[0]?.total_count ?? 0),
+  };
+}
+
+const VAT_WORKING_PAPER_COLUMNS = [
+  "document_type",
+  "reference",
+  "issue_date_dubai",
+  "customer_name",
+  "customer_trn",
+  "supplier_trn",
+  "tax_category_code",
+  "tax_category",
+  "vat_rate_percent",
+  "currency",
+  "taxable_excl_vat",
+  "tax_amount",
+  "tax_recomputed_at_stated_rate",
+  "tax_difference",
+  "total_incl_vat",
+  "vat_return_box",
+  "document_id",
+] as const;
+
+/** "S" -> "Standard-rated". The word, so the file is readable without a codelist. */
+function taxCategoryLabel(code: string): string {
+  if (code === "S") return "Standard-rated";
+  if (code === "Z") return "Zero-rated";
+  if (code === "E") return "Exempt";
+  return code;
+}
+
+/** Which box on VAT 201 a document's supplies land in. */
+function vatReturnBox(code: string): string {
+  if (code === "S") return "1";
+  if (code === "Z") return "4";
+  if (code === "E") return "5";
+  return "unmapped";
+}
+
+/**
+ * The working papers behind the pack: every document in the period, one row
+ * each (`INV-11`).
+ *
+ * ── WHY THIS IS NOT A CAPPED LIST ───────────────────────────────────────────
+ *
+ * Because it is the evidence for a filed return. It batches with the same
+ * keyset loop the accounting export uses, it stops only when the database
+ * returns a short batch, and the row count written into the file's trailer
+ * comes from the rows actually collected — so a short file is visibly short.
+ * A working paper that quietly stops at row 200 would defend a return with
+ * two hundred documents when the return declared four hundred, and the person
+ * holding it would have no way to tell.
+ *
+ * The columns carry both the recorded tax and the tax recomputed from the
+ * document's own taxable amount and rate, with the difference beside them, so
+ * the reconciliation on the pack can be re-derived from this file alone.
+ */
+export async function vatWorkingPapers(
+  tx: TenantScopedTx,
+  options: { from: string; to: string },
+): Promise<ExportTable> {
+  const { from, to } = options;
+
+  if (!ISO_DATE.test(from) || !ISO_DATE.test(to)) {
+    throw new UserFacingError("Give the tax period as two dates, each YYYY-MM-DD.");
+  }
+  if (from > to) {
+    throw new UserFacingError("That tax period starts after it ends.");
+  }
+
+  type Row = {
+    cursor_sort: string;
+    cursor_id: string;
+    kind: string;
+    reference: string;
+    issue_date: string;
+    customer_name: string | null;
+    customer_trn: string | null;
+    supplier_trn: string | null;
+    tax_category_code: string;
+    tax_rate_basis_points: string;
+    currency: string;
+    taxable_minor: string;
+    tax_minor: string;
+    expected_tax_minor: string;
+    total_minor: string;
+  };
+
+  const rows: (readonly CsvValue[])[] = [];
+
+  for await (const r of exportRows<Row>(tx, (after, limit) => sql`
+    with ${vatPeriodSource(from, to)}
+    select to_char(cursor_source.issued_local, 'YYYY-MM-DD HH24:MI:SS.US') as cursor_sort,
+           cursor_source.id::text                                          as cursor_id,
+           cursor_source.kind,
+           cursor_source.reference,
+           to_char(cursor_source.issued_local, 'YYYY-MM-DD')               as issue_date,
+           cu.name                                                         as customer_name,
+           cu.trn                                                          as customer_trn,
+           cursor_source.supplier_trn,
+           cursor_source.tax_category_code,
+           cursor_source.tax_rate_basis_points::text                       as tax_rate_basis_points,
+           cursor_source.currency,
+           cursor_source.taxable_minor::text                               as taxable_minor,
+           cursor_source.tax_minor::text                                   as tax_minor,
+           cursor_source.expected_tax_minor::text                          as expected_tax_minor,
+           cursor_source.total_minor::text                                 as total_minor
+      from period_documents cursor_source
+      left join customers cu on cu.id = cursor_source.customer_id
+     where true
+       ${afterCursor(after, sql`cursor_source.issued_local`)}
+     order by cursor_source.issued_local, cursor_source.id
+     limit ${limit}
+  `)) {
+    // A credit note reduces every one of these figures, so it is written with
+    // the sign it will be applied with. A working paper whose amount column
+    // sums to the declared figure is one an accountant can total in a
+    // spreadsheet; one that needs the reader to notice a "document_type"
+    // column and negate by hand is not.
+    const sign = r.kind === "credit_note" ? -1 : 1;
+    const taxMinor = sign * Number(r.tax_minor);
+    const expectedMinor = sign * Number(r.expected_tax_minor);
+
+    rows.push([
+      r.kind === "credit_note" ? "credit_note" : "invoice",
+      r.reference,
+      r.issue_date,
+      r.customer_name,
+      r.customer_trn,
+      r.supplier_trn,
+      r.tax_category_code,
+      taxCategoryLabel(r.tax_category_code),
+      vatRatePercent(Number(r.tax_rate_basis_points)),
+      r.currency,
+      csvAmount(sign * Number(r.taxable_minor)),
+      csvAmount(taxMinor),
+      csvAmount(expectedMinor),
+      csvAmount(taxMinor - expectedMinor),
+      csvAmount(sign * Number(r.total_minor)),
+      vatReturnBox(r.tax_category_code),
+      r.cursor_id,
+    ]);
+  }
+
+  return {
+    name: "vat-working-papers",
+    title: `Every tax document issued between ${from} and ${to} (Asia/Dubai), signed as it applies to the return`,
+    columns: [...VAT_WORKING_PAPER_COLUMNS],
+    rows,
+    rowCount: rows.length,
+  };
+}

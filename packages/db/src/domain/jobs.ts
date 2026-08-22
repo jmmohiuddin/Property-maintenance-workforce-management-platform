@@ -25,6 +25,18 @@ import { assertJobCardComplete } from "./jobcard";
 // second base64url encoder for the same opaque cursor — is two things that can
 // drift apart, which is worse than one import edge that cannot.
 import { encodeCursor, decodeCursor, type Page } from "./leads";
+// The one list of "this visit is still expected to happen", imported rather
+// than restated. Its own comment in `assignment.ts` explains why: it had been
+// copied by hand into three places and `superseded` had to be excluded from
+// all of them at once. A fourth copy here would be the same mistake with a
+// worse blast radius, because this one decides whose attendance is recorded.
+//
+// This makes jobs.ts and assignment.ts mutually importing — assignment.ts
+// already imports `transitionJob` from here. That is the same edge the
+// `leads.ts` import above documents and it is safe for the same reason: both
+// sides only touch each other inside function bodies, so module evaluation
+// order cannot bite.
+import { OCCUPYING_VISIT_STATUSES } from "./assignment";
 import { rowDate, requiredRowDate } from "./_rows";
 
 /**
@@ -56,6 +68,17 @@ export async function transitionJob(
     note?: string | undefined;
     /** Set when the transition is a side effect of something else. */
     actorKind?: "user" | "system" | "ai" | "customer";
+    /**
+     * The technician this transition is being recorded BY, when the caller
+     * knows. Optional, and resolved from `ctx.userId` when it is not given —
+     * see `advanceVisitsWithJob`, which is the only thing that reads it.
+     *
+     * The field sync passes it because it already authenticated the device to
+     * a technician and that is a stronger fact than the user join. Nobody has
+     * to pass it: a caller that says nothing gets the office reading, which is
+     * the right default for the dispatch board.
+     */
+    actorTechnicianId?: string | null | undefined;
   },
 ): Promise<{ from: JobStatus; to: JobStatus }> {
   const rows = await tx
@@ -125,6 +148,17 @@ export async function transitionJob(
 
   await tx.update(schema.jobs).set(patch).where(eq(schema.jobs.id, input.jobId));
 
+  // The attendance record follows the status. This is the whole reason the
+  // rule sits on this function rather than on the dispatch action — see
+  // `advanceVisitsWithJob` below for what it does and what it refuses to do.
+  await advanceVisitsWithJob(tx, {
+    jobId: input.jobId,
+    to: input.to,
+    at: now,
+    actorTechnicianId: input.actorTechnicianId ?? null,
+    actorUserId: ctx.userId,
+  });
+
   await tx.insert(schema.jobEvents).values({
     tenantId: ctx.tenantId,
     jobId: input.jobId,
@@ -137,6 +171,287 @@ export async function transitionJob(
   });
 
   return { from, to: input.to };
+}
+
+// ── Attendance: the visit follows the job ────────────────────────────────────
+
+/**
+ * Make `job_visits` record that somebody actually turned up.
+ *
+ * ── THE HOLE THIS FILLS ─────────────────────────────────────────────────────
+ *
+ * A `job_visits` row was written at ASSIGNMENT and nothing ever moved it. It
+ * was created `assigned` by `assignTechnician` and it stayed `assigned` until
+ * a reassignment retired it or the row was deleted. `en_route_at` and
+ * `arrived_at` have existed since `0000` and, before this function, the only
+ * writers of either column in the entire repository were `seed.ts` and the
+ * test suites. Three finished features were sitting on top of that:
+ *
+ *  1. **Customer live tracking** (`CUST-3`, `EMG-5`). Both halves of it — the
+ *     RESTRICTIVE `customer_scope` policy on `technician_locations` in
+ *     `sql/customer-scope.sql`, and `getPortalLiveTracking` in `portal.ts` —
+ *     key on `v.status IN ('en_route','arrived') AND v.en_route_at IS NOT
+ *     NULL`. With nothing writing either, the feature could never show a
+ *     customer anything, in production, ever. It passed its tests because the
+ *     tests seeded `en_route` visits by hand.
+ *  2. **`G11` first-time-fix**, which needs a visit to be an attendance rather
+ *     than a plan before either side of its fraction can be counted. See the
+ *     `DASHBOARD_GAPS` entry in `reporting.ts`.
+ *  3. **Utilisation coverage** (`reporting.ts`), which measures recorded labour
+ *     against visits that never recorded attendance.
+ *
+ * ── THIS FIXES THE FUTURE, AND ONLY THE FUTURE ──────────────────────────────
+ *
+ * No backfill, deliberately. In a database that already exists, a visit that
+ * was attended and a visit that was abandoned are byte-for-byte identical —
+ * both are `assigned` with null stamps — so any backfill would be inventing
+ * attendances at an unknown rate and there would be no way afterwards to tell
+ * the invented ones from the real ones. Rows written before this function
+ * existed stay as they are and stay uncountable, which is the honest state for
+ * them. Every visit from here forward carries the fact.
+ *
+ * ── WHICH VISIT ─────────────────────────────────────────────────────────────
+ *
+ * A job may carry several visits, and the difference between them matters
+ * because `en_route` on a visit is what publishes a named employee's live
+ * position to a member of the public.
+ *
+ *   * The candidates are the LIVE visits — `OCCUPYING_VISIT_STATUSES`. That
+ *     excludes `superseded` (a plan a reassignment replaced), `declined`, and
+ *     the three recorded outcomes. A retired plan must never be stamped with
+ *     an attendance, and a recorded outcome must never be overwritten by one.
+ *   * If the actor is a TECHNICIAN and one of those visits is theirs, only
+ *     their own is advanced. This is load bearing rather than tidy: on a
+ *     two-person job, stamping the other technician's arrival from this
+ *     technician's handset would both invent an attendance and start sharing
+ *     a second employee's location with the customer while they are still in
+ *     the depot.
+ *   * Otherwise — the office, a scheduled job, an AI actor, or a technician
+ *     with no live visit of their own — every live visit is advanced. A
+ *     dispatcher moving the job to `en_route` is making a statement about the
+ *     job, and on a two-person job that statement covers both people. The
+ *     "technician with no live visit" fallback is what keeps a working
+ *     supervisor, who has a technician row but is not on this job, behaving
+ *     like the office rather than silently advancing nothing.
+ *
+ * NONE is a no-op, not an error. A job can legitimately reach `en_route` with
+ * no visit on it at all: `triaged -> dispatched -> en_route` is a legal walk
+ * and `transitionJob` is reachable without `assignTechnician` ever running.
+ * Refusing there would break job movement to protect a record that is not
+ * required to exist, and the job's own status plus `job_events` still say what
+ * happened. SEVERAL is described above and is a real shape, not a fault.
+ *
+ * ── IDEMPOTENCY ────────────────────────────────────────────────────────────
+ *
+ * Every stamp is `coalesce(existing, new)`. The first arrival is the true one.
+ * The field app replays mutations and a technician with bad signal will send
+ * "arrived" twice; the second must not move `arrived_at` half an hour later
+ * and quietly rewrite how long the job took. `transitionJob` itself refuses a
+ * same-status move, so the replay is usually stopped before it gets here — but
+ * `on_site -> paused -> on_site` is a legal walk that arrives twice for real,
+ * and this is what makes the second arrival keep the first one's clock.
+ *
+ * That `coalesce` is also the cheapest honest answer to a real objection.
+ * `apps/field/src/domain/attendance.ts` argues, with TRD §8.4 behind it, that
+ * an arrival modelled as `job_visits.arrived_at` is "a mutable scalar two
+ * writers can disagree about" and belongs in an append-only stream instead.
+ * That is right, and the device already keeps one — but `timing_events` is a
+ * device-local table that nothing pushes: what the handset actually sends is
+ * `job_status/transition`, and the three features waiting on attendance all
+ * read the scalar. So the scalar is written, and written once, which is the
+ * property the stream was wanted for. A server-side visit timing stream would
+ * be a better shape and is a schema change, not this one.
+ *
+ * The interpolation is `${at.toISOString()}::timestamptz`, NOT `${at}`. A JS
+ * Date inside a raw `sql` template is stringified by the driver and refused
+ * with ERR_INVALID_ARG_TYPE before Postgres ever sees the statement — the bug
+ * that made every `transitionJob(to: "on_site")` call throw. See the comment
+ * on `firstResponseAt` above.
+ *
+ * ── GOING BACKWARDS ────────────────────────────────────────────────────────
+ *
+ * Only forward moves and `cancelled` are handled, and the omissions are
+ * decisions:
+ *
+ *   * `en_route -> dispatched` (a recall) and `on_site -> paused` (waiting on
+ *     parts) leave the visit exactly where it is. There is no visit state
+ *     meaning "travelled and was turned back": demoting to `assigned` would
+ *     claim the trip never happened AND would put an attended row back into
+ *     `RETIRABLE_VISIT_STATUSES`, where the next reassignment would silently
+ *     supersede a real journey — which is precisely what `0040` refuses to do.
+ *     A paused job is worse still, because the technician is usually still
+ *     standing on the site. The customer-visible exposure this leaves is
+ *     already bounded: the policy closes the window twelve hours after
+ *     `en_route_at` regardless of what anybody remembers to do.
+ *   * `cancelled` IS handled, because there the job itself says the attendance
+ *     is over and leaving a live visit standing would keep a customer watching
+ *     a technician who is no longer coming. A visit that had travelled becomes
+ *     `aborted` — the word this schema already defines as "the visit STARTED
+ *     and was abandoned" — which is in `SETTLED_VISIT_STATUSES`, so no reader
+ *     mistakes it for a plan. A visit that had NOT travelled is left alone: it
+ *     is a plan that was never acted on, and calling that "aborted" would
+ *     claim an attendance in order to tidy a row.
+ *
+ * `no_access` and `aborted` are VISIT states, not job states — a job never
+ * transitions to either, so there is no branch for them here. What a
+ * no-access job does is record an outcome code through `recordJobOutcome`,
+ * which reaches `work_complete` through this same function.
+ *
+ * ── SETTLING ───────────────────────────────────────────────────────────────
+ *
+ * On `work_complete`, only ATTENDED visits settle to `completed`. A visit
+ * still sitting at `assigned` when the job finishes is a crew member nobody
+ * recorded as having turned up, and completing it would manufacture exactly
+ * the attendance this function exists to stop manufacturing. Settling also
+ * closes the tracking window immediately rather than waiting out the twelve
+ * hours, because the policy takes `LEAST(completed_at, en_route_at + 12h)`.
+ *
+ * A settled visit is no longer live, so reopening the job (`work_complete ->
+ * on_site`) finds nothing to advance. That is correct: a second attendance is
+ * a second visit, raised through `assignTechnician`, which is what
+ * `rescheduleVisit` already tells a dispatcher when they try to move a
+ * finished one.
+ *
+ * ── NO AUDIT ROW ───────────────────────────────────────────────────────────
+ *
+ * `job_events` already records the transition that caused this, in the same
+ * transaction, and the stamps are themselves the record. A second ledger entry
+ * per visit per status change would be noise in the table that supersession
+ * and reassignment use to say something a reader cannot otherwise reconstruct.
+ */
+async function advanceVisitsWithJob(
+  tx: TenantScopedTx,
+  input: {
+    jobId: string;
+    to: JobStatus;
+    /** The transition's instant. Shared with the job row so they agree. */
+    at: Date;
+    actorTechnicianId: string | null;
+    actorUserId: string | undefined;
+  },
+): Promise<void> {
+  if (
+    input.to !== "en_route" &&
+    input.to !== "on_site" &&
+    input.to !== "work_complete" &&
+    input.to !== "cancelled"
+  ) {
+    return;
+  }
+
+  const live = await tx
+    .select({
+      id: schema.jobVisits.id,
+      status: schema.jobVisits.status,
+      technicianId: schema.jobVisits.technicianId,
+    })
+    .from(schema.jobVisits)
+    .where(
+      and(
+        eq(schema.jobVisits.jobId, input.jobId),
+        isNull(schema.jobVisits.deletedAt),
+        inArray(schema.jobVisits.status, [...OCCUPYING_VISIT_STATUSES]),
+      ),
+    )
+    .orderBy(asc(schema.jobVisits.sequence));
+
+  if (live.length === 0) return;
+
+  const stamp = input.at.toISOString();
+
+  // Settling and cancelling are statements about the job ending, so they are
+  // never narrowed to one technician: a second crew member's `arrived` row
+  // left open would go on publishing their location after the work stopped.
+  if (input.to === "work_complete" || input.to === "cancelled") {
+    const attended = live.filter((v) => v.status === "en_route" || v.status === "arrived");
+    if (attended.length === 0) return;
+
+    if (input.to === "work_complete") {
+      await tx
+        .update(schema.jobVisits)
+        .set({
+          status: "completed",
+          completedAt: sql`coalesce(${schema.jobVisits.completedAt}, ${stamp}::timestamptz)`,
+          updatedAt: input.at,
+        })
+        .where(
+          inArray(
+            schema.jobVisits.id,
+            attended.map((v) => v.id),
+          ),
+        );
+      return;
+    }
+
+    await tx
+      .update(schema.jobVisits)
+      .set({ status: "aborted", updatedAt: input.at })
+      .where(
+        inArray(
+          schema.jobVisits.id,
+          attended.map((v) => v.id),
+        ),
+      );
+    return;
+  }
+
+  // ── Attendance. Narrowed to the actor when the actor is a technician ─────
+  //
+  // The question is not "who is this user" but "does this user own one of THESE
+  // visits", so it is asked of the candidate set rather than of `technicians`
+  // at large. That matters: `technicians.user_id` is not unique, one login can
+  // sit against more than one technician row, and a bare `limit 1` on it would
+  // pick an arbitrary one and then narrow to nothing — silently recording no
+  // attendance at all, which is the failure this whole function exists to end.
+  let own = input.actorTechnicianId
+    ? live.filter((v) => v.technicianId === input.actorTechnicianId)
+    : [];
+
+  if (own.length === 0 && !input.actorTechnicianId && input.actorUserId) {
+    const rows = await tx
+      .select({ id: schema.technicians.id })
+      .from(schema.technicians)
+      .where(
+        and(
+          inArray(schema.technicians.id, [...new Set(live.map((v) => v.technicianId))]),
+          eq(schema.technicians.userId, input.actorUserId),
+          isNull(schema.technicians.deletedAt),
+        ),
+      );
+    const mine = new Set(rows.map((r) => r.id));
+    own = live.filter((v) => mine.has(v.technicianId));
+  }
+
+  const targets = own.length > 0 ? own : live;
+  const ids = targets.map((v) => v.id);
+
+  if (input.to === "en_route") {
+    await tx
+      .update(schema.jobVisits)
+      .set({
+        status: "en_route",
+        enRouteAt: sql`coalesce(${schema.jobVisits.enRouteAt}, ${stamp}::timestamptz)`,
+        updatedAt: input.at,
+      })
+      .where(inArray(schema.jobVisits.id, ids));
+    return;
+  }
+
+  // `on_site`. `en_route_at` is deliberately NOT backfilled here for a visit
+  // that never travelled — `paused -> on_site` is a legal walk that skips
+  // `en_route` entirely. Writing the arrival instant into `en_route_at` would
+  // state that the technician set off at the moment they arrived, which is
+  // false and would be costed as zero travel. The visible consequence is that
+  // such a visit is not customer-trackable, and that is the safe direction for
+  // a feature that shares an employee's location.
+  await tx
+    .update(schema.jobVisits)
+    .set({
+      status: "arrived",
+      arrivedAt: sql`coalesce(${schema.jobVisits.arrivedAt}, ${stamp}::timestamptz)`,
+      updatedAt: input.at,
+    })
+    .where(inArray(schema.jobVisits.id, ids));
 }
 
 // ── Dispatch board ───────────────────────────────────────────────────────────

@@ -1303,6 +1303,14 @@ async function handleStatusTransition(h: HandlerContext, payload: Record<string,
   await transitionJob(h.tx, h.ctx, {
     jobId,
     to,
+    // Who is speaking. `transitionJob` advances the visit record along with
+    // the job, and on a two-person job it must stamp THIS technician's
+    // attendance and not their colleague's — stamping the colleague's would
+    // both invent an attendance and start sharing a second employee's live
+    // position with the customer. It would resolve the same answer from
+    // `ctx.userId` on its own; passing it is cheaper and does not depend on
+    // the technician having a login row wired to this device's user.
+    actorTechnicianId: h.technicianId,
     // The offline capture time goes in the note rather than in `occurred_at`,
     // which stays the server's clock. A status history whose instants come from
     // sixty different handsets does not sort.
