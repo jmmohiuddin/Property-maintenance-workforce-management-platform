@@ -587,7 +587,11 @@ export interface RevenueBreakdown {
   readonly byServiceLine: readonly ServiceLineRevenue[];
   /** Every line below the cap, summed. Zero when nothing was cut. */
   readonly otherMinor: number;
-  /** Distinct service lines with revenue in the window. The "of 41". */
+  /**
+   * Distinct service lines with revenue OR completed jobs in the window — every
+   * line `byServiceLine` was ranked over, not only the ones displayed. The
+   * "of 41".
+   */
   readonly serviceLinesTotal: number;
   /** Oldest month first, so it reads left to right as a chart. */
   readonly byMonth: readonly MonthlyRevenue[];
@@ -1463,9 +1467,11 @@ export async function revenueBreakdown(
     unattributedMinor: windowRevenueMinor - attributedMinor,
     byServiceLine: shown,
     otherMinor,
-    // Lines with revenue, not lines with a completed job and no money against
-    // them: "8 of 41" has to count the same things the eight rows are ranked by.
-    serviceLinesTotal: all.filter((r) => r.revenueMinor !== 0).length,
+    // Every line the list is ranked over, including one with completed jobs and
+    // no money against it — contract-covered work is exactly that, and it is
+    // information rather than noise. "8 of 41" has to count the same things the
+    // eight rows were chosen from, or the two numbers describe different sets.
+    serviceLinesTotal: all.length,
     byMonth: monthRows.map((r) => ({
       month: r.month,
       revenueMinor: Number(r.revenue_minor),

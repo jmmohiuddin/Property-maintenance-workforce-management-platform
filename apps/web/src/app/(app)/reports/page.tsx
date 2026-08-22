@@ -10,6 +10,29 @@ import { AttentionItem, Card, Meter, Metric, money, priorityLabel } from "./dash
 export const metadata: Metadata = { title: "Owner dashboard" };
 export const dynamic = "force-dynamic";
 
+/** Minutes as hours, to one decimal. Utilisation is read in days, not minutes. */
+function hours(minutes: number): string {
+  return `${(minutes / 60).toLocaleString("en-GB", { maximumFractionDigits: 0 })} h`;
+}
+
+/** "hvac-installation-maintenance" -> "Hvac installation maintenance". */
+function serviceLabel(slug: string | null): string {
+  if (!slug) return "Not classified";
+  const words = slug.replace(/[-_]+/g, " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/** "2026-08" -> "Aug 26". Short enough for twelve rows on a phone. */
+function monthLabel(key: string): string {
+  const [year, month] = key.split("-");
+  // An unparseable key renders as itself rather than as "Invalid Date". The
+  // breakdown always returns a key; this is the guard that keeps a future
+  // caller's empty string from putting nonsense on the owner's screen.
+  if (!year || !month || Number.isNaN(Number(year)) || Number.isNaN(Number(month))) return key;
+  const date = new Date(Date.UTC(Number(year), Number(month) - 1, 1));
+  return `${date.toLocaleString("en-GB", { month: "short", timeZone: "UTC" })} ${year.slice(2)}`;
+}
+
 /**
  * The owner dashboard (`KPI-3`), and the screen the weekly email (`KPI-5`)
  * renders as text.
@@ -51,6 +74,7 @@ export default async function DashboardPage() {
 
   const { cash, revenue, pipeline, work, contracts, compliance, hiring, billing, emiratisation } =
     dashboard;
+  const { revenueBreakdown: breakdown, utilisation, outcomes, retention } = dashboard;
   const critical = dashboard.attention.filter((a) => a.severity === "critical");
 
   const asOf = dashboard.generatedAt.toLocaleString("en-GB", {
@@ -70,8 +94,9 @@ export default async function DashboardPage() {
         </div>
 
         <p className="prose-body mt-2 max-w-2xl text-[14px]">
-          The same figures arrive by email every Sunday morning, so the number reaches you whether
-          or not you sign in. Every card links to the records it is computed from.
+          The cash, revenue, work, pipeline and compliance figures arrive by email every Sunday
+          morning, so those numbers reach you whether or not you sign in; the three management
+          cards lower down are read here. Every card links to the records it is computed from.
         </p>
 
         {/* One column on a phone, two on a laptop. Never three: the card stack
@@ -628,6 +653,323 @@ export default async function DashboardPage() {
                       : `Median across ${hiring.hiresInWindow} hire${hiring.hiresInWindow === 1 ? "" : "s"} in ${hiring.windowDays} days, from application received to offer accepted. Target under ${DASHBOARD_GOALS["daysToHire"]!.target} days (G13).`
                   }
                 />
+              </>
+            )}
+          </Card>
+
+          {/* ── 9a. Where the money comes from (MD-1) ────────────────────── */}
+          <div className="lg:col-span-2">
+            <Card
+              title="Where the money comes from"
+              href="/invoices"
+              subtitle={`Tax-exclusive, net of credit notes, over ${breakdown.months} months from ${monthLabel(breakdown.fromMonth)}`}
+            >
+              {breakdown.attributedMinor === 0 && breakdown.windowRevenueMinor === 0 ? (
+                <EmptyState kind="start" title="Nothing has been invoiced in the last year.">
+                  <p>
+                    The breakdown is computed from invoice lines, so it begins the moment the first
+                    invoice is issued. Nothing is missing &mdash; there is simply nothing to split
+                    yet.
+                  </p>
+                </EmptyState>
+              ) : (
+                <div className="grid gap-8 md:grid-cols-2">
+                  <div>
+                    <p
+                      className="text-[12px] font-semibold uppercase tracking-wide"
+                      style={{ color: "var(--text-secondary)" }}
+                    >
+                      By service line
+                    </p>
+                    {/*
+                      "Showing 8 of 41", not eight rows presented as the whole
+                      business. The figure above the list is a SQL aggregate over
+                      every line; the list is the top of it. Five separate places
+                      in this product once summed a headline from a page of rows,
+                      and none of them looked truncated — they looked like a
+                      plateau, which is the one shape of wrong number nobody
+                      investigates.
+                    */}
+                    <p className="mt-1 text-[11px]" style={{ color: "var(--text-muted)" }}>
+                      Showing {breakdown.byServiceLine.length} of {breakdown.serviceLinesTotal}
+                      {breakdown.otherMinor !== 0
+                        ? ` — the rest total ${money(breakdown.otherMinor, breakdown.currency)}`
+                        : ""}
+                    </p>
+                    <ul className="mt-3 space-y-1">
+                      {breakdown.byServiceLine.map((line) => (
+                        <li
+                          key={line.serviceSlug ?? "unclassified"}
+                          className="flex flex-wrap items-baseline justify-between gap-x-4"
+                        >
+                          <span className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                            {serviceLabel(line.serviceSlug)}
+                          </span>
+                          <span className="tnum text-[13px]">
+                            {money(line.revenueMinor, breakdown.currency)}
+                            <span style={{ color: "var(--text-muted)" }}>
+                              {" "}
+                              · {line.jobsCompleted} job{line.jobsCompleted === 1 ? "" : "s"}
+                            </span>
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                    {breakdown.unattributedMinor !== 0 ? (
+                      /*
+                        The residual. Normally zero, because a document's line
+                        nets sum exactly to its taxable amount. It is shown
+                        rather than absorbed because a breakdown that quietly
+                        fails to add up to the total above it is worse than one
+                        that says so.
+                      */
+                      <p className="mt-3 text-[12px]" style={{ color: "var(--status-warning-text)" }}>
+                        {money(breakdown.unattributedMinor, breakdown.currency)} of revenue cannot
+                        be attributed to a service line &mdash; those invoice lines carry no net
+                        amount, which is what every line written before the Article 59 migration
+                        looks like. It is counted in the total and left out of the split rather
+                        than spread across it.
+                      </p>
+                    ) : null}
+                  </div>
+
+                  <div>
+                    <p
+                      className="text-[12px] font-semibold uppercase tracking-wide"
+                      style={{ color: "var(--text-secondary)" }}
+                    >
+                      By month
+                    </p>
+                    <p className="mt-1 text-[11px]" style={{ color: "var(--text-muted)" }}>
+                      Dubai calendar months. An invoice raised at 01:00 on the 1st belongs to the
+                      month it was raised in here, whatever the server thinks the date is.
+                    </p>
+                    <ul className="mt-3 space-y-1">
+                      {breakdown.byMonth.map((m) => (
+                        <li key={m.month} className="flex flex-wrap items-baseline justify-between gap-x-4">
+                          <span className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                            {monthLabel(m.month)}
+                          </span>
+                          <span className="tnum text-[13px]">
+                            {money(m.revenueMinor, breakdown.currency)}
+                            <span style={{ color: "var(--text-muted)" }}>
+                              {" "}
+                              · {m.jobsCompleted} job{m.jobsCompleted === 1 ? "" : "s"}
+                            </span>
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              )}
+
+              {/*
+                MD-1 asks for margin and this card does not show it, for the
+                same reason the AMC screen does not: the system records price
+                and not cost outside project work. Said here rather than left as
+                a blank space, because an absent number reads as an oversight
+                and somebody eventually fills it with an estimate. The full
+                reasoning is in the "Not measured" card below.
+              */}
+              <p className="mt-6 border-t pt-4 text-[12px]" style={{ color: "var(--text-muted)" }}>
+                No margin is shown, and that is deliberate. Cost is recorded only against projects
+                &mdash; maintenance and AMC work, which is nearly all of the revenue above, has no
+                cost row at all &mdash; so a margin here would be estimated rather than measured.
+                A made-up number that looks precise is worse than none, because somebody prices
+                against it.
+              </p>
+            </Card>
+          </div>
+
+          {/* ── 9b. Technicians (MD-3) ───────────────────────────────────── */}
+          <Card
+            title="Technicians"
+            href="/technicians"
+            subtitle={`Time on the tools over ${utilisation.windowDays} days`}
+          >
+            <Metric
+              label="Utilisation"
+              value={utilisation.utilisationPercent === null ? null : `${utilisation.utilisationPercent}%`}
+              emphasis
+              note={
+                utilisation.utilisationPercent === null
+                  ? "No visit in the window carries recorded labour, so there is nothing to divide. Not zero — zero would say the technicians did nothing."
+                  : `${hours(utilisation.workedMinutes)} recorded against ${hours(utilisation.availableMinutes)} available across ${utilisation.technicians} technician${utilisation.technicians === 1 ? "" : "s"}, on this company's own working calendar and less approved leave.`
+              }
+            />
+            {/*
+              The coverage line is not decoration. Utilisation computed over a
+              job card nobody fills in reads as idle technicians and means an
+              empty form, and those are opposite conclusions from the same
+              absent data.
+            */}
+            <Metric
+              label="Visits with labour recorded"
+              value={
+                utilisation.labourCoveragePercent === null
+                  ? null
+                  : `${utilisation.labourCoveragePercent}%`
+              }
+              verdict={
+                utilisation.labourCoveragePercent !== null && utilisation.labourCoveragePercent < 80
+                  ? "missed"
+                  : undefined
+              }
+              note={
+                utilisation.labourCoveragePercent === null
+                  ? "No visit on a completed job fell inside the window."
+                  : `${utilisation.visitsWithLabour} of ${utilisation.visitsOnCompletedJobs} visits on completed jobs. The figure above rests on these; below about 80% it is measuring the paperwork rather than the work.`
+              }
+            />
+            <Metric
+              label="Travel"
+              value={hours(utilisation.travelMinutes)}
+              note="Recorded travelling. Real time, and not productive time — reported here rather than folded into utilisation."
+            />
+
+            {utilisation.byTechnician.length > 0 ? (
+              <>
+                <div className="my-3 border-t" />
+                <p className="text-[11px]" style={{ color: "var(--text-muted)" }}>
+                  Showing {utilisation.byTechnician.length} of {utilisation.technicians}
+                </p>
+                <ul className="mt-2 space-y-1">
+                  {utilisation.byTechnician.map((t) => (
+                    <li key={t.technicianId} className="flex flex-wrap items-baseline justify-between gap-x-4">
+                      <span className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                        {t.name}
+                      </span>
+                      <span
+                        className="tnum text-[13px]"
+                        style={{ color: t.utilisationPercent === null ? "var(--text-muted)" : undefined }}
+                      >
+                        {t.utilisationPercent === null
+                          ? "not measured"
+                          : `${t.utilisationPercent}% · ${hours(t.workedMinutes)}`}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            ) : null}
+
+            <div className="my-3 border-t" />
+            {/*
+              This is NOT first-time fix, and the copy says so where somebody
+              might otherwise assume it. G11 needs to know which attendance
+              closed the job and nothing here records that; what is recorded is
+              the outcome somebody chose when the work ended.
+            */}
+            <Metric
+              label="Left a return visit owed"
+              value={
+                outcomes.returnVisitRatePercent === null ? null : `${outcomes.returnVisitRatePercent}%`
+              }
+              note={
+                outcomes.returnVisitRatePercent === null
+                  ? `None of the ${outcomes.jobsCompleted} jobs completed in ${outcomes.windowDays} days carries a recorded outcome, so there is nothing to take a proportion of.`
+                  : `${outcomes.returnVisitRequired} of ${outcomes.outcomesRecorded} completed jobs with a recorded outcome, over ${outcomes.windowDays} days. This is not the first-time-fix rate — see "Not measured" below for why that one cannot be computed.`
+              }
+            />
+            <Metric
+              label="Jobs with an outcome recorded"
+              value={
+                outcomes.outcomeCoveragePercent === null ? null : `${outcomes.outcomeCoveragePercent}%`
+              }
+              verdict={
+                outcomes.outcomeCoveragePercent !== null && outcomes.outcomeCoveragePercent < 80
+                  ? "missed"
+                  : undefined
+              }
+              note={`${outcomes.outcomesRecorded} of ${outcomes.jobsCompleted} jobs completed in the window.`}
+            />
+          </Card>
+
+          {/* ── 9c. Customers at risk (MD-5) ─────────────────────────────── */}
+          <Card
+            title="Customers at risk"
+            href="/customers"
+            tone={retention.atRisk > 0 || retention.lapsed > 0 ? "warning" : "neutral"}
+            subtitle={`Quiet for ${retention.quietAfterDays} days is a risk; ${retention.lapsedAfterDays} is churn`}
+          >
+            {retention.everActive === 0 ? (
+              <EmptyState kind="start" title="No customer has traded yet.">
+                <p>
+                  Risk is read from silence &mdash; the gap since a customer&rsquo;s last job or
+                  invoice &mdash; so it begins being measured once there is a first one to be
+                  silent after. The {retention.neverActive} customer
+                  {retention.neverActive === 1 ? "" : "s"} on file
+                  {retention.neverActive === 1 ? " is" : " are"} held out of the rate rather than
+                  counted as lost.
+                </p>
+              </EmptyState>
+            ) : (
+              <>
+                <Metric
+                  label="At risk"
+                  value={`${retention.atRisk}`}
+                  emphasis
+                  verdict={retention.atRisk > 0 ? "missed" : "met"}
+                  note={`No live contract, and nothing raised or invoiced for over ${retention.quietAfterDays} days — or an agreement that ran out and was never replaced.`}
+                />
+                <Metric
+                  label="Already gone"
+                  value={`${retention.lapsed}`}
+                  note={`Silent for over ${retention.lapsedAfterDays} days with no live contract.`}
+                />
+                <Metric
+                  label="Churn rate"
+                  value={retention.churnRatePercent === null ? null : `${retention.churnRatePercent}%`}
+                  note={
+                    retention.churnRatePercent === null
+                      ? "No customer has ever raised a job or been invoiced, so there is no denominator."
+                      : `${retention.lapsed} of ${retention.everActive} customers who have ever traded. The ${retention.neverActive} that never have are excluded from both sides — counting them would report a freshly imported customer list as catastrophic churn.`
+                  }
+                />
+
+                {retention.customers.length > 0 ? (
+                  <>
+                    <div className="my-3 border-t" />
+                    {/*
+                      The count above is a SQL aggregate over every customer and
+                      is NOT the length of this list, which is why the line below
+                      states both.
+                    */}
+                    <p className="text-[11px]" style={{ color: "var(--text-muted)" }}>
+                      Showing {retention.customers.length} of {retention.atRisk + retention.lapsed},
+                      most revenue first
+                    </p>
+                    <ul className="mt-2 space-y-2">
+                      {retention.customers.map((c) => (
+                        <li key={c.id}>
+                          <div className="flex flex-wrap items-baseline justify-between gap-x-4">
+                            <span className="text-[13px]">{c.name}</span>
+                            <span className="tnum text-[13px]">
+                              {money(c.revenueMinor, retention.currency)}
+                            </span>
+                          </div>
+                          <p className="text-[11px]" style={{ color: "var(--text-muted)" }}>
+                            {c.reason === "contract_lapsed"
+                              ? "Agreement ended and nothing signed since"
+                              : "Gone quiet"}
+                            {c.daysQuiet === null ? "" : ` · ${c.daysQuiet} days since anything`}
+                            {c.state === "lapsed" ? " · already gone" : ""}
+                          </p>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                ) : (
+                  <div className="mt-3">
+                    <EmptyState kind="good" title="Nobody has gone quiet.">
+                      <p>
+                        Every customer who has ever traded has either been active inside{" "}
+                        {retention.quietAfterDays} days or holds a live agreement.
+                      </p>
+                    </EmptyState>
+                  </div>
+                )}
               </>
             )}
           </Card>

@@ -268,6 +268,84 @@ export const DASHBOARD_WEEK_DAYS = 7;
  */
 export const DASHBOARD_HIRING_WINDOW_DAYS = 365;
 
+// ── MD-1, MD-3, MD-5: the definitions the executive cards are computed under ──
+
+/**
+ * How many months of history the revenue-by-month breakdown carries (`MD-1`).
+ *
+ * Twelve, so the month being read always has the same month a year earlier
+ * beside it. A maintenance business in this market is strongly seasonal — AC
+ * work triples between April and August — and a six-month chart shows that
+ * seasonality as a trend, which is the reading that gets somebody to hire in
+ * September.
+ *
+ * The window is a count of whole Dubai calendar months INCLUDING the current
+ * partial one, not a rolling 365 days, because the question the breakdown
+ * answers is "how did June compare with May" and a rolling window has no June.
+ */
+export const DASHBOARD_REVENUE_MONTHS = 12;
+
+/**
+ * How many service lines the revenue breakdown lists individually (`MD-1`).
+ *
+ * Everything below the cut is summed into one "other" row and the number of
+ * lines behind it is carried alongside, so the card can say "8 of 41" rather
+ * than presenting a truncated list as a complete one. That failure — a
+ * headline summed from a capped list — has been found five separate times in
+ * this repository, and the defence is structural: the total is a SQL aggregate
+ * over every row and the cut only decides what is *displayed*.
+ */
+export const DASHBOARD_SERVICE_LINE_ROWS = 8;
+
+/**
+ * The window technician utilisation and job outcomes are measured over
+ * (`MD-3`), in days.
+ *
+ * Ninety, matching the rest of the dashboard. Shorter would make a single
+ * fortnight's leave move the figure by ten points; longer would let a bad
+ * quarter hide inside a good year, which is the opposite of what a weekly read
+ * is for.
+ */
+export const DASHBOARD_UTILISATION_WINDOW_DAYS = 90;
+
+/**
+ * When a customer with no activity starts being reported as at risk (`MD-5`).
+ *
+ * ── WHY 90 AND 180, AND WHERE THE JUDGEMENT IS ──────────────────────────────
+ *
+ * `MD-5` is "know which customers are at risk **before** they leave", so the
+ * threshold has to fire while there is still something to do about it. There
+ * is no event in this system that says a customer left — nobody cancels an
+ * account, they simply stop calling — so the only available signal is silence,
+ * and the whole metric turns on how long silence has to last before it means
+ * something.
+ *
+ * Ninety days is the judgement call. A reactive maintenance customer in this
+ * market calls a handful of times a year, so three months of quiet is unusual
+ * without being conclusive; six months is conclusive and too late to be worth
+ * a phone call. Both numbers are here rather than in the query precisely so
+ * that a business which knows its own rhythm can move them without touching
+ * SQL — and so that moving them changes the dashboard and the test together.
+ *
+ * A customer holding a live contract is never counted as either, whatever the
+ * silence: they are contractually retained, and a contracted customer who
+ * looks quiet is a PPM-generation fault rather than a churn signal.
+ */
+export const CUSTOMER_QUIET_AFTER_DAYS = 90;
+
+/** When silence stops being a risk and is reported as churn (`MD-5`). */
+export const CUSTOMER_LAPSED_AFTER_DAYS = 180;
+
+/**
+ * How many at-risk customers the card lists, highest revenue first.
+ *
+ * As with the service lines above, this caps the LIST and never the count:
+ * `RetentionPosition.atRisk` and `.lapsed` are SQL aggregates over every
+ * customer, so the figure cannot plateau at this number the way a
+ * `list(..., { limit: N }).length` would.
+ */
+export const DASHBOARD_AT_RISK_ROWS = 8;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // INV-17 — the corporate tax support pack, by tax period
 // ═══════════════════════════════════════════════════════════════════════════
