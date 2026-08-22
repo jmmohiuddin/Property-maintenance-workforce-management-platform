@@ -146,6 +146,17 @@ function main(): void {
   // The money boundary. A dispatcher who can raise an invoice is a segregation
   // failure, not a convenience.
   check("invoices:create is owner, admin and accountant", holders("invoices:create"), "owner,admin,accountant");
+
+  // `payments:record` is the permission the payment form on /invoices/[id]
+  // demands. It was `invoices:create` until the authorisation sweep, and the
+  // reason that survived is visible in the next line: the two sets are equal
+  // today, so the wrong one behaves identically until somebody uses an
+  // override. Asserted as a set so that stops being true loudly.
+  check(
+    "payments:record is owner, admin and accountant",
+    holders("payments:record"),
+    "owner,admin,accountant",
+  );
   check("users:manage is owner and admin", holders("users:manage"), "owner,admin");
   check("settings:write is the owner alone", holders("settings:write"), "owner");
 
@@ -166,6 +177,28 @@ function main(): void {
   checkTrue(
     "the operations manager can certify it and cannot allocate the number",
     has("operations_manager", "projects:write") && !has("operations_manager", "invoices:create"),
+  );
+
+  // INV-6, and the same shape of trap as PRJ-3 above. The payment form lives on
+  // /invoices/[id], which loads on `invoices:read`; the form posts to an action
+  // that demands `payments:record`. Both halves have to land on the same person
+  // or the button is a dead end for whoever can see it — so this is asserted as
+  // a positive ("the accountant can actually do it") and not only as a refusal.
+  checkTrue(
+    "the accountant can open an invoice AND record money against it",
+    has("accountant", "invoices:read") && has("accountant", "payments:record"),
+  );
+  checkTrue(
+    "nobody may record a payment against an invoice they cannot open",
+    ALL_ROLES.every((r) => !has(r, "payments:record") || has(r, "invoices:read")),
+  );
+  // The portal customer is the reason the action goes through the staff
+  // boundary and not the permission alone: they hold invoices:read on their own
+  // account, so a permission check is the only thing between their session and
+  // the ledger if the staff check is skipped.
+  checkTrue(
+    "a portal customer reads invoices and records nothing against them",
+    has("customer", "invoices:read") && !has("customer", "payments:record"),
   );
 
   // ── Roles that must not reach things ─────────────────────────────────────

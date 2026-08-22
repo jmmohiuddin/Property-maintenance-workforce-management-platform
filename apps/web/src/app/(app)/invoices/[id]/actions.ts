@@ -7,9 +7,20 @@ import {
   issueCreditNote,
   type CreditReason,
 } from "@meridian/db";
-import { requirePermission } from "@meridian/auth";
-import { requireSession } from "@/lib/session";
+import { requireSessionWith } from "@/lib/session";
 import { userMessage } from "@/lib/errors";
+
+/**
+ * Writes against a single invoice (`INV-6`, `INV-7`).
+ *
+ * Both authorise through `requireSessionWith`, the same way every other module
+ * does, rather than taking any signed-in session and checking a permission
+ * afterwards. The difference is not style: `requireSessionWith` goes through
+ * `requireStaffSession`, so a portal `customer` — who holds `invoices:read` and
+ * can therefore hold a valid session on an invoice URL — is refused by the
+ * staff boundary as well as by the permission. Relying on the permission alone
+ * left one check between a customer session and the accounts-receivable ledger.
+ */
 
 export interface ActionState {
   error?: string;
@@ -18,24 +29,44 @@ export interface ActionState {
 
 const CREDIT_REASONS: readonly CreditReason[] = ["return", "discount", "cancellation", "correction"];
 
-/** Record a payment against an invoice. */
+/**
+ * The methods a person may record by hand.
+ *
+ * A positive list, and it is deliberately NOT the whole `payment_method` enum.
+ * `credit_note` is a method the system writes for itself when a credit note is
+ * issued; accepting it here would let a posted form settle an invoice as
+ * "credited" with no credit note behind it — no `INV-7` document, no 14-day
+ * clock, and output tax reduced on the strength of a dropdown value nobody
+ * chose. The select on this screen offers exactly these five.
+ */
+const PAYMENT_METHODS = ["bank_transfer", "cheque", "cash", "card", "online_gateway"] as const;
+type PaymentMethod = (typeof PAYMENT_METHODS)[number];
+
+/**
+ * Record a payment against an invoice (`INV-6`).
+ *
+ * `payments:record`, not `invoices:create`. The two happen to be held by the
+ * same three roles today, which is exactly why the wrong one survived here: it
+ * tests identically until a tenant uses `permission_overrides` to take
+ * "may bank money against a customer's account" away from someone who still
+ * raises invoices, at which point the override silently does nothing.
+ */
 export async function recordPaymentAction(
   _prev: ActionState,
   formData: FormData,
 ): Promise<ActionState> {
-  const session = await requireSession();
-  const invoiceId = String(formData.get("invoiceId") ?? "");
+  const session = await requireSessionWith("payments:record");
+
+  const invoiceId = String(formData.get("invoiceId") ?? "").trim();
   const amount = String(formData.get("amount") ?? "").trim();
-  const method = String(formData.get("method") ?? "bank_transfer");
+  const method = String(formData.get("method") ?? "bank_transfer").trim();
   const reference = String(formData.get("reference") ?? "").trim();
 
-  try {
-    requirePermission(session.principal, "invoices:create");
-  } catch {
-    return { error: "Your role cannot record payments." };
-  }
-
+  if (!invoiceId) return { error: "Which invoice?" };
   if (!amount) return { error: "Enter the amount received." };
+  if (!(PAYMENT_METHODS as readonly string[]).includes(method)) {
+    return { error: "Choose how the money was received." };
+  }
 
   try {
     const result = await withTenant(
@@ -47,7 +78,7 @@ export async function recordPaymentAction(
           {
             invoiceId,
             amount,
-            method: method as "bank_transfer",
+            method: method as PaymentMethod,
             reference: reference || undefined,
           },
         ),
@@ -72,19 +103,15 @@ export async function issueCreditNoteAction(
   _prev: ActionState,
   formData: FormData,
 ): Promise<ActionState> {
-  const session = await requireSession();
-  const invoiceId = String(formData.get("invoiceId") ?? "");
+  const session = await requireSessionWith("invoices:void");
+
+  const invoiceId = String(formData.get("invoiceId") ?? "").trim();
   const reason = String(formData.get("reason") ?? "");
   const reasonDetail = String(formData.get("reasonDetail") ?? "").trim();
   const description = String(formData.get("description") ?? "").trim();
   const amount = String(formData.get("amount") ?? "").trim();
 
-  try {
-    requirePermission(session.principal, "invoices:void");
-  } catch {
-    return { error: "Your role cannot issue credit notes." };
-  }
-
+  if (!invoiceId) return { error: "Which invoice?" };
   if (!CREDIT_REASONS.includes(reason as CreditReason)) {
     return { error: "Choose why output tax is being reduced." };
   }

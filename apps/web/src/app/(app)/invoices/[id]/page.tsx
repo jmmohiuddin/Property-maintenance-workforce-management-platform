@@ -360,7 +360,10 @@ export default async function InvoiceDetailPage({ params }: { params: Promise<{ 
                 </div>
               </dl>
 
-              {can(session.principal, "invoices:create") ? (
+              {/* `payments:record`, matching the action. Banking money against
+                  a customer's account is not the same act as raising the
+                  invoice, and this screen used to ask for the invoice one. */}
+              {can(session.principal, "payments:record") ? (
                 <PaymentPanel
                   invoiceId={invoice.invoiceId}
                   outstandingMinor={invoice.outstandingMinor}
