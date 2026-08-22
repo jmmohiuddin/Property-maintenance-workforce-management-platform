@@ -21,6 +21,7 @@ import {
   ASSIGNMENT_WARNING_LABEL,
   QUOTE_STATUS_LABEL,
   INVOICE_STATUS_LABEL,
+  REVISABLE_QUOTE_STATUSES,
   type AssignmentWarningType,
 } from "@meridian/db";
 import { eq } from "drizzle-orm";
@@ -44,10 +45,10 @@ import { can } from "@meridian/auth";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 import { StatusActions, AssignPanel, type CandidateOption } from "./job-actions";
-import { OutcomePanel } from "./outcome-panel";
+import { OutcomePanel, RaiseReturnVisitButton } from "./outcome-panel";
 import { JobCardPanel, type JobCardView } from "./job-card-panel";
 import { JobSheetPanel, type JobSheetView } from "./job-sheet-panel";
-import { QuotePanel, SendQuoteButton, QuoteDocumentLink } from "./quote-panel";
+import { QuotePanel, SendQuoteButton, QuoteDocumentLink, ReviseQuoteButton } from "./quote-panel";
 import { InvoicePanel } from "./invoice-panel";
 import { OutOfScopePanel } from "./out-of-scope-panel";
 import { MapPin, Key, Clock, ShieldCheck, Warning } from "@phosphor-icons/react/dist/ssr";
@@ -402,6 +403,26 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
             </div>
 
             <h1 className="mt-3 text-2xl font-semibold tracking-tight md:text-3xl">{job.title}</h1>
+            {/* Revisit tracking. Only ever set by `raiseReturnVisit`, never backfilled — a job
+                raised before that existed shows nothing here, which is honest: this codebase
+                genuinely cannot tell whether it was a return visit or not. */}
+            {job.isRevisit ? (
+              <p
+                className="mt-2 flex items-center gap-1.5 text-[13px] font-medium"
+                style={{ color: "var(--status-warning-text)" }}
+              >
+                <ShieldCheck size={14} aria-hidden />
+                Return visit
+                {job.parentJobReference ? (
+                  <>
+                    {" for "}
+                    <Link href={`/jobs/${job.parentJobId}`} className="underline">
+                      {job.parentJobReference}
+                    </Link>
+                  </>
+                ) : null}
+              </p>
+            ) : null}
             {job.description ? <p className="prose-body mt-4">{job.description}</p> : null}
 
             <dl className="mt-8 grid gap-6 sm:grid-cols-2">
@@ -670,6 +691,13 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
               </div>
             ) : null}
 
+            {/* Revisit tracking. Offered whenever the recorded outcome calls for one,
+                regardless of whether the job itself has moved on — an operator may only
+                notice the note a day later. `raiseReturnVisit` re-checks the same fact. */}
+            {canUpdate && outcome.requiresReturnVisit && can(session.principal, "jobs:create") ? (
+              <RaiseReturnVisitButton jobId={job.id} />
+            ) : null}
+
             {can(session.principal, "quotes:read") ? (
               <div className="rounded border p-5" style={{ backgroundColor: "var(--surface-raised)" }}>
                 <h2 className="text-[14px] font-semibold">Quotations</h2>
@@ -687,12 +715,27 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
                         </div>
                         <p className="mt-0.5 text-[12px]" style={{ color: "var(--text-muted)" }}>
                           {QUOTE_STATUS_LABEL[q.status]}
+                          {q.supersedesQuoteId ? " · new version" : ""}
                         </p>
+                        {/* QTE-5: the discount is stated with where it came from, not left as a
+                            bare number the customer has to take on trust. */}
+                        {q.discountSource ? (
+                          <p className="mt-0.5 text-[12px]" style={{ color: "var(--text-muted)" }}>
+                            Discount: {q.discountSource}
+                          </p>
+                        ) : null}
                         <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1">
                           {q.status === "draft" && can(session.principal, "quotes:send") ? (
                             <SendQuoteButton quoteId={q.id} reference={q.reference} />
                           ) : null}
                           <QuoteDocumentLink quoteId={q.id} reference={q.reference} />
+                          {/* QTE-10. Never offered for `approved` or `superseded` — the
+                              server's own list, not a re-derived one, so the button and
+                              the refusal can never disagree about which states qualify. */}
+                          {REVISABLE_QUOTE_STATUSES.includes(q.status) &&
+                          can(session.principal, "quotes:create") ? (
+                            <ReviseQuoteButton jobId={job.id} quoteId={q.id} reference={q.reference} />
+                          ) : null}
                         </div>
                       </li>
                     ))}

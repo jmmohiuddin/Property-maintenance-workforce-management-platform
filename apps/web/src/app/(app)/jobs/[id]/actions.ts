@@ -9,6 +9,7 @@ import {
   recordJobOutcome,
   recordProductEvent,
   createQuote,
+  reviseQuote,
   sendQuote,
   getQuoteForNotification,
   getVisitForNotification,
@@ -16,6 +17,7 @@ import {
   getInvoiceForNotification,
   jobContractScope,
   quoteOutOfScopeWork,
+  raiseReturnVisit,
   ASSIGNMENT_WARNING_LABEL,
   recordJobAttachment,
   recordJobMaterial,
@@ -86,6 +88,14 @@ async function materialise(
 export interface ActionState {
   error?: string;
   ok?: string;
+  /**
+   * `QTE-9`. A quote was created or revised but at least one line describes
+   * work outside the ten DET-licensed activities. Separate from `error`
+   * because it never blocked the save — see `licensedActivityWarnings` in
+   * `@meridian/db` for why quoting out-of-licence work is warned about rather
+   * than refused.
+   */
+  warning?: string;
 }
 
 /**
@@ -395,6 +405,57 @@ export async function recordOutcomeAction(
   return { ok: `Recorded as ${label}.${moved}${owing}` };
 }
 
+/**
+ * Raise the return visit an outcome left owing (`JOB-13`'s `requiresReturnVisit`,
+ * wired to `jobs.parent_job_id` / `jobs.is_revisit`).
+ *
+ * The gate lives in `raiseReturnVisit` itself, not here: it refuses unless the
+ * job's own recorded outcome calls for one. This action only supplies who is
+ * asking and which job, and reads the refusal back as a plain sentence — the
+ * button that reaches this one is only ever offered by `outcome-panel.tsx`
+ * when `recordedOutcome.requiresReturnVisit` is true, but the server check is
+ * the actual control, matching every other guard in this file.
+ */
+export async function raiseReturnVisitAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const session = await requireSession();
+  const parentJobId = String(formData.get("jobId") ?? "");
+
+  try {
+    requirePermission(session.principal, "jobs:create");
+  } catch {
+    return { error: "Your role cannot raise a return visit." };
+  }
+
+  let reference = "";
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
+      async (tx) => {
+        const result = await raiseReturnVisit(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          { parentJobId },
+        );
+        reference = result.reference;
+      },
+    );
+  } catch (error) {
+    return { error: userMessage(error, "Could not raise the return visit.", "jobs") };
+  }
+
+  revalidatePath(`/jobs/${parentJobId}`);
+  revalidatePath("/jobs");
+  revalidatePath("/dispatch");
+
+  return {
+    ok: `${reference} raised as a return visit for this job, and linked back to it.`,
+  };
+}
+
 /** Create a draft quotation from the job detail panel. */
 export async function createQuoteAction(_prev: ActionState, formData: FormData): Promise<ActionState> {
   const session = await requireSession();
@@ -430,8 +491,10 @@ export async function createQuoteAction(_prev: ActionState, formData: FormData):
   if (lines.length === 0) return { error: "Add at least one line with a description." };
   if (!title) return { error: "Give the quotation a title." };
 
+  let warnings: readonly string[] = [];
+
   try {
-    await withTenant(
+    const result = await withTenant(
       { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
       (tx) =>
         createQuote(
@@ -440,12 +503,16 @@ export async function createQuoteAction(_prev: ActionState, formData: FormData):
           { jobId, title, lines },
         ),
     );
+    warnings = result.warnings;
   } catch (error) {
     return { error: userMessage(error, "Could not create the quotation.", "jobs") };
   }
 
   revalidatePath(`/jobs/${jobId}`);
-  return { ok: "Draft quotation created. Send it when you are ready." };
+  return {
+    ok: "Draft quotation created. Send it when you are ready.",
+    warning: warnings.length > 0 ? warnings.join(" ") : undefined,
+  };
 }
 
 /**
@@ -665,6 +732,79 @@ export async function sendQuoteAction(_prev: ActionState, formData: FormData): P
       : "Sent. The customer has been emailed and can approve or decline it in their portal.";
 
   return { ok: documentProblem ? `${sent} ${documentProblem}` : sent };
+}
+
+/**
+ * Raise a new version of a quote, retiring the old one (`QTE-10`).
+ *
+ * `reviseQuote` itself is the authority on which states may be revised — see
+ * its docstring in `packages/db/src/domain/commerce.ts`. This action exists
+ * only to read the session, parse the form and translate a refusal into a
+ * sentence; `quotes:create` is the permission because what this produces IS a
+ * new quote.
+ */
+export async function reviseQuoteAction(_prev: ActionState, formData: FormData): Promise<ActionState> {
+  const session = await requireSession();
+  const jobId = String(formData.get("jobId") ?? "");
+  const quoteId = String(formData.get("quoteId") ?? "");
+  const title = String(formData.get("title") ?? "").trim();
+  const reason = String(formData.get("reason") ?? "").trim();
+
+  try {
+    requirePermission(session.principal, "quotes:create");
+  } catch {
+    return { error: "Your role cannot create quotations." };
+  }
+
+  let lines: DraftLine[];
+  try {
+    const parsed: unknown = JSON.parse(String(formData.get("lines") ?? "[]"));
+    if (!Array.isArray(parsed)) throw new Error("not an array");
+    lines = parsed
+      .map((l) => l as Record<string, unknown>)
+      .filter((l) => String(l["description"] ?? "").trim() !== "")
+      .map((l) => ({
+        description: String(l["description"]).trim(),
+        quantity: String(l["quantity"] ?? "1").trim() || "1",
+        unit: String(l["unit"] ?? "ea").trim() || "ea",
+        unitPrice: String(l["unitPrice"] ?? "0").trim() || "0",
+      }));
+  } catch {
+    return { error: "Could not read the quote lines." };
+  }
+
+  if (lines.length === 0) return { error: "Add at least one line with a description." };
+
+  let reference = "";
+  let warnings: readonly string[] = [];
+
+  try {
+    const result = await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
+      (tx) =>
+        reviseQuote(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          {
+            quoteId,
+            title: title || undefined,
+            lines,
+            reason: reason || undefined,
+          },
+        ),
+    );
+    reference = result.reference;
+    warnings = result.warnings;
+  } catch (error) {
+    return { error: userMessage(error, "Could not revise the quotation.", "jobs") };
+  }
+
+  revalidatePath(`/jobs/${jobId}`);
+
+  return {
+    ok: `${reference} raised as the new version. The previous quote is kept on file, marked superseded.`,
+    warning: warnings.length > 0 ? warnings.join(" ") : undefined,
+  };
 }
 
 /**

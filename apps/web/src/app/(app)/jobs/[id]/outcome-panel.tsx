@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useActionState, useState } from "react";
-import { recordOutcomeAction, type ActionState } from "./actions";
+import { recordOutcomeAction, raiseReturnVisitAction, type ActionState } from "./actions";
 import { Warning, CheckCircle } from "@phosphor-icons/react/dist/ssr";
 
 const INITIAL: ActionState = {};
@@ -328,6 +328,53 @@ function FaultSelect({
           </option>
         ))}
       </select>
+    </div>
+  );
+}
+
+/**
+ * Raise the return visit an outcome left owing — the wiring for
+ * `jobs.parent_job_id` / `jobs.is_revisit`.
+ *
+ * Only rendered by the job page when the recorded outcome's own
+ * `requiresReturnVisit` is true; `raiseReturnVisit` re-checks the same fact
+ * server-side, so the button is a convenience and the check is the control,
+ * matching every other guard in this file.
+ */
+export function RaiseReturnVisitButton({ jobId }: { jobId: string }) {
+  const [state, formAction, pending] = useActionState(raiseReturnVisitAction, INITIAL);
+
+  return (
+    <div className="rounded border p-5" style={{ backgroundColor: "var(--surface-raised)" }}>
+      <h2 className="text-[14px] font-semibold">Return visit owed</h2>
+      <p className="prose-body mt-2 text-[13px]">
+        This outcome leaves work owing. Raising a return visit creates a new job linked back to
+        this one, so PPM compliance and the return-visit rate can tell it apart from fresh work.
+      </p>
+      <form action={formAction} className="mt-3">
+        <input type="hidden" name="jobId" value={jobId} />
+        <button
+          type="submit"
+          disabled={pending}
+          className="btn btn-primary !py-2 text-[14px] disabled:opacity-60"
+        >
+          {pending ? "Raising..." : "Raise return visit"}
+        </button>
+      </form>
+      {state.error || state.ok ? (
+        <p
+          role="status"
+          className="mt-3 flex items-start gap-2 text-[13px]"
+          style={{ color: state.error ? "var(--accent-text)" : "var(--text-secondary)" }}
+        >
+          {state.error ? (
+            <Warning size={14} weight="fill" aria-hidden className="mt-0.5 shrink-0" />
+          ) : (
+            <CheckCircle size={14} weight="fill" aria-hidden className="mt-0.5 shrink-0" />
+          )}
+          {state.error ?? state.ok}
+        </p>
+      ) : null}
     </div>
   );
 }

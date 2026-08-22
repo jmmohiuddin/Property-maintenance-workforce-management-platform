@@ -274,6 +274,20 @@
       "when": 1787830000000,
       "tag": "0040_visit_superseded",
       "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1787920000000,
+      "tag": "0041_work_injuries_hse_records",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1787950000000,
+      "tag": "0042_quote_versioning_and_discount",
+      "breakpoints": true
     }
   ]
 }

@@ -59,6 +59,19 @@ export const quotes = pgTable(
     /** Portal approval token — single-use, hashed. */
     approvalTokenHash: text("approval_token_hash"),
     supersedesQuoteId: uuid("supersedes_quote_id"),
+    /**
+     * `QTE-5`. Basis points, matching `contract_terms.discount_rate_basis_points`
+     * — set only when `discountAmount` came from a contract rate rather than
+     * being typed in by an operator. Null means the discount (if any) is manual.
+     */
+    discountBasisPoints: integer("discount_basis_points"),
+    /**
+     * Where `discountAmount` came from, in words a customer-facing document can
+     * show beside the figure — the contract reference and rate, snapshotted at
+     * creation so a later contract renegotiation cannot rewrite what this quote
+     * says it applied. Null when the discount is manual or there is none.
+     */
+    discountSource: varchar("discount_source", { length: 160 }),
     /** Provenance when a draft was AI-generated: model, prompt hash, confidence. */
     aiGeneration: jsonb("ai_generation"),
 
@@ -80,6 +93,8 @@ export const quotes = pgTable(
     uniqueIndex("quotes_tenant_reference_key").on(t.tenantId, t.reference),
     index("quotes_tenant_status_idx").on(t.tenantId, t.status, t.createdAt),
     index("quotes_customer_idx").on(t.tenantId, t.customerId),
+    // QTE-10: walking a revision chain (who superseded whom) without a scan.
+    index("quotes_supersedes_idx").on(t.tenantId, t.supersedesQuoteId),
   ],
 );
 

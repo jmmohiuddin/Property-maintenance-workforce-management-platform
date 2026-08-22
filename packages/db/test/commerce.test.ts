@@ -16,6 +16,8 @@ import {
   withTenant,
   withCustomerScope,
   createQuote,
+  reviseQuote,
+  REVISABLE_QUOTE_STATUSES,
   sendQuote,
   decideQuote,
   getQuoteWithLines,
@@ -176,6 +178,295 @@ async function main(): Promise<void> {
     doubleDecideRejected = true;
   }
   checkTrue("a decided quote cannot be decided again", doubleDecideRejected);
+
+  // ── QTE-9: licensed-activity warning on quote lines ─────────────────────────
+  //
+  // Warns, never blocks — `licensedActivityWarnings` in `commerce.ts` argues
+  // why. A line whose service is not one of the ten catalogued (and therefore
+  // licensed) activities is named back to the caller; a line that is one of
+  // the ten raises nothing.
+  const qte9Ids: string[] = [];
+
+  const outOfLicence = await withTenant(ctx, (tx) =>
+    createQuote(tx, ctx, {
+      jobId: setup.id,
+      title: "QTE-9: out-of-licence line",
+      lines: [
+        {
+          description: "Pest control treatment",
+          quantity: "1",
+          unit: "ea",
+          unitPrice: "300.00",
+          serviceSlug: "pest-control",
+        },
+      ],
+    }),
+  );
+  qte9Ids.push(outOfLicence.quoteId);
+  checkTrue("QTE-9: a line outside the licence is warned about", outOfLicence.warnings.length === 1);
+  checkTrue(
+    "QTE-9: the warning names the line's own description",
+    (outOfLicence.warnings[0] ?? "").includes("Pest control treatment"),
+  );
+
+  // Load-bearing positive: a line that IS one of the ten raises nothing.
+  const inLicence = await withTenant(ctx, (tx) =>
+    createQuote(tx, ctx, {
+      jobId: setup.id,
+      title: "QTE-9: licensed line",
+      lines: [
+        {
+          description: "AC unit service",
+          quantity: "1",
+          unit: "ea",
+          unitPrice: "300.00",
+          serviceSlug: "hvac-installation-maintenance",
+        },
+      ],
+    }),
+  );
+  qte9Ids.push(inLicence.quoteId);
+  checkTrue("QTE-9: a licensed line raises no warning", inLicence.warnings.length === 0);
+
+  // ── QTE-5: the AMC's own rate, applied and named ────────────────────────────
+  //
+  // `CON-<year>-00001` is the seeded Bay Tower comprehensive AMC, active, at a
+  // 15% (1500 bp) rate. A fresh job is linked to it here rather than reusing a
+  // seeded job, because no seeded job carries `contract_id` — this is the exact
+  // gap `resolveContractDiscount` closes.
+  const amcContract = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({ id: schema.contracts.id, customerId: schema.contracts.customerId, reference: schema.contracts.reference })
+      .from(schema.contracts)
+      .where(eq(schema.contracts.reference, `CON-${new Date().getFullYear()}-00001`));
+    return rows[0];
+  });
+  if (!amcContract) throw new Error("Seed data missing: CON-<year>-00001 (Bay Tower AMC). Run `npm run db:seed`.");
+
+  const amcProperty = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({ propertyId: schema.contractProperties.propertyId })
+      .from(schema.contractProperties)
+      .where(eq(schema.contractProperties.contractId, amcContract.id))
+      .limit(1);
+    return rows[0]?.propertyId;
+  });
+  if (!amcProperty) throw new Error("Seed data missing: no property on the Bay Tower AMC.");
+
+  const qte5JobRef = `QTE5-${Date.now()}`;
+  const amcJob = await withTenant(ctx, (tx) =>
+    tx
+      .insert(schema.jobs)
+      .values({
+        tenantId: TENANT,
+        reference: qte5JobRef,
+        customerId: amcContract.customerId,
+        propertyId: amcProperty,
+        serviceSlug: "hvac-installation-maintenance",
+        title: "QTE-5 fixture: extra AC service under AMC",
+        status: "triaged",
+        priority: "p3_standard",
+        source: "internal",
+        contractId: amcContract.id,
+      })
+      .returning({ id: schema.jobs.id }),
+  );
+  const amcJobId = amcJob[0]!.id;
+
+  const amcAutoQuote = await withTenant(ctx, (tx) =>
+    createQuote(tx, ctx, {
+      jobId: amcJobId,
+      title: "QTE-5: contract-rate quote",
+      lines: [{ description: "Additional AC unit service", quantity: "1", unit: "ea", unitPrice: "1000.00" }],
+    }),
+  );
+  qte9Ids.push(amcAutoQuote.quoteId);
+
+  // 1000.00 subtotal, 15% (1500bp) discount = 150.00; taxable 850.00; VAT 5% =
+  // 42.50; total 892.50.
+  const amcAutoDetail = await withTenant(ctx, (tx) => getQuoteWithLines(tx, amcAutoQuote.quoteId));
+  check("QTE-5: the contract's own discount is applied automatically", amcAutoDetail?.discountAmount, "150.00");
+  check("QTE-5: the rate behind it is recorded", amcAutoDetail?.discountBasisPoints, 1500);
+  checkTrue(
+    "QTE-5: the source names the contract, not just a number",
+    (amcAutoDetail?.discountSource ?? "").includes(amcContract.reference),
+  );
+  check("QTE-5: VAT and total reflect the contract discount", amcAutoDetail?.total, "892.50");
+
+  // Load-bearing positive on the other side: an operator's own figure is
+  // honoured, not silently replaced by the contract's rate.
+  const amcManualQuote = await withTenant(ctx, (tx) =>
+    createQuote(tx, ctx, {
+      jobId: amcJobId,
+      title: "QTE-5: manual override",
+      lines: [{ description: "Additional AC unit service", quantity: "1", unit: "ea", unitPrice: "1000.00" }],
+      discount: "50.00",
+    }),
+  );
+  qte9Ids.push(amcManualQuote.quoteId);
+  const amcManualDetail = await withTenant(ctx, (tx) => getQuoteWithLines(tx, amcManualQuote.quoteId));
+  check("QTE-5: a manual discount overrides the contract rate", amcManualDetail?.discountAmount, "50.00");
+  checkTrue("QTE-5: a manual discount records no contract source", amcManualDetail?.discountSource == null);
+
+  // ── QTE-10: quote versioning ─────────────────────────────────────────────
+  //
+  // Which states may be revised, and why, is documented on `reviseQuote`
+  // itself (packages/db/src/domain/commerce.ts). Every branch, both ways.
+  const setupJobId = setup.id;
+  async function makeDraft(title: string, price: string) {
+    const q = await withTenant(ctx, (tx) =>
+      createQuote(tx, ctx, {
+        jobId: setupJobId,
+        title,
+        lines: [{ description: title, quantity: "1", unit: "ea", unitPrice: price }],
+      }),
+    );
+    qte9Ids.push(q.quoteId);
+    return q;
+  }
+
+  // draft → revisable.
+  const draftQ = await makeDraft("QTE-10: draft", "100.00");
+  const draftRevised = await withTenant(ctx, (tx) =>
+    reviseQuote(tx, ctx, {
+      quoteId: draftQ.quoteId,
+      lines: [{ description: "QTE-10: draft, revised", quantity: "1", unit: "ea", unitPrice: "110.00" }],
+      reason: "test: draft revision",
+    }),
+  );
+  qte9Ids.push(draftRevised.quoteId);
+  checkTrue("QTE-10: a draft quote may be revised", draftRevised.quoteId !== draftQ.quoteId);
+
+  const draftOriginalAfter = await withTenant(ctx, (tx) => getQuoteWithLines(tx, draftQ.quoteId));
+  check("QTE-10: revising marks the original superseded", draftOriginalAfter?.status, "superseded");
+  const draftRevisedDetail = await withTenant(ctx, (tx) => getQuoteWithLines(tx, draftRevised.quoteId));
+  check("QTE-10: the new version points back at what it replaced", draftRevisedDetail?.supersedesQuoteId, draftQ.quoteId);
+
+  // superseded → refused. Idempotency: a quote already replaced cannot be
+  // replaced again, which would let two later quotes both claim the same
+  // ancestor.
+  let supersededRefused = false;
+  try {
+    await withTenant(ctx, (tx) =>
+      reviseQuote(tx, ctx, {
+        quoteId: draftQ.quoteId,
+        lines: [{ description: "should not be created", quantity: "1", unit: "ea", unitPrice: "1.00" }],
+      }),
+    );
+  } catch {
+    supersededRefused = true;
+  }
+  checkTrue("QTE-10: an already-superseded quote cannot be revised again", supersededRefused);
+
+  // sent → revisable. The customer has seen it; the old row is kept exactly as
+  // sent (sentAt untouched), and a new one takes over.
+  const sentQ = await makeDraft("QTE-10: sent", "200.00");
+  await withTenant(ctx, (tx) => sendQuote(tx, sentQ.quoteId));
+  const sentBefore = await withTenant(ctx, async (tx) => {
+    const rows = await tx.select({ sentAt: schema.quotes.sentAt }).from(schema.quotes).where(eq(schema.quotes.id, sentQ.quoteId));
+    return rows[0]?.sentAt ?? null;
+  });
+  const sentRevised = await withTenant(ctx, (tx) =>
+    reviseQuote(tx, ctx, {
+      quoteId: sentQ.quoteId,
+      lines: [{ description: "QTE-10: sent, revised", quantity: "1", unit: "ea", unitPrice: "210.00" }],
+    }),
+  );
+  qte9Ids.push(sentRevised.quoteId);
+  checkTrue("QTE-10: a sent quote may be revised", sentRevised.quoteId !== sentQ.quoteId);
+  const sentOriginalAfter = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({ status: schema.quotes.status, sentAt: schema.quotes.sentAt })
+      .from(schema.quotes)
+      .where(eq(schema.quotes.id, sentQ.quoteId));
+    return rows[0];
+  });
+  check("QTE-10: the superseded 'sent' quote's status moves", sentOriginalAfter?.status, "superseded");
+  checkTrue(
+    "QTE-10: but what the customer was shown (sentAt) is untouched",
+    sentOriginalAfter?.sentAt?.getTime() === sentBefore?.getTime(),
+  );
+
+  // approved → refused outright. The central guarantee: a signed quote cannot
+  // change after signature.
+  const approvedQ = await makeDraft("QTE-10: approved", "300.00");
+  await withTenant(ctx, (tx) => sendQuote(tx, approvedQ.quoteId));
+  await withTenant(ctx, (tx) => decideQuote(tx, ctx, { quoteId: approvedQ.quoteId, decision: "approved" }));
+  let approvedRefusal = "";
+  try {
+    await withTenant(ctx, (tx) =>
+      reviseQuote(tx, ctx, {
+        quoteId: approvedQ.quoteId,
+        lines: [{ description: "should not be created", quantity: "1", unit: "ea", unitPrice: "1.00" }],
+      }),
+    );
+  } catch (error) {
+    approvedRefusal = error instanceof Error ? error.message : String(error);
+  }
+  checkTrue("QTE-10: an approved quote cannot be revised", approvedRefusal.includes("approved quote cannot be revised"));
+
+  // rejected → revisable, and the rejection itself is preserved on the
+  // retired row rather than erased.
+  const rejectedQ = await makeDraft("QTE-10: rejected", "400.00");
+  await withTenant(ctx, (tx) => sendQuote(tx, rejectedQ.quoteId));
+  await withTenant(ctx, (tx) =>
+    decideQuote(tx, ctx, { quoteId: rejectedQ.quoteId, decision: "rejected", reason: "Too expensive" }),
+  );
+  const rejectedRevised = await withTenant(ctx, (tx) =>
+    reviseQuote(tx, ctx, {
+      quoteId: rejectedQ.quoteId,
+      lines: [{ description: "QTE-10: rejected, revised cheaper", quantity: "1", unit: "ea", unitPrice: "250.00" }],
+      reason: "Lower price after rejection",
+    }),
+  );
+  qte9Ids.push(rejectedRevised.quoteId);
+  checkTrue("QTE-10: a rejected quote may be revised", rejectedRevised.quoteId !== rejectedQ.quoteId);
+  const rejectedOriginalAfter = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({ status: schema.quotes.status, rejectionReason: schema.quotes.rejectionReason })
+      .from(schema.quotes)
+      .where(eq(schema.quotes.id, rejectedQ.quoteId));
+    return rows[0];
+  });
+  check("QTE-10: the rejected quote's own reason survives being superseded", rejectedOriginalAfter?.rejectionReason, "Too expensive");
+  check("QTE-10: and its status moves to superseded", rejectedOriginalAfter?.status, "superseded");
+
+  // expired → revisable. Nobody decided against the work; the clock ran out.
+  const expiredQ = await makeDraft("QTE-10: expired", "500.00");
+  await withTenant(ctx, (tx) => tx.update(schema.quotes).set({ status: "expired" }).where(eq(schema.quotes.id, expiredQ.quoteId)));
+  const expiredRevised = await withTenant(ctx, (tx) =>
+    reviseQuote(tx, ctx, {
+      quoteId: expiredQ.quoteId,
+      lines: [{ description: "QTE-10: expired, re-quoted", quantity: "1", unit: "ea", unitPrice: "520.00" }],
+    }),
+  );
+  qte9Ids.push(expiredRevised.quoteId);
+  checkTrue("QTE-10: an expired quote may be revised", expiredRevised.quoteId !== expiredQ.quoteId);
+
+  checkTrue(
+    "QTE-10: REVISABLE_QUOTE_STATUSES matches what was just exercised",
+    REVISABLE_QUOTE_STATUSES.includes("draft") &&
+      REVISABLE_QUOTE_STATUSES.includes("sent") &&
+      REVISABLE_QUOTE_STATUSES.includes("rejected") &&
+      REVISABLE_QUOTE_STATUSES.includes("expired") &&
+      !REVISABLE_QUOTE_STATUSES.includes("approved") &&
+      !REVISABLE_QUOTE_STATUSES.includes("superseded"),
+  );
+
+  // ── QTE-5 / QTE-9 / QTE-10 cleanup ──────────────────────────────────────
+  await withTenant(ctx, async (tx) => {
+    const allQuoteIds = [
+      ...qte9Ids,
+      draftQ.quoteId,
+      sentQ.quoteId,
+      approvedQ.quoteId,
+      rejectedQ.quoteId,
+      expiredQ.quoteId,
+    ];
+    await tx.delete(schema.quoteLines).where(inArray(schema.quoteLines.quoteId, allQuoteIds));
+    await tx.delete(schema.quotes).where(inArray(schema.quotes.id, allQuoteIds));
+    await tx.delete(schema.jobs).where(eq(schema.jobs.id, amcJobId));
+  });
 
   // ── Invoicing ─────────────────────────────────────────────────────────────
   // Invoicing work nobody signed for must be refused.

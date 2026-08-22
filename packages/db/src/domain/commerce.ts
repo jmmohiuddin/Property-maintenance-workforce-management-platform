@@ -4,6 +4,7 @@ import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
 import { decodeCursor, encodeCursor, type Page } from "./leads";
 import { rowDate, requiredRowDate } from "./_rows";
+import { writeAuditNote } from "./staff";
 import {
   computeTotals,
   toMinor,
@@ -21,6 +22,7 @@ import {
   LATE_ISSUANCE_PENALTY,
   type InvoiceVariant,
   type TaxDocumentDraft,
+  LICENSED_ACTIVITIES,
 } from "@meridian/core";
 
 /**
@@ -90,6 +92,113 @@ export interface DraftLine {
   readonly serviceSlug?: string | undefined;
 }
 
+// ── QTE-9: licensed-activity warning ────────────────────────────────────────
+
+/**
+ * Warn (`QTE-9`), never block, a quote line whose service falls outside the
+ * ten activities the DET licence permits (`LICENSED_ACTIVITIES`,
+ * `packages/core/src/company.ts`).
+ *
+ * ── WHY THIS WARNS RATHER THAN REFUSES ──────────────────────────────────────
+ *
+ * This system has exactly three hard blocks, and each stops the unlawful act
+ * ITSELF at the point it would happen: an expired blocking document or work
+ * permit stops a *dispatch* that would send someone to work unlawfully, and
+ * the summer midday ban stops *outdoor work* at an hour the law forbids it
+ * (`JOB-15`'s job-card gate is the same shape — it stops a job reaching
+ * `work_complete` with no evidence of what was done, not a proposal). Quoting
+ * is neither of those. A quote is a proposal to a customer, not the
+ * performance of work, and this company legitimately raises exactly that
+ * proposal and then subcontracts the labour — `project_subcontracts` exists
+ * for that reason. Refusing to create the quote at all would stop real,
+ * lawful business (subcontracted work) to prevent a violation that has not
+ * happened yet and might never happen, which is precisely the asymmetry
+ * `assessWpsCycle`'s docstring argues against for late wages.
+ *
+ * What IS real, and what `catalog.ts`'s rebuild happened over: `/services`
+ * advertised pest control while `/about` disclaimed it by name, in public,
+ * with a URL attached. A quote line is the same exposure with a customer's
+ * signature attached instead. So every line whose service does not resolve to
+ * one of the ten is named back to the caller — on creation and on revision —
+ * and the caller decides: subcontract it and note that, or don't raise it.
+ *
+ * A line with no service at all, on a job whose own service is also unset,
+ * cannot be classified and is not warned about — inventing a violation from
+ * an absence would be the exact fabrication `company.ts`'s "no invented
+ * default" rule exists to forbid, applied to a warning instead of a fact.
+ */
+export function licensedActivityWarnings(
+  lines: readonly { readonly description: string; readonly serviceSlug?: string | undefined }[],
+  fallbackServiceSlug: string,
+): readonly string[] {
+  const licensed = new Set<string>(LICENSED_ACTIVITIES);
+  const warnings: string[] = [];
+  lines.forEach((line, i) => {
+    const slug = line.serviceSlug ?? fallbackServiceSlug;
+    if (!slug || licensed.has(slug)) return;
+    warnings.push(
+      `Line ${i + 1} ("${line.description}") is not one of the company's ten DET-licensed ` +
+        `activities. Raise it only if the work is being subcontracted, and note that on the quote.`,
+    );
+  });
+  return warnings;
+}
+
+// ── QTE-5: the contract's own rate, shown rather than silently applied ─────
+
+interface ResolvedContractDiscount {
+  readonly discountMinor: number;
+  readonly discountBasisPoints: number;
+  readonly source: string;
+}
+
+/**
+ * The rate an AMC customer is actually entitled to on a quote for their
+ * contract work, and where it came from — never re-typed by an operator who
+ * has to remember it, and never a number the quote states without saying why.
+ *
+ * Only an ACTIVE contract prices anything. A draft, pending-signature,
+ * suspended, expired or cancelled contract is not a live commercial agreement,
+ * so pricing off its terms would apply a rate nobody currently holds — exactly
+ * the "different number" `QTE-5` exists to stop a quote silently applying.
+ *
+ * Returns null when the job carries no contract, or the contract found is not
+ * active, or it carries no terms row (`contract_terms` is created with the
+ * contract, but a row from before that pairing, or a deleted one, should not
+ * silently price work at zero). `createQuote` and `reviseQuote` both fall back
+ * to whatever the caller typed when this returns null — unchanged behaviour
+ * for every quote that is not against a live AMC.
+ */
+async function resolveContractDiscount(
+  tx: TenantScopedTx,
+  jobId: string,
+  subtotalMinor: number,
+): Promise<ResolvedContractDiscount | null> {
+  const rows = await tx.execute<{
+    reference: string;
+    status: string;
+    discount_rate_basis_points: number | null;
+  }>(sql`
+    select c.reference, c.status, t.discount_rate_basis_points
+      from jobs j
+      join contracts c on c.id = j.contract_id and c.deleted_at is null
+      left join contract_terms t on t.contract_id = c.id and t.deleted_at is null
+     where j.id = ${jobId} and j.deleted_at is null
+  `);
+
+  const row = rows[0];
+  if (!row || row.status !== "active" || row.discount_rate_basis_points == null) return null;
+
+  const basisPoints = row.discount_rate_basis_points;
+  const discountMinor = Math.round((subtotalMinor * basisPoints) / 10_000);
+
+  return {
+    discountMinor,
+    discountBasisPoints: basisPoints,
+    source: `Contract ${row.reference} · ${(basisPoints / 100).toFixed(2)}% AMC rate`,
+  };
+}
+
 /** Create a draft quote against a job, with its lines and computed totals. */
 export async function createQuote(
   tx: TenantScopedTx,
@@ -102,7 +211,7 @@ export async function createQuote(
     validForDays?: number;
     notes?: string | undefined;
   },
-): Promise<{ quoteId: string; reference: string; totalMinor: number }> {
+): Promise<{ quoteId: string; reference: string; totalMinor: number; warnings: readonly string[] }> {
   if (input.lines.length === 0) throw new UserFacingError("A quote needs at least one line");
 
   const jobRows = await tx
@@ -122,10 +231,27 @@ export async function createQuote(
     quantity: l.quantity,
     unitPriceMinor: toMinor(l.unitPrice),
   }));
+  const grossSubtotal = computeTotals({ lines: lineInputs, taxRateBasisPoints: 0 }).subtotalMinor;
+
+  // QTE-5. A manually typed figure is an operator's deliberate override and
+  // wins outright; only in its absence does the contract's own rate step in,
+  // so an AMC customer's rate is never silently replaced by a number nobody
+  // chose, and an operator's own number is never silently replaced either.
+  let discountMinor = input.discount ? toMinor(input.discount) : 0;
+  let discountBasisPoints: number | null = null;
+  let discountSource: string | null = null;
+  if (!input.discount) {
+    const contractDiscount = await resolveContractDiscount(tx, input.jobId, grossSubtotal);
+    if (contractDiscount) {
+      discountMinor = contractDiscount.discountMinor;
+      discountBasisPoints = contractDiscount.discountBasisPoints;
+      discountSource = contractDiscount.source;
+    }
+  }
 
   const totals = computeTotals({
     lines: lineInputs,
-    discountMinor: input.discount ? toMinor(input.discount) : 0,
+    discountMinor,
     taxRateBasisPoints: UAE_VAT_BASIS_POINTS,
   });
 
@@ -144,6 +270,8 @@ export async function createQuote(
       status: "draft",
       subtotal: toDecimalString(totals.subtotalMinor),
       discountAmount: toDecimalString(totals.discountMinor),
+      discountBasisPoints,
+      discountSource,
       taxRateBasisPoints: UAE_VAT_BASIS_POINTS,
       taxAmount: toDecimalString(totals.taxMinor),
       total: toDecimalString(totals.totalMinor),
@@ -169,7 +297,221 @@ export async function createQuote(
     })),
   );
 
-  return { quoteId: quote.id, reference, totalMinor: totals.totalMinor };
+  return {
+    quoteId: quote.id,
+    reference,
+    totalMinor: totals.totalMinor,
+    warnings: licensedActivityWarnings(input.lines, job.serviceSlug),
+  };
+}
+
+/** Quote states from which a revision may be raised (`QTE-10`). */
+export const REVISABLE_QUOTE_STATUSES: readonly QuoteStatus[] = [
+  "draft",
+  "sent",
+  "viewed",
+  "rejected",
+  "expired",
+];
+
+/**
+ * Replace a quote with a new version, rather than overwriting it in place
+ * (`QTE-10`).
+ *
+ * ── WHICH STATES MAY BE REVISED, AND WHY ────────────────────────────────────
+ *
+ *  * `draft` — never shown to a customer, so there is nothing on file yet to
+ *    protect. Revising one costs nothing extra; the same rule that governs
+ *    every other state applies to it too, rather than a silent-edit exception
+ *    that would have to be remembered as a special case forever.
+ *  * `sent` / `viewed` — the customer HAS seen this and is deciding. A price
+ *    error found now must not vanish into the row the customer already has
+ *    open in their portal; the old one is kept exactly as it was sent, and a
+ *    new one is raised and sent in its place.
+ *  * `rejected` — a decision was made, and it stays made: `decidedAt` and
+ *    `rejectionReason` are untouched on the retired row. A follow-up quote
+ *    after "too expensive" is ordinary business, and forbidding it would force
+ *    every renegotiation to start a brand-new, unlinked quote with no record
+ *    that it answers a specific rejection.
+ *  * `expired` — the same reasoning as `rejected`: nobody decided against the
+ *    work, the clock on it simply ran out, and re-quoting it is routine.
+ *
+ * ── WHICH STATES MAY NOT, AND WHY ───────────────────────────────────────────
+ *
+ *  * `approved` is refused outright, and this is the line the ticket exists to
+ *    draw. An approved quote is what the customer agreed to pay. Rewriting it
+ *    afterwards — even by "superseding" rather than overwriting — is a
+ *    contract that changes after signature. Anyone who genuinely needs to
+ *    change approved work raises a NEW, independent quote against the job, on
+ *    purpose, so the record shows two documents and a reason, not one document
+ *    that quietly grew a second version nobody signed.
+ *  * `superseded` is refused for a different reason: idempotency. A superseded
+ *    quote is already a dead end in the chain; revising it again would let two
+ *    later quotes both claim to replace the same ancestor, silently forking
+ *    history instead of telling the caller to look at the current version.
+ *    `RETIRABLE_VISIT_STATUSES` (`0040`, `domain/assignment.ts`) excludes its
+ *    own terminal state for the same reason, so a retirement is idempotent.
+ */
+export async function reviseQuote(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    quoteId: string;
+    title?: string | undefined;
+    lines: readonly DraftLine[];
+    discount?: string | undefined;
+    validForDays?: number;
+    notes?: string | undefined;
+    /** Why this quote needed a new version. Carried onto the audit trail. */
+    reason?: string | undefined;
+  },
+): Promise<{ quoteId: string; reference: string; totalMinor: number; warnings: readonly string[] }> {
+  if (input.lines.length === 0) throw new UserFacingError("A quote needs at least one line");
+
+  const originalRows = await tx
+    .select({
+      id: schema.quotes.id,
+      status: schema.quotes.status,
+      jobId: schema.quotes.jobId,
+      title: schema.quotes.title,
+    })
+    .from(schema.quotes)
+    .where(eq(schema.quotes.id, input.quoteId))
+    .limit(1);
+
+  const original = originalRows[0];
+  if (!original) throw new Error("Quote not found in this tenant");
+  if (!original.jobId) {
+    throw new UserFacingError("This quote has no job linked to it, so it cannot be revised.");
+  }
+
+  const status = original.status as QuoteStatus;
+  if (status === "approved") {
+    throw new UserFacingError(
+      "An approved quote cannot be revised. The customer agreed to this document — raise a new " +
+        "quote against the job instead, so the record shows two documents and why.",
+    );
+  }
+  if (!REVISABLE_QUOTE_STATUSES.includes(status)) {
+    throw new UserFacingError(
+      `This quote is ${QUOTE_STATUS_LABEL[status].toLowerCase()} and cannot be revised. Look up ` +
+        "the current version and revise that one instead.",
+    );
+  }
+
+  const jobRows = await tx
+    .select({
+      customerId: schema.jobs.customerId,
+      propertyId: schema.jobs.propertyId,
+      serviceSlug: schema.jobs.serviceSlug,
+    })
+    .from(schema.jobs)
+    .where(eq(schema.jobs.id, original.jobId))
+    .limit(1);
+
+  const job = jobRows[0];
+  if (!job) throw new Error("Job not found in this tenant");
+
+  const lineInputs: LineInput[] = input.lines.map((l) => ({
+    quantity: l.quantity,
+    unitPriceMinor: toMinor(l.unitPrice),
+  }));
+  const grossSubtotal = computeTotals({ lines: lineInputs, taxRateBasisPoints: 0 }).subtotalMinor;
+
+  let discountMinor = input.discount ? toMinor(input.discount) : 0;
+  let discountBasisPoints: number | null = null;
+  let discountSource: string | null = null;
+  if (!input.discount) {
+    const contractDiscount = await resolveContractDiscount(tx, original.jobId, grossSubtotal);
+    if (contractDiscount) {
+      discountMinor = contractDiscount.discountMinor;
+      discountBasisPoints = contractDiscount.discountBasisPoints;
+      discountSource = contractDiscount.source;
+    }
+  }
+
+  const totals = computeTotals({
+    lines: lineInputs,
+    discountMinor,
+    taxRateBasisPoints: UAE_VAT_BASIS_POINTS,
+  });
+
+  const reference = await nextReference(tx, "QUO", new Date().getFullYear());
+  const validUntil = new Date(Date.now() + (input.validForDays ?? 30) * 24 * 60 * 60 * 1000);
+
+  const [quote] = await tx
+    .insert(schema.quotes)
+    .values({
+      tenantId: ctx.tenantId,
+      reference,
+      customerId: job.customerId,
+      propertyId: job.propertyId,
+      jobId: original.jobId,
+      title: input.title ?? original.title,
+      status: "draft",
+      subtotal: toDecimalString(totals.subtotalMinor),
+      discountAmount: toDecimalString(totals.discountMinor),
+      discountBasisPoints,
+      discountSource,
+      taxRateBasisPoints: UAE_VAT_BASIS_POINTS,
+      taxAmount: toDecimalString(totals.taxMinor),
+      total: toDecimalString(totals.totalMinor),
+      validUntil,
+      notes: input.notes ?? null,
+      supersedesQuoteId: original.id,
+      preparedById: ctx.userId ?? null,
+    })
+    .returning({ id: schema.quotes.id });
+
+  if (!quote) throw new Error("Failed to create the revised quote");
+
+  await tx.insert(schema.quoteLines).values(
+    input.lines.map((l, i) => ({
+      tenantId: ctx.tenantId,
+      quoteId: quote.id,
+      position: i + 1,
+      serviceSlug: l.serviceSlug ?? job.serviceSlug,
+      description: l.description,
+      quantity: l.quantity,
+      unit: l.unit,
+      unitPrice: toDecimalString(toMinor(l.unitPrice)),
+      lineTotal: toDecimalString(
+        lineInputs[i] ? computeTotals({ lines: [lineInputs[i]!], taxRateBasisPoints: 0 }).subtotalMinor : 0,
+      ),
+    })),
+  );
+
+  // The original is retired, never edited or removed: what the customer was
+  // shown when they decided (or when the clock ran out on it) stays on file
+  // exactly as it was. `sentAt`, `viewedAt`, `decidedAt` and `rejectionReason`
+  // are all untouched by this update — only `status` and `updatedAt` move.
+  await tx
+    .update(schema.quotes)
+    .set({ status: "superseded", updatedAt: new Date() })
+    .where(eq(schema.quotes.id, original.id));
+
+  // One note against the retired quote, matching the pattern `0040` set for
+  // retired visits: the question asked later is "why was MY quote replaced",
+  // and the generic row-diff `audit_log` trigger cannot answer that.
+  await writeAuditNote(tx, ctx, {
+    tableName: "quotes",
+    recordId: original.id,
+    action: "superseded",
+    detail: {
+      rule: "QTE-10",
+      newQuoteId: quote.id,
+      newReference: reference,
+      previousStatus: status,
+      reason: input.reason ?? null,
+    },
+  });
+
+  return {
+    quoteId: quote.id,
+    reference,
+    totalMinor: totals.totalMinor,
+    warnings: licensedActivityWarnings(input.lines, job.serviceSlug),
+  };
 }
 
 /**
@@ -307,6 +649,12 @@ export interface QuoteRow {
   readonly createdAt: Date;
   readonly customerName: string;
   readonly jobId: string | null;
+  /** `QTE-10`. The quote this one replaced, or null on a first version. */
+  readonly supersedesQuoteId: string | null;
+  /** `QTE-5`. Basis points behind `discountAmount`, only when it is a contract rate. */
+  readonly discountBasisPoints: number | null;
+  /** `QTE-5`. Where the discount came from, in words — null when it is manual or there is none. */
+  readonly discountSource: string | null;
 }
 
 export async function listQuotes(
@@ -325,6 +673,9 @@ export async function listQuotes(
       createdAt: schema.quotes.createdAt,
       customerName: schema.customers.name,
       jobId: schema.quotes.jobId,
+      supersedesQuoteId: schema.quotes.supersedesQuoteId,
+      discountBasisPoints: schema.quotes.discountBasisPoints,
+      discountSource: schema.quotes.discountSource,
     })
     .from(schema.quotes)
     .innerJoin(schema.customers, eq(schema.customers.id, schema.quotes.customerId))
@@ -413,6 +764,9 @@ export async function getQuoteWithLines(
       notes: schema.quotes.notes,
       customerName: schema.customers.name,
       jobId: schema.quotes.jobId,
+      supersedesQuoteId: schema.quotes.supersedesQuoteId,
+      discountBasisPoints: schema.quotes.discountBasisPoints,
+      discountSource: schema.quotes.discountSource,
     })
     .from(schema.quotes)
     .innerJoin(schema.customers, eq(schema.customers.id, schema.quotes.customerId))

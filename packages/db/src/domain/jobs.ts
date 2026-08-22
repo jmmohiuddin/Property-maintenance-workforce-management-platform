@@ -10,6 +10,7 @@ import {
   OPEN_STATUSES,
   AT_RISK_THRESHOLD,
   UserFacingError,
+  computeSlaDeadlines,
   type SlaState,
   type JobStatus,
   type JobPriority,
@@ -627,6 +628,10 @@ export interface JobDetail {
   readonly propertyLat: number | null;
   readonly propertyLng: number | null;
   readonly accessInstructions: string | null;
+  /** `Revisit tracking`. Set only from `raiseReturnVisit` onward — never backfilled. */
+  readonly parentJobId: string | null;
+  readonly parentJobReference: string | null;
+  readonly isRevisit: boolean;
   readonly sla: SlaState;
   readonly visits: readonly {
     readonly id: string;
@@ -677,6 +682,8 @@ export async function getJobDetail(
       propertyLat: schema.properties.lat,
       propertyLng: schema.properties.lng,
       accessInstructions: schema.properties.accessInstructions,
+      parentJobId: schema.jobs.parentJobId,
+      isRevisit: schema.jobs.isRevisit,
     })
     .from(schema.jobs)
     .innerJoin(schema.customers, eq(schema.customers.id, schema.jobs.customerId))
@@ -686,6 +693,19 @@ export async function getJobDetail(
 
   const job = rows[0];
   if (!job) return null;
+
+  // A second, tiny query rather than a self-join: most jobs have no parent, so
+  // the common case pays nothing and the uncommon one pays one indexed lookup
+  // by primary key.
+  let parentJobReference: string | null = null;
+  if (job.parentJobId) {
+    const parentRows = await tx
+      .select({ reference: schema.jobs.reference })
+      .from(schema.jobs)
+      .where(eq(schema.jobs.id, job.parentJobId))
+      .limit(1);
+    parentJobReference = parentRows[0]?.reference ?? null;
+  }
 
   const visits = await tx
     .select({
@@ -721,6 +741,7 @@ export async function getJobDetail(
     ...job,
     status: job.status as JobStatus,
     priority: job.priority as JobPriority,
+    parentJobReference,
     sla: slaState({
       createdAt: job.createdAt,
       resolveByAt: job.resolveByAt,
@@ -897,6 +918,159 @@ export async function nextJobReference(tx: TenantScopedTx, year = new Date().get
   const reference = rows[0]?.reference;
   if (!reference) throw new Error("Could not allocate a job reference");
   return reference;
+}
+
+// ── Revisit tracking ─────────────────────────────────────────────────────────
+
+/**
+ * Raise a return visit for work already done, and say so on the new job.
+ *
+ * ── THE GAP THIS CLOSES ──────────────────────────────────────────────────────
+ *
+ * `jobs.parent_job_id` and `jobs.is_revisit` have existed since `0000_init`.
+ * Nothing has ever written either — every job raised by any path in this
+ * codebase leaves both null, `parent_job_id` is named only in a design-
+ * rationale comment (`domain/contracts.ts`), and `DASHBOARD_GAPS` names the
+ * consequence: "reactive" has no marker, so a job that is a return visit to
+ * work already done is indistinguishable from fresh work in every count that
+ * cares — PPM compliance, and any reactive-vs-planned split. This is the first
+ * writer.
+ *
+ * ── WHY THE GATE IS `requiresReturnVisit`, NOT AN OPERATOR'S SAY-SO ─────────
+ *
+ * A revisit is not "any job raised against the same property soon after
+ * another one" — that would tag genuinely unrelated work by coincidence of
+ * timing. It is specifically work owed because the LAST visit did not finish
+ * the job, and `JOB-13`'s outcome codes are where that fact already lives:
+ * `job_outcome_codes.requires_return_visit`, recorded by `recordJobOutcome`
+ * against the parent job's own `outcome_code`. Gating on it here is what makes
+ * `is_revisit` mean something rather than being a checkbox an operator can
+ * tick on any job for any reason — the same distinction `JOB-13`'s outcome
+ * vocabulary itself protects by refusing free text.
+ *
+ * A parent with no recorded outcome, or an outcome that does not call for one
+ * (`fixed_first_visit`, for instance) is refused: raising a "return visit"
+ * off nothing said would defeat the entire point of recording outcomes, which
+ * is that the return-visit rate (`outcomePosition`, `domain/reporting.ts`) can
+ * be trusted.
+ *
+ * ── WHY THIS DOES NOT TOUCH ANY EXISTING ROW ────────────────────────────────
+ *
+ * No backfill. Every job raised before this function existed has
+ * `parent_job_id` and `is_revisit` null, and a genuine revisit raised by hand
+ * (a dispatcher creating a plain new job for work already attempted) is
+ * byte-for-byte identical to fresh work in those rows — nothing distinguishes
+ * the two populations, which is the same shape of problem `0040` refused to
+ * backfill for `job_visits.arrived_at`. `G11` (first-time-fix rate) is not
+ * built from this either, for the separate and already-documented reason in
+ * `DASHBOARD_GAPS`: it needs a per-visit outcome and enough post-cutover
+ * history, neither of which exists yet. What this DOES support, from today
+ * forward, is `outcomePosition`'s return-visit rate actually meaning
+ * "work that came back", instead of counting outcome codes with no way to
+ * confirm the return visit it predicted ever happened.
+ */
+export async function raiseReturnVisit(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    parentJobId: string;
+    title?: string | undefined;
+    scheduledFor?: Date | undefined;
+    priority?: JobPriority | undefined;
+  },
+): Promise<{ jobId: string; reference: string }> {
+  const parentRows = await tx
+    .select({
+      id: schema.jobs.id,
+      reference: schema.jobs.reference,
+      customerId: schema.jobs.customerId,
+      propertyId: schema.jobs.propertyId,
+      unitId: schema.jobs.unitId,
+      assetId: schema.jobs.assetId,
+      serviceSlug: schema.jobs.serviceSlug,
+      title: schema.jobs.title,
+      priority: schema.jobs.priority,
+      isOutdoor: schema.jobs.isOutdoor,
+      outcomeCode: schema.jobs.outcomeCode,
+      contractId: schema.jobs.contractId,
+    })
+    .from(schema.jobs)
+    .where(eq(schema.jobs.id, input.parentJobId))
+    .limit(1);
+
+  const parent = parentRows[0];
+  if (!parent) throw new Error("Job not found in this tenant");
+
+  if (!parent.outcomeCode) {
+    throw new UserFacingError(
+      "This job has no recorded outcome yet. Record what happened on the visit before raising a " +
+        "return visit against it.",
+    );
+  }
+
+  const outcomeRows = await tx
+    .select({
+      label: schema.jobOutcomeCodes.label,
+      requiresReturnVisit: schema.jobOutcomeCodes.requiresReturnVisit,
+    })
+    .from(schema.jobOutcomeCodes)
+    .where(eq(schema.jobOutcomeCodes.code, parent.outcomeCode))
+    .limit(1);
+
+  const outcome = outcomeRows[0];
+  if (!outcome?.requiresReturnVisit) {
+    throw new UserFacingError(
+      `"${outcome?.label ?? parent.outcomeCode}" does not call for a return visit. Raise an ` +
+        "ordinary job instead if more work is genuinely needed.",
+    );
+  }
+
+  const calendar = await loadWorkingCalendar(tx);
+  const priority = input.priority ?? (parent.priority as JobPriority);
+  const { respondByAt, resolveByAt } = computeSlaDeadlines(priority, new Date(), undefined, calendar);
+  const reference = await nextJobReference(tx);
+
+  const [job] = await tx
+    .insert(schema.jobs)
+    .values({
+      tenantId: ctx.tenantId,
+      reference,
+      customerId: parent.customerId,
+      propertyId: parent.propertyId,
+      unitId: parent.unitId,
+      assetId: parent.assetId,
+      serviceSlug: parent.serviceSlug,
+      title: input.title ?? `Return visit: ${parent.title}`,
+      status: "triaged",
+      priority,
+      source: "internal",
+      isOutdoor: parent.isOutdoor,
+      contractId: parent.contractId,
+      scheduledFor: input.scheduledFor ?? null,
+      respondByAt,
+      resolveByAt,
+      // The whole point: named to its parent and flagged, so PPM compliance,
+      // first-time-fix maths and any reactive/planned split can tell this
+      // apart from fresh work.
+      parentJobId: parent.id,
+      isRevisit: true,
+      createdById: ctx.userId ?? null,
+    })
+    .returning({ id: schema.jobs.id });
+
+  if (!job) throw new Error("Failed to create the return-visit job");
+
+  await tx.insert(schema.jobEvents).values({
+    tenantId: ctx.tenantId,
+    jobId: job.id,
+    fromStatus: null,
+    toStatus: "triaged",
+    note: `Return visit for ${parent.reference} — ${outcome.label}`,
+    actorId: ctx.userId ?? null,
+    actorKind: "user",
+  });
+
+  return { jobId: job.id, reference };
 }
 
 // ── The jobs list: search and keyset pagination (`LEAD-8`) ───────────────────

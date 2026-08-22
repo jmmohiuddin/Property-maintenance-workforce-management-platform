@@ -51,6 +51,9 @@ import {
   loadSchedule,
   rescheduleVisit,
   transitionJob,
+  recordJobOutcome,
+  raiseReturnVisit,
+  getJobDetail,
 } from "../src/index";
 import { slaState, UserFacingError, DEFAULT_MIDDAY_BAN, formatMinute, type JobStatus } from "@meridian/core";
 import { testTenantId } from "./_tenant";
@@ -550,6 +553,72 @@ async function main(): Promise<void> {
   checkTrue(
     "a completed visit cannot be rescheduled",
     settledRefusal.includes("cannot be rescheduled"),
+  );
+
+  // ── Revisit tracking: `parentJobId` / `isRevisit`, wired for the first time ─
+  //
+  // `raiseReturnVisit` is gated on the PARENT job's own recorded outcome, so
+  // every case below records one first with `recordJobOutcome({ completeWork:
+  // false })` — a correction-only call that sets `outcome_code` without moving
+  // the job (avoiding the JOB-15 job-card gate, which is not what this suite
+  // is testing).
+
+  // Positive: an outcome that calls for a return visit (`no_access`) lets one
+  // be raised, and the new job says so and names its parent.
+  const revisitParent = await makeJob({ suffix: "REVISIT-PARENT", title: `${TOKEN} revisit parent`, status: "on_site" });
+  await withTenant(ctx, (tx) =>
+    recordJobOutcome(tx, ctx, { jobId: revisitParent, outcomeCode: "no_access", completeWork: false }),
+  );
+  const revisit = await withTenant(ctx, (tx) => raiseReturnVisit(tx, ctx, { parentJobId: revisitParent }));
+  createdJobs.push(revisit.jobId);
+  checkTrue("raising a return visit yields a new job", revisit.jobId !== revisitParent);
+
+  const revisitDetail = await withTenant(ctx, (tx) => getJobDetail(tx, revisit.jobId));
+  check("the new job names its parent", revisitDetail?.parentJobId, revisitParent);
+  checkTrue("the new job is flagged as a revisit", revisitDetail?.isRevisit === true);
+  checkTrue(
+    "the new job carries the parent's own reference for display",
+    (revisitDetail?.parentJobReference ?? "").includes(`ZZ-${RUN}-REVISIT-PARENT`),
+  );
+  checkTrue("the return visit gets an SLA clock of its own", revisitDetail?.resolveByAt != null);
+
+  // Load-bearing positive on the OTHER side: an ordinary job raised by
+  // `makeJob` (not through `raiseReturnVisit`) has both columns null — the
+  // "do not backfill" guarantee, checked directly rather than assumed.
+  const ordinaryJob = await makeJob({ suffix: "ORDINARY", title: `${TOKEN} ordinary job`, status: "triaged" });
+  const ordinaryDetail = await withTenant(ctx, (tx) => getJobDetail(tx, ordinaryJob));
+  check("an ordinary job has no parent", ordinaryDetail?.parentJobId, null);
+  checkTrue("and is not flagged as a revisit", ordinaryDetail?.isRevisit === false);
+
+  // Negative: an outcome that does NOT call for a return visit (`completed`)
+  // refuses to raise one.
+  const noReturnParent = await makeJob({ suffix: "NORETURN", title: `${TOKEN} no return needed`, status: "on_site" });
+  await withTenant(ctx, (tx) =>
+    recordJobOutcome(tx, ctx, { jobId: noReturnParent, outcomeCode: "completed", completeWork: false }),
+  );
+  let noReturnRefusal = "";
+  try {
+    await withTenant(ctx, (tx) => raiseReturnVisit(tx, ctx, { parentJobId: noReturnParent }));
+  } catch (error) {
+    noReturnRefusal = error instanceof UserFacingError ? error.message : String(error);
+  }
+  checkTrue(
+    "an outcome that does not require a return visit refuses to raise one",
+    noReturnRefusal.includes("does not call for a return visit"),
+  );
+
+  // Negative: a job with no recorded outcome at all refuses too — there is
+  // nothing yet to justify a return visit against.
+  const noOutcomeParent = await makeJob({ suffix: "NOOUTCOME", title: `${TOKEN} no outcome yet`, status: "on_site" });
+  let noOutcomeRefusal = "";
+  try {
+    await withTenant(ctx, (tx) => raiseReturnVisit(tx, ctx, { parentJobId: noOutcomeParent }));
+  } catch (error) {
+    noOutcomeRefusal = error instanceof UserFacingError ? error.message : String(error);
+  }
+  checkTrue(
+    "a job with no recorded outcome refuses a return visit",
+    noOutcomeRefusal.includes("no recorded outcome"),
   );
 
   // ── Clean-up: nothing this test wrote should outlive it ──────────────────
