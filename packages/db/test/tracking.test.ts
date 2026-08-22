@@ -49,6 +49,8 @@ import {
   purgeLocationTraces,
   RETENTION_LOCATION_TRACE_DAYS,
   TRACKING_STALE_AFTER_MINUTES,
+  applyFieldMutations,
+  registerFieldDevice,
   schema,
   closeConnection,
 } from "../src/index";
@@ -561,6 +563,180 @@ async function main(): Promise<void> {
   });
   const purged = await withTenant(ctx, (tx) => purgeLocationTraces(tx, ctx));
   checkTrue("   while a trace past the window is purged", purged.deleted >= 1);
+
+  console.log("\n── 16. FLD-16's producer: the field app's own mutations, end to end");
+
+  // Every section above drives `recordTechnicianPing` directly, which is the
+  // right way to test the READ side and the write function's own rules. None
+  // of it proves the thing `FLD-16` was actually about: that BEFORE this
+  // change, nothing anywhere called `recordTechnicianPing` outside its own
+  // test, so a real handset produced no rows and this whole file was
+  // exercising a function nobody could reach.
+  //
+  // So this drives it the other way: a status transition and a location
+  // batch, submitted exactly as `apps/web/src/app/api/field/v1/mutations/
+  // route.ts` submits them for a real handset - through `applyFieldMutations`
+  // - and then asks the SAME question section 1 asked, of a customer session
+  // that has seen none of the domain functions above by name.
+  //
+  // A dedicated technician, customer and property, entirely separate from
+  // `techShared`'s: that fixture already carries a live `en_route` visit by
+  // this point in the file (section 10 left it that way), and
+  // `currentTrackingAudience` picks the EARLIEST live visit when a technician
+  // has two - reusing `techShared` here would silently assert against the
+  // wrong job the moment that ordering did not go this test's way.
+
+  const producerIds = await withTenant(ctx, async (tx) => {
+    const [customer] = await tx
+      .insert(schema.customers)
+      .values({
+        tenantId,
+        code: `${TAG}-PROD`,
+        name: `${TAG} Producer Co`,
+        phone: "+971509990099",
+        billingEmail: "prod@tracktest.invalid",
+      })
+      .returning({ id: schema.customers.id });
+    if (!customer) throw new Error("could not create the producer-test customer");
+
+    const [property] = await tx
+      .insert(schema.properties)
+      .values({
+        tenantId,
+        customerId: customer.id,
+        name: `${TAG} Producer Site`,
+        addressLine: "1 Test Street",
+        city: "Dubai",
+        lat: PROPERTY_POINT.lat,
+        lng: PROPERTY_POINT.lng,
+      })
+      .returning({ id: schema.properties.id });
+    if (!property) throw new Error("could not create the producer-test property");
+
+    const [technician] = await tx
+      .insert(schema.technicians)
+      .values({
+        tenantId,
+        employeeCode: `${TAG}-TPROD`,
+        fullName: `${TAG} Technician Producer`,
+        phone: "+971508880088",
+        primaryTrade: "handyman",
+      })
+      .returning({ id: schema.technicians.id });
+    if (!technician) throw new Error("could not create the producer-test technician");
+
+    // `dispatched` / `assigned` - the real starting point, so the mutation
+    // below is a genuine transition and not a same-status no-op the way an
+    // `en_route`-seeded fixture would make it.
+    const [job] = await tx
+      .insert(schema.jobs)
+      .values({
+        tenantId,
+        reference: `${TAG}-J-PROD`,
+        customerId: customer.id,
+        propertyId: property.id,
+        serviceSlug: "handyman",
+        title: `${TAG} producer job`,
+        status: "dispatched",
+        source: "customer_portal",
+      })
+      .returning({ id: schema.jobs.id });
+    if (!job) throw new Error("could not create the producer-test job");
+
+    await tx.insert(schema.jobVisits).values({
+      tenantId,
+      jobId: job.id,
+      technicianId: technician.id,
+      sequence: 1,
+      status: "assigned",
+    });
+
+    const userRow = (await tx.execute<{ user_id: string }>(sql`
+      select user_id from memberships where is_active limit 1
+    `)) as unknown as { user_id: string }[];
+    const userId = userRow[0]?.user_id;
+    if (!userId) throw new Error("Seed data missing a membership. Run `npm run db:seed`.");
+
+    return { customerId: customer.id, technicianId: technician.id, jobId: job.id, userId };
+  });
+
+  const device = await withTenant({ ...ctx, userId: producerIds.userId }, async (tx) =>
+    registerFieldDevice(tx, { tenantId, userId: producerIds.userId }, {
+      technicianId: producerIds.technicianId,
+      userId: producerIds.userId,
+      label: `${TAG} producer handset`,
+      platform: "ios",
+      tokenHash: "f".repeat(64),
+      tokenExpiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    }),
+  );
+
+  const producerScope = { tenantId, customerId: producerIds.customerId };
+
+  check(
+    "16a. before the phone sends anything, the customer sees no position and no tracking",
+    await withCustomerScope(producerScope, (tx) => getPortalLiveTracking(tx, producerIds.jobId)),
+    null,
+  );
+
+  // The button `JobCardScreen`'s "On my way" drives - `job_status/transition`.
+  const setOff = await withTenant({ tenantId, userId: producerIds.userId }, (tx) =>
+    applyFieldMutations(tx, { tenantId, userId: producerIds.userId }, {
+      deviceId: device.id,
+      technicianId: producerIds.technicianId,
+      mutations: [
+        {
+          clientId: "TRACKTESTPRODSETOFF001",
+          entity: "job_status",
+          op: "transition",
+          payload: { jobId: producerIds.jobId, to: "en_route" },
+        },
+      ],
+    }),
+  );
+  check("16b. the field app's own status mutation is accepted", setOff.accepted.length, 1);
+
+  // What `LocationSharingTracker` sends once the watch reports a fix.
+  const pinged = await withTenant({ tenantId, userId: producerIds.userId }, (tx) =>
+    applyFieldMutations(tx, { tenantId, userId: producerIds.userId }, {
+      deviceId: device.id,
+      technicianId: producerIds.technicianId,
+      mutations: [
+        {
+          clientId: "TRACKTESTPRODPING00001",
+          entity: "technician_location",
+          op: "append",
+          payload: { pings: [{ lat: PING_POINT.lat, lng: PING_POINT.lng, recordedAt: new Date().toISOString() }] },
+        },
+      ],
+    }),
+  );
+  check("16c. the field app's own location mutation is accepted", pinged.accepted.length, 1);
+  check(
+    "   and it tells the technician who is watching",
+    (pinged.accepted[0]?.result["sharedWithCustomer"] as { customerName: string } | null)?.customerName,
+    `${TAG} Producer Co`,
+  );
+
+  // ── 16d. THE assertion this whole section exists for ─────────────────────
+  const producerTracking = await withCustomerScope(producerScope, (tx) =>
+    getPortalLiveTracking(tx, producerIds.jobId),
+  );
+  checkTrue(
+    "16d. the customer can now see live tracking, produced entirely by the field app's own mutations",
+    producerTracking !== null,
+  );
+  check("   in the travelling state", producerTracking?.state, "travelling");
+  check("   naming the right technician", producerTracking?.technicianName, `${TAG} Technician Producer`);
+  // The load-bearing part of 16d: `state: "travelling"` is a property of the
+  // VISIT alone (`job_visits.status = 'en_route'`) and would read the same
+  // even if the field app's location mutation never landed a single row — see
+  // section 11's `stuck` fixture, which is `on_site` with nothing behind it.
+  // `lastSeenAt` is what actually depends on a ping having been recorded, so
+  // it is the assertion that fails if `handleLocationPing`'s wiring is
+  // removed, not merely one that happens to still pass.
+  checkTrue("   with a real position behind it, not just a live visit", producerTracking?.lastSeenAt !== null);
+  checkBetween("   and a distance derived from that position", producerTracking?.distanceKm ?? null, 0, 50);
 
   await purge(tenantId);
   await closeConnection();

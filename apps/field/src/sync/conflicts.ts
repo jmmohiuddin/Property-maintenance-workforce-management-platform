@@ -54,6 +54,10 @@ export const DATA_CLASS_OF: Readonly<Record<FieldMutationKind, DataClass>> = {
   "job_attachment/append": "immutable_event",
   "attendance/append": "immutable_event",
   "job_signature/record": "immutable_event",
+  // A position. Nothing overwrites a fix that has already landed, and the
+  // server never asks the device for one back - same class as an attendance
+  // event, for the same reason.
+  "technician_location/append": "immutable_event",
 
   // "Additive collections - materials, notes, photos. Union by
   //  client-generated ID. An or-set, implementable without a CRDT library."

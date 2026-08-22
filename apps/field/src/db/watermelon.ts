@@ -233,6 +233,33 @@ export async function writeCardMutation(
   });
 }
 
+/**
+ * Queue a mutation with no paired domain write.
+ *
+ * Every other capture in this module pairs its outbox row with a local
+ * domain record (see the module header) - the domain row is what a screen
+ * reads back before the mutation has even reached the office. Two callers
+ * have nothing local to write:
+ *
+ *   * A job-status transition ("On my way", "Arrived") drives `jobs.status`,
+ *     a column this device does not own - it arrives from the SERVER on the
+ *     next pull, via `applySyncPlan`. Writing it here too would make this
+ *     device a second writer of one field, and the two would only ever agree
+ *     by coincidence, not because anything keeps them in step.
+ *   * A location ping (`FLD-16`) has no local representation to render at
+ *     all - no screen on this phone shows a technician their own trail, only
+ *     the customer's board does, on the office's copy of the data.
+ *
+ * So this is the one path that writes an outbox row alone, named and
+ * explained here rather than left for the next reader to find as a bare
+ * `database.write()` and wonder whether it was a mistake.
+ */
+export async function queueMutationOnly(database: Database, outbox: OutboxWrite): Promise<void> {
+  await database.write(async () => {
+    await createOutboxRecord(database, outbox);
+  });
+}
+
 // ── Photos and signatures: captured instantly, filed once uploaded ─────────
 
 /**

@@ -6,7 +6,7 @@
   "main": "index.js",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx test/ids.test.ts && tsx test/clock.test.ts && tsx test/outbox.test.ts && tsx test/engine.test.ts && tsx test/conflicts.test.ts && tsx test/jobcard.test.ts && tsx test/working-set.test.ts && tsx test/media.test.ts && tsx test/schema.test.ts && tsx test/protocol.test.ts && tsx test/payloads.test.ts && tsx test/apply-sync.test.ts && tsx test/device-auth.test.ts && tsx test/hash.test.ts && tsx test/base64.test.ts && tsx test/raster.test.ts && tsx test/material-entry.test.ts && tsx test/outcome-entry.test.ts && tsx test/upload-orchestrator.test.ts && tsx test/geofence.test.ts && tsx test/shift-clock.test.ts",
+    "test": "tsx test/ids.test.ts && tsx test/clock.test.ts && tsx test/outbox.test.ts && tsx test/engine.test.ts && tsx test/conflicts.test.ts && tsx test/jobcard.test.ts && tsx test/working-set.test.ts && tsx test/media.test.ts && tsx test/schema.test.ts && tsx test/protocol.test.ts && tsx test/payloads.test.ts && tsx test/apply-sync.test.ts && tsx test/device-auth.test.ts && tsx test/hash.test.ts && tsx test/base64.test.ts && tsx test/raster.test.ts && tsx test/material-entry.test.ts && tsx test/outcome-entry.test.ts && tsx test/upload-orchestrator.test.ts && tsx test/geofence.test.ts && tsx test/shift-clock.test.ts && tsx test/location-tracking.test.ts",
     "check": "npm run typecheck && npm run test",
     "typecheck:native": "tsc -p tsconfig.native.json --noEmit",
     "start:expo": "expo start",

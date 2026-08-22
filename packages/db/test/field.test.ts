@@ -905,6 +905,136 @@ async function main(): Promise<void> {
     checkTrue("which is a different instant from the corrected one", Math.abs(raw - occurred) > 60_000);
   }
 
+  // ── 8b. FLD-16: technician_location/append, the one batched mutation ─────
+  //
+  // `recordTechnicianPing` itself is exhaustively tested in
+  // `tracking.test.ts` — this is only about the field app's own transport
+  // around it: the batch shape, the technician boundary, and that one bad
+  // fix costs its own mutation and nothing else in the request.
+
+  async function locationCount(forTechnician: string): Promise<number> {
+    return withTenant(ctx, async (tx) => {
+      const rows = (await tx.execute<{ n: number }>(sql`
+        select count(*)::int as n from technician_locations where technician_id = ${forTechnician}::uuid
+      `)) as unknown as { n: number }[];
+      return Number(rows[0]?.n ?? 0);
+    });
+  }
+
+  const beforePings = await locationCount(technicianId);
+
+  const pingBatchId = clientId();
+  const pinged = await withTenant({ ...ctx, userId }, async (tx) =>
+    applyFieldMutations(tx, { ...ctx, userId }, {
+      deviceId: device.id,
+      technicianId,
+      mutations: [
+        {
+          clientId: pingBatchId,
+          entity: "technician_location",
+          op: "append",
+          payload: {
+            pings: [
+              { lat: 25.2, lng: 55.27, recordedAt: new Date().toISOString() },
+              { lat: 25.201, lng: 55.271, recordedAt: new Date(Date.now() + 1000).toISOString(), speedKph: 30 },
+            ],
+          },
+        },
+      ],
+    }),
+  );
+  check("a batch of positions is accepted as one mutation", pinged.accepted.length, 1);
+  check("and both pings in it are recorded", pinged.accepted[0]?.result["recorded"], 2);
+  checkTrue(
+    "the response says whether a customer is watching, one way or the other",
+    Object.prototype.hasOwnProperty.call(pinged.accepted[0]?.result ?? {}, "sharedWithCustomer"),
+  );
+  check("and the rows really did land", (await locationCount(technicianId)) - beforePings, 2);
+
+  // No field for the device to name a technician in at all — the row is
+  // stamped from the authenticated device, not from anything in the payload.
+  const beforeOtherPings = await locationCount(otherTechnicianId);
+  await withTenant({ ...ctx, userId }, async (tx) =>
+    applyFieldMutations(tx, { ...ctx, userId }, {
+      deviceId: device.id,
+      technicianId,
+      mutations: [
+        {
+          clientId: clientId(),
+          entity: "technician_location",
+          op: "append",
+          payload: {
+            // A `technicianId` field that does not exist on `TechnicianPing`'s
+            // wire shape, aimed at somebody else's rows.
+            pings: [{ technicianId: otherTechnicianId, lat: 25.3, lng: 55.3, recordedAt: new Date().toISOString() }],
+          },
+        },
+      ],
+    }),
+  );
+  check(
+    "an injected technicianId in the payload is ignored — the position lands under the authenticated device's own technician",
+    await locationCount(otherTechnicianId),
+    beforeOtherPings,
+  );
+
+  // An empty batch names nothing to record.
+  const emptyBatch = await withTenant({ ...ctx, userId }, async (tx) =>
+    applyFieldMutations(tx, { ...ctx, userId }, {
+      deviceId: device.id,
+      technicianId,
+      mutations: [{ clientId: clientId(), entity: "technician_location", op: "append", payload: { pings: [] } }],
+    }),
+  );
+  check("an empty batch of positions is refused, not silently accepted", emptyBatch.rejected.length, 1);
+
+  // One bad fix costs its own mutation, not the whole request — the savepoint
+  // around every mutation in `applyFieldMutations` is what makes this true,
+  // and it is worth asserting for THIS handler because it is the one whose
+  // domain call (`recordTechnicianPing`) can fail partway through a batch
+  // that is otherwise entirely good.
+  const beforeMixed = await locationCount(technicianId);
+  const nullIslandId = clientId();
+  const mixedBatch = await withTenant({ ...ctx, userId }, async (tx) =>
+    applyFieldMutations(tx, { ...ctx, userId }, {
+      deviceId: device.id,
+      technicianId,
+      mutations: [
+        {
+          clientId: nullIslandId,
+          entity: "technician_location",
+          op: "append",
+          payload: {
+            pings: [
+              { lat: 25.4, lng: 55.4, recordedAt: new Date().toISOString() },
+              // Null Island: a GPS fix that never arrived. `assertPlausible`
+              // refuses the row, and refuses the whole batch it travelled in.
+              { lat: 0, lng: 0, recordedAt: new Date(Date.now() + 1000).toISOString() },
+            ],
+          },
+        },
+        {
+          // A fresh, entirely valid batch — proving the savepoint around the
+          // FIRST mutation rolled back on its own and did not abort the
+          // shared transaction the second one still needed.
+          clientId: clientId(),
+          entity: "technician_location",
+          op: "append",
+          payload: {
+            pings: [{ lat: 25.5, lng: 55.5, recordedAt: new Date().toISOString() }],
+          },
+        },
+      ],
+    }),
+  );
+  check("a batch with one Null Island fix is rejected", mixedBatch.rejected.length, 1);
+  check(
+    "and a good batch beside it in the same request is still accepted, savepoint intact",
+    mixedBatch.accepted.length,
+    1,
+  );
+  check("nothing from the BAD batch was written — not even the plausible fix it travelled with", await locationCount(technicianId), beforeMixed + 1);
+
   // ── 9. The one conflict a rule may not decide (§8.4, ADR 0004) ───────────
   //
   // The technician completes offline; the office cancelled the job. Both are

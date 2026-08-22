@@ -4,6 +4,7 @@ import {
   UnavailableFromTheFieldError,
   appendAttachment,
   appendAttendance,
+  appendLocationPings,
   appendMaterial,
   declareNoMaterials,
   exemptFromPhoto,
@@ -31,6 +32,7 @@ const built = [
   recordSignature({ jobId: "j1", uploadId: "u2", signedByName: "A. Customer" }),
   upsertNote({ jobId: "j1", workCarriedOut: "Replaced contactor", baseVersion: null }),
   appendAttendance({ kind: "shift_in", occurredAt: "2026-08-22T06:00:00.000Z" }),
+  appendLocationPings([{ lat: 25.2048, lng: 55.2708, recordedAt: "2026-08-22T06:00:00.000Z" }]),
 ];
 
 for (const spec of built) {
@@ -265,5 +267,32 @@ deepEqual("lat/lng/accuracy and withinGeofence all travel independently", positi
   accuracyMetres: 12,
   withinGeofence: false,
 });
+
+// ── FLD-16: the one payload that is an array ────────────────────────────────
+
+const onePing = appendLocationPings([{ lat: 25.2048, lng: 55.2708, recordedAt: "2026-08-22T06:00:00.000Z" }]);
+equal("a location ping belongs to no job", onePing.jobId, null);
+check("and does not invent one in the payload", !("jobId" in onePing.payload));
+check("the payload carries an array, unlike every other mutation kind", Array.isArray(onePing.payload["pings"]));
+equal("of exactly the pings given", (onePing.payload["pings"] as unknown[]).length, 1);
+check(
+  "never a technicianId — the device gets no field to claim an identity in",
+  !("technicianId" in ((onePing.payload["pings"] as Record<string, unknown>[])[0] ?? {})),
+);
+equal("a ping is append-only, so it carries no baseVersion", onePing.baseVersion, null);
+
+const batch = appendLocationPings([
+  { lat: 25.2, lng: 55.27, recordedAt: "2026-08-22T06:00:00.000Z" },
+  { lat: 25.21, lng: 55.28, recordedAt: "2026-08-22T06:00:20.000Z", speedKph: 44, headingDegrees: 90 },
+]);
+equal("a batch of two pings arrives as two", (batch.payload["pings"] as unknown[]).length, 2);
+deepEqual(
+  "optional fields on the first ping are omitted, not sent as null",
+  batch.payload["pings"] as unknown[],
+  [
+    { lat: 25.2, lng: 55.27, recordedAt: "2026-08-22T06:00:00.000Z" },
+    { lat: 25.21, lng: 55.28, headingDegrees: 90, speedKph: 44, recordedAt: "2026-08-22T06:00:20.000Z" },
+  ],
+);
 
 done("payloads");

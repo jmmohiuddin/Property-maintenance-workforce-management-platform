@@ -72,15 +72,22 @@ import {
   TIMING_EVENT_LABEL,
   type TimingEvent,
 } from "../../domain/attendance";
-import { formatDuration } from "@meridian/core";
+import { canTransition, formatDuration, STATUS_LABEL, type JobStatus } from "@meridian/core";
 import { systemClock, stampOffline, type OfflineStamp } from "../../domain/clock";
 import { newClientId } from "../../domain/ids";
-import { appendMaterial, declareNoMaterials, recordOutcome, type MutationSpec } from "../../sync/payloads";
+import {
+  appendMaterial,
+  declareNoMaterials,
+  recordOutcome,
+  transition,
+  type MutationSpec,
+} from "../../sync/payloads";
 import {
   writeWithOutbox,
   writeCardMutation,
   updateJobCard,
   createJobPhotoRecord,
+  queueMutationOnly,
   type OutboxWrite,
 } from "../../db/watermelon";
 import {
@@ -105,6 +112,27 @@ const FAULT_KIND_LABEL: Readonly<Record<FaultCodeKind, string>> = {
   cause: "Cause",
   remedy: "Remedy",
 };
+
+/**
+ * `FLD-3`: the two visit transitions this screen drives.
+ *
+ * `transition()` in `sync/payloads.ts` will build a mutation for any of
+ * `en_route | on_site | paused` - the server's own `DEVICE_DRIVABLE_STATUSES`
+ * - but `paused` has no control on this screen. It is a dispatch-adjacent
+ * state ("waiting on a part", "site inaccessible") this session did not build
+ * a reason-capture flow for, and a bare pause button with no reason attached
+ * would be a worse gap than not offering one yet. Arrival is what `FLD-3` and
+ * `FLD-16` both need — `transitionJob` is what stamps `job_visits.en_route_at`
+ * / `arrived_at`, which is simultaneously the attendance record and the ONLY
+ * thing that opens the customer-tracking window (`customer_scope` in
+ * `packages/db/sql/customer-scope.sql` and `domain/location-tracking.ts` both
+ * key off exactly these two statuses) — so this is the button that makes
+ * both features real, not a UI nicety layered on top of them.
+ */
+const VISIT_STATUS_BUTTONS: readonly { readonly to: "en_route" | "on_site"; readonly label: string }[] = [
+  { to: "en_route", label: "On my way" },
+  { to: "on_site", label: "Arrived" },
+];
 
 export function JobCardScreen({
   database,
@@ -132,6 +160,7 @@ export function JobCardScreen({
   const [materialErrors, setMaterialErrors] = useState<readonly string[]>([]);
   const [outcomeNote, setOutcomeNote] = useState("");
   const [outcomeError, setOutcomeError] = useState<string | null>(null);
+  const [statusBusy, setStatusBusy] = useState<"en_route" | "on_site" | null>(null);
 
   useEffect(() => {
     const subscriptions = [
@@ -286,6 +315,32 @@ export function JobCardScreen({
     };
   }
 
+  /**
+   * `FLD-3` / `FLD-16`. Queues `job_status/transition` - the same mutation
+   * `transitionJob` on the office side has always accepted, just never driven
+   * from this screen (see the header on `VISIT_STATUS_BUTTONS`).
+   *
+   * No local write pairs with this outbox row - `queueMutationOnly`'s own
+   * header explains why: `jobs.status` is a server-owned column and this
+   * device does not get to be a second writer of it. The button stays live
+   * until the next sync pulls the new status back down; `statusBusy` only
+   * stops a double-tap while one send is in flight, it does not simulate the
+   * transition locally.
+   */
+  async function setVisitStatus(to: "en_route" | "on_site"): Promise<void> {
+    setStatusBusy(to);
+    try {
+      const spec = transition({ jobId, to, baseVersion: job?.version ?? null });
+      const stamp = stampOffline(systemClock, null);
+      await queueMutationOnly(database, outboxWrite(spec, stamp));
+      setNotice(null);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "That could not be recorded on this phone.");
+    } finally {
+      setStatusBusy(null);
+    }
+  }
+
   async function chooseFaultCode(choice: FaultCodeChoice): Promise<void> {
     const next = withFaultCode(faultSelection, choice);
     const stamp = stampOffline(systemClock, null);
@@ -398,6 +453,14 @@ export function JobCardScreen({
 
   if (!job || !draft) return <View style={styles.screen} />;
 
+  // Only the transitions legal from where this job's own last-synced status
+  // sits - `canTransition` is `@meridian/core`'s, the same graph
+  // `transitionJob` enforces, so this screen cannot offer a button the server
+  // is certain to refuse.
+  const availableVisitActions = VISIT_STATUS_BUTTONS.filter((action) =>
+    canTransition(job.status as JobStatus, action.to),
+  );
+
   // The server's answer, not ours. `undefined` when this job has never synced;
   // `null` when completion is not on the table; `[]` when it is ready.
   const serverGaps = job.gapsJson === undefined ? undefined : (JSON.parse(job.gapsJson) as string[] | null);
@@ -433,9 +496,31 @@ export function JobCardScreen({
       </Pressable>
 
       <Text style={styles.title}>{job.title}</Text>
-      <Text style={styles.reference}>{job.reference}</Text>
+      <Text style={styles.reference}>
+        {job.reference} · {STATUS_LABEL[job.status as JobStatus] ?? job.status}
+      </Text>
 
       {notice ? <Text style={styles.notice}>{notice}</Text> : null}
+
+      {/* `FLD-3`: the visit's own progress, driven from the job it belongs to.
+          Hidden once neither is legal - a job the office has already moved on
+          past `on_site`, or one not yet `dispatched` - rather than shown
+          disabled, which would invite a tap this build already knows fails. */}
+      {availableVisitActions.length > 0 ? (
+        <View style={styles.visitActions}>
+          {availableVisitActions.map((action) => (
+            <Pressable
+              key={action.to}
+              onPress={() => void setVisitStatus(action.to)}
+              disabled={statusBusy !== null}
+              style={[styles.primary, styles.visitButton, statusBusy !== null && styles.primaryDisabled]}
+              accessibilityRole="button"
+            >
+              <Text style={styles.primaryText}>{statusBusy === action.to ? "Sending…" : action.label}</Text>
+            </Pressable>
+          ))}
+        </View>
+      ) : null}
 
       {/* The server's refusal, above the local checklist and never overruled. */}
       {lastRefusal ? (
@@ -762,6 +847,8 @@ const styles = StyleSheet.create({
   title: { color: theme.colour.text, fontSize: theme.font.display, marginBottom: theme.space.xs },
   reference: { color: theme.colour.textMuted, fontSize: theme.font.small, marginBottom: theme.space.lg },
   notice: { color: theme.colour.warning, fontSize: theme.font.small, marginBottom: theme.space.md },
+  visitActions: { flexDirection: "row", gap: theme.space.sm, marginBottom: theme.space.lg },
+  visitButton: { flex: 1, marginTop: 0 },
   section: { marginBottom: theme.space.lg },
   sectionTitle: {
     color: theme.colour.textMuted,

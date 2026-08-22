@@ -117,6 +117,7 @@ export const FIELD_MUTATION_KINDS = [
   "job_signature/record",
   "job_note/upsert",
   "attendance/append",
+  "technician_location/append",
 ] as const;
 
 export type FieldMutationKind = (typeof FIELD_MUTATION_KINDS)[number];
@@ -131,6 +132,7 @@ export const MUTATION_ENTITIES = [
   "job_signature",
   "job_note",
   "attendance",
+  "technician_location",
 ] as const;
 
 export type MutationEntity = (typeof MUTATION_ENTITIES)[number];

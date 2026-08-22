@@ -518,6 +518,61 @@ export function appendAttendance(input: {
   };
 }
 
+// ── Location pings (`FLD-16`) ────────────────────────────────────────────────
+
+export interface LocationPingInput {
+  readonly lat: number;
+  readonly lng: number;
+  readonly headingDegrees?: number | null;
+  readonly speedKph?: number | null;
+  readonly batteryPercent?: number | null;
+  /** Device wall-clock ISO-8601 of the fix itself, not of the flush. */
+  readonly recordedAt: string;
+}
+
+/**
+ * `technician_location/append`. **The one mutation whose payload is an array.**
+ *
+ * Every other builder in this file composes one event. A position is
+ * different: `recordTechnicianPing` (`packages/db/src/domain/tracking.ts`)
+ * takes a BATCH and dedupes it by `(technician_id, recorded_at)`, because the
+ * whole reason continuous tracking is affordable on a phone is that dozens of
+ * fixes collected on a walk to the plant room travel as one request instead of
+ * one outbox row and one HTTP round trip each. Queuing a mutation the instant
+ * `watchPositionAsync` reports a fix would defeat that - see
+ * `domain/location-tracking.ts` for the buffer this is built from, and
+ * `app/components/LocationSharingTracker.tsx` for what flushes it.
+ *
+ * `technicianId` is never a field here, for any ping. Every other builder that
+ * names an actor at least lets the server check the device's claim
+ * (`requireJobForTechnician`); this one gives the device nothing to claim -
+ * `handleLocationPing` in `field.ts` stamps every ping in the batch with the
+ * authenticated device's own technician. There is no field for a buggy or
+ * compromised client to lie in.
+ */
+export function appendLocationPings(pings: readonly LocationPingInput[]): MutationSpec {
+  return {
+    entity: "technician_location",
+    op: "append",
+    // No job: a position belongs to the technician's shift, not to one job -
+    // the same reasoning `appendAttendance` gives for its own `jobId: null`.
+    jobId: null,
+    payload: {
+      pings: pings.map((p) => ({
+        lat: p.lat,
+        lng: p.lng,
+        ...optional("headingDegrees", p.headingDegrees ?? null),
+        ...optional("speedKph", p.speedKph ?? null),
+        ...optional("batteryPercent", p.batteryPercent ?? null),
+        recordedAt: p.recordedAt,
+      })),
+    },
+    // Append-only: nothing can make a fix that already landed stale (§8.4).
+    baseVersion: null,
+    dependsOnClientId: null,
+  };
+}
+
 /**
  * Omit rather than send null.
  *

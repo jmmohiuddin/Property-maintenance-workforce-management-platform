@@ -37,6 +37,7 @@ import { SignatureScreen } from "./screens/SignatureScreen";
 import { SignInScreen } from "./screens/SignInScreen";
 import { SyncStatusScreen } from "./screens/SyncStatusScreen";
 import { SyncBanner } from "./components/SyncBanner";
+import { LocationSharingTracker } from "./components/LocationSharingTracker";
 import { createDatabase } from "../db/watermelon";
 import { FieldApiClient } from "../sync/client";
 import { SyncRunner, type SyncStatus } from "./sync-runner";
@@ -258,6 +259,10 @@ export default function App(): React.JSX.Element {
     <SafeAreaView style={styles.root}>
       <StatusBar barStyle="light-content" backgroundColor={theme.colour.background} />
       <SyncBanner status={status} onPress={() => setRoute({ name: "sync" })} />
+      {/* `FLD-16`: mounted once, alongside the route switch rather than
+          inside one screen - the capture window it drives does not care
+          which screen is on top, only which job is `en_route`/`on_site`. */}
+      {gateOpen ? <LocationSharingTracker database={database} /> : null}
       <View style={styles.body}>
         {registered === null ? null : !gateOpen ? (
           <SignInScreen

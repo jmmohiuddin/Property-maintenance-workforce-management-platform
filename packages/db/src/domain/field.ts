@@ -12,6 +12,7 @@ import {
 } from "@meridian/core";
 import { transitionJob } from "./jobs";
 import { recordJobOutcome } from "./outcomes";
+import { recordTechnicianPing, type TechnicianPing } from "./tracking";
 import {
   recordJobAttachment,
   recordJobMaterial,
@@ -1016,6 +1017,7 @@ export const FIELD_MUTATION_KINDS = [
   "job_signature/record", // recordJobSignature
   "job_note/upsert", // this file — see recordFieldJobNote
   "attendance/append", // this file — see recordFieldAttendance
+  "technician_location/append", // this file — see handleLocationPing; recordTechnicianPing (tracking.ts) writes the rows (FLD-16)
 ] as const;
 
 export type FieldMutationKind = (typeof FIELD_MUTATION_KINDS)[number];
@@ -1905,6 +1907,94 @@ async function handleAttendance(h: HandlerContext, payload: Record<string, unkno
 }
 
 /**
+ * A sanity ceiling on one flushed batch of positions, unrelated to whatever
+ * flush cadence the device is tuned to (see `apps/field/src/domain/
+ * location-tracking.ts`'s own, smaller `MAX_BUFFERED_PINGS`). A batch this
+ * large is not a phone catching up after a dead zone, it is a bug — a runaway
+ * buffer that never flushed, or a device sending something this API was never
+ * meant to carry — and the honest response is a refusal that says so, not an
+ * INSERT with an unbounded VALUES list.
+ */
+const MAX_LOCATION_PINGS_PER_BATCH = 500;
+
+/**
+ * A batch of positions from one device (`FLD-16`).
+ *
+ * ── THE ONE HANDLER WHOSE PAYLOAD IS A LIST ─────────────────────────────────
+ *
+ * Every other mutation in this file is one event. `technician_location/append`
+ * is a flush of however many fixes the device collected since the last one —
+ * `payload.pings` is the array — because a request per GPS fix is the battery
+ * and bandwidth cost continuous tracking cannot carry on a technician's phone.
+ * Everything below exists to turn that array into the one thing
+ * `recordTechnicianPing` (`./tracking.ts`) will accept: one technician, one
+ * batch, plausible coordinates.
+ *
+ * `technicianId` is never read from the payload, for any ping in the batch.
+ * It is `h.technicianId` — the authenticated device's own technician —
+ * always. Every other handler that names an actor either checks the device's
+ * claim (`requireJobForTechnician`) or has no claim to check; this one goes
+ * one step further and gives the device no field to make a claim in at all,
+ * which is stronger than validating one.
+ *
+ * `recordedAt` is corrected by the measured clock skew before it becomes the
+ * value `tracking.ts` dedupes and windows on, for the same reason
+ * `attendance/append` corrects `occurredAt`: `customer_scope` in
+ * `sql/customer-scope.sql` compares `recorded_at` against `v.en_route_at`,
+ * which is a SERVER instant, and an uncorrected device clock would put every
+ * ping from a fast or slow handset outside the very window it exists to be
+ * read inside.
+ */
+async function handleLocationPing(h: HandlerContext, payload: Record<string, unknown>): Promise<HandlerOutcome> {
+  const rawPings = payload["pings"];
+  if (!Array.isArray(rawPings) || rawPings.length === 0) {
+    throw new UserFacingError("This position update carries no positions.");
+  }
+  if (rawPings.length > MAX_LOCATION_PINGS_PER_BATCH) {
+    throw new UserFacingError("Too many positions in one update.");
+  }
+
+  const pings: TechnicianPing[] = rawPings.map((raw, index) => {
+    if (typeof raw !== "object" || raw === null) {
+      throw new UserFacingError(`Position ${index + 1} in this update is not a record.`);
+    }
+    const row = raw as Record<string, unknown>;
+    const lat = Number(row["lat"]);
+    const lng = Number(row["lng"]);
+    const deviceIso = typeof row["recordedAt"] === "string" ? row["recordedAt"] : null;
+    const recordedAt = toServerTime(deviceIso, h.skewMs);
+    if (!recordedAt) {
+      throw new UserFacingError(`Position ${index + 1} in this update has no usable time on it.`);
+    }
+    return {
+      // Never `row["technicianId"]`. See the header above.
+      technicianId: h.technicianId,
+      lat,
+      lng,
+      headingDegrees: optionalInteger(row, "headingDegrees"),
+      speedKph: optionalInteger(row, "speedKph"),
+      batteryPercent: optionalInteger(row, "batteryPercent"),
+      recordedAt,
+    };
+  });
+
+  const outcome = await recordTechnicianPing(h.tx, h.ctx, pings);
+  return {
+    kind: "accepted",
+    result: {
+      recorded: outcome.recorded,
+      // Named, per-ping refusals (Null Island, off-planet, `NaN`) surface as
+      // the ordinary `UserFacingError` catch in `applyFieldMutations` below —
+      // `recordTechnicianPing` throws for the whole batch rather than
+      // returning a partial result, and one savepoint per mutation is exactly
+      // what makes that safe: a bad fix costs this one flush, not the rest of
+      // the queue.
+      sharedWithCustomer: outcome.sharedWithCustomer,
+    },
+  };
+}
+
+/**
  * Apply a batch of mutations from one device (§8.3).
  *
  * ── THE FOUR OUTCOMES, AND WHY THERE ARE FOUR ───────────────────────────────
@@ -2073,6 +2163,9 @@ export async function applyFieldMutations(
           break;
         case "attendance/append":
           outcome = await handleAttendance(handlerContext, payload);
+          break;
+        case "technician_location/append":
+          outcome = await handleLocationPing(handlerContext, payload);
           break;
         default:
           outcome = await handleAppend(handlerContext, mutation.entity, mutation.op, payload);
