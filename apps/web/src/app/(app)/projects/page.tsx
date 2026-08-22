@@ -111,6 +111,16 @@ export default async function ProjectsPage() {
           exactly one invoice.
         </p>
 
+        <p className="mt-3 text-[14px]">
+          <Link href="/projects/chase" className="font-medium hover:underline">
+            Open the chase list →
+          </Link>{" "}
+          <span style={{ color: "var(--text-secondary)" }}>
+            — retention falling due, subcontracts still without the employer&rsquo;s approval, and
+            permits about to lapse, exactly as sent to the morning digest.
+          </span>
+        </p>
+
         {/* ── 1. Retention ──────────────────────────────────────────────── */}
         <section aria-labelledby="retention-heading" className="mt-10">
           <div id="retention-heading">

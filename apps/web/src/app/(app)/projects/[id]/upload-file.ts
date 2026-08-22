@@ -18,12 +18,50 @@
  * that, up to three passes, so a connection that drops halfway through part
  * eleven of twenty does not restart at part one.
  *
- * It does **not** survive a page reload. Resumption across a reload needs the
- * `clientUploadId` to outlive the page — the id is the idempotency key, and
- * without the same one the server correctly opens a second session — and that
- * means persisting it against the file's identity in `sessionStorage`. That is
- * a real feature with real edge cases (which file is "the same" file?) and it
- * is not built. A reload starts the upload again.
+ * ── AND IT NOW SURVIVES A PAGE RELOAD ───────────────────────────────────────
+ *
+ * It used to not. `clientUploadId` is the idempotency key `openUpload` matches
+ * on — the reason the server always returns the *same* session for the same id
+ * is `§8.3`'s "the dominant real-world failure is request succeeded, response
+ * lost, client retries" — but the id was generated fresh with
+ * `crypto.randomUUID()` on every call and lived only in a JS variable. A tab
+ * reload after part eleven of twenty had gone up did not resume that session;
+ * it could not even find it, because the one fact that named it — the id — was
+ * gone with the tab. The upload restarted at part one, chunks it had already
+ * paid for on hotel or site wifi and all.
+ *
+ * "Which file is the same file" turned out to have an answer already sitting
+ * in this function: `sha256`. It is computed before the server is ever
+ * contacted, it is content-addressed rather than name-addressed (a renamed
+ * copy of the same photograph is still the same upload; two different files
+ * that happen to share a name are not confused with each other), and nothing
+ * else needs deriving. So the id is now looked up and stored in
+ * `sessionStorage`, keyed by `purpose` and that hash, before the session is
+ * opened:
+ *
+ *  1. The file is chosen, its bytes are hashed, and `sessionStorage` is asked
+ *     whether this exact `(purpose, sha256)` pair has a `clientUploadId` on
+ *     file from an earlier attempt in this tab.
+ *  2. If it does, that id is reused — the `POST` to `/api/uploads` matches the
+ *     existing session and comes back with the *true* `missingChunks`, which
+ *     after a reload mid-upload is a handful of parts, not twenty.
+ *  3. If it does not, a fresh id is generated, exactly as before, and is
+ *     stored under that key immediately — before the first byte goes over the
+ *     wire — so a reload one second into "opening the upload" still has
+ *     something to resume.
+ *  4. The entry is removed once the upload completes. A finished session has
+ *     nothing left to resume, and clearing it is what stops a second, later
+ *     upload of the same bytes for a different purpose from finding a stale
+ *     id belonging to an attach that already happened.
+ *
+ * `sessionStorage`, not `localStorage`: an upload in flight belongs to this
+ * tab's attempt at this form, and a stale id surviving into a browser restart
+ * days later — to be matched against a session the 48-hour TTL sweep has long
+ * since reclaimed — buys nothing (the server just opens a new one, as before)
+ * while making the storage key list grow forever. Every access is wrapped in
+ * `try`/`catch`: private browsing and a full quota both throw on `setItem`,
+ * and the correct behaviour there is exactly the old behaviour — start over —
+ * not a thrown error the operator cannot do anything about.
  *
  * The one thing it never does is handle a storage key. The server hands back an
  * upload id and nothing else; `sessionResponse` deliberately omits the key, and
@@ -63,6 +101,53 @@ interface SessionBody {
   status: string;
 }
 
+/**
+ * Where an in-flight session's `clientUploadId` is kept between a chunk going
+ * up and a reload wiping every JS variable that named it. See the file
+ * comment above — content-addressed, per tab, best-effort.
+ */
+const RESUME_KEY_PREFIX = "meridian:upload-resume:";
+
+function resumeKey(purpose: BrowserUploadPurpose, sha256: string): string {
+  return `${RESUME_KEY_PREFIX}${purpose}:${sha256}`;
+}
+
+/**
+ * The id a previous attempt at this exact `(purpose, sha256)` left behind, if
+ * `sessionStorage` still has it and still allows reading it.
+ *
+ * Never throws. A private-browsing tab or a full quota is not this function's
+ * problem to report — it is indistinguishable from "no earlier attempt", which
+ * is the same fallback the pre-fix code always took.
+ */
+function loadResumeId(purpose: BrowserUploadPurpose, sha256: string): string | null {
+  try {
+    return sessionStorage.getItem(resumeKey(purpose, sha256));
+  } catch {
+    return null;
+  }
+}
+
+/** Remember this attempt's id, before the first byte is sent. Best-effort. */
+function saveResumeId(purpose: BrowserUploadPurpose, sha256: string, clientUploadId: string): void {
+  try {
+    sessionStorage.setItem(resumeKey(purpose, sha256), clientUploadId);
+  } catch {
+    // Nothing to resume into if this fails; the upload still proceeds, it
+    // just cannot survive a reload — exactly today's behaviour.
+  }
+}
+
+/** Forget it once there is nothing left to resume. Best-effort. */
+function clearResumeId(purpose: BrowserUploadPurpose, sha256: string): void {
+  try {
+    sessionStorage.removeItem(resumeKey(purpose, sha256));
+  } catch {
+    // Leaving a stale entry behind costs nothing worse than the id it always
+    // held: a finished session, which `openUpload` only ever hands back as-is.
+  }
+}
+
 export async function uploadFile(input: {
   file: File;
   purpose: BrowserUploadPurpose;
@@ -78,10 +163,14 @@ export async function uploadFile(input: {
   const sha256 = await hexSha256(buffer);
   const bytes = new Uint8Array(buffer);
 
-  // The idempotency key. Generated before the server is involved, exactly as
-  // the field app's device does — a retried init returns the same session
-  // rather than opening a second one.
-  const clientUploadId = crypto.randomUUID();
+  // The idempotency key. `loadResumeId` recovers the one a previous attempt at
+  // this exact `(purpose, sha256)` pair left in `sessionStorage`, so a page
+  // reload mid-upload reopens the *same* session on the server instead of a
+  // second one; only when there is nothing to recover is a fresh id generated,
+  // exactly as the field app's device does. Stored again immediately either
+  // way — a reload one line from now must find it too.
+  const clientUploadId = loadResumeId(purpose, sha256) ?? crypto.randomUUID();
+  saveResumeId(purpose, sha256, clientUploadId);
 
   say("opening the upload");
   const opened = await fetch("/api/uploads", {
@@ -151,6 +240,11 @@ export async function uploadFile(input: {
   if (!completed.ok) {
     throw new Error(await refusalText(completed, "The upload could not be completed."));
   }
+
+  // Nothing left to resume. Left in place, a finished session's id would only
+  // ever be handed back as itself — harmless — but clearing it is what stops
+  // it outliving its purpose in a tab that goes on to upload other files.
+  clearResumeId(purpose, sha256);
 
   return { uploadId, filename: file.name };
 }

@@ -716,6 +716,51 @@ export const SUBCONTRACT_APPROVAL_LABEL: Readonly<Record<SubcontractApproval, st
 export const SUBCONTRACT_APPROVAL_AUTHORITY =
   "Dubai Law No. 7 of 2025 requires the employer's prior approval before subcontracting.";
 
+/**
+ * How an engagement's approval may move, once `engageSubcontractor` has
+ * created it.
+ *
+ * `pending` is the only state something is chased about, and it resolves one
+ * of two ways: `approved`, with the employer's letter, or `refused`, with the
+ * employer's answer of no. `refused` still has a way forward — an operations
+ * manager who reads "no" often goes back and gets a yes, and the refusal was
+ * not wrong when it was recorded, only not final — so `refused → approved` is
+ * allowed. There is no route back to `pending` from either terminal state: an
+ * approval or a refusal is a decision the employer made and dated, not a
+ * position that lapses on its own, and `not_required` is excluded from this
+ * graph entirely because it was never a question needing an employer's answer
+ * in the first place — see the comment above it.
+ */
+const SUBCONTRACT_APPROVAL_TRANSITIONS: Readonly<
+  Record<SubcontractApproval, readonly SubcontractApproval[]>
+> = {
+  pending: ["approved", "refused"],
+  refused: ["approved"],
+  approved: [],
+  not_required: [],
+};
+
+export function canTransitionSubcontractApproval(
+  from: SubcontractApproval,
+  to: SubcontractApproval,
+): boolean {
+  return SUBCONTRACT_APPROVAL_TRANSITIONS[from].includes(to);
+}
+
+export class InvalidSubcontractApprovalTransitionError extends UserFacingError {
+  constructor(from: SubcontractApproval, to: SubcontractApproval) {
+    super(
+      `Cannot move a subcontract engagement's approval from "${SUBCONTRACT_APPROVAL_LABEL[from]}" ` +
+        `to "${SUBCONTRACT_APPROVAL_LABEL[to]}". Allowed: ` +
+        `${
+          SUBCONTRACT_APPROVAL_TRANSITIONS[from].map((s) => SUBCONTRACT_APPROVAL_LABEL[s]).join(", ") ||
+          "none, this is final"
+        }.`,
+    );
+    this.name = "InvalidSubcontractApprovalTransitionError";
+  }
+}
+
 export interface SubcontractorCompliance {
   readonly licenceExpiresOn: string | null;
   readonly insuranceExpiresOn: string | null;

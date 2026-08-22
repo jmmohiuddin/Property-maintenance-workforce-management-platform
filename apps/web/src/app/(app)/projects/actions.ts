@@ -9,6 +9,7 @@ import {
   attachSnagPhoto,
   closeSnag,
   createProject,
+  decideSubcontractApproval,
   decideVariation,
   engageSubcontractor,
   markMilestoneReached,
@@ -121,6 +122,10 @@ function ctxOf(session: Awaited<ReturnType<typeof write>>) {
 function refresh(projectId: string): void {
   revalidatePath(`/projects/${projectId}`);
   revalidatePath("/projects");
+  // The chase screen (`/projects/chase`) reads the same retention, permit and
+  // subcontract-approval state as the project detail page and the board — an
+  // action taken from any of the three must not leave the others stale.
+  revalidatePath("/projects/chase");
 }
 
 // ── PRJ-1 ────────────────────────────────────────────────────────────────────
@@ -987,6 +992,57 @@ export async function engageSubcontractorAction(
   } catch (error) {
     return {
       error: userMessage(error, "The subcontractor could not be engaged.", "projects:subcontract"),
+    };
+  }
+}
+
+/**
+ * Record the employer's decision on an engagement's approval (`PRJ-9`).
+ *
+ * The one action the chase screen (`/projects/chase`) offers against an
+ * unapproved subcontract row: "approved", with the reference the final account
+ * will want, or "refused". There was no such action anywhere in this
+ * application before tonight — see `decideSubcontractApproval`'s own comment.
+ */
+export async function decideSubcontractApprovalAction(
+  _prev: ProjectFormState,
+  formData: FormData,
+): Promise<ProjectFormState> {
+  const session = await write();
+  const projectId = text(formData, "projectId");
+  const subcontractId = text(formData, "subcontractId");
+  const to = text(formData, "to");
+
+  if (!subcontractId) return { error: "Which engagement?" };
+  if (to !== "approved" && to !== "refused") return { error: "Choose approved or refused." };
+
+  const approvalReference = text(formData, "approvalReference");
+
+  try {
+    await withTenant(ctxOf(session), (tx) =>
+      decideSubcontractApproval(tx, ctxOf(session), {
+        subcontractId,
+        to,
+        approvedOn: day(formData, "approvedOn") ?? undefined,
+        approvalReference: approvalReference || undefined,
+      }),
+    );
+
+    refresh(projectId);
+    return {
+      ok:
+        to === "approved" && !approvalReference
+          ? "Approved. There is no approval reference against it — that is the document a " +
+            "dispute over this subcontract will ask for, so add it as soon as it arrives."
+          : `Recorded as ${to}.`,
+    };
+  } catch (error) {
+    return {
+      error: userMessage(
+        error,
+        "The approval could not be recorded.",
+        "projects:subcontract-approval",
+      ),
     };
   }
 }
