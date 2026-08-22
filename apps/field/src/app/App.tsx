@@ -40,6 +40,7 @@ import { SyncBanner } from "./components/SyncBanner";
 import { createDatabase } from "../db/watermelon";
 import { FieldApiClient } from "../sync/client";
 import { SyncRunner, type SyncStatus } from "./sync-runner";
+import { MediaUploadRunner } from "./upload-runner";
 import { systemClock } from "../domain/clock";
 import { DeviceStore, expoSecureStoreBackend } from "../auth/device-store";
 import { signInAndRegister, type WebLoginPresenter } from "../auth/registration";
@@ -94,33 +95,58 @@ export default function App(): React.JSX.Element {
   const [registered, setRegistered] = useState<boolean | null>(null);
   const [signingIn, setSigningIn] = useState(false);
   const [signInError, setSignInError] = useState<string | null>(null);
+  /**
+   * This device's own technician id, once known - the one identity fact this
+   * phone holds about who is using it. `SignatureScreen` cites it on the local
+   * job sheet digest; nothing synced to the device carries a technician's
+   * *name* (see that screen's header).
+   */
+  const [technicianId, setTechnicianId] = useState<string | null>(null);
 
-  const runner = useMemo(() => {
-    const api = new FieldApiClient({
-      // Not configurable in the UI yet. A real build needs this per
-      // environment, and the technician needs to be able to see which server
-      // they are on when something is wrong.
-      baseUrl: BASE_URL,
-      appVersion: APP_VERSION,
-      getDeviceToken: () => store.token(),
-      // Awaited by the client before the response body reaches the caller, and
-      // its failure is not caught here: a dropped rotation strands the handset
-      // once the ten-minute grace closes, and the office will not offer that
-      // token a second time.
-      onDeviceToken: (token) => store.saveRotatedToken(token),
-      // Called only for `device_revoked`, which is what
-      // `DeviceAuthError.clearsStoredToken` encodes. An expired token is left
-      // alone: clearing it loses nothing and gains nothing.
-      clearDeviceToken: () => store.clear(),
-      clock: systemClock,
-    });
-    // One runner for the life of the screen. It used to be rebuilt after every
-    // registration, to work around `needsSignIn` latching true for ever; the
-    // runner now clears that flag when a device-authenticated request comes
-    // back, so there is nothing left for a new instance to reset - and keeping
-    // the old one keeps the outbox recovery it has already done.
-    return new SyncRunner(database, api, systemClock);
-  }, [database, store]);
+  /**
+   * One `FieldApiClient` for the life of the screen, shared by `SyncRunner`
+   * (mutations and the working-set pull) and `MediaUploadRunner` (uploads).
+   * Both are device-authenticated requests through the same token and the
+   * same rotation handling; splitting the client would split that handling
+   * too, silently, the first time the two runners disagreed about a token.
+   */
+  const api = useMemo(
+    () =>
+      new FieldApiClient({
+        // Not configurable in the UI yet. A real build needs this per
+        // environment, and the technician needs to be able to see which server
+        // they are on when something is wrong.
+        baseUrl: BASE_URL,
+        appVersion: APP_VERSION,
+        getDeviceToken: () => store.token(),
+        // Awaited by the client before the response body reaches the caller, and
+        // its failure is not caught here: a dropped rotation strands the handset
+        // once the ten-minute grace closes, and the office will not offer that
+        // token a second time.
+        onDeviceToken: (token) => store.saveRotatedToken(token),
+        // Called only for `device_revoked`, which is what
+        // `DeviceAuthError.clearsStoredToken` encodes. An expired token is left
+        // alone: clearing it loses nothing and gains nothing.
+        clearDeviceToken: () => store.clear(),
+        clock: systemClock,
+      }),
+    [store],
+  );
+
+  // One runner for the life of the screen. It used to be rebuilt after every
+  // registration, to work around `needsSignIn` latching true for ever; the
+  // runner now clears that flag when a device-authenticated request comes
+  // back, so there is nothing left for a new instance to reset - and keeping
+  // the old one keeps the outbox recovery it has already done.
+  const runner = useMemo(() => new SyncRunner(database, api, systemClock), [database, api]);
+
+  /**
+   * The media queue: turns a captured-but-unsent photo or signature into an
+   * `uploadId` and files the mutation it unlocks. See that file's header for
+   * why it is a separate runner from `SyncRunner` rather than a step inside
+   * `drain()`.
+   */
+  const uploadRunner = useMemo(() => new MediaUploadRunner(database, api, systemClock), [database, api]);
 
   useEffect(() => {
     const unsubscribe = runner.subscribe(setStatus);
@@ -128,9 +154,17 @@ export default function App(): React.JSX.Element {
     // operating system left `inflight` go back to `pending` before anything
     // else looks at the queue, so a pull that evicts an out-of-scope job can
     // see that the job still has unsynced work and refuse to drop it.
-    void runner.recover().then(() => runner.pull());
-    return unsubscribe;
-  }, [runner]);
+    //
+    // The upload runner follows the first pull/drain, not before it: a photo
+    // or signature captured before this device has ever registered has
+    // nowhere to upload to, and `MediaUploadRunner.run()` fails each item
+    // individually and logs rather than blocking - so running it here costs
+    // nothing when there is nothing queued, which is the common case.
+    void runner
+      .recover()
+      .then(() => runner.pull())
+      .then(() => uploadRunner.run());
+  }, [runner, uploadRunner]);
 
   // Read the credential once at startup. A keystore that refuses to be read is
   // reported as "not registered", which is true in the only sense that matters:
@@ -140,7 +174,9 @@ export default function App(): React.JSX.Element {
     store
       .read()
       .then((registration) => {
-        if (!cancelled) setRegistered(registration !== null);
+        if (cancelled) return;
+        setRegistered(registration !== null);
+        setTechnicianId(registration?.technicianId ?? null);
       })
       .catch(() => {
         if (cancelled) return;
@@ -162,7 +198,9 @@ export default function App(): React.JSX.Element {
     store
       .read()
       .then((registration) => {
-        if (!cancelled) setRegistered(registration !== null);
+        if (cancelled) return;
+        setRegistered(registration !== null);
+        setTechnicianId(registration?.technicianId ?? null);
       })
       .catch(() => {
         if (!cancelled) setRegistered(false);
@@ -191,10 +229,12 @@ export default function App(): React.JSX.Element {
         },
       });
       setRegistered(true);
+      const registration = await store.read();
+      setTechnicianId(registration?.technicianId ?? null);
       setRoute({ name: "jobs" });
       // Nothing to reset on the runner: its next pull or push clears the
       // signed-out flag by succeeding, which is the only proof worth taking.
-      void runner.pull();
+      void runner.pull().then(() => uploadRunner.run());
     } catch (error) {
       // Whatever sentence the server or the flow wrote. Never a code, and
       // never the response body - which on the success path holds the token.
@@ -204,7 +244,7 @@ export default function App(): React.JSX.Element {
     } finally {
       setSigningIn(false);
     }
-  }, [runner, store]);
+  }, [runner, uploadRunner, store]);
 
   const openJob = useCallback((jobId: string) => setRoute({ name: "jobCard", jobId }), []);
   const openSignature = useCallback((jobId: string) => setRoute({ name: "signature", jobId }), []);
@@ -241,7 +281,12 @@ export default function App(): React.JSX.Element {
               />
             )}
             {route.name === "signature" && (
-              <SignatureScreen database={database} jobId={route.jobId} onDone={back} />
+              <SignatureScreen
+                database={database}
+                jobId={route.jobId}
+                technicianId={technicianId}
+                onDone={back}
+              />
             )}
             {route.name === "sync" && (
               <SyncStatusScreen runner={runner} status={status} onBack={back} />

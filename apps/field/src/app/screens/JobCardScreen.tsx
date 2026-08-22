@@ -22,15 +22,27 @@
  * sent back with the rejection, and the queued write stays in the outbox as
  * `refused` so the technician can correct the card rather than re-enter it.
  *
- * ── WHAT IS STUBBED HERE, EXPLICITLY ───────────────────────────────────────
+ * ── WHAT IS REAL HERE NOW, AND HOW ───────────────────────────────────────
  *
- * The three buttons marked `notImplemented` below do nothing but say so. They
- * are camera capture (`FLD-7`/`FLD-8`), part scanning (`FLD-5`/`FLD-9`) and the
- * outcome picker's write path. Each needs either a native module that is not
- * installed or a sync payload shape that is not yet known, and a button that
- * silently does nothing is worse than one that admits it.
+ * Every control below writes to the local database first and, where the
+ * capture has its own mutation, queues that mutation into the outbox in the
+ * same transaction - never straight to the network (`db/watermelon.ts`'s
+ * `writeWithOutbox` / `writeCardMutation`). "Take a photo" is the one
+ * exception worth naming: its `job_attachment/append` mutation cannot exist
+ * until the photograph has an `uploadId`, so the capture is saved locally and
+ * instantly, and `app/upload-runner.ts` files the mutation once the upload
+ * (a real network operation) completes - see that file's header for why that
+ * is a real asymmetry and not a shortcut.
  *
- * NOT RENDERED IN THIS SESSION - see the note at the top of App.tsx.
+ * `symptomCodeId` / `causeCodeId` / `remedyCodeId` and `outcomeCode` are set
+ * on the job card immediately when chosen (a local fact, no mutation of its
+ * own - `domain/outcome-entry.ts` explains why there is no such mutation) and
+ * are only sent to the office when "Record outcome" is pressed, which is the
+ * one control here that can complete the job.
+ *
+ * NOT RENDERED IN THIS SESSION - see the note at the top of App.tsx. It
+ * compiles under `npm run typecheck:native`; nothing about its layout, its
+ * touch targets or its scroll behaviour has been seen.
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -39,14 +51,17 @@ import type { Database } from "@nozbe/watermelondb";
 import { Q } from "@nozbe/watermelondb";
 
 import { theme } from "../theme";
-import type { Job, JobCardModel, JobMaterial, JobPhoto, TimingEventModel } from "../../db/models";
+import type { Job, JobCardModel, JobMaterial, JobPhoto, TaxonomyTerm, TimingEventModel } from "../../db/models";
 import {
   canDeclareNoMaterials,
   completionReadiness,
   interpretRefusal,
   isMaterialSource,
   isPhotoRole,
+  MATERIAL_SOURCES,
+  MATERIAL_SOURCE_LABEL,
   PHOTO_ROLE_LABEL,
+  type FaultCodeKind,
   type JobCardDraft,
 } from "../../domain/job-card";
 import {
@@ -58,6 +73,38 @@ import {
   type TimingEvent,
 } from "../../domain/attendance";
 import { formatDuration } from "@meridian/core";
+import { systemClock, stampOffline, type OfflineStamp } from "../../domain/clock";
+import { newClientId } from "../../domain/ids";
+import { appendMaterial, declareNoMaterials, recordOutcome, type MutationSpec } from "../../sync/payloads";
+import {
+  writeWithOutbox,
+  writeCardMutation,
+  updateJobCard,
+  createJobPhotoRecord,
+  type OutboxWrite,
+} from "../../db/watermelon";
+import {
+  EMPTY_MATERIAL_ENTRY,
+  MATERIAL_ENTRY_ERROR_MESSAGE,
+  validateMaterialEntry,
+  type MaterialEntryDraft,
+} from "../../domain/material-entry";
+import {
+  EMPTY_FAULT_CODE_SELECTION,
+  OUTCOME_SUBMIT_ERROR_MESSAGE,
+  validateOutcomeDraft,
+  withFaultCode,
+  type FaultCodeChoice,
+  type FaultCodeSelection,
+} from "../../domain/outcome-entry";
+import { CameraCaptureScreen, type CapturedPhotoResult } from "./CameraCaptureScreen";
+
+const FAULT_KINDS: readonly FaultCodeKind[] = ["symptom", "cause", "remedy"];
+const FAULT_KIND_LABEL: Readonly<Record<FaultCodeKind, string>> = {
+  symptom: "Symptom",
+  cause: "Cause",
+  remedy: "Remedy",
+};
 
 export function JobCardScreen({
   database,
@@ -75,7 +122,16 @@ export function JobCardScreen({
   const [photos, setPhotos] = useState<JobPhoto[]>([]);
   const [materials, setMaterials] = useState<JobMaterial[]>([]);
   const [events, setEvents] = useState<TimingEventModel[]>([]);
+  const [faultTerms, setFaultTerms] = useState<TaxonomyTerm[]>([]);
+  const [outcomeTerms, setOutcomeTerms] = useState<TaxonomyTerm[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [showMaterialForm, setShowMaterialForm] = useState(false);
+  const [materialDraft, setMaterialDraft] = useState<MaterialEntryDraft>(EMPTY_MATERIAL_ENTRY);
+  const [materialErrors, setMaterialErrors] = useState<readonly string[]>([]);
+  const [outcomeNote, setOutcomeNote] = useState("");
+  const [outcomeError, setOutcomeError] = useState<string | null>(null);
 
   useEffect(() => {
     const subscriptions = [
@@ -92,11 +148,44 @@ export function JobCardScreen({
         .query(Q.where("job_id", jobId))
         .observe()
         .subscribe(setEvents),
+      database
+        .get<TaxonomyTerm>("taxonomy_terms")
+        .query(Q.where("vocabulary", "faultCodes"))
+        .observe()
+        .subscribe(setFaultTerms),
+      database
+        .get<TaxonomyTerm>("taxonomy_terms")
+        .query(Q.where("vocabulary", "outcomeCodes"))
+        .observe()
+        .subscribe(setOutcomeTerms),
     ];
     return () => subscriptions.forEach((s) => s.unsubscribe());
   }, [database, jobId]);
 
   const labour = useMemo(() => deriveLabour(events.map(toTimingEvent)), [events]);
+
+  const faultByKind = useMemo(() => {
+    const groups: Record<FaultCodeKind, TaxonomyTerm[]> = { symptom: [], cause: [], remedy: [] };
+    for (const term of faultTerms) {
+      if (term.kind === "symptom" || term.kind === "cause" || term.kind === "remedy") groups[term.kind].push(term);
+    }
+    return groups;
+  }, [faultTerms]);
+
+  const faultSelection: FaultCodeSelection = useMemo(() => {
+    function findChoice(id: string | undefined): FaultCodeChoice | null {
+      if (!id) return null;
+      const term = faultTerms.find((t) => t.id === id);
+      return term && (term.kind === "symptom" || term.kind === "cause" || term.kind === "remedy")
+        ? { id: term.id, kind: term.kind, code: term.code, label: term.label }
+        : null;
+    }
+    return {
+      symptom: findChoice(card?.symptomCodeId),
+      cause: findChoice(card?.causeCodeId),
+      remedy: findChoice(card?.remedyCodeId),
+    };
+  }, [faultTerms, card]);
 
   const draft: JobCardDraft | null = useMemo(() => {
     if (!job) return null;
@@ -181,6 +270,132 @@ export function JobCardScreen({
     };
   }, [job, card, photos, materials, labour, jobId]);
 
+  // ── Write paths - every one offline-first, none of them awaiting the network ──
+
+  function outboxWrite(spec: MutationSpec, stamp: OfflineStamp): OutboxWrite {
+    return {
+      clientId: newClientId(),
+      entity: spec.entity,
+      op: spec.op,
+      jobId: spec.jobId,
+      payload: spec.payload,
+      baseVersion: spec.baseVersion,
+      dependsOnClientId: spec.dependsOnClientId,
+      createdAt: stamp.recordedOfflineAt,
+      createdMonotonic: stamp.monotonicAt,
+    };
+  }
+
+  async function chooseFaultCode(choice: FaultCodeChoice): Promise<void> {
+    const next = withFaultCode(faultSelection, choice);
+    const stamp = stampOffline(systemClock, null);
+    await updateJobCard(database, jobId, stamp, (cardDraft) => {
+      cardDraft.symptomCodeId = next.symptom?.id ?? undefined;
+      cardDraft.causeCodeId = next.cause?.id ?? undefined;
+      cardDraft.remedyCodeId = next.remedy?.id ?? undefined;
+    });
+  }
+
+  async function submitMaterial(): Promise<void> {
+    const result = validateMaterialEntry(materialDraft);
+    if (!result.ok) {
+      setMaterialErrors(result.errors.map((e) => MATERIAL_ENTRY_ERROR_MESSAGE[e]));
+      return;
+    }
+    setMaterialErrors([]);
+    const spec = appendMaterial({ jobId, ...result.value });
+    const stamp = stampOffline(systemClock, null);
+    try {
+      await writeWithOutbox<JobMaterial>(database, "job_materials", outboxWrite(spec, stamp), (materialDraftRow) => {
+        materialDraftRow.jobId = jobId;
+        materialDraftRow.sku = result.value.sku ?? undefined;
+        materialDraftRow.description = result.value.description;
+        materialDraftRow.quantity = result.value.quantity;
+        materialDraftRow.unit = result.value.unit;
+        materialDraftRow.source = result.value.source;
+        materialDraftRow.serialNumber = result.value.serialNumber ?? undefined;
+        materialDraftRow.needsOfficeReconciliation = false;
+        materialDraftRow.recordedOfflineAt = new Date(stamp.recordedOfflineAt);
+        materialDraftRow.deviceOffsetMsAtCapture = stamp.deviceOffsetMsAtCapture ?? undefined;
+        materialDraftRow.monotonicAt = stamp.monotonicAt;
+      });
+      setMaterialDraft(EMPTY_MATERIAL_ENTRY);
+      setShowMaterialForm(false);
+      setNotice(null);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "That part could not be saved on this phone.");
+    }
+  }
+
+  async function declareNoParts(): Promise<void> {
+    const spec = declareNoMaterials({ jobId });
+    const stamp = stampOffline(systemClock, null);
+    try {
+      await writeCardMutation(database, jobId, stamp, outboxWrite(spec, stamp), (cardDraft) => {
+        cardDraft.materialsNoneAt = Date.now();
+      });
+      setNotice(null);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "That could not be recorded on this phone.");
+    }
+  }
+
+  async function submitOutcome(): Promise<void> {
+    const result = validateOutcomeDraft({
+      outcomeCode: card?.outcomeCode ?? null,
+      outcomeLabel: null,
+      fault: faultSelection,
+      note: outcomeNote,
+    });
+    if (!result.ok) {
+      setOutcomeError(result.errors.map((e) => OUTCOME_SUBMIT_ERROR_MESSAGE[e]).join(" "));
+      return;
+    }
+    setOutcomeError(null);
+    const spec = recordOutcome({ jobId, baseVersion: job?.version ?? null, ...result.value });
+    const stamp = stampOffline(systemClock, null);
+    try {
+      await writeCardMutation(database, jobId, stamp, outboxWrite(spec, stamp), () => {
+        // `outcomeCode` and the fault code ids are already on the card from
+        // `chooseFaultCode` / the outcome picker below - this write only adds
+        // the outbox row that sends them.
+      });
+      setOutcomeNote("");
+      setNotice(null);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "The outcome could not be recorded on this phone.");
+    }
+  }
+
+  async function handleCaptured(result: CapturedPhotoResult): Promise<void> {
+    const stamp = stampOffline(systemClock, null);
+    try {
+      await createJobPhotoRecord(database, {
+        clientId: newClientId(),
+        jobId,
+        role: result.role,
+        localUri: result.localUri,
+        originalUri: result.originalUri,
+        byteSize: result.byteSize,
+        caption: null,
+        dependsOnClientId: null,
+        stamp,
+        geo: result.geo,
+      });
+      setNotice(null);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "That photo could not be saved on this phone.");
+    } finally {
+      setCameraOpen(false);
+    }
+  }
+
+  if (cameraOpen) {
+    return (
+      <CameraCaptureScreen onCaptured={(result) => void handleCaptured(result)} onCancel={() => setCameraOpen(false)} />
+    );
+  }
+
   if (!job || !draft) return <View style={styles.screen} />;
 
   // The server's answer, not ours. `undefined` when this job has never synced;
@@ -255,7 +470,28 @@ export function JobCardScreen({
           defaultValue={card?.diagnosisNote ?? ""}
           editable={false}
         />
-        <Stub label="Fault codes (symptom / cause / remedy)" setNotice={setNotice} />
+        {FAULT_KINDS.map((kind) => (
+          <View key={kind} style={styles.faultGroup}>
+            <Text style={styles.faultKindLabel}>{FAULT_KIND_LABEL[kind]}</Text>
+            <View style={styles.chips}>
+              {faultByKind[kind].length === 0 ? (
+                <Text style={styles.muted}>Not synced to this phone yet.</Text>
+              ) : (
+                faultByKind[kind].map((term) => (
+                  <Pressable
+                    key={term.id}
+                    onPress={() => void chooseFaultCode({ id: term.id, kind, code: term.code, label: term.label })}
+                    style={[styles.chip, faultSelection[kind]?.id === term.id && styles.chipSelected]}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: faultSelection[kind]?.id === term.id }}
+                  >
+                    <Text style={styles.chipText}>{term.label}</Text>
+                  </Pressable>
+                ))
+              )}
+            </View>
+          </View>
+        ))}
       </Section>
 
       <Section title="What you did">
@@ -277,7 +513,9 @@ export function JobCardScreen({
                 .map((p) => (isPhotoRole(p.role) ? PHOTO_ROLE_LABEL[p.role] : "Role not recognised"))
                 .join(", ")}
         </Text>
-        <Stub label="Take a photo" setNotice={setNotice} />
+        <Pressable style={styles.outline} onPress={() => setCameraOpen(true)} accessibilityRole="button">
+          <Text style={styles.outlineText}>Take a photo</Text>
+        </Pressable>
       </Section>
 
       <Section title={`Materials (${materials.length})`}>
@@ -291,9 +529,88 @@ export function JobCardScreen({
             </Text>
           ))
         )}
-        <Stub label="Scan or add a part" setNotice={setNotice} />
+
+        {showMaterialForm ? (
+          <View style={styles.form}>
+            <TextInput
+              style={styles.input}
+              placeholder="What is the part? (typed - no parts catalogue is on this phone yet)"
+              placeholderTextColor={theme.colour.textMuted}
+              value={materialDraft.description}
+              onChangeText={(text) => setMaterialDraft((d) => ({ ...d, description: text }))}
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Quantity"
+              placeholderTextColor={theme.colour.textMuted}
+              keyboardType="decimal-pad"
+              value={materialDraft.quantity}
+              onChangeText={(text) => setMaterialDraft((d) => ({ ...d, quantity: text }))}
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Unit (ea, m, litre...)"
+              placeholderTextColor={theme.colour.textMuted}
+              value={materialDraft.unit}
+              onChangeText={(text) => setMaterialDraft((d) => ({ ...d, unit: text }))}
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="SKU (optional)"
+              placeholderTextColor={theme.colour.textMuted}
+              value={materialDraft.sku}
+              onChangeText={(text) => setMaterialDraft((d) => ({ ...d, sku: text }))}
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Serial number (optional)"
+              placeholderTextColor={theme.colour.textMuted}
+              value={materialDraft.serialNumber}
+              onChangeText={(text) => setMaterialDraft((d) => ({ ...d, serialNumber: text }))}
+            />
+            <Text style={styles.faultKindLabel}>Where did it come from?</Text>
+            <View style={styles.chips}>
+              {MATERIAL_SOURCES.map((source) => (
+                <Pressable
+                  key={source}
+                  onPress={() => setMaterialDraft((d) => ({ ...d, source }))}
+                  style={[styles.chip, materialDraft.source === source && styles.chipSelected]}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: materialDraft.source === source }}
+                >
+                  <Text style={styles.chipText}>{MATERIAL_SOURCE_LABEL[source]}</Text>
+                </Pressable>
+              ))}
+            </View>
+            {materialErrors.map((message) => (
+              <Text key={message} style={styles.warning}>
+                {message}
+              </Text>
+            ))}
+            <Pressable style={styles.primary} onPress={() => void submitMaterial()} accessibilityRole="button">
+              <Text style={styles.primaryText}>Add part</Text>
+            </Pressable>
+            <Pressable
+              style={styles.secondary}
+              onPress={() => {
+                setShowMaterialForm(false);
+                setMaterialErrors([]);
+              }}
+              accessibilityRole="button"
+            >
+              <Text style={styles.secondaryText}>Cancel</Text>
+            </Pressable>
+          </View>
+        ) : (
+          <Pressable style={styles.outline} onPress={() => setShowMaterialForm(true)} accessibilityRole="button">
+            <Text style={styles.outlineText}>Scan or add a part</Text>
+          </Pressable>
+        )}
+
         {canDeclareNoMaterials(draft) ? (
-          <Stub label="Record that you used no parts" setNotice={setNotice} />
+          <Pressable style={styles.outline} onPress={() => void declareNoParts()} accessibilityRole="button">
+            <Text style={styles.outlineText}>Record that you used no parts</Text>
+          </Pressable>
         ) : draft.materialsDeclaredNone ? (
           <Text style={styles.muted}>You recorded that no parts were used.</Text>
         ) : null}
@@ -321,8 +638,50 @@ export function JobCardScreen({
       </Section>
 
       <Section title="Outcome">
-        <Text style={styles.body}>{card?.outcomeCode ?? "Not chosen."}</Text>
-        <Stub label="Choose what happened" setNotice={setNotice} />
+        <Text style={styles.body}>
+          {card?.outcomeCode
+            ? (outcomeTerms.find((t) => t.code === card.outcomeCode)?.label ?? card.outcomeCode)
+            : "Not chosen."}
+        </Text>
+        <View style={styles.chips}>
+          {outcomeTerms.length === 0 ? (
+            <Text style={styles.muted}>Outcomes have not synced to this phone yet.</Text>
+          ) : (
+            outcomeTerms.map((term) => (
+              <Pressable
+                key={term.id}
+                onPress={() => {
+                  const stamp = stampOffline(systemClock, null);
+                  void updateJobCard(database, jobId, stamp, (cardDraft) => {
+                    cardDraft.outcomeCode = term.code;
+                  });
+                }}
+                style={[styles.chip, card?.outcomeCode === term.code && styles.chipSelected]}
+                accessibilityRole="button"
+                accessibilityState={{ selected: card?.outcomeCode === term.code }}
+              >
+                <Text style={styles.chipText}>{term.label}</Text>
+              </Pressable>
+            ))
+          )}
+        </View>
+        <TextInput
+          style={styles.input}
+          multiline
+          placeholder="Note for the office (optional)"
+          placeholderTextColor={theme.colour.textMuted}
+          value={outcomeNote}
+          onChangeText={setOutcomeNote}
+        />
+        {outcomeError ? <Text style={styles.warning}>{outcomeError}</Text> : null}
+        <Pressable style={styles.outline} onPress={() => void submitOutcome()} accessibilityRole="button">
+          <Text style={styles.outlineText}>Record outcome</Text>
+        </Pressable>
+        <Text style={styles.footnote}>
+          This sends the outcome above, along with whatever symptom, cause and remedy you chose. If the job
+          card is not ready yet, the office refuses it and says why — what you recorded stays on this phone
+          and you do not need to re-enter it.
+        </Text>
       </Section>
 
       {/* JOB-15's checklist, exactly as the server computed it. */}
@@ -374,19 +733,6 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-/** A control that is not built, and says so rather than doing nothing. */
-function Stub({ label, setNotice }: { label: string; setNotice: (m: string) => void }): React.JSX.Element {
-  return (
-    <Pressable
-      style={styles.stub}
-      accessibilityRole="button"
-      onPress={() => setNotice(`"${label}" is not built yet in this version.`)}
-    >
-      <Text style={styles.stubText}>{label} — not built</Text>
-    </Pressable>
-  );
-}
-
 function toTimingEvent(model: TimingEventModel): TimingEvent {
   return {
     clientId: model.id,
@@ -435,18 +781,33 @@ const styles = StyleSheet.create({
     padding: theme.space.md,
     minHeight: 88,
     textAlignVertical: "top",
+    marginBottom: theme.space.sm,
   },
-  stub: {
+  form: { marginTop: theme.space.sm },
+  faultGroup: { marginTop: theme.space.sm },
+  faultKindLabel: { color: theme.colour.textMuted, fontSize: theme.font.small, marginBottom: theme.space.xs },
+  chips: { flexDirection: "row", flexWrap: "wrap", gap: theme.space.sm, marginBottom: theme.space.sm },
+  chip: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: theme.colour.border,
+    borderRadius: theme.radius.sm,
+    paddingHorizontal: theme.space.md,
+    paddingVertical: theme.space.sm,
+    minHeight: 44,
+    justifyContent: "center",
+  },
+  chipSelected: { borderColor: theme.colour.accent, backgroundColor: theme.colour.surface },
+  chipText: { color: theme.colour.text, fontSize: theme.font.small },
+  outline: {
     minHeight: theme.touchTarget,
     justifyContent: "center",
     borderRadius: theme.radius.md,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: theme.colour.border,
-    borderStyle: "dashed",
+    borderColor: theme.colour.accent,
     paddingHorizontal: theme.space.md,
     marginTop: theme.space.sm,
   },
-  stubText: { color: theme.colour.textMuted, fontSize: theme.font.small },
+  outlineText: { color: theme.colour.accent, fontSize: theme.font.small, fontWeight: "700" },
   refusal: {
     backgroundColor: theme.colour.surface,
     borderLeftWidth: 4,
@@ -473,8 +834,11 @@ const styles = StyleSheet.create({
     borderRadius: theme.radius.md,
     alignItems: "center",
     justifyContent: "center",
+    marginTop: theme.space.sm,
   },
   primaryDisabled: { backgroundColor: theme.colour.surfaceRaised },
   primaryText: { color: theme.colour.text, fontSize: theme.font.body, fontWeight: "700" },
+  secondary: { minHeight: theme.touchTarget, alignItems: "center", justifyContent: "center" },
+  secondaryText: { color: theme.colour.accent, fontSize: theme.font.body },
   footnote: { color: theme.colour.textMuted, fontSize: theme.font.small, marginTop: theme.space.md, lineHeight: 20 },
 });

@@ -122,23 +122,266 @@ export async function writeWithOutbox<T extends Model>(
       build(draft);
     });
 
-    await database.get<models.Outbox>("outbox").create((row) => {
-      (row._raw as { id: string }).id = outbox.clientId;
-      row.entity = outbox.entity;
-      row.op = outbox.op;
-      row.jobId = outbox.jobId ?? undefined;
-      row.payloadJson = JSON.stringify(outbox.payload);
-      row.baseVersion = outbox.baseVersion ?? undefined;
-      row.dependsOnClientId = outbox.dependsOnClientId ?? undefined;
-      row.createdAtDevice = Date.parse(outbox.createdAt);
-      row.createdMonotonic = outbox.createdMonotonic;
-      row.attemptCount = 0;
-      row.nextAttemptAfter = 0;
-      row.status = "pending";
-    });
+    await createOutboxRecord(database, outbox);
 
     return record;
   });
+}
+
+/**
+ * The outbox-row half of `writeWithOutbox`, factored out so that a capture
+ * which is **not** a brand-new domain record - updating the job card with an
+ * outcome, say, rather than creating a job material - can still get one row
+ * written in the same transaction as its domain write. Must be called from
+ * inside a `database.write()` block; it does not open its own.
+ */
+async function createOutboxRecord(database: Database, outbox: OutboxWrite): Promise<void> {
+  await database.get<models.Outbox>("outbox").create((row) => {
+    (row._raw as { id: string }).id = outbox.clientId;
+    row.entity = outbox.entity;
+    row.op = outbox.op;
+    row.jobId = outbox.jobId ?? undefined;
+    row.payloadJson = JSON.stringify(outbox.payload);
+    row.baseVersion = outbox.baseVersion ?? undefined;
+    row.dependsOnClientId = outbox.dependsOnClientId ?? undefined;
+    row.createdAtDevice = Date.parse(outbox.createdAt);
+    row.createdMonotonic = outbox.createdMonotonic;
+    row.attemptCount = 0;
+    row.nextAttemptAfter = 0;
+    row.status = "pending";
+  });
+}
+
+/**
+ * Find this job's `job_cards` row, or start one - there is exactly one per
+ * job, and most of what lands on it (a diagnosis, an outcome, a "no parts"
+ * declaration) arrives well after the row would first be needed.
+ *
+ * Must be called from inside a `database.write()` block.
+ */
+async function findOrCreateJobCard(database: Database, jobId: string, stamp: OfflineWriteStamp): Promise<models.JobCardModel> {
+  const collection = database.get<models.JobCardModel>("job_cards");
+  const existing = await collection.query(Q.where("job_id", jobId)).fetch();
+  if (existing[0]) return existing[0];
+  return collection.create((draft) => {
+    draft.jobId = jobId;
+    applyStamp(draft, stamp);
+  });
+}
+
+export interface OfflineWriteStamp {
+  readonly recordedOfflineAt: string;
+  readonly deviceOffsetMsAtCapture: number | null;
+  readonly monotonicAt: number;
+}
+
+function applyStamp(
+  draft: { recordedOfflineAt: Date; deviceOffsetMsAtCapture?: number; monotonicAt: number },
+  stamp: OfflineWriteStamp,
+): void {
+  draft.recordedOfflineAt = new Date(stamp.recordedOfflineAt);
+  draft.deviceOffsetMsAtCapture = stamp.deviceOffsetMsAtCapture ?? undefined;
+  draft.monotonicAt = stamp.monotonicAt;
+}
+
+/**
+ * Update the job card with no outbox row - for the pieces of a capture that
+ * are locally meaningful before they are anything the server has a mutation
+ * for. Choosing a symptom/cause/remedy code is the only caller today: those
+ * ids travel to the office only as fields of `job_outcome/record`
+ * (`domain/outcome-entry.ts`'s header explains why there is no separate fault
+ * code mutation), so selecting one is a local fact until the outcome is sent.
+ */
+export async function updateJobCard(
+  database: Database,
+  jobId: string,
+  stamp: OfflineWriteStamp,
+  patch: (draft: models.JobCardModel) => void,
+): Promise<void> {
+  await database.write(async () => {
+    const card = await findOrCreateJobCard(database, jobId, stamp);
+    await card.update((draft) => {
+      applyStamp(draft, stamp);
+      patch(draft);
+    });
+  });
+}
+
+/**
+ * Update the job card **and** queue a mutation, in one transaction - the
+ * `job_cards` half of `writeWithOutbox`. Used by "record that you used no
+ * parts" (`job_material/declare_none`) and "choose what happened"
+ * (`job_outcome/record`): both change something the checklist reads locally
+ * (`materialsNoneAt`, `outcomeCode`) and both produce a mutation, and a crash
+ * between the two writes must not happen - the same atomicity argument
+ * `writeWithOutbox`'s own header makes.
+ */
+export async function writeCardMutation(
+  database: Database,
+  jobId: string,
+  stamp: OfflineWriteStamp,
+  outbox: OutboxWrite,
+  patch: (draft: models.JobCardModel) => void,
+): Promise<void> {
+  await database.write(async () => {
+    const card = await findOrCreateJobCard(database, jobId, stamp);
+    await card.update((draft) => {
+      applyStamp(draft, stamp);
+      patch(draft);
+    });
+    await createOutboxRecord(database, outbox);
+  });
+}
+
+// ── Photos and signatures: captured instantly, filed once uploaded ─────────
+
+/**
+ * A photograph, the instant the shutter closes. **No outbox row** - see the
+ * header of `sync/upload-orchestrator.ts` for why a photo cannot queue its
+ * `job_attachment/append` mutation before an `uploadId` exists, and why that
+ * is a real asymmetry rather than a shortcut. This is still offline-safe: the
+ * write happens against local SQLite only, is never blocked on connectivity,
+ * and survives the app being killed a moment later exactly as any other
+ * WatermelonDB write does.
+ */
+export async function createJobPhotoRecord(
+  database: Database,
+  input: {
+    readonly clientId: string;
+    readonly jobId: string;
+    readonly role: string;
+    readonly localUri: string;
+    readonly originalUri: string | null;
+    readonly byteSize: number;
+    readonly caption: string | null;
+    readonly dependsOnClientId: string | null;
+    readonly stamp: OfflineWriteStamp;
+    readonly geo: { readonly lat: number; readonly lng: number; readonly accuracyMetres: number | null } | null;
+  },
+): Promise<models.JobPhoto> {
+  return database.write(async () =>
+    database.get<models.JobPhoto>("job_photos").create((draft) => {
+      (draft._raw as { id: string }).id = input.clientId;
+      draft.jobId = input.jobId;
+      draft.role = input.role;
+      draft.localUri = input.localUri;
+      draft.originalUri = input.originalUri ?? undefined;
+      draft.byteSize = input.byteSize;
+      draft.caption = input.caption ?? undefined;
+      draft.dependsOnClientId = input.dependsOnClientId ?? undefined;
+      draft.uploadState = "queued";
+      draft.uploadNowOverride = false;
+      applyStamp(draft, input.stamp);
+      if (input.geo) {
+        draft.lat = input.geo.lat;
+        draft.lng = input.geo.lng;
+        draft.accuracyMetres = input.geo.accuracyMetres ?? undefined;
+      }
+    }),
+  );
+}
+
+/**
+ * A signature, the instant it is drawn and its sheet sealed. Same reasoning
+ * as `createJobPhotoRecord`: no outbox row until the rendered image has an
+ * `uploadId` to cite.
+ */
+export async function createJobSignoffRecord(
+  database: Database,
+  input: {
+    readonly clientId: string;
+    readonly jobId: string;
+    readonly visitId: string | null;
+    readonly signedByName: string;
+    readonly signedByRole: string | null;
+    readonly signedByEmail: string | null;
+    readonly strokesJson: string;
+    readonly aspectRatio: number;
+    readonly consentVersion: string;
+    readonly consentText: string;
+    readonly sheetDigest: string;
+    readonly sheetCanonical: string;
+    readonly technicianId: string;
+    readonly appVersion: string;
+    readonly satisfactionRating: number | null;
+    readonly comments: string | null;
+    readonly stamp: OfflineWriteStamp;
+  },
+): Promise<models.JobSignoff> {
+  return database.write(async () =>
+    database.get<models.JobSignoff>("job_signoffs").create((draft) => {
+      (draft._raw as { id: string }).id = input.clientId;
+      draft.jobId = input.jobId;
+      draft.visitId = input.visitId ?? undefined;
+      draft.signedByName = input.signedByName;
+      draft.signedByRole = input.signedByRole ?? undefined;
+      draft.signedByEmail = input.signedByEmail ?? undefined;
+      draft.strokesJson = input.strokesJson;
+      draft.aspectRatio = input.aspectRatio;
+      draft.consentVersion = input.consentVersion;
+      draft.consentText = input.consentText;
+      draft.sheetDigest = input.sheetDigest;
+      draft.sheetCanonical = input.sheetCanonical;
+      draft.technicianId = input.technicianId;
+      draft.appVersion = input.appVersion;
+      draft.satisfactionRating = input.satisfactionRating ?? undefined;
+      draft.comments = input.comments ?? undefined;
+      applyStamp(draft, input.stamp);
+    }),
+  );
+}
+
+/**
+ * The other half of a photo or a signature's life: its upload has completed,
+ * so mark the local record filed and - in the same transaction - queue the
+ * `job_attachment/append` / `job_signature/record` mutation the upload
+ * unlocked. Generic over the two tables because the shape of "patch the
+ * record, then queue a mutation" is identical for both.
+ */
+export async function fileUploadedCapture<T extends Model>(
+  database: Database,
+  table: string,
+  recordId: string,
+  outbox: OutboxWrite,
+  patch: (draft: T) => void,
+): Promise<void> {
+  await database.write(async () => {
+    const record = await database.get<T>(table).find(recordId);
+    await record.update(patch);
+    await createOutboxRecord(database, outbox);
+  });
+}
+
+/** A photo captured but not yet filed as an attachment mutation. */
+export async function loadQueuedPhotos(database: Database): Promise<models.JobPhoto[]> {
+  return database
+    .get<models.JobPhoto>("job_photos")
+    .query(Q.where("upload_state", Q.notEq("filed")))
+    .fetch();
+}
+
+/** A signature captured but with no upload id yet - never yet sent to the office. */
+export async function loadQueuedSignoffs(database: Database): Promise<models.JobSignoff[]> {
+  return database
+    .get<models.JobSignoff>("job_signoffs")
+    .query(Q.where("upload_id", Q.eq(null)))
+    .fetch();
+}
+
+/** The synced fault-code taxonomy, grouped by nothing - the screen groups it. */
+export async function loadFaultCodeTerms(database: Database): Promise<models.TaxonomyTerm[]> {
+  return database
+    .get<models.TaxonomyTerm>("taxonomy_terms")
+    .query(Q.where("vocabulary", "faultCodes"))
+    .fetch();
+}
+
+/** The synced job-outcome taxonomy. */
+export async function loadOutcomeCodeTerms(database: Database): Promise<models.TaxonomyTerm[]> {
+  return database
+    .get<models.TaxonomyTerm>("taxonomy_terms")
+    .query(Q.where("vocabulary", "outcomeCodes"))
+    .fetch();
 }
 
 /** Read the outbox into the plain rows the pure drain planner understands. */
