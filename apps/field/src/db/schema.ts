@@ -239,6 +239,25 @@ export const FIELD_SCHEMA: DatabaseSchema = {
         ...GEO,
       ],
     },
+    /**
+     * `TECH-8`: shift-in / shift-out / breaks, geofenced. A day-level stream,
+     * deliberately separate from `timing_events` above - see
+     * `domain/shift-clock.ts`'s header for why the two are not the same
+     * vocabulary. Syncs as `attendance/append`
+     * (`recordFieldAttendance` in `packages/db/src/domain/field.ts`).
+     */
+    {
+      name: "attendance_events",
+      columns: [
+        { name: "kind", type: "string", isIndexed: true },
+        // `null` here means "not evaluated" - no fix, permission refused, or
+        // no property in the working set carries coordinates - and must
+        // never be conflated with a real `false`. See `domain/geofence.ts`.
+        { name: "within_geofence", type: "boolean", isOptional: true },
+        ...OFFLINE_STAMP,
+        ...GEO,
+      ],
+    },
     {
       name: "job_cards",
       columns: [
@@ -442,6 +461,7 @@ export const FIELD_SCHEMA: DatabaseSchema = {
 /** Tables holding records the technician captured, which must carry both clocks. */
 export const OFFLINE_CAPTURED_TABLES: readonly string[] = [
   "timing_events",
+  "attendance_events",
   "job_cards",
   "job_materials",
   "job_photos",

@@ -211,4 +211,59 @@ const shift = appendAttendance({ kind: "shift_in", occurredAt: "2026-08-22T06:00
 equal("a shift event belongs to no job", shift.jobId, null);
 check("and does not invent one in the payload", !("jobId" in shift.payload));
 
+// ── TECH-8: withinGeofence ───────────────────────────────────────────────────
+
+const unknownGeofence = appendAttendance({
+  kind: "shift_in",
+  occurredAt: "2026-08-22T06:00:00.000Z",
+  withinGeofence: null,
+});
+check(
+  "an unevaluated geofence (null) is omitted, not sent as a literal null",
+  !("withinGeofence" in unknownGeofence.payload),
+);
+
+const noGeofenceGiven = appendAttendance({ kind: "shift_in", occurredAt: "2026-08-22T06:00:00.000Z" });
+check(
+  "omitting withinGeofence entirely behaves the same as passing null",
+  !("withinGeofence" in noGeofenceGiven.payload),
+);
+
+const insideGeofence = appendAttendance({
+  kind: "shift_in",
+  occurredAt: "2026-08-22T06:00:00.000Z",
+  withinGeofence: true,
+});
+equal("a known true reaches the payload as true", insideGeofence.payload["withinGeofence"], true);
+
+const outsideGeofence = appendAttendance({
+  kind: "shift_in",
+  occurredAt: "2026-08-22T06:00:00.000Z",
+  withinGeofence: false,
+});
+check(
+  "a known false is NOT dropped - it is a real fact, not an absent one",
+  "withinGeofence" in outsideGeofence.payload,
+);
+equal("and it survives as false, not coerced to true or omitted", outsideGeofence.payload["withinGeofence"], false);
+
+// A clock event with a captured position and no geofence verdict yet - the
+// coordinates and the verdict are independent fields.
+const positionedNoVerdict = appendAttendance({
+  kind: "shift_out",
+  occurredAt: "2026-08-22T14:00:00.000Z",
+  lat: 25.2048,
+  lng: 55.2708,
+  accuracyMetres: 12,
+  withinGeofence: false,
+});
+deepEqual("lat/lng/accuracy and withinGeofence all travel independently", positionedNoVerdict.payload, {
+  kind: "shift_out",
+  occurredAt: "2026-08-22T14:00:00.000Z",
+  lat: 25.2048,
+  lng: 55.2708,
+  accuracyMetres: 12,
+  withinGeofence: false,
+});
+
 done("payloads");

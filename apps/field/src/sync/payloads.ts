@@ -483,6 +483,16 @@ export function appendAttendance(input: {
   readonly lat?: number | null;
   readonly lng?: number | null;
   readonly accuracyMetres?: number | null;
+  /**
+   * `TECH-8`. `null` or `undefined` means unknown - no fix, permission
+   * refused, or nothing in the working set to compare against - and is
+   * **omitted** from the payload like `lat`/`lng`/`accuracyMetres` above:
+   * `handleAttendance` reads a missing key as `null` itself, so omitting and
+   * sending `null` are the same fact on arrival. A known `false` is not
+   * omitted - see below. `domain/geofence.ts` computes this; this builder
+   * only carries the answer onto the wire.
+   */
+  readonly withinGeofence?: boolean | null;
 }): MutationSpec {
   if (!input.occurredAt.trim()) {
     throw new Error("An attendance event needs the time it happened, not the time it was sent.");
@@ -498,6 +508,10 @@ export function appendAttendance(input: {
       ...optional("lat", input.lat),
       ...optional("lng", input.lng),
       ...optional("accuracyMetres", input.accuracyMetres),
+      // Unlike the other optional fields, a known `false` must reach the
+      // server as `false`, not be dropped - `optional()` only omits `null`/
+      // `undefined`, so a real "outside the geofence" survives here.
+      ...optional("withinGeofence", input.withinGeofence ?? null),
     },
     baseVersion: null,
     dependsOnClientId: null,

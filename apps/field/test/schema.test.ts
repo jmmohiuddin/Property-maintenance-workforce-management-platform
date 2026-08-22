@@ -156,6 +156,23 @@ if (signoffs) {
   check("and the app build that rendered it", columns.includes("app_version"));
 }
 
+// ── TECH-8: attendance carries a geofence verdict, tri-state ───────────────
+
+const attendance = tableByName("attendance_events");
+check("the attendance table exists", attendance !== null);
+if (attendance) {
+  const columns = columnNames(attendance);
+  check("attendance carries a kind", columns.includes("kind"));
+  const withinGeofence = attendance.columns.find((c) => c.name === "within_geofence");
+  check("attendance carries a geofence verdict", withinGeofence !== undefined);
+  check(
+    "and it is optional, so 'not evaluated' is representable and is not coerced to false",
+    withinGeofence?.isOptional === true,
+  );
+  check("as a boolean column", withinGeofence?.type === "boolean");
+  check("attendance carries lat/lng like every other geo-stamped capture", columns.includes("lat") && columns.includes("lng"));
+}
+
 // ── The list screen's query must be indexed ────────────────────────────────
 
 const jobs = tableByName("jobs");

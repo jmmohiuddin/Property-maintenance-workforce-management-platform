@@ -113,12 +113,17 @@ export function SyncStatusScreen({
 
       <Section title="Location">
         <Text style={styles.muted}>
-          Your position is recorded when you arrive, start, finish, photograph and sign - six moments, not a
-          continuous trail. It is not recorded outside working hours and it is not used to judge your
-          performance.
+          Your position is recorded when you clock in, clock out, take a break, photograph and sign - a
+          handful of moments, never a continuous trail. It is not recorded outside those moments and there
+          is no background tracking.
+        </Text>
+        <Text style={styles.muted}>
+          If you decline location access, or there is no signal for a fix, clocking in and out still
+          works - the record is kept with no position rather than being blocked.
         </Text>
         <Text style={styles.notBuilt}>
-          Location capture is not built in this version. Nothing is being recorded.
+          Arriving, starting and leaving a job do not record a position yet - only the clock and the
+          photograph/signature captures above do.
         </Text>
       </Section>
     </ScrollView>

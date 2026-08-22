@@ -24,6 +24,7 @@ import { Q } from "@nozbe/watermelondb";
 import { theme } from "../theme";
 import type { Job } from "../../db/models";
 import { PRIORITY_LABEL, STATUS_LABEL, type JobPriority, type JobStatus } from "@meridian/core";
+import { AttendanceBar } from "../components/AttendanceBar";
 
 export function JobListScreen({
   database,
@@ -48,28 +49,46 @@ export function JobListScreen({
   // `null` means the query has not returned yet - microseconds, not a network
   // round trip. An empty array means the technician genuinely has no work,
   // which is a different sentence.
-  if (jobs === null) return <View style={styles.screen} />;
+  //
+  // `TECH-8`'s clock-in/out lives here, above every state below including the
+  // empty one: a shift is clocked in and out on a day-level fact, not a
+  // per-job one (`domain/shift-clock.ts`), and this screen is the one place
+  // in the app not scoped to a single job - see the header this screen
+  // already carries about being "My jobs", read first thing in a shift.
+  if (jobs === null) {
+    return (
+      <View style={styles.screen}>
+        <AttendanceBar database={database} />
+      </View>
+    );
+  }
 
   if (jobs.length === 0) {
     return (
-      <View style={[styles.screen, styles.centred]}>
-        <Text style={styles.emptyTitle}>No jobs on this phone</Text>
-        <Text style={styles.emptyBody}>
-          Either you have nothing assigned, or this phone has not synced yet. Check the bar at the top -
-          if it says the sync has failed, that is why.
-        </Text>
+      <View style={styles.screen}>
+        <AttendanceBar database={database} />
+        <View style={styles.centred}>
+          <Text style={styles.emptyTitle}>No jobs on this phone</Text>
+          <Text style={styles.emptyBody}>
+            Either you have nothing assigned, or this phone has not synced yet. Check the bar at the top -
+            if it says the sync has failed, that is why.
+          </Text>
+        </View>
       </View>
     );
   }
 
   return (
-    <FlatList
-      style={styles.screen}
-      data={jobs}
-      keyExtractor={(job) => job.id}
-      renderItem={({ item }) => <JobRow job={item} onPress={() => onOpenJob(item.id)} />}
-      ItemSeparatorComponent={() => <View style={styles.separator} />}
-    />
+    <View style={styles.screen}>
+      <AttendanceBar database={database} />
+      <FlatList
+        style={styles.list}
+        data={jobs}
+        keyExtractor={(job) => job.id}
+        renderItem={({ item }) => <JobRow job={item} onPress={() => onOpenJob(item.id)} />}
+        ItemSeparatorComponent={() => <View style={styles.separator} />}
+      />
+    </View>
   );
 }
 
@@ -119,7 +138,8 @@ function priorityStyle(priority: JobPriority) {
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: theme.colour.background },
-  centred: { alignItems: "center", justifyContent: "center", padding: theme.space.xl },
+  list: { flex: 1 },
+  centred: { flex: 1, alignItems: "center", justifyContent: "center", padding: theme.space.xl },
   emptyTitle: { color: theme.colour.text, fontSize: theme.font.title, marginBottom: theme.space.md },
   emptyBody: { color: theme.colour.textMuted, fontSize: theme.font.body, textAlign: "center", lineHeight: 24 },
   row: { padding: theme.space.md, minHeight: theme.touchTarget },

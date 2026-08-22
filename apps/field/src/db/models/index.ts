@@ -136,6 +136,21 @@ export class TimingEventModel extends Model {
   @field("accuracy_metres") accuracyMetres?: number;
 }
 
+/** `TECH-8`. See `domain/shift-clock.ts` for why this is a separate table and kind vocabulary from `TimingEventModel` above. */
+export class AttendanceEvent extends Model {
+  static override table = "attendance_events";
+  @text("kind") kind!: string;
+  /** `null` is "not evaluated"; never conflated with a real `false`. */
+  @field("within_geofence") withinGeofence?: boolean;
+  @date("recorded_offline_at") recordedOfflineAt!: Date;
+  @field("device_offset_ms_at_capture") deviceOffsetMsAtCapture?: number;
+  @field("server_received_at") serverReceivedAt?: number;
+  @field("monotonic_at") monotonicAt!: number;
+  @field("lat") lat?: number;
+  @field("lng") lng?: number;
+  @field("accuracy_metres") accuracyMetres?: number;
+}
+
 export class JobCardModel extends Model {
   static override table = "job_cards";
   @text("job_id") jobId!: string;
