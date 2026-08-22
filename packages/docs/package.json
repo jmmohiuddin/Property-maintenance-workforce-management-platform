@@ -9,7 +9,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx test/render.test.ts && tsx test/job-sheet.test.ts && tsx test/tender-pack.test.ts && tsx --env-file-if-exists=../../.env test/materialise.test.ts && tsx --env-file-if-exists=../../.env test/job-sheet-seal.test.ts",
+    "test": "tsx test/render.test.ts && tsx test/statement.test.ts && tsx test/job-sheet.test.ts && tsx test/tender-pack.test.ts && tsx --env-file-if-exists=../../.env test/materialise.test.ts && tsx --env-file-if-exists=../../.env test/job-sheet-seal.test.ts",
     "check": "npm run typecheck && npm run test"
   },
   "dependencies": {

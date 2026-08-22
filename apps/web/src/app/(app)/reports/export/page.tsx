@@ -239,11 +239,14 @@ export default async function AccountingExportPage({
           </section>
         </div>
 
-        <p className="mt-8 text-[13px]">
+        <div className="mt-8 flex flex-wrap gap-x-6 gap-y-2 text-[13px]">
+          <Link href="/reports/vat" style={{ color: "var(--accent-text)" }}>
+            The VAT return pack, and its working papers &rarr;
+          </Link>
           <Link href="/reports/tax" style={{ color: "var(--accent-text)" }}>
             Corporate tax and the Small Business Relief line &rarr;
           </Link>
-        </p>
+        </div>
       </div>
     </AppShell>
   );

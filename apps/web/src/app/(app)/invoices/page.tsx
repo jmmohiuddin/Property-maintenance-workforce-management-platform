@@ -94,7 +94,19 @@ export default async function InvoicesPage({
   return (
     <AppShell session={session} active="invoices">
       <div className="container-page py-8">
-        <h1 className="text-2xl font-semibold tracking-tight md:text-3xl">Invoices</h1>
+        <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2">
+          <h1 className="text-2xl font-semibold tracking-tight md:text-3xl">Invoices</h1>
+          {/*
+            `INV-13`. This list answers "what is outstanding across the
+            business"; a customer ringing up asks "what do WE owe you", and that
+            is one account's ledger with a running balance rather than a filter
+            over this table. It is one click from here because here is where
+            somebody is standing when the phone rings.
+          */}
+          <Link href="/invoices/statements" className="text-[13px]" style={{ color: "var(--accent-text)" }}>
+            Statement of account for one customer &rarr;
+          </Link>
+        </div>
         <p className="prose-body mt-2 text-[14px]">
           Receivables aged from each invoice&apos;s due date, computed live rather than from a status
           column that drifts when a nightly job stops running.

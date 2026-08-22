@@ -12,8 +12,13 @@
  * `job-sheet-seal.ts`, which is the snapshot, the lock and the customer's copy.
  * Read the first of those before the second.
  *
- * Still to build here, and deliberately not stubbed: the statement of account
- * (`INV-13`) and the Arabic bilingual layout variant (`INV-14`). The tender
+ * The statement of account (`INV-13`) is `statement.ts` — a report about
+ * documents rather than a document in its own right, which is why it has no
+ * sequential number and is not stored write-once; read its header for how it
+ * differs from the portal's own statement screen.
+ *
+ * Still to build here, and deliberately not stubbed: the Arabic bilingual
+ * layout variant (`INV-14`). The tender
  * pack (`CON-12`) is in `tender-pack.ts`, and it is the one document here
  * assembled from several renders — see its header.
  */
@@ -23,6 +28,7 @@ export * from "./format";
 export { Canvas } from "./layout";
 export * from "./blocks";
 export * from "./tax-document";
+export * from "./statement";
 export * from "./quote-document";
 export * from "./issue";
 export * from "./tender-pack";

@@ -1,5 +1,5 @@
 import { randomBytes, createHash } from "node:crypto";
-import { and, count, eq, desc, sql, inArray, isNull } from "drizzle-orm";
+import { and, count, eq, desc, sql, inArray, isNull, type SQL } from "drizzle-orm";
 import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
 import { decodeCursor, encodeCursor, type Page } from "./leads";
@@ -1816,5 +1816,512 @@ export async function customerCreditPosition(
     outstandingMinor,
     headroomMinor: creditLimitMinor === null ? null : creditLimitMinor - outstandingMinor,
     overLimit: creditLimitMinor !== null && outstandingMinor > creditLimitMinor,
+  };
+}
+
+// ── The statement of account (INV-13) ────────────────────────────────────────
+
+/** Who the statement is addressed to. Read at generation, not snapshotted. */
+export interface StatementParty {
+  readonly customerId: string;
+  readonly code: string;
+  readonly name: string;
+  readonly trn: string | null;
+  readonly address: string | null;
+  readonly billingEmail: string | null;
+  readonly paymentTermsDays: number;
+}
+
+export interface StatementLine {
+  readonly kind: "invoice" | "credit_note" | "payment" | "write_off";
+  readonly reference: string;
+  readonly occurredAt: Date;
+  /** Dubai calendar day of `occurredAt`, which is the date the document shows. */
+  readonly occurredOn: string;
+  /** Positive increases what is owed, negative reduces it. VAT-inclusive. */
+  readonly amountMinor: number;
+  readonly detail: string | null;
+  /** The balance after this line, opening balance included. */
+  readonly balanceMinor: number;
+}
+
+export interface StatementAgeing {
+  readonly currentMinor: number;
+  readonly days1to30Minor: number;
+  readonly days31to60Minor: number;
+  readonly days61PlusMinor: number;
+  readonly totalMinor: number;
+}
+
+export interface CustomerStatement {
+  readonly customer: StatementParty;
+  /** Inclusive Dubai day, or null for "everything from the beginning". */
+  readonly from: string | null;
+  /** Inclusive Dubai day. Nothing after this appears or is counted. */
+  readonly to: string;
+  readonly generatedAt: Date;
+  readonly currency: string;
+  /** What was owed the instant before `from`. Zero when `from` is null. */
+  readonly openingBalanceMinor: number;
+  /** EVERY movement in the range, oldest first. Never capped — see below. */
+  readonly entries: readonly StatementLine[];
+  readonly invoicedMinor: number;
+  readonly creditedMinor: number;
+  readonly paidMinor: number;
+  readonly writtenOffMinor: number;
+  /** Opening plus every movement. Negative means the customer is in credit. */
+  readonly closingBalanceMinor: number;
+  /**
+   * How the closing balance is aged, as at `to` — reconstructed from the dated
+   * events rather than read from today's position, so a statement for a past
+   * quarter ages the way it did then.
+   */
+  readonly ageing: StatementAgeing;
+  /** Invoices still open at `to` and past their due date, oldest first. */
+  readonly oldestOverdue: { reference: string; dueOn: string; daysOverdue: number } | null;
+}
+
+/**
+ * The point at which a statement refuses rather than truncates.
+ *
+ * A statement of account is a document that gets emailed to a customer and paid
+ * against, so it must contain every movement in its range — a capped one is a
+ * demand for the wrong amount. This is therefore not a page size: the query
+ * asks for one row more than this, and finding it throws. Two thousand
+ * movements is roughly a decade of monthly billing on one account, so reaching
+ * it means the range is wrong, and the honest response is to say so rather than
+ * to send a document that silently omits the oldest half of the ledger.
+ */
+const STATEMENT_MAX_ENTRIES = 2_000;
+
+/**
+ * The statement of account (`INV-13`).
+ *
+ * ── HOW THIS DIFFERS FROM `portalStatement`, AND WHY BOTH EXIST ─────────────
+ *
+ * `portalStatement` in `domain/portal.ts` is a SCREEN for the signed-in
+ * customer: it takes no customer argument at all, because the customer is the
+ * session — customer-scope RLS makes every other customer's rows absent — and
+ * it deliberately CAPS its entry list because a screen has to end somewhere,
+ * publishing `truncated` so the page can say so.
+ *
+ * This is a DOCUMENT, produced by staff, for one named customer, over a chosen
+ * range, to be emailed and paid against. Three consequences follow, and each is
+ * why this is not the same function with an argument added:
+ *
+ *  1. **It cannot be capped.** A statement missing movements is a demand for
+ *     the wrong amount. So it refuses beyond `STATEMENT_MAX_ENTRIES` instead of
+ *     truncating, and there is no `truncated` flag to ignore.
+ *  2. **It has an opening balance.** A range that starts in April has to say
+ *     what was owed on 31 March, or the closing balance cannot be checked. That
+ *     is its own aggregate over every movement before the range.
+ *  3. **It is as at a date, not as at now.** The ageing is reconstructed from
+ *     the dated payments and credit notes, so a statement reissued for last
+ *     quarter shows last quarter's ageing rather than today's.
+ *
+ * ── THE TOTALS ARE AGGREGATES, NOT SUMS OF THE ROWS ─────────────────────────
+ *
+ * Even though the entry list is complete, the four totals below come from their
+ * own `group by` over the same predicate rather than from a fold over the rows.
+ * That is deliberate: it makes the document self-checking. `customerStatement`
+ * computes the closing balance twice by two different routes — the aggregate,
+ * and the running balance down the rows — and the test asserts they agree to
+ * the fil. A single route cannot catch a missing row; two can.
+ *
+ * ── DUBAI, EVERY TIME ───────────────────────────────────────────────────────
+ *
+ * A statement for "March" must contain an invoice issued at 23:30 Dubai on 31
+ * March and must not contain one issued at 00:30 Dubai on 1 April. This session
+ * runs in a timezone AHEAD of Dubai, so a boundary taken from the host clock
+ * would put the first in April and could pass a test written the same way. Both
+ * boundaries are `at time zone 'Asia/Dubai'` in SQL, half-open at the top.
+ */
+export async function customerStatement(
+  tx: TenantScopedTx,
+  options: { customerId: string; from?: string | null; to: string; now?: Date },
+): Promise<CustomerStatement> {
+  const { customerId, to } = options;
+  const from = options.from ?? null;
+  const generatedAt = options.now ?? new Date();
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(to) || (from !== null && !/^\d{4}-\d{2}-\d{2}$/.test(from))) {
+    throw new UserFacingError("Give the statement period as dates, each YYYY-MM-DD.");
+  }
+  if (from !== null && from > to) {
+    throw new UserFacingError("That statement period starts after it ends.");
+  }
+
+  const customerRows = await tx
+    .select({
+      id: schema.customers.id,
+      code: schema.customers.code,
+      name: schema.customers.name,
+      trn: schema.customers.taxRegistrationNumber,
+      address: schema.customers.billingAddress,
+      city: schema.customers.billingCity,
+      country: schema.customers.billingCountry,
+      billingEmail: schema.customers.billingEmail,
+      paymentTermsDays: schema.customers.paymentTermsDays,
+      currency: schema.customers.currency,
+    })
+    .from(schema.customers)
+    .where(and(eq(schema.customers.id, customerId), isNull(schema.customers.deletedAt)))
+    .limit(1);
+
+  const customerRow = customerRows[0];
+  if (!customerRow) {
+    // Absent, not forbidden. Under customer-scope RLS a portal session asking
+    // about somebody else's account reaches this branch because the row is not
+    // visible, which is the behaviour that file is written to produce — so the
+    // message must not confirm that the customer exists.
+    throw new UserFacingError("No such customer on this account.");
+  }
+
+  const ledger = statementLedger(customerId);
+
+  // ── The opening balance ───────────────────────────────────────────────────
+  //
+  // Its own aggregate over every movement strictly before the range. Zero when
+  // there is no start date, because then there is nothing before the range.
+  let openingBalanceMinor = 0;
+  if (from !== null) {
+    const openingRows = (await tx.execute<{ opening: string }>(sql`
+      with ${ledger}
+      select coalesce(sum(amount_minor), 0)::text as opening
+        from movements
+       where (occurred_at at time zone 'Asia/Dubai') < ${from}::date
+    `)) as unknown as { opening: string }[];
+    openingBalanceMinor = Number(openingRows[0]?.opening ?? 0);
+  }
+
+  // ── The movements in the range ────────────────────────────────────────────
+
+  type EntryRow = {
+    kind: string;
+    reference: string;
+    occurred_at: string;
+    occurred_on: string;
+    amount_minor: string;
+    detail: string | null;
+  };
+
+  const entryRows = (await tx.execute<EntryRow>(sql`
+    with ${ledger}
+    select kind,
+           reference,
+           occurred_at,
+           to_char(occurred_at at time zone 'Asia/Dubai', 'YYYY-MM-DD') as occurred_on,
+           amount_minor::text                                          as amount_minor,
+           detail
+      from movements
+     where (${from === null}::boolean or (occurred_at at time zone 'Asia/Dubai') >= ${from ?? to}::date)
+       and (occurred_at at time zone 'Asia/Dubai') < ${to}::date + interval '1 day'
+     order by occurred_at asc, reference asc, kind asc
+     limit ${STATEMENT_MAX_ENTRIES + 1}
+  `)) as unknown as EntryRow[];
+
+  if (entryRows.length > STATEMENT_MAX_ENTRIES) {
+    throw new UserFacingError(
+      `This account has more than ${STATEMENT_MAX_ENTRIES} movements in that period. ` +
+        `Narrow the range — a statement that quietly left some of them out would be a ` +
+        `demand for the wrong amount.`,
+    );
+  }
+
+  let running = openingBalanceMinor;
+  const entries: StatementLine[] = entryRows.map((r) => {
+    const amountMinor = Number(r.amount_minor);
+    running += amountMinor;
+    return {
+      kind: r.kind as StatementLine["kind"],
+      reference: r.reference,
+      occurredAt: requiredRowDate(r.occurred_at),
+      occurredOn: r.occurred_on,
+      amountMinor,
+      detail: r.detail,
+      balanceMinor: running,
+    };
+  });
+
+  // ── The totals, computed independently of the rows above ──────────────────
+
+  type TotalRow = { kind: string; total: string; currency: string | null };
+  const totalRows = (await tx.execute<TotalRow>(sql`
+    with ${ledger}
+    select kind,
+           coalesce(sum(amount_minor), 0)::text as total,
+           min(currency)                        as currency
+      from movements
+     where (${from === null}::boolean or (occurred_at at time zone 'Asia/Dubai') >= ${from ?? to}::date)
+       and (occurred_at at time zone 'Asia/Dubai') < ${to}::date + interval '1 day'
+     group by kind
+  `)) as unknown as TotalRow[];
+
+  const byKind = new Map(totalRows.map((r) => [r.kind, Number(r.total)]));
+  const invoicedMinor = byKind.get("invoice") ?? 0;
+  // Stored positive on the statement even though the movements are signed, so
+  // the footer reads as four columns a reader adds up rather than as three
+  // positives and a negative they have to notice.
+  const creditedMinor = -(byKind.get("credit_note") ?? 0);
+  const paidMinor = -(byKind.get("payment") ?? 0);
+  const writtenOffMinor = -(byKind.get("write_off") ?? 0);
+
+  const ageing = await statementAgeing(tx, customerId, to);
+
+  return {
+    customer: {
+      customerId: customerRow.id,
+      code: customerRow.code,
+      name: customerRow.name,
+      trn: customerRow.trn,
+      address:
+        [customerRow.address, customerRow.city, customerRow.country].filter(Boolean).join(", ") ||
+        null,
+      billingEmail: customerRow.billingEmail,
+      paymentTermsDays: customerRow.paymentTermsDays,
+    },
+    from,
+    to,
+    generatedAt,
+    currency: totalRows.find((r) => r.currency)?.currency ?? customerRow.currency ?? "AED",
+    openingBalanceMinor,
+    entries,
+    invoicedMinor,
+    creditedMinor,
+    paidMinor,
+    writtenOffMinor,
+    closingBalanceMinor:
+      openingBalanceMinor + invoicedMinor - creditedMinor - paidMinor - writtenOffMinor,
+    ageing,
+    oldestOverdue: ageing.oldestOverdue,
+  };
+}
+
+/**
+ * One customer's ledger, as signed VAT-inclusive minor units.
+ *
+ * A CTE builder rather than three near-identical queries, so the opening
+ * balance, the entry list and the totals cannot disagree about what a movement
+ * is. Every caller applies its own date predicate to the same rows.
+ *
+ * NO BACKTICKS IN ANY COMMENT BELOW. This sits inside a tagged template
+ * literal, and one backtick ends the template — the error then surfaces as a
+ * syntax failure dozens of lines away from the mistake.
+ */
+function statementLedger(customerId: string): SQL {
+  return sql`
+    movements as (
+      select 'invoice'::text                                as kind,
+             i.reference                                    as reference,
+             coalesce(i.issued_on, i.created_at)            as occurred_at,
+             -- Never ::int: a decade of one owners association's invoices in
+             -- fils passes int4 in the sum long before it passes belief.
+             (i.total * 100)::bigint                        as amount_minor,
+             null::text                                     as detail,
+             i.currency                                     as currency
+        from invoices i
+       where i.customer_id = ${customerId}::uuid
+         and i.deleted_at is null
+         -- A draft is not a document and has no place on a demand for payment.
+         and i.status <> 'draft'
+
+      union all
+
+      select 'credit_note',
+             n.reference,
+             coalesce(n.issued_on, n.created_at),
+             -(n.total * 100)::bigint,
+             n.reason::text,
+             n.currency
+        from credit_notes n
+       where n.customer_id = ${customerId}::uuid
+         and n.deleted_at is null
+
+      union all
+
+      -- Reached through the invoice, because a payment carries no customer_id
+      -- of its own; the invoice reference is what the statement has to show
+      -- anyway so the customer can see what their money was applied to.
+      select 'payment',
+             i.reference,
+             p.received_at,
+             -(p.amount * 100)::bigint,
+             p.method::text,
+             p.currency
+        from payments p
+        join invoices i on i.id = p.invoice_id
+       where i.customer_id = ${customerId}::uuid
+         and p.deleted_at is null
+         and i.deleted_at is null
+
+      union all
+
+      -- Debt the business stopped pursuing, as the ledger event it is.
+      --
+      -- The amount is the FORGIVEN portion measured at the moment of the
+      -- write-off: the total, less what had been paid by then, less what had
+      -- been credited by then. Subtracting the whole total would double-count
+      -- the payments that are already rows in this same ledger and show the
+      -- customer as in credit.
+      --
+      -- Dated by written_off_at rather than updated_at, which moves on a
+      -- re-rendered PDF or a reminder count. A write-off filed at the wrong
+      -- date makes every later row's running balance wrong.
+      --
+      -- The detail is null on purpose. written_off_reason is internal free text
+      -- of the "customer dissolved, uncollectable" kind, and this document goes
+      -- to the customer. They are told the debt was written off, which is the
+      -- part that concerns them, and not what was said about them while doing
+      -- it.
+      select 'write_off',
+             w.reference,
+             coalesce(w.written_off_at, w.updated_at),
+             -greatest(
+                (w.total * 100)::bigint
+                - coalesce((select sum((p2.amount * 100)::bigint) from payments p2
+                             where p2.invoice_id = w.id
+                               and p2.deleted_at is null
+                               and p2.received_at <= coalesce(w.written_off_at, w.updated_at)), 0)
+                - coalesce((select sum((n2.total * 100)::bigint) from credit_notes n2
+                             where n2.invoice_id = w.id
+                               and n2.deleted_at is null
+                               and coalesce(n2.issued_on, n2.created_at) <= coalesce(w.written_off_at, w.updated_at)), 0),
+                0),
+             null::text,
+             w.currency
+        from invoices w
+       where w.customer_id = ${customerId}::uuid
+         and w.deleted_at is null
+         and w.status = 'written_off'
+         -- A zero-value write-off moves nothing, and a 0.00 row on a statement
+         -- reads as an error rather than as a non-event.
+         and greatest(
+               (w.total * 100)::bigint
+               - coalesce((select sum((p3.amount * 100)::bigint) from payments p3
+                            where p3.invoice_id = w.id
+                              and p3.deleted_at is null
+                              and p3.received_at <= coalesce(w.written_off_at, w.updated_at)), 0)
+               - coalesce((select sum((n3.total * 100)::bigint) from credit_notes n3
+                            where n3.invoice_id = w.id
+                              and n3.deleted_at is null
+                              and coalesce(n3.issued_on, n3.created_at) <= coalesce(w.written_off_at, w.updated_at)), 0),
+               0) > 0
+    )`;
+}
+
+/**
+ * How the closing balance is aged, as at a Dubai day.
+ *
+ * Reconstructed from the dated events, not read from `invoices.amount_paid`.
+ * That column is today's position: using it would age a statement for last
+ * quarter using this quarter's receipts, so an invoice paid in July would show
+ * as settled on a statement dated 30 June. The accounting export's receivables
+ * schedule cannot do this and says so; here it is possible because payments and
+ * credit notes both carry their own dates.
+ *
+ * The buckets are the same four `arAgeing` uses, so the two screens cannot
+ * disagree about what "31 to 60 days" means.
+ */
+async function statementAgeing(
+  tx: TenantScopedTx,
+  customerId: string,
+  to: string,
+): Promise<StatementAgeing & { oldestOverdue: CustomerStatement["oldestOverdue"] }> {
+  type Row = {
+    current_minor: string;
+    days_1_30_minor: string;
+    days_31_60_minor: string;
+    days_61_plus_minor: string;
+    total_minor: string;
+    oldest_reference: string | null;
+    oldest_due_on: string | null;
+    oldest_days_overdue: string | null;
+  };
+
+  const rows = (await tx.execute<Row>(sql`
+    with asof as (
+      -- The last instant of the statement day, in Dubai. The half-open bound
+      -- is applied to each event below rather than to a truncated date, so an
+      -- invoice issued at 23:30 Dubai on the closing day is aged on that
+      -- statement and not carried into the next.
+      select ${to}::date + interval '1 day' as day_after
+    ),
+    open_invoices as (
+      select i.reference,
+             i.due_on,
+             (i.total * 100)::bigint
+             - coalesce((select sum((p.amount * 100)::bigint) from payments p
+                          where p.invoice_id = i.id
+                            and p.deleted_at is null
+                            and (p.received_at at time zone 'Asia/Dubai') < (select day_after from asof)), 0)
+             - coalesce((select sum((n.total * 100)::bigint) from credit_notes n
+                          where n.invoice_id = i.id
+                            and n.deleted_at is null
+                            and (coalesce(n.issued_on, n.created_at) at time zone 'Asia/Dubai') < (select day_after from asof)), 0)
+               as outstanding_minor,
+             -- Whole days between the due date and the statement day, both
+             -- taken as Dubai calendar days so a due date stored at a UTC
+             -- instant cannot shift the bucket by one.
+             (${to}::date - (i.due_on at time zone 'Asia/Dubai')::date) as days_overdue
+        from invoices i
+       where i.customer_id = ${customerId}::uuid
+         and i.deleted_at is null
+         and i.status <> 'draft'
+         and i.issued_on is not null
+         and (i.issued_on at time zone 'Asia/Dubai') < (select day_after from asof)
+         -- Written off ON OR BEFORE the statement day is no longer receivable;
+         -- written off afterwards was still owed on the day, so it is aged.
+         and not (i.status = 'written_off'
+                  and (coalesce(i.written_off_at, i.updated_at) at time zone 'Asia/Dubai')
+                        < (select day_after from asof))
+    ),
+    aged as (
+      select * from open_invoices where outstanding_minor > 0
+    ),
+    -- ONE row, picked once, and all three fields taken from it.
+    --
+    -- This was three separate scalar subqueries, each with its own
+    -- order by days_overdue desc. The one selecting days_overdue::text named
+    -- its output column days_overdue as well, and Postgres resolves an
+    -- ORDER BY name against the OUTPUT list first — so that subquery sorted
+    -- the ages as TEXT, where "60" comes after "273", and returned the age of
+    -- a different invoice from the one the other two named. The statement then
+    -- said the oldest overdue document was 60 days old when it was 273. Caught
+    -- by a hand-computed assertion; invisible to any check that compared the
+    -- output to itself.
+    oldest as (
+      select reference, due_on, days_overdue
+        from aged
+       where days_overdue > 0
+       order by days_overdue desc, reference
+       limit 1
+    )
+    select
+      coalesce(sum(outstanding_minor) filter (where days_overdue is null or days_overdue <= 0), 0)::text as current_minor,
+      coalesce(sum(outstanding_minor) filter (where days_overdue between 1 and 30), 0)::text            as days_1_30_minor,
+      coalesce(sum(outstanding_minor) filter (where days_overdue between 31 and 60), 0)::text           as days_31_60_minor,
+      coalesce(sum(outstanding_minor) filter (where days_overdue > 60), 0)::text                        as days_61_plus_minor,
+      coalesce(sum(outstanding_minor), 0)::text                                                         as total_minor,
+      (select reference from oldest)                                                                    as oldest_reference,
+      (select to_char(due_on at time zone 'Asia/Dubai', 'YYYY-MM-DD') from oldest)                      as oldest_due_on,
+      (select days_overdue::text from oldest)                                                           as oldest_days_overdue
+      from aged
+  `)) as unknown as Row[];
+
+  const r = rows[0];
+  return {
+    currentMinor: Number(r?.current_minor ?? 0),
+    days1to30Minor: Number(r?.days_1_30_minor ?? 0),
+    days31to60Minor: Number(r?.days_31_60_minor ?? 0),
+    days61PlusMinor: Number(r?.days_61_plus_minor ?? 0),
+    totalMinor: Number(r?.total_minor ?? 0),
+    oldestOverdue:
+      r?.oldest_reference && r.oldest_due_on
+        ? {
+            reference: r.oldest_reference,
+            dueOn: r.oldest_due_on,
+            daysOverdue: Number(r.oldest_days_overdue ?? 0),
+          }
+        : null,
   };
 }

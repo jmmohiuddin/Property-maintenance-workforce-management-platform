@@ -50,9 +50,10 @@ function monthLabel(key: string): string {
  * in §1.1, the role-to-landing-page table in §1.2 and the screen index in §12.
  * It was built at `/dashboard` because the brief said so; the brief was wrong
  * and the spec was not, so the spec won. Recorded here because the reasoning
- * outlives the rename: this screen grows a VAT-return pack and an accounting
- * export beside it, and "reports" still describes that page while "dashboard"
- * stops doing so the moment it holds something you export rather than read.
+ * outlives the rename: this screen has since grown a VAT-return pack (`INV-11`)
+ * and an accounting export beside it, and "reports" still describes that page
+ * while "dashboard" stops doing so the moment it holds something you export
+ * rather than read.
  *
  * ── WHY EVERY FIGURE CARRIES A LINK ─────────────────────────────────────────
  *
@@ -1032,12 +1033,19 @@ export default async function DashboardPage() {
         </div>
 
         {/*
-          The two screens this dashboard summarises rather than replaces. Both
-          are read at a different moment — the tax page when a return is being
-          prepared, the export when the accountant asks — so neither belongs in
-          the weekly card stack, and both belong within one click of it.
+          The three screens this dashboard summarises rather than replaces. Each
+          is read at a different moment — the VAT pack inside 28 days of a tax
+          period ending, the corporate tax page when the annual return is being
+          prepared, the export when the accountant asks — so none belongs in the
+          weekly card stack, and all three belong within one click of it.
+
+          The VAT pack leads, because it is the only one of the three with a
+          recurring statutory deadline and a late-filing penalty attached to it.
         */}
         <div className="mt-8 flex flex-wrap gap-x-6 gap-y-2 text-[13px]">
+          <Link href="/reports/vat" style={{ color: "var(--accent-text)" }}>
+            VAT return &mdash; the figures for Form VAT 201, and the papers behind them &rarr;
+          </Link>
           <Link href="/reports/tax" style={{ color: "var(--accent-text)" }}>
             Corporate tax &mdash; every period against the AED 3m line &rarr;
           </Link>

@@ -281,6 +281,16 @@ export default async function CorporateTaxPage() {
               </Link>
               , which is what your accountant should be reconciling against.
             </li>
+            <li>
+              This is <strong>corporate</strong> tax, which is annual. VAT is a different tax on a
+              different clock &mdash; quarterly or monthly, filed within 28 days of the period
+              ending &mdash; and its figures are on the{" "}
+              <Link href="/reports/vat" style={{ color: "var(--accent-text)" }}>
+                VAT return pack
+              </Link>
+              . Do not read one from the other: revenue here is tax-exclusive and net of credit
+              notes, which is not the same measurement as any box on Form VAT 201.
+            </li>
           </ul>
         </div>
       </div>
