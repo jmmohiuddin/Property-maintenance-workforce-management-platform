@@ -182,6 +182,21 @@ jobs:
       - name: Typecheck all workspaces
         run: npm run typecheck
 
+      # The root gate does NOT see the field app's screens. `apps/field`'s own
+      # tsconfig.json excludes `src/app/**`, `src/db/models/**` and
+      # `watermelon.ts`, because that config is the Node-flavoured one the test
+      # suites compile under and it carries neither JSX nor the React Native
+      # types. The exclusion is correct; running only that config is not.
+      #
+      # Without the line below, every screen in the field app -- the whole
+      # capture surface a technician touches, the job card, the camera, the
+      # signature pad -- is code CI has never compiled. It typechecks today
+      # only because it was run by hand. A gate that skips the half of a
+      # workspace most likely to break is the shape this repo keeps finding:
+      # a check that cannot fail, counted as though it had passed.
+      - name: Typecheck the field app's native half
+        run: npm run typecheck:native -w ./apps/field
+
       # ── 2. Schema, security, and the proof it worked ─────────────────────
       # Order is load-bearing and mirrors the deployment runbook exactly:
       # migrations define the tables, then rls.sql applies policies to every
