@@ -125,6 +125,33 @@ jobs:
       COMPANY_PHONE: "+971 4 000 0000"
       COMPANY_EMAIL: "ci@example.invalid"
       COMPANY_EMERGENCY_PHONE: "+971 55 000 0000"
+      #
+      # The rest of the identity, added because CI's first-ever run failed
+      # without it. `packages/docs`' materialise suite renders a real tax
+      # invoice, and INV-3 refuses to render one without a supplier TRN and
+      # address -- correctly, since issuing an incomplete tax invoice is an
+      # Article 59 failure at AED 2,500 a document.
+      #
+      # It passed on every developer's machine for a reason that does not exist
+      # here: that suite runs under `--env-file-if-exists=../../.env`, and the
+      # flag does exactly what it says -- when the file is absent it loads
+      # nothing, silently, and the suite runs on whatever the environment
+      # happens to hold. Locally that is a populated .env. In CI it is nothing.
+      # So the suite was green everywhere it had ever been run and red the first
+      # time anything else ran it.
+      #
+      # These are deliberately obvious fakes. A CI identity that looked real
+      # would eventually be copied into a deployment.
+      COMPANY_LEGAL_NAME: "CI Test Services LLC"
+      COMPANY_TRN: "100000000000003"
+      COMPANY_CR_NUMBER: "CI-000000"
+      COMPANY_LICENCE_NUMBER: "000000"
+      COMPANY_ADDRESS_STREET: "1 Continuous Integration Street"
+      COMPANY_ADDRESS_CITY: "Dubai"
+      COMPANY_ADDRESS_REGION: "Dubai"
+      COMPANY_ADDRESS_COUNTRY: "AE"
+      COMPANY_LAT: "25.2048"
+      COMPANY_LNG: "55.2708"
 
     steps:
       - uses: actions/checkout@v4
