@@ -241,12 +241,15 @@ Claims in this README that have been executed rather than asserted:
 
 - `npm run typecheck` passes across all eight workspaces — `apps/web` and `apps/field` included,
   which are easy to assume are skipped and are not; npm runs `apps/*` first, so their banners are
-  the ones that scroll off the top of a truncated log. `npm run test` passes 3,623 checks across
-  60 suites, no skips
+  the ones that scroll off the top of a truncated log. There is a second typecheck — `npm run
+  typecheck:native -w ./apps/field` — and it is not optional: the field workspace's own
+  `tsconfig.json` excludes `src/app/**`, so the root gate never sees a single one of the screens a
+  technician touches. CI runs both. `npm run test` passes 4,252 checks across 77 suites, no skips
 - `npm run check:contrast --workspace=@meridian/web` passes 72/72 token pairings at WCAG AA, light
   and dark. It is workspace-scoped: there is no root `check:contrast`, and CI invokes it this way
-- `next build` produces 112 routes — 99 server-rendered, 11 static, and 2 prerendered from
-  `generateStaticParams`, expanding to 30 static HTML pages of which 10 are services and 10 are areas.
+- `next build` produces 128 routes — 106 server-rendered, 18 static, and 4 prerendered from
+  `generateStaticParams`, expanding to 57 static HTML pages. 26 of those are the Arabic half of the
+  public site, served from `/ar` with reciprocal `hreflang` alternates.
   The route count grows with the operational app; the public half stays small on purpose: `WEB-1`
   rebuilt the service pages one-to-one against the licensed activities and removed the rest, and
   `WEB-6` cut the area pages to the ones the company will genuinely travel to
