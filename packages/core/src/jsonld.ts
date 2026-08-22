@@ -290,6 +290,52 @@ export function webPageSchema(input: {
 }
 
 /**
+ * One published, in-force line of the rate card — the plain shape
+ * `listPublicRateCard` (`packages/db/src/domain/reference.ts`) returns, restated
+ * here so `packages/core` (zero runtime dependencies) never has to import the
+ * database package to describe it.
+ */
+export interface RateCardEntry {
+  readonly serviceSlug: string;
+  /** Includes the rate band already, e.g. "Plumbing labour — Emergency". */
+  readonly label: string;
+  readonly unit: string;
+  /** Decimal string, e.g. "150.00". VAT-exclusive, matching the visible price. */
+  readonly priceAed: string;
+}
+
+/**
+ * `OfferCatalog` for the published schedule of rates (`WEB-16`).
+ *
+ * Built from the exact rows the page renders — the same array, not a
+ * re-fetch — so the structured data cannot say a price the visible table does
+ * not. Each line carries a `UnitPriceSpecification` rather than a bare `price`,
+ * because a rate is always per something (per hour, per visit) and a schema.org
+ * consumer that drops the unit would read AED 150 as the whole job.
+ */
+export function rateCardSchema(entries: readonly RateCardEntry[]): Json {
+  return {
+    "@type": "OfferCatalog",
+    "@id": absoluteUrl("/rates#schedule"),
+    name: "Published schedule of rates",
+    itemListElement: entries.map((e, i) => ({
+      "@type": "Offer",
+      position: i + 1,
+      name: e.label,
+      priceCurrency: tenant.currency,
+      price: e.priceAed,
+      priceSpecification: {
+        "@type": "UnitPriceSpecification",
+        price: e.priceAed,
+        priceCurrency: tenant.currency,
+        unitText: e.unit,
+      },
+      itemOffered: { "@type": "Service", "@id": absoluteUrl(`/services/${e.serviceSlug}#service`) },
+    })),
+  };
+}
+
+/**
  * Wraps nodes into a single `@graph`. One script tag per page beats several
  * disconnected ones — it lets crawlers resolve `@id` references in one pass.
  */
