@@ -4054,7 +4054,7 @@ export const VAT_INPUT_TAX_UNAVAILABLE: VatInputTaxPosition = {
  *
  * An invoice issued at 23:30 Dubai on 31 March belongs in Q1. In UTC it is
  * 19:30 on 31 March, which is still Q1 — but this repository's session timezone
- * is Asia/Dhaka, four hours AHEAD of Dubai, and there the same instant is
+ * is Asia/Dhaka, two hours AHEAD of Dubai, and there the same instant is
  * 01:30 on 1 April: Q2. A boundary taken from the session clock therefore moves
  * revenue between two returns, understating one and overstating the next, and
  * both are wrong in a way that is only discovered by an auditor. So every

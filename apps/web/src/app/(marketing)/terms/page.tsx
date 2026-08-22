@@ -2,11 +2,12 @@ import type { Metadata } from "next";
 import { tenant, graph, webPageSchema, breadcrumbSchema } from "@meridian/core";
 import { JsonLd } from "@/components/json-ld";
 import { LegalPage, LegalSection, ReviewBanner } from "@/components/legal";
+import { hreflangAlternates } from "@/lib/i18n";
 
 export const metadata: Metadata = {
   title: "Terms of Service",
   description: `Terms on which ${tenant.legalName} provides maintenance services.`,
-  alternates: { canonical: "/terms" },
+  alternates: { canonical: "/terms", languages: hreflangAlternates("/terms") },
   robots: { index: false, follow: true },
 };
 

@@ -155,8 +155,22 @@ export const tenant: TenantProfile = {
     "A Dubai mainland technical services contractor licensed for painting, wallpaper, false ceilings, tiling, plumbing and sanitary works, carpentry, electrical fittings repair, electromechanical installation, HVAC installation and maintenance, and building cleaning — working for villas, apartments, commercial units and buildings on annual maintenance contracts, reactive callouts and fit-out projects.",
   domain: process.env["NEXT_PUBLIC_SITE_URL"] ?? "http://localhost:3000",
   locale: company.locale,
-  // English only. §6.2 scopes a full Arabic RTL interface out; Arabic appears
-  // on customer-facing documents (`INV-14`) where it has commercial value.
+  // `locales` drives `ContactPoint.availableLanguage` in JSON-LD — a claim
+  // about which languages a caller is actually served in, not about the
+  // website's UI. Left at English only because nobody has confirmed which
+  // languages the phone line is staffed in; changing it is a staffing fact to
+  // verify, not a copy change. It is intentionally not read by the website's
+  // language plumbing.
+  //
+  // The *public marketing site* separately ships an Arabic RTL locale under
+  // `/ar` (Phase 3 roadmap item, see `docs/architecture/05-roadmap.md` and
+  // `apps/web/src/lib/i18n.ts`) — a subset of pages, with licensed-activity
+  // content and legal text left in English pending professional translation.
+  // Each `/ar` page sets its own `inLanguage: "ar-AE"` in `webPageSchema` /
+  // `websiteSchema` rather than reading this field. §6.2 / the "Native Arabic
+  // UI" row in `01-product-requirements.md` still holds for the *operator*
+  // app: that scoping was always about `(app)`, not the public site, and
+  // `(app)` stays English-only.
   locales: ["en"],
   currency: company.currency,
   currencySymbol: company.currency,

@@ -57,10 +57,14 @@ export function ServiceCard({ service, image }: { service: Service; image?: stri
       <div>
         <div className="flex items-start justify-between gap-4">
           <h3 className="text-[17px] font-semibold tracking-tight">{service.name}</h3>
+          {/* `rtl:` flips the glyph on the Arabic pages so it still points
+              toward reading-forward direction — a logical property has no
+              equivalent for mirroring an icon's artwork, only for box model
+              and position. */}
           <ArrowUpRight
             size={17}
             aria-hidden
-            className="mt-0.5 shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
+            className="mt-0.5 shrink-0 opacity-0 transition-opacity rtl:-scale-x-100 group-hover:opacity-100"
             style={{ color: "var(--accent-text)" }}
           />
         </div>
@@ -104,8 +108,13 @@ export function ServiceCard({ service, image }: { service: Service; image?: stri
  * hierarchy. Do not reintroduce it elsewhere.
  */
 export function AnswerBlock({ children }: { children: React.ReactNode }) {
+  // Logical properties (`border-s-2`/`ps-*`, i.e. border-inline-start /
+  // padding-inline-start) rather than `border-l-2`/`pl-*`, so this mirrors
+  // correctly under `dir="rtl"` on the Arabic marketing pages without a
+  // separate rule — identical rendering in LTR, accent on the correct side in
+  // RTL.
   return (
-    <div className="border-l-2 pl-5 md:pl-6" style={{ borderColor: "var(--accent)" }}>
+    <div className="border-s-2 ps-5 md:ps-6" style={{ borderColor: "var(--accent)" }}>
       <p className="answer-lead">{children}</p>
     </div>
   );

@@ -90,6 +90,7 @@ export const config = {
 const STATIC_MARKETING_PREFIXES = [
   "/about",
   "/areas",
+  "/ar",
   "/careers",
   "/contact",
   "/contracts",

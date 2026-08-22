@@ -19,11 +19,12 @@ import { Section, Eyebrow, ServiceCard, AnswerBlock, CallLink } from "@/componen
 import { FaqList } from "@/components/faq";
 import { JsonLd } from "@/components/json-ld";
 import { PhoneCall, WhatsappLogo, ShieldCheck, MapPin } from "@phosphor-icons/react/dist/ssr";
+import { hreflangAlternates } from "@/lib/i18n";
 
 export const metadata: Metadata = {
   title: `Property Maintenance & Facility Management in ${tenant.address.city}`,
   description: tenant.elevatorAnswer,
-  alternates: { canonical: "/" },
+  alternates: { canonical: "/", languages: hreflangAlternates("/") },
 };
 
 /** Pulled up to the homepage so the highest-intent questions get FAQ markup. */

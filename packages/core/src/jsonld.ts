@@ -24,13 +24,13 @@ type Json = Record<string, unknown>;
 const ORG_ID = absoluteUrl("/#organization");
 const SITE_ID = absoluteUrl("/#website");
 
-export function organizationSchema(): Json {
+export function organizationSchema(options?: { readonly description?: string }): Json {
   return {
     "@type": ["Organization", "LocalBusiness", "HomeAndConstructionBusiness"],
     "@id": ORG_ID,
     name: tenant.brandName,
     legalName: tenant.legalName,
-    description: tenant.elevatorAnswer,
+    description: options?.description ?? tenant.elevatorAnswer,
     url: absoluteUrl("/"),
     // `?? undefined`, never `null` and never a placeholder. `graph()`
     // serialises with JSON.stringify, which drops undefined properties
@@ -104,15 +104,15 @@ export function organizationSchema(): Json {
   };
 }
 
-export function websiteSchema(): Json {
+export function websiteSchema(options?: { readonly description?: string; readonly inLanguage?: string }): Json {
   return {
     "@type": "WebSite",
     "@id": SITE_ID,
     url: absoluteUrl("/"),
     name: tenant.brandName,
-    description: tenant.elevatorAnswer,
+    description: options?.description ?? tenant.elevatorAnswer,
     publisher: { "@id": ORG_ID },
-    inLanguage: tenant.locale,
+    inLanguage: options?.inLanguage ?? tenant.locale,
     potentialAction: {
       "@type": "SearchAction",
       target: { "@type": "EntryPoint", urlTemplate: absoluteUrl("/search?q={search_term_string}") },
@@ -271,6 +271,8 @@ export function webPageSchema(input: {
   description: string;
   /** The one-paragraph answer this page exists to give. */
   primaryAnswer?: string;
+  /** Overrides `tenant.locale` — set to `"ar-AE"` for pages under `/ar`. */
+  inLanguage?: string;
 }): Json {
   return {
     "@type": "WebPage",
@@ -280,7 +282,7 @@ export function webPageSchema(input: {
     description: input.description,
     isPartOf: { "@id": SITE_ID },
     about: { "@id": ORG_ID },
-    inLanguage: tenant.locale,
+    inLanguage: input.inLanguage ?? tenant.locale,
     ...(input.primaryAnswer
       ? { mainContentOfPage: { "@type": "WebPageElement", text: input.primaryAnswer } }
       : {}),

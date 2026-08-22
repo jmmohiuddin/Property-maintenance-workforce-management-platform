@@ -11,6 +11,7 @@ import {
 } from "@meridian/core";
 import { Section, AnswerBlock } from "@/components/ui";
 import { JsonLd } from "@/components/json-ld";
+import { hreflangAlternates } from "@/lib/i18n";
 
 /**
  * About.
@@ -35,7 +36,7 @@ const ANSWER = `${company.legalName} is a Dubai mainland technical services cont
 export const metadata: Metadata = {
   title: "About",
   description: ANSWER,
-  alternates: { canonical: "/about" },
+  alternates: { canonical: "/about", languages: hreflangAlternates("/about") },
 };
 
 /** Work we are asked for and are not licensed to do. Naming it is the point. */

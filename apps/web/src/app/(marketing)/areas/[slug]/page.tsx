@@ -20,6 +20,7 @@ import { Section, Eyebrow, ServiceCard, AnswerBlock } from "@/components/ui";
 import { FaqList } from "@/components/faq";
 import { JsonLd } from "@/components/json-ld";
 import { PhoneCall, Wrench, MapPin } from "@phosphor-icons/react/dist/ssr";
+import { hreflangAlternates } from "@/lib/i18n";
 
 type Params = { slug: string };
 
@@ -42,7 +43,7 @@ export async function generateMetadata({ params }: { params: Promise<Params> }):
       `AC repair ${area.name}`,
       `handyman ${area.name}`,
     ],
-    alternates: { canonical: `/areas/${area.slug}` },
+    alternates: { canonical: `/areas/${area.slug}`, languages: hreflangAlternates(`/areas/${area.slug}`) },
     openGraph: {
       type: "article",
       title: `Property Maintenance in ${area.name}`,

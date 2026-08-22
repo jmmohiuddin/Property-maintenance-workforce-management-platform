@@ -21,6 +21,7 @@ import { Section, Eyebrow, ServiceCard, AnswerBlock, CallLink } from "@/componen
 import { FaqList } from "@/components/faq";
 import { JsonLd } from "@/components/json-ld";
 import { PhoneCall, WhatsappLogo, Check, Warning } from "@phosphor-icons/react/dist/ssr";
+import { hreflangAlternates } from "@/lib/i18n";
 
 type Params = { slug: string };
 
@@ -40,7 +41,10 @@ export async function generateMetadata({ params }: { params: Promise<Params> }):
     // rather than mid-word, because this string is frequently what gets quoted.
     description: service.answer.split(". ")[0] + ".",
     keywords: [...service.aliases, service.name, `${service.shortName} ${tenant.address.city}`],
-    alternates: { canonical: `/services/${service.slug}` },
+    alternates: {
+      canonical: `/services/${service.slug}`,
+      languages: hreflangAlternates(`/services/${service.slug}`),
+    },
     openGraph: {
       type: "article",
       title: `${service.name} in ${tenant.address.city}`,
