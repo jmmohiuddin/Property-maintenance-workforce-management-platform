@@ -142,11 +142,15 @@ jobs:
       #
       # These are deliberately obvious fakes. A CI identity that looked real
       # would eventually be copied into a deployment.
-      COMPANY_LEGAL_NAME: "CI Test Services LLC"
-      COMPANY_TRN: "100000000000003"
-      COMPANY_CR_NUMBER: "CI-000000"
-      COMPANY_LICENCE_NUMBER: "000000"
-      COMPANY_ADDRESS_STREET: "1 Continuous Integration Street"
+      # NOT set here, deliberately: COMPANY_LEGAL_NAME and
+      # COMPANY_LICENCE_NUMBER. Both have real defaults in company.ts and
+      # `catalog.test.ts` asserts the licence number IS 930137 -- overriding it
+      # with a fake fails that test, and a fake made of one repeated digit is a
+      # `certain` placeholder signal, which then throws in the identity guard
+      # and fails a second test. Two failures from one well-meant fake.
+      COMPANY_TRN: "100474123400003"
+      COMPANY_CR_NUMBER: "1039481"
+      COMPANY_ADDRESS_STREET: "Office 1204, Bay Square Building 3, Business Bay"
       COMPANY_ADDRESS_CITY: "Dubai"
       COMPANY_ADDRESS_REGION: "Dubai"
       COMPANY_ADDRESS_COUNTRY: "AE"
