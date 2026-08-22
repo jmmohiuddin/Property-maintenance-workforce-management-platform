@@ -485,6 +485,75 @@ export interface DispositionReasonRow {
   readonly leadCount: number;
 }
 
+/**
+ * A starting set of lost/dormant reasons, as data.
+ *
+ * Unlike fault codes and rate card prices, these six are near-universal
+ * categories rather than anything specific to one business — every service
+ * business loses work on price, to a competitor, to silence, to being outside
+ * where it operates, because the need went away, or because the buyer wants to
+ * revisit it next budget cycle. Naming them is not putting words in an
+ * operator's mouth the way a price or a fault description would be; it is the
+ * same judgement call `STANDARD_JOB_OUTCOMES` already makes for job outcomes.
+ *
+ * A fresh install otherwise leaves `lead_disposition_reasons` empty, and
+ * `leads_disposition_required` then refuses every `lost` or `dormant` stage
+ * change on day one — not because a real reason was missing, but because
+ * nobody had typed the vocabulary in yet. `installStandardDispositionReasons`
+ * exists so that is one click, not a blocked funnel.
+ */
+export const STANDARD_DISPOSITION_REASONS: readonly {
+  code: string;
+  label: string;
+  appliesTo: DispositionScope;
+  guidance: string;
+  sortOrder: number;
+}[] = [
+  {
+    code: "lost_on_price",
+    label: "Price too high",
+    appliesTo: "lost",
+    guidance: "They wanted the work done, just not at this price.",
+    sortOrder: 10,
+  },
+  {
+    code: "competitor_won",
+    label: "Chose a competitor",
+    appliesTo: "lost",
+    guidance: "They picked someone else — not necessarily on price.",
+    sortOrder: 20,
+  },
+  {
+    code: "no_response",
+    label: "Stopped responding",
+    appliesTo: "both",
+    guidance:
+      "Follow-ups went unanswered. Dormant if it is still worth trying again; lost if it has gone quiet for good.",
+    sortOrder: 30,
+  },
+  {
+    code: "out_of_area",
+    label: "Outside the service area",
+    appliesTo: "lost",
+    guidance: "The property is somewhere this business does not send technicians.",
+    sortOrder: 40,
+  },
+  {
+    code: "work_no_longer_needed",
+    label: "Work no longer needed",
+    appliesTo: "lost",
+    guidance: "The problem went away, was fixed elsewhere, or the plan changed.",
+    sortOrder: 50,
+  },
+  {
+    code: "budget_deferred",
+    label: "Budget deferred",
+    appliesTo: "dormant",
+    guidance: "Wants the work, just not until a future budget period.",
+    sortOrder: 60,
+  },
+];
+
 export async function listDispositionReasons(
   tx: TenantScopedTx,
   options?: { stage?: "lost" | "dormant"; activeOnly?: boolean },
@@ -538,6 +607,39 @@ export async function listDispositionReasons(
     isActive: r.is_active,
     leadCount: Number(r.lead_count),
   }));
+}
+
+/**
+ * Put the six standard reasons in place, leaving any local edits alone.
+ *
+ * `do nothing` rather than `do update`, exactly as `installStandardJobOutcomes`
+ * does: an operator who has reworded "Price too high" for their own team should
+ * not have that undone by somebody clicking the button again, and the codes —
+ * which is what a funnel report groups on — are identical either way.
+ */
+export async function installStandardDispositionReasons(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+): Promise<number> {
+  let added = 0;
+  for (const reason of STANDARD_DISPOSITION_REASONS) {
+    const inserted = (await tx.execute<{ id: string }>(sql`
+      insert into lead_disposition_reasons
+        (tenant_id, code, label, applies_to, guidance, sort_order)
+      values (
+        ${ctx.tenantId}::uuid,
+        ${reason.code},
+        ${reason.label},
+        ${reason.appliesTo},
+        ${reason.guidance},
+        ${reason.sortOrder}
+      )
+      on conflict (tenant_id, code) do nothing
+      returning id
+    `)) as unknown as { id: string }[];
+    if (inserted.length > 0) added += 1;
+  }
+  return added;
 }
 
 /**

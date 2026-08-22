@@ -11,6 +11,7 @@ import {
   addRateVersion,
   endRate,
   installStandardAssetCategories,
+  installStandardDispositionReasons,
   installStandardJobOutcomes,
   installStandardPhotoExemptionReasons,
   setAssetCategoryActive,
@@ -84,6 +85,38 @@ async function context() {
 }
 
 // ── Lead disposition reasons (LEAD-6) ───────────────────────────────────────
+
+export async function installDispositions(
+  _prev: ReferenceState,
+  _formData: FormData,
+): Promise<ReferenceState> {
+  const { session, ctx } = await context();
+
+  let added = 0;
+  try {
+    await withTenant(ctx, async (tx) => {
+      added = await installStandardDispositionReasons(tx, ctx);
+      await writeAuditNote(tx, ctx, {
+        tableName: "lead_disposition_reasons",
+        // 13 characters. See the note at the top of this file.
+        action: "reasons_added",
+        detail: { added, changedBy: session.user.email },
+      });
+    });
+  } catch (error) {
+    console.error("[admin] install standard disposition reasons failed", error);
+    return fail("Could not add the standard reasons.");
+  }
+
+  revalidatePath("/admin/reference/dispositions");
+  revalidatePath("/leads");
+  return {
+    success:
+      added === 0
+        ? "Every standard reason was already here. Nothing was changed or overwritten."
+        : `${added} standard ${added === 1 ? "reason" : "reasons"} added. Existing wording was left alone.`,
+  };
+}
 
 export async function addDisposition(
   _prev: ReferenceState,

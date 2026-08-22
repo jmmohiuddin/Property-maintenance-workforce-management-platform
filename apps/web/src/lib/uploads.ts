@@ -54,7 +54,27 @@ import { getSession } from "@/lib/session";
  * front of `completeStagedUpload`, and it is the only place that can notice.
  */
 
-export const UPLOAD_PURPOSES = ["job_photo", "job_signature", "candidate_document"] as const;
+export const UPLOAD_PURPOSES = [
+  "job_photo",
+  "job_signature",
+  "candidate_document",
+  /**
+   * `PRJ-6`: the permit itself — the DDA approval, the Civil Defence NOC, the
+   * DEWA connection letter. Its own purpose rather than a shared "document",
+   * because the purpose recorded on the session is what
+   * `attachPermitDocument` checks before it will staple the file to a permit
+   * row; a single generic purpose would let anybody who may upload one kind of
+   * file attach it to any kind of record.
+   */
+  "project_permit_document",
+  /**
+   * `PRJ-7`: a snag photograph, raised or closure. One purpose covers both
+   * slots deliberately — they are the same kind of file, taken by the same
+   * person on the same walk, and which slot it lands in is named at attach
+   * time by somebody holding `projects:write` against that snag.
+   */
+  "project_snag_photo",
+] as const;
 export type UploadPurpose = (typeof UPLOAD_PURPOSES)[number];
 
 /**
@@ -70,6 +90,13 @@ const PERMISSION_FOR: Readonly<Record<UploadPurpose, Permission>> = {
   job_photo: "jobs:update",
   job_signature: "jobs:update",
   candidate_document: "recruitment:write",
+  // Both of these are `projects:write` — the permission that already guards
+  // recording the permit and raising the snag they attach to. Attaching the
+  // document to a permit is part of recording the permit, not a separate
+  // lesser act, and giving it a separate lesser permission would be exactly
+  // the conveyor-belt grant this table exists to avoid.
+  project_permit_document: "projects:write",
+  project_snag_photo: "projects:write",
 };
 
 export function isUploadPurpose(value: string): value is UploadPurpose {
@@ -98,7 +125,11 @@ export async function authoriseUpload(purpose: UploadPurpose): Promise<UploadAut
   if (!can(session.principal, PERMISSION_FOR[purpose])) {
     return {
       ok: false,
-      response: uploadRefusal(403, `Your role cannot upload a ${purpose.replace("_", " ")}.`),
+      // `replaceAll`, not `replace`. `String.replace` with a string pattern
+      // substitutes the FIRST match only, which read acceptably while every
+      // purpose had one underscore and turns `project_permit_document` into
+      // "project permit_document" now that they do not.
+      response: uploadRefusal(403, `Your role cannot upload a ${purpose.replaceAll("_", " ")}.`),
     };
   }
 

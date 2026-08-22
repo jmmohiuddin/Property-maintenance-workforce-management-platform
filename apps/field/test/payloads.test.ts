@@ -29,7 +29,7 @@ const built = [
   recordLabour({ jobId: "j1", visitId: "v1", workMinutes: 0 }),
   recordSignature({ jobId: "j1", uploadId: "u2", signedByName: "A. Customer" }),
   upsertNote({ jobId: "j1", workCarriedOut: "Replaced contactor", baseVersion: null }),
-  appendAttendance({ kind: "shift_in" }),
+  appendAttendance({ kind: "shift_in", occurredAt: "2026-08-22T06:00:00.000Z" }),
 ];
 
 for (const spec of built) {
@@ -178,7 +178,7 @@ equal("the job id is in the payload the server parses", dependent.payload["jobId
 equal("and on the spec, for local ordering", dependent.jobId, "j1");
 
 // An attendance event with no job is its own aggregate.
-const shift = appendAttendance({ kind: "shift_in" });
+const shift = appendAttendance({ kind: "shift_in", occurredAt: "2026-08-22T06:00:00.000Z" });
 equal("a shift event belongs to no job", shift.jobId, null);
 check("and does not invent one in the payload", !("jobId" in shift.payload));
 

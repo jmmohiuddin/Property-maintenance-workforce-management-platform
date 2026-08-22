@@ -47,7 +47,17 @@ const minimal = parseSyncResponse({ serverTime: "2026-08-21T09:00:00.000Z", next
 deepEqual("a delta that changed nothing parses with empty collections", minimal.jobs, []);
 equal("and carries the cursor", minimal.nextCursor, "c1");
 equal("and the server time, which is what the clock reading needs", minimal.serverTime, "2026-08-21T09:00:00.000Z");
-deepEqual("scope defaults to an empty membership list", minimal.scope.jobIds, []);
+// Absent scope is NOT an empty membership list. `[]` means "you have nothing
+// assigned, empty the phone"; absent means the server said nothing about
+// membership and the device must keep what it holds. Defaulting one to the
+// other evicts a technician's whole working set on a missing key.
+equal("absent scope stays absent, never an empty membership list", minimal.scope, undefined);
+deepEqual(
+  "and an explicitly empty scope is still a real, empty answer",
+  parseSyncResponse({ serverTime: "2026-08-21T09:00:00.000Z", nextCursor: "c1", scope: { jobIds: [] } }).scope
+    ?.jobIds,
+  [],
+);
 
 // Null taxonomies mean "unchanged, keep what you have" - NOT empty. Defaulting
 // them to {} would blank the technician's fault-code picker, which is the
@@ -70,7 +80,7 @@ const withUnknownColumns = parseSyncResponse({
 });
 equal("a job with a column this build has never seen still syncs", withUnknownColumns.jobs.length, 1);
 equal("and the unknown value is kept", withUnknownColumns.jobs[0]?.["some_column_added_next_year"], true);
-deepEqual("the scope names what the device may keep", withUnknownColumns.scope.jobIds, ["j1"]);
+deepEqual("the scope names what the device may keep", withUnknownColumns.scope?.jobIds, ["j1"]);
 
 // A missing serverTime is fatal: without it there is no clock reading and no
 // way to stamp a receipt time, which is the whole two-clock discipline.

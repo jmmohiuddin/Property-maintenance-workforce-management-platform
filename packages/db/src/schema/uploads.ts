@@ -73,7 +73,19 @@ export const uploadSessions = pgTable(
      * bad wifi leaves forty abandoned half-uploads and one photo.
      */
     clientUploadId: varchar("client_upload_id", { length: 64 }).notNull(),
-    /** `job_photo` | `job_signature` | `candidate_document`. Vocabulary, not a foreign key. */
+    /**
+     * Vocabulary, not a foreign key. The list lives in
+     * `apps/web/src/lib/uploads.ts`, which is also where each purpose is mapped
+     * to the permission a caller must already hold — `job_photo`,
+     * `job_signature`, `candidate_document`, `project_permit_document`,
+     * `project_snag_photo`. Adding one needs no migration; the column is wide
+     * enough, and that is deliberate.
+     *
+     * What is recorded here is what the attach path checks: a caller cites an
+     * upload id and the server reads the purpose off this row, so an upload
+     * authorised as one kind of file cannot be stapled to another kind of
+     * record.
+     */
     purpose: varchar("purpose", { length: 32 }).notNull(),
     /** The caller's handle for what this illustrates. Never resolved here; handed back at completion. */
     reference: varchar("reference", { length: 120 }),

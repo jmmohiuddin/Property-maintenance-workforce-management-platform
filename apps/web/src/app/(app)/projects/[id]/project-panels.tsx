@@ -1,6 +1,7 @@
 "use client";
 
-import { useActionState } from "react";
+import { useActionState, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   COST_CATEGORIES,
   COST_CATEGORY_LABEL,
@@ -8,23 +9,29 @@ import {
   MILESTONE_TRIGGER_LABEL,
   PERMIT_STATUSES,
   PERMIT_STATUS_LABEL,
+  PRIORITY_LABEL,
   PROJECT_STATUS_LABEL,
   SNAG_PARTY_LABEL,
   SNAG_SEVERITIES,
   SNAG_SEVERITY_LABEL,
   VARIATION_STATE_LABEL,
+  type JobPriority,
   type ProjectStatus,
   type VariationState,
 } from "@meridian/core";
 import { Field, TextInput, TextArea, Select, FormBanner, SubmitButton } from "@/components/form";
+import { uploadFile, type BrowserUploadPurpose } from "./upload-file";
 import {
   addMilestoneAction,
   addPhaseAction,
+  attachPermitDocumentAction,
+  attachSnagPhotoAction,
   closeSnagAction,
   decideVariationAction,
   engageSubcontractorAction,
   markMilestoneReachedAction,
   raiseMilestoneInvoiceAction,
+  raiseJobForPhaseAction,
   raiseSnagAction,
   raiseVariationAction,
   recordCostAction,
@@ -46,6 +53,22 @@ const INITIAL: ProjectFormState = {};
  * it is a subcontractor about to be sent to a client's building with no
  * evidence they may lawfully be there.
  */
+/**
+ * Job priorities, planned first.
+ *
+ * `@meridian/core` exports the labels but no ordered list, and the order here
+ * is not the enum's. Work raised from a programme is planned work by default,
+ * so the option an operator will pick nine times in ten sits at the top and is
+ * the one already selected. Emergency is last because a construction phase that
+ * genuinely needs a P1 is a phone call, not a form.
+ */
+const JOB_PRIORITIES: readonly JobPriority[] = [
+  "p4_planned",
+  "p3_standard",
+  "p2_urgent",
+  "p1_emergency",
+];
+
 const COMPLIANCE_LABEL: Readonly<Record<string, string>> = {
   valid: "licence and insurance current",
   expiring: "licence or insurance expiring within 30 days",
@@ -155,19 +178,36 @@ export function TransitionPanel({
   );
 }
 
-/** `PRJ-2`: add a phase and record progress on the ones that exist. */
+/**
+ * `PRJ-2`: add a phase, record progress on the ones that exist, and raise the
+ * jobs a phase produces.
+ *
+ * The third form is the half of `PRJ-2` that was missing. Phases, weights and
+ * dependencies were all here; nothing raised work from them, so the Jobs column
+ * on the table above rendered a truthful zero for every phase of every project.
+ */
 export function PhasePanel({
   projectId,
   phases,
   weightGap,
 }: {
   projectId: string;
-  phases: { id: string; sequence: number; name: string; percentComplete: number }[];
+  phases: {
+    id: string;
+    sequence: number;
+    name: string;
+    percentComplete: number;
+    serviceSlug: string | null;
+  }[];
   weightGap: number;
 }) {
   const [addState, addAction, addPending] = useActionState(addPhaseAction, INITIAL);
   const [progressState, progressAction, progressPending] = useActionState(
     setPhaseProgressAction,
+    INITIAL,
+  );
+  const [jobState, jobAction, jobPending] = useActionState(
+    raiseJobForPhaseAction,
     INITIAL,
   );
 
@@ -227,6 +267,113 @@ export function PhasePanel({
             </div>
           </div>
         </form>
+      ) : null}
+
+      {/*
+        Hidden until a phase exists. A picker with no options is a form that cannot be
+        submitted, and the empty state above the table already says what to do instead.
+      */}
+      {phases.length > 0 ? (
+        <details className="rounded border p-4" style={{ backgroundColor: "var(--surface-raised)" }}>
+          <summary className="cursor-pointer text-[13px] font-semibold">Raise a job from a phase</summary>
+          <p className="mt-3 text-[13px]" style={{ color: "var(--text-muted)" }}>
+            The job is created the way every other job in this system is created: a{" "}
+            <span className="tnum">JOB-</span> reference allocated by the database, an SLA clock
+            computed against the working calendar an administrator maintains, and the summer midday
+            ban applying when a visit is booked against it. It then appears on the jobs board and
+            the dispatch board, attached to this phase.
+          </p>
+          <form action={jobAction} className="mt-4 space-y-4">
+            <Banner state={jobState} />
+            <input type="hidden" name="projectId" value={projectId} />
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="Phase">
+                {({ id, describedBy }) => (
+                  <Select id={id} name="phaseId" required defaultValue="" aria-describedby={describedBy}>
+                    <option value="" disabled>
+                      Choose
+                    </option>
+                    {phases.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.sequence}. {p.name}
+                        {p.serviceSlug ? ` · ${p.serviceSlug}` : ""}
+                      </option>
+                    ))}
+                  </Select>
+                )}
+              </Field>
+              <Field label="What is the job" description="The line a technician reads first.">
+                {({ id, describedBy }) => (
+                  <TextInput
+                    id={id}
+                    name="title"
+                    required
+                    minLength={3}
+                    maxLength={240}
+                    placeholder="Second fix containment, level 12 north"
+                    aria-describedby={describedBy}
+                  />
+                )}
+              </Field>
+              <Field
+                label="Trade"
+                description="Blank takes the phase's own trade. It is what dispatch matches a technician's skills against."
+              >
+                {({ id, describedBy }) => (
+                  <TextInput
+                    id={id}
+                    name="serviceSlug"
+                    maxLength={64}
+                    placeholder="electrical"
+                    aria-describedby={describedBy}
+                  />
+                )}
+              </Field>
+              <Field label="Priority" description="Programme work is planned work. The SLA clock follows this.">
+                {({ id, describedBy }) => (
+                  <Select id={id} name="priority" defaultValue="p4_planned" aria-describedby={describedBy}>
+                    {JOB_PRIORITIES.map((p) => (
+                      <option key={p} value={p}>
+                        {PRIORITY_LABEL[p]}
+                      </option>
+                    ))}
+                  </Select>
+                )}
+              </Field>
+              <Field
+                label="Exposure"
+                description="Outdoor work is refused between 12:30 and 15:00 from 15 June to 15 September. AED 5,000 per worker."
+              >
+                {({ id, describedBy }) => (
+                  <Select id={id} name="exposure" defaultValue="outdoor" aria-describedby={describedBy}>
+                    <option value="outdoor">In direct sun — outdoor</option>
+                    <option value="indoor">Indoors or shaded</option>
+                  </Select>
+                )}
+              </Field>
+              <Field label="Planned for" description="Optional. The visit itself is booked on the job.">
+                {({ id, describedBy }) => (
+                  <TextInput id={id} name="scheduledFor" type="datetime-local" aria-describedby={describedBy} />
+                )}
+              </Field>
+            </div>
+
+            <Field label="Instructions" description="Optional.">
+              {({ id, describedBy }) => (
+                <TextArea id={id} name="description" rows={3} aria-describedby={describedBy} />
+              )}
+            </Field>
+
+            <SubmitButton
+              pending={jobPending}
+              pendingLabel="Raising…"
+              className="btn btn-secondary disabled:opacity-60"
+            >
+              Raise job
+            </SubmitButton>
+          </form>
+        </details>
       ) : null}
 
       <details className="rounded border p-4" style={{ backgroundColor: "var(--surface-raised)" }}>
@@ -745,6 +892,152 @@ export function RetentionPanel({
   );
 }
 
+/**
+ * The one control on this screen that genuinely needs JavaScript.
+ *
+ * ── WHY IT BREAKS THE FILE'S OWN RULE ──────────────────────────────────────
+ *
+ * Every other form here is a plain server-action post that works with
+ * JavaScript switched off. This one cannot be: the file goes up in parts, each
+ * part is a separate idempotent request, and the server is asked between passes
+ * which parts are still missing. That is what makes a 12 MB permit PDF survive
+ * a site connection, and there is no version of it that a browser form post can
+ * express. The trade is deliberate and it is confined to this component — the
+ * permit and the snag are still recorded, updated and closed without it.
+ *
+ * ── WHY THE FORM POSTS AN UPLOAD ID AND NOT A FILE ─────────────────────────
+ *
+ * The bytes never touch the server action. They go to `/api/uploads`, which
+ * authorises them against the same `projects:write` the action takes and stamps
+ * the purpose onto the session row; what crosses into the action afterwards is
+ * the session id. The action then reads the storage key off that row, server
+ * side, inside the tenant transaction. No field on this form — hidden or
+ * otherwise — carries a storage key, and that is the point: a key in a form is
+ * a key an operator can edit.
+ */
+function AttachForm({
+  purpose,
+  accept,
+  attach,
+  fileLabel,
+  fileDescription,
+  replaceLabel,
+  submitLabel,
+  children,
+}: {
+  purpose: BrowserUploadPurpose;
+  accept: string;
+  attach: (
+    prev: ProjectFormState,
+    formData: FormData,
+  ) => Promise<ProjectFormState>;
+  fileLabel: string;
+  fileDescription: string;
+  replaceLabel: string;
+  submitLabel: string;
+  children: React.ReactNode;
+}) {
+  const [state, setState] = useState<ProjectFormState>(INITIAL);
+  const [phase, setPhase] = useState("");
+  const router = useRouter();
+
+  async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (phase) return;
+
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    const file = data.get("file");
+    // The bytes are removed from the payload before it goes anywhere near the
+    // server action. What is left is the upload id and the identifiers.
+    data.delete("file");
+
+    if (!(file instanceof File) || file.size === 0) {
+      setState({ error: "Choose a file first." });
+      return;
+    }
+
+    setState(INITIAL);
+
+    try {
+      const uploaded = await uploadFile({
+        file,
+        purpose,
+        reference: file.name,
+        onPhase: setPhase,
+      });
+      data.set("uploadId", uploaded.uploadId);
+      setPhase("attaching");
+
+      const result = await attach(INITIAL, data);
+      setState(result);
+      if (result.ok) {
+        form.reset();
+        // The action revalidated the path; this is what makes the table above
+        // redraw without the operator reloading and wondering whether it saved.
+        router.refresh();
+      }
+    } catch (error) {
+      setState({
+        error:
+          error instanceof Error
+            ? error.message
+            : "The file could not be uploaded.",
+      });
+    } finally {
+      setPhase("");
+    }
+  }
+
+  return (
+    <form onSubmit={onSubmit} className="space-y-4">
+      <Banner state={state} />
+      {children}
+
+      <Field label={fileLabel} description={fileDescription}>
+        {({ id, describedBy }) => (
+          <input
+            id={id}
+            name="file"
+            type="file"
+            accept={accept}
+            required
+            aria-describedby={describedBy}
+            className="block w-full text-[13px]"
+          />
+        )}
+      </Field>
+
+      <label className="flex items-start gap-2.5 text-[13px]">
+        <input type="checkbox" name="replace" className="mt-1" />
+        <span>
+          <span className="font-medium">{replaceLabel}</span>{" "}
+          <span style={{ color: "var(--text-muted)" }}>
+            &mdash; the superseded file is kept and the swap is recorded,
+            because the register has to be able to show what was on file at the
+            time.
+          </span>
+        </span>
+      </label>
+
+      <div className="flex items-center gap-3">
+        <button
+          type="submit"
+          disabled={phase !== ""}
+          className="btn btn-secondary disabled:opacity-60"
+        >
+          {phase === "" ? submitLabel : "Uploading…"}
+        </button>
+        {phase ? (
+          <span className="text-[13px]" style={{ color: "var(--text-muted)" }}>
+            {phase}
+          </span>
+        ) : null}
+      </div>
+    </form>
+  );
+}
+
 /** `PRJ-6`: the permit register and the status changes that unblock a site. */
 export function PermitPanel({
   projectId,
@@ -753,7 +1046,13 @@ export function PermitPanel({
 }: {
   projectId: string;
   authorities: { code: string; label: string }[];
-  permits: { id: string; authorityLabel: string; permitType: string; status: string }[];
+  permits: {
+    id: string;
+    authorityLabel: string;
+    permitType: string;
+    status: string;
+    hasDocument: boolean;
+  }[];
 }) {
   const [addState, addAction, addPending] = useActionState(recordPermitAction, INITIAL);
   const [statusState, statusAction, statusPending] = useActionState(setPermitStatusAction, INITIAL);
@@ -815,6 +1114,40 @@ export function PermitPanel({
             Update permit
           </SubmitButton>
         </form>
+      ) : null}
+
+      {permits.length > 0 ? (
+        <details className="rounded border p-4" style={{ backgroundColor: "var(--surface-raised)" }}>
+          <summary className="cursor-pointer text-[13px] font-semibold">Attach the permit document</summary>
+          <div className="mt-4">
+            <AttachForm
+              purpose="project_permit_document"
+              accept="application/pdf,image/jpeg,image/png"
+              attach={attachPermitDocumentAction}
+              fileLabel="The permit itself"
+              fileDescription="The approval, NOC or connection letter as issued. A PDF, or a photograph of it."
+              replaceLabel="Replace the document already on file"
+              submitLabel="Attach document"
+            >
+              <input type="hidden" name="projectId" value={projectId} />
+              <Field label="Permit">
+                {({ id, describedBy }) => (
+                  <Select id={id} name="permitId" required defaultValue="" aria-describedby={describedBy}>
+                    <option value="" disabled>
+                      Choose
+                    </option>
+                    {permits.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.authorityLabel} — {p.permitType}
+                        {p.hasDocument ? " (document on file)" : ""}
+                      </option>
+                    ))}
+                  </Select>
+                )}
+              </Field>
+            </AttachForm>
+          </div>
+        </details>
       ) : null}
 
       <details className="rounded border p-4" style={{ backgroundColor: "var(--surface-raised)" }}>
@@ -912,10 +1245,28 @@ export function SnagPanel({
   projectId,
   trades,
   openSnags,
+  allSnags,
 }: {
   projectId: string;
   trades: { code: string; label: string }[];
-  openSnags: { id: string; sequence: number; locationText: string; severity: string }[];
+  openSnags: {
+    id: string;
+    sequence: number;
+    locationText: string;
+    severity: string;
+  }[];
+  /**
+   * Every snag, not only the open ones. Closure evidence is routinely found on
+   * a phone after the snag was closed from the site office, and a picker that
+   * offered only open snags would make reopening one the only way to file it.
+   */
+  allSnags: {
+    id: string;
+    sequence: number;
+    locationText: string;
+    hasPhoto: boolean;
+    hasClosure: boolean;
+  }[];
 }) {
   const [raiseState, raiseAction, raisePending] = useActionState(raiseSnagAction, INITIAL);
   const [closeState, closeAction, closePending] = useActionState(closeSnagAction, INITIAL);
@@ -975,6 +1326,54 @@ export function SnagPanel({
             </span>
           </label>
         </form>
+      ) : null}
+
+      {allSnags.length > 0 ? (
+        <details className="rounded border p-4" style={{ backgroundColor: "var(--surface-raised)" }}>
+          <summary className="cursor-pointer text-[13px] font-semibold">Attach a photograph</summary>
+          <div className="mt-4">
+            <AttachForm
+              purpose="project_snag_photo"
+              accept="image/jpeg,image/png,application/pdf"
+              attach={attachSnagPhotoAction}
+              fileLabel="Photograph"
+              fileDescription="Attach before closing. The upload goes up in parts, so a large photograph survives a site connection."
+              replaceLabel="Replace the photograph already in this slot"
+              submitLabel="Attach photograph"
+            >
+              <input type="hidden" name="projectId" value={projectId} />
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="Snag">
+                  {({ id, describedBy }) => (
+                    <Select id={id} name="snagId" required defaultValue="" aria-describedby={describedBy}>
+                      <option value="" disabled>
+                        Choose
+                      </option>
+                      {allSnags.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          #{s.sequence} {s.locationText}
+                          {s.hasPhoto ? " · photo" : ""}
+                          {s.hasClosure ? " · evidence" : ""}
+                        </option>
+                      ))}
+                    </Select>
+                  )}
+                </Field>
+                <Field
+                  label="Which photograph"
+                  description="The defect as raised, or the evidence that it was put right."
+                >
+                  {({ id, describedBy }) => (
+                    <Select id={id} name="slot" required defaultValue="photo" aria-describedby={describedBy}>
+                      <option value="photo">The snag itself</option>
+                      <option value="closure">Closure evidence</option>
+                    </Select>
+                  )}
+                </Field>
+              </div>
+            </AttachForm>
+          </div>
+        </details>
       ) : null}
 
       <details className="rounded border p-4" style={{ backgroundColor: "var(--surface-raised)" }}>

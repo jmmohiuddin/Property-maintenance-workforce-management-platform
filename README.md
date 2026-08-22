@@ -49,9 +49,9 @@ Two deployment-specific notes worth keeping:
 
 | Package | What it is | State |
 | --- | --- | --- |
-| `apps/web` | Public site (60 static routes), operational app, and customer portal | Built, verified in browser |
+| `apps/web` | Public site (30 static pages), operational app, and customer portal | Built, verified in browser |
 | `packages/core` | Service catalogue, area data, tenant profile, JSON-LD, exact-decimal money, validation, QR encoder | Built |
-| `packages/db` | Schema (81 tables), tenant + customer RLS, audit triggers, job/SLA/commerce/workforce/contracts/recruitment/HR/assets domain, seed | Built, verified against real Postgres |
+| `packages/db` | Schema (111 tables), tenant + customer RLS, audit triggers, job/SLA/commerce/workforce/contracts/recruitment/HR/assets domain, seed | Built, verified against real Postgres |
 | `packages/auth` | Argon2id hashing, revocable sessions, 10-role RBAC, TOTP two-factor with recovery codes | Built, verified end to end |
 | `packages/notify` | Templates, transactional queue, retry with attempt limits, pluggable transport | Built, verified — console transport only |
 | `packages/files` | Object store (local driver only), magic-byte sniffing, resumable chunked upload, EXIF extraction and stripping, image compression, ClamAV virus scanning | Built — **no scanner and no S3 bucket configured on this deployment**, and both say so |
@@ -239,15 +239,17 @@ Same family as trap 2: the type system says one thing, the runtime hands you ano
 
 Claims in this README that have been executed rather than asserted:
 
-- `npm run typecheck` passes across all seven workspaces — `apps/web` included, which is easy to
-  assume is skipped and is not; `npm run test` passes 1,735 checks across 32 suites, no skips
+- `npm run typecheck` passes across all eight workspaces — `apps/web` and `apps/field` included,
+  which are easy to assume are skipped and are not; npm runs `apps/*` first, so their banners are
+  the ones that scroll off the top of a truncated log. `npm run test` passes 3,623 checks across
+  60 suites, no skips
 - `npm run check:contrast --workspace=@meridian/web` passes 72/72 token pairings at WCAG AA, light
   and dark. It is workspace-scoped: there is no root `check:contrast`, and CI invokes it this way
-- `next build` produces 47 routes — 35 server-rendered, 7 static, 5 prerendered from
-  `generateStaticParams`, expanding to 30 static HTML pages of which 8 are services and 8 are areas.
-  That is fewer than this file used to claim, and deliberately: `WEB-1` rebuilt the service pages
-  one-to-one against the licensed activities and removed the rest, and `WEB-6` cut the area pages to
-  the ones the company will genuinely travel to
+- `next build` produces 112 routes — 99 server-rendered, 11 static, and 2 prerendered from
+  `generateStaticParams`, expanding to 30 static HTML pages of which 10 are services and 10 are areas.
+  The route count grows with the operational app; the public half stays small on purpose: `WEB-1`
+  rebuilt the service pages one-to-one against the licensed activities and removed the rest, and
+  `WEB-6` cut the area pages to the ones the company will genuinely travel to
 - Schema applied to PostgreSQL 16; all 14 RLS isolation checks pass
 - JSON-LD parsed and validated across 10 blocks on 9 pages, 0 invalid
 - Quote form submitted end to end in a browser: success path and validation-failure path both confirmed

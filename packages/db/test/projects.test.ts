@@ -40,8 +40,9 @@
  * trusting the suite. Everything below is anchored to `TAG`.
  */
 
-import { sql } from "drizzle-orm";
-import { withTenant, closeConnection, db } from "../src/index";
+import { eq, sql } from "drizzle-orm";
+import { withTenant, closeConnection } from "../src/index";
+import * as schema from "../src/schema";
 import { testTenantId, otherTenantId } from "./_tenant";
 import {
   addMilestone,
@@ -687,11 +688,32 @@ async function main(): Promise<void> {
         closeSnag(tx, ctx, { snagId: critical.snagId, closureNote: "" }),
       );
 
+      // Evidence goes on before the closure, not through it. `closeSnag` no
+      // longer takes a storage key — this fixture used to be the only caller
+      // that passed one, which is exactly why the parameter survived. Written
+      // directly here because the real path is `attachSnagPhoto`, and that
+      // needs a completed upload session; `projects-media.test.ts` covers it.
+      await tx
+        .update(schema.projectSnags)
+        .set({ closurePhotoStorageKey: `${TAG}/snag-1-closed.jpg` })
+        .where(eq(schema.projectSnags.id, critical.snagId));
+
       await closeSnag(tx, ctx, {
         snagId: critical.snagId,
         closureNote: "Detector head fitted and zone tested with the consultant present.",
-        closurePhotoStorageKey: `${TAG}/snag-1-closed.jpg`,
       });
+
+      // The clobber this file would not have caught before: closing must leave
+      // evidence filed beforehand exactly where it was.
+      const keptEvidence = await tx
+        .select({ key: schema.projectSnags.closurePhotoStorageKey })
+        .from(schema.projectSnags)
+        .where(eq(schema.projectSnags.id, critical.snagId));
+      check(
+        "closing a snag leaves the closure evidence attached",
+        keptEvidence[0]?.key,
+        `${TAG}/snag-1-closed.jpg`,
+      );
 
       const completionOn = day(0);
       const completed = await transitionProject(tx, ctx, {
@@ -862,33 +884,57 @@ async function main(): Promise<void> {
       }
     });
 
-    const leftovers = (await db.execute<{ count: number }>(sql`
-      select count(*)::int as count from projects where name like ${`${TAG}%`}
-    `)) as unknown as { count: number }[];
-    check("no test project survived cleanup", leftovers[0]?.count, 0);
+    // ── WHY THESE FOUR COUNTS RUN INSIDE withTenant AND NOT ON `db` ─────────
+    //
+    // They used to run on the bare `db` handle, and all four were checks that
+    // could not fail. Outside a tenant transaction `app.tenant_id` is unset,
+    // every policy here is FORCE RLS keyed on it, and so every one of these
+    // SELECTs matches zero rows whether or not the cleanup above worked. They
+    // reported 0 unconditionally — a green line under a table still holding the
+    // fixtures. It is the same trap `_tenant.ts` documents at length for
+    // `otherTenantId`, where three suites each routed around the helper rather
+    // than through it, and it was found here by a suite that left two projects
+    // and five jobs behind while this block cheerfully printed ok.
+    //
+    // A check that cannot fail is worse than no check, because it occupies the
+    // place where somebody would otherwise write one.
+    const survivors = await withTenant(ctx, async (tx) => {
+      const projectRows = (await tx.execute<{ count: number }>(sql`
+        select count(*)::int as count from projects where name like ${`${TAG}%`}
+      `)) as unknown as { count: number }[];
 
-    const strayInvoices = (await db.execute<{ count: number }>(sql`
-      select count(*)::int as count from invoices
-       where id = any(${sql`array[${sql.join(
-         [
-           ...invoiceIds.map((id) => sql`${id}`),
-           sql`'00000000-0000-0000-0000-000000000000'`,
-         ],
-         sql`, `,
-       )}]::uuid[]`})
-    `)) as unknown as { count: number }[];
-    check("and no invoice it raised survived either", strayInvoices[0]?.count, 0);
+      const invoiceRows = (await tx.execute<{ count: number }>(sql`
+        select count(*)::int as count from invoices
+         where id = any(${sql`array[${sql.join(
+           [
+             ...invoiceIds.map((id) => sql`${id}`),
+             sql`'00000000-0000-0000-0000-000000000000'`,
+           ],
+           sql`, `,
+         )}]::uuid[]`})
+      `)) as unknown as { count: number }[];
 
-    const straySubs = (await db.execute<{ count: number }>(sql`
-      select count(*)::int as count from subcontractors where name like ${`${TAG}%`}
-    `)) as unknown as { count: number }[];
-    check("nor the subcontractor fixture", straySubs[0]?.count, 0);
+      const subRows = (await tx.execute<{ count: number }>(sql`
+        select count(*)::int as count from subcontractors where name like ${`${TAG}%`}
+      `)) as unknown as { count: number }[];
 
-    const strayRetention = (await db.execute<{ count: number }>(sql`
-      select count(*)::int as count from project_retention
-       where invoice_id = ${milestoneInvoiceId || "00000000-0000-0000-0000-000000000000"}::uuid
-    `)) as unknown as { count: number }[];
-    check("nor any retention claim against it", strayRetention[0]?.count, 0);
+      const retentionRows = (await tx.execute<{ count: number }>(sql`
+        select count(*)::int as count from project_retention
+         where invoice_id = ${milestoneInvoiceId || "00000000-0000-0000-0000-000000000000"}::uuid
+      `)) as unknown as { count: number }[];
+
+      return {
+        projects: projectRows[0]?.count,
+        invoices: invoiceRows[0]?.count,
+        subcontractors: subRows[0]?.count,
+        retention: retentionRows[0]?.count,
+      };
+    });
+
+    check("no test project survived cleanup", survivors.projects, 0);
+    check("and no invoice it raised survived either", survivors.invoices, 0);
+    check("nor the subcontractor fixture", survivors.subcontractors, 0);
+    check("nor any retention claim against it", survivors.retention, 0);
   }
 
   console.log(fail === 0 ? "\nAll project checks passed.\n" : `\n${fail} check(s) FAILED.\n`);

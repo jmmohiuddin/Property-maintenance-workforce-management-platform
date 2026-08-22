@@ -1,6 +1,7 @@
 import { MAX_OBJECT_BYTES, UPLOAD_CHUNK_BYTES, UploadError, planUpload } from "@meridian/files";
 import { openUpload } from "@meridian/db/domain";
 import {
+  UPLOAD_PURPOSES,
   authoriseUpload,
   inTenant,
   isUploadPurpose,
@@ -46,7 +47,11 @@ export async function POST(request: Request): Promise<Response> {
 
   const purpose = String(body["purpose"] ?? "");
   if (!isUploadPurpose(purpose)) {
-    return uploadRefusal(400, `purpose must be one of: job_photo, job_signature, candidate_document.`);
+    // Listed from the constant rather than typed out. The hand-written list
+    // this replaced was already two purposes out of date the day a third was
+    // added, and a refusal that names the wrong set sends the caller looking
+    // for a bug in their own code.
+    return uploadRefusal(400, `purpose must be one of: ${UPLOAD_PURPOSES.join(", ")}.`);
   }
 
   const auth = await authoriseUpload(purpose);

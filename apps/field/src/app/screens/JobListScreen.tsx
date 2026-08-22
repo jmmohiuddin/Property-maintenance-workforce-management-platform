@@ -31,7 +31,7 @@ export function JobListScreen({
 }: {
   database: Database;
   onOpenJob: (jobId: string) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const [jobs, setJobs] = useState<Job[] | null>(null);
 
   useEffect(() => {
@@ -73,7 +73,7 @@ export function JobListScreen({
   );
 }
 
-function JobRow({ job, onPress }: { job: Job; onPress: () => void }): JSX.Element {
+function JobRow({ job, onPress }: { job: Job; onPress: () => void }): React.JSX.Element {
   return (
     <Pressable onPress={onPress} style={styles.row} accessibilityRole="button">
       <View style={styles.rowHeader}>

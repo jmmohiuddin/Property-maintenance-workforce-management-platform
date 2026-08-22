@@ -66,7 +66,7 @@ export function JobCardScreen({
   jobId: string;
   onBack: () => void;
   onSign: () => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const [job, setJob] = useState<Job | null>(null);
   const [card, setCard] = useState<JobCardModel | null>(null);
   const [photos, setPhotos] = useState<JobPhoto[]>([]);
@@ -124,6 +124,11 @@ export function JobCardScreen({
         capturedLng: photo.lng ?? null,
         caption: photo.caption ?? null,
         uploadState: photo.uploadState as never,
+        // Both null until the upload has been opened and the server has
+        // scanned it. `scanStatus` is deliberately not defaulted to anything
+        // that reads as cleared - see `CapturedPhoto`.
+        uploadId: photo.uploadId ?? null,
+        scanStatus: photo.scanStatus ?? null,
       })),
       photoExemptionCode: card?.photoExemptionCode ?? null,
       photoExemptionNote: card?.photoExemptionNote ?? null,
@@ -332,7 +337,7 @@ export function JobCardScreen({
   );
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }): JSX.Element {
+function Section({ title, children }: { title: string; children: React.ReactNode }): React.JSX.Element {
   return (
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>{title}</Text>
@@ -342,7 +347,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 }
 
 /** A control that is not built, and says so rather than doing nothing. */
-function Stub({ label, setNotice }: { label: string; setNotice: (m: string) => void }): JSX.Element {
+function Stub({ label, setNotice }: { label: string; setNotice: (m: string) => void }): React.JSX.Element {
   return (
     <Pressable
       style={styles.stub}

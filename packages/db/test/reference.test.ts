@@ -32,6 +32,7 @@ import {
   addFaultCode,
   addRateVersion,
   createLeadFromEnquiry,
+  installStandardDispositionReasons,
   installStandardJobOutcomes,
   listDispositionReasons,
   listFaultCodes,
@@ -41,6 +42,7 @@ import {
   rateOn,
   resolveDispositionReason,
   setLeadStage,
+  STANDARD_DISPOSITION_REASONS,
 } from "../src/index";
 
 const TENANT = "11111111-1111-4111-8111-111111111111";
@@ -392,6 +394,50 @@ async function referenceDataChecks(ctx: { tenantId: string }): Promise<void> {
 
     const symptoms = await listFaultCodes(tx, { kind: "symptom" });
     checkTrue("kind filters to one part of the taxonomy", symptoms.every((c) => c.kind === "symptom"));
+  });
+
+  // ── LEAD-6: the standard disposition reasons install idempotently ────────
+  await withTenant(ctx, async (tx) => {
+    // The first call may or may not add anything, depending on whether this
+    // database has already been seeded with the standard set — both are legal
+    // states here, so only the second call's count is asserted.
+    await installStandardDispositionReasons(tx, ctx);
+    const secondAdded = await installStandardDispositionReasons(tx, ctx);
+    check("installing the standard reasons twice adds nothing the second time", secondAdded, 0);
+
+    const afterInstall = await listDispositionReasons(tx);
+    const presentCodes = new Set(afterInstall.map((r) => r.code));
+    checkTrue(
+      "every standard reason is present after install",
+      STANDARD_DISPOSITION_REASONS.every((r) => presentCodes.has(r.code)),
+    );
+
+    // Reworded the way an operator would from the admin screen; a reinstall
+    // must leave that alone, the same `do nothing` precedent
+    // `installStandardJobOutcomes` relies on above.
+    const standard = STANDARD_DISPOSITION_REASONS[0];
+    if (!standard) throw new Error("STANDARD_DISPOSITION_REASONS is empty");
+
+    await addDispositionReason(tx, ctx, {
+      code: standard.code,
+      label: "__test reworded label",
+      appliesTo: standard.appliesTo,
+      guidance: standard.guidance,
+      sortOrder: standard.sortOrder,
+    });
+    await installStandardDispositionReasons(tx, ctx);
+    const reworded = (await listDispositionReasons(tx)).find((r) => r.code === standard.code);
+    check("a reworded standard reason survives a reinstall", reworded?.label, "__test reworded label");
+
+    // Restored so this run leaves the fixture as it found it, the same as
+    // `referenceDataChecks` does for everything else it touches.
+    await addDispositionReason(tx, ctx, {
+      code: standard.code,
+      label: standard.label,
+      appliesTo: standard.appliesTo,
+      guidance: standard.guidance,
+      sortOrder: standard.sortOrder,
+    });
   });
 
   // ── QTE-4: a price has a history, not just a value ───────────────────────

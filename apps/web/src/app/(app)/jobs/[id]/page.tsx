@@ -15,6 +15,8 @@ import {
   getJobOutcome,
   getJobCard,
   listPhotoExemptionReasons,
+  listJobSheets,
+  listJobSheetAmendmentReasons,
   schema,
   ASSIGNMENT_WARNING_LABEL,
   QUOTE_STATUS_LABEL,
@@ -34,14 +36,17 @@ import {
   formatDuration,
   formatMoney,
   toMinor,
+  UserFacingError,
   type JobStatus,
 } from "@meridian/core";
+import { jobSheetPresentation } from "@meridian/docs";
 import { can } from "@meridian/auth";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 import { StatusActions, AssignPanel, type CandidateOption } from "./job-actions";
 import { OutcomePanel } from "./outcome-panel";
 import { JobCardPanel, type JobCardView } from "./job-card-panel";
+import { JobSheetPanel, type JobSheetView } from "./job-sheet-panel";
 import { QuotePanel, SendQuoteButton, QuoteDocumentLink } from "./quote-panel";
 import { InvoicePanel } from "./invoice-panel";
 import { OutOfScopePanel } from "./out-of-scope-panel";
@@ -183,6 +188,34 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
       const card = await getJobCard(tx, id);
       const exemptionReasons = await listPhotoExemptionReasons(tx);
 
+      // FLD-14. The sheets on file, and — when none is signed yet — the digest
+      // of the sheet this page is about to offer for signature.
+      //
+      // `jobSheetPresentation` rather than `presentJobSheet`: the screen needs
+      // the 64-character digest to put in the signature form, not a PDF, and
+      // rendering one on every page view to obtain a string nobody reads would
+      // be work for its own sake. The preview route renders when somebody asks
+      // to see the sheet.
+      //
+      // It throws rather than returning null when the card is not ready — the
+      // `JOB-15` gate is what refuses — and the sentence it throws is the one
+      // the operator needs. Caught here rather than pre-checked, so the screen
+      // and the server cannot disagree about what "ready" means.
+      const sheets = await listJobSheets(tx, id);
+      const amendmentReasons = await listJobSheetAmendmentReasons(tx);
+      let presentedSha256: string | null = null;
+      let sheetNotReady: string | null = null;
+      if (!sheets.some((sheet) => sheet.kind === "original")) {
+        try {
+          presentedSha256 = (await jobSheetPresentation(tx, id)).contentSha256;
+        } catch (error) {
+          sheetNotReady =
+            error instanceof UserFacingError
+              ? error.message
+              : "The job sheet cannot be produced yet.";
+        }
+      }
+
       const quotes = await listQuotes(tx, { jobId: id });
       const invoices = await listInvoices(tx, { jobId: id });
 
@@ -211,6 +244,10 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
         faults,
         card,
         exemptionReasons,
+        sheets,
+        amendmentReasons,
+        presentedSha256,
+        sheetNotReady,
         windowStart,
         windowEnd,
       };
@@ -234,6 +271,10 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
     faults,
     card,
     exemptionReasons,
+    sheets,
+    amendmentReasons,
+    presentedSha256,
+    sheetNotReady,
     windowStart,
     windowEnd,
   } = data;
@@ -285,6 +326,37 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
       : null,
     gaps: [...card.gaps],
     reasons: exemptionReasons.map((r) => ({
+      code: r.code,
+      label: r.label,
+      description: r.description,
+    })),
+  };
+
+  const jobSheetView: JobSheetView = {
+    jobId: id,
+    sheets: sheets.map((sheet) => ({
+      id: sheet.id,
+      kind: sheet.kind,
+      reference: sheet.reference,
+      sequence: sheet.sequence,
+      contentSha256: sheet.contentSha256,
+      pdfSha256: sheet.pdfSha256,
+      sealedAt: dubaiStamp(sheet.sealedAt),
+      amendmentReasonLabel: sheet.amendmentReasonLabel,
+      amendmentDetail: sheet.amendmentDetail,
+    })),
+    signature: card.signature
+      ? {
+          signedByName: card.signature.signedByName,
+          signedByRole: card.signature.signedByRole,
+          signerEmail: card.signature.signerEmail,
+          signedAt: dubaiStamp(card.signature.signedAt),
+          consentVersion: card.signature.consentVersion,
+        }
+      : null,
+    presentedSha256,
+    notReady: sheetNotReady,
+    reasons: amendmentReasons.map((r) => ({
       code: r.code,
       label: r.label,
       description: r.description,
@@ -412,6 +484,21 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
               the server rather than merely hidden.
             */}
             {canUpdate ? <JobCardPanel card={jobCardView} /> : null}
+
+            {/*
+              FLD-14. Below the job card, because it is what happens at the end
+              of filling one in — and because a reader working down the page
+              meets the record before the thing that freezes it.
+
+              Rendered for readers as well as editors when a sheet exists: the
+              digest and the signed document are the record of what the customer
+              agreed to, and a role that can read the job can read that. The
+              forms inside it are the part `canUpdate` gates, and the server
+              refuses them regardless.
+            */}
+            {canUpdate || jobSheetView.sheets.length > 0 ? (
+              <JobSheetPanel sheet={jobSheetView} />
+            ) : null}
 
             {/* ── Timeline ──────────────────────────────────────────────── */}
             <h2 className="mt-10 text-lg font-semibold tracking-tight">Timeline</h2>

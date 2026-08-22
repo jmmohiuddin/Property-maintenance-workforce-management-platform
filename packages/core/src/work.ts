@@ -133,6 +133,59 @@ export class InvalidTransitionError extends UserFacingError {
   }
 }
 
+// ── Materials (FLD-9) ────────────────────────────────────────────────────────
+
+/**
+ * Where a part came from.
+ *
+ * ── WHY THIS LIVES IN core AND NOT IN THE FIELD APP ────────────────────────
+ *
+ * It was defined in `apps/field/src/domain/job-card.ts` and nowhere else, and
+ * that is precisely how the server came not to know it existed: the field
+ * client sent `source` on every `job_material/append`, `job_materials` had no
+ * column for it, and `recordJobMaterial` read no such key. Nothing refused and
+ * nothing warned — the line was accepted and the provenance was gone. A
+ * vocabulary owned by one end of a wire is a vocabulary the other end can
+ * silently disagree with.
+ *
+ * `FLD-9` exists to answer "where did this part come from", which is the
+ * question a warranty claim, a supplier dispute and a parts-markup audit all
+ * turn on. That answer is only worth having if it is answerable by report
+ * rather than by reading, so this is a closed set rather than free text.
+ *
+ * ── WHY A CHECK CONSTRAINT AND NOT A REFERENCE TABLE ───────────────────────
+ *
+ * `permit_authorities` and `snag_trades` are tables because an operator
+ * genuinely adds to them — a new authority, a new trade. This is not that
+ * shape. It is the same shape as `project_snags.responsible_party`, which is a
+ * `varchar` with a CHECK for the same reason: a small, closed set of
+ * provenance categories that nobody extends.
+ *
+ * The deciding argument is the field app. Its picker is compiled into an
+ * offline client that may not be updated for weeks. A row added to a reference
+ * table would be a value that client can neither render nor produce, so the
+ * table would offer an operator a choice that does not work — which is worse
+ * than the free-text fallback a vocabulary is supposed to prevent.
+ */
+export type MaterialSource = "van_stock" | "purchased" | "customer_supplied";
+
+/** The wire spelling, in the order a picker should offer them. */
+export const MATERIAL_SOURCES: readonly MaterialSource[] = [
+  "van_stock",
+  "purchased",
+  "customer_supplied",
+];
+
+export const MATERIAL_SOURCE_LABEL: Readonly<Record<MaterialSource, string>> = {
+  van_stock: "Van stock",
+  purchased: "Purchased",
+  customer_supplied: "Customer supplied",
+};
+
+export function isMaterialSource(value: unknown): value is MaterialSource {
+  return typeof value === "string" && (MATERIAL_SOURCES as readonly string[]).includes(value);
+}
+
 // ── Priority and SLA ─────────────────────────────────────────────────────────
 
 export type JobPriority = "p1_emergency" | "p2_urgent" | "p3_standard" | "p4_planned";

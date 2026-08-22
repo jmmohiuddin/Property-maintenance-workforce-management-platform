@@ -7,6 +7,7 @@ import {
   blockingPermits,
   canTransitionProject,
   canTransitionVariation,
+  computeSlaDeadlines,
   criticalSnagsBlockingCompletion,
   defectsLiabilityEnd,
   dubaiDateKey,
@@ -15,6 +16,7 @@ import {
   lineTotalMinor,
   milestoneTriggerMet,
   projectMargin,
+  PROJECT_STATUS_LABEL,
   retentionSplit,
   toDecimalString,
   toMinor,
@@ -24,6 +26,7 @@ import {
   MAX_RETENTION_BASIS_POINTS,
   UAE_VAT_BASIS_POINTS,
   type CostCategory,
+  type JobPriority,
   type MilestoneTrigger,
   type PermitStatus,
   type ProjectMargin,
@@ -35,6 +38,12 @@ import {
   type VariationState,
 } from "@meridian/core";
 import { writeAuditNote } from "./staff";
+// PRJ-2 raises its jobs through the ordinary job path rather than around it:
+// the reference allocator and the stored working calendar, both imported here
+// so that a project job is indistinguishable from any other job downstream.
+import { nextJobReference } from "./jobs";
+import { loadWorkingCalendar } from "./reference";
+import { getUpload } from "./uploads";
 import { rowDate } from "./_rows";
 
 /**
@@ -533,6 +542,423 @@ export async function attachJobToPhase(
     .returning({ id: schema.projectPhaseJobs.id });
 
   return { attached: inserted.length > 0 };
+}
+
+/**
+ * Project statuses a phase job may not be raised against.
+ *
+ * Read `ALL_PROJECT_STATUSES` and `PROJECT_TRANSITIONS` beside this list. Three
+ * of the nine are refused and the other six are deliberately allowed:
+ *
+ *  * `quoted` is a tender being priced. Nothing has been won, nobody has been
+ *    instructed, and `projects.property_id` is routinely still null at this
+ *    point precisely because the unit is not identified yet. A job raised here
+ *    would put a dispatchable, SLA-clocked instruction on the board for work no
+ *    customer has asked for — and the SLA clock, once started, is reported on.
+ *  * `closed` and `cancelled` are the two terminal states in the transition
+ *    machine: nothing moves out of either. Work raised against them is work
+ *    that can never be reported against a live project again, and the honest
+ *    answer to "we found more to do on a closed project" is a new project or a
+ *    variation, not a job attached to a finished one.
+ *
+ * And the six that are allowed, because each produces real daily work:
+ *
+ *  * `awarded` and `mobilising` produce site setup, hoarding, permits chasing
+ *    and surveys. Waiting for `on_site` would mean the work that *gets* a
+ *    project on site is the only work the system cannot express, which is how
+ *    it ends up raised as an unattached ad-hoc job instead.
+ *  * `on_site` and `snagging` are the obvious ones.
+ *  * `practical_completion` and `defects_liability` produce defect
+ *    rectification, and that is exactly the work the retention withheld under
+ *    `PRJ-5` is being held against. Refusing it here would push the most
+ *    financially consequential jobs on the project off the phase they belong
+ *    to.
+ */
+const PHASE_JOBS_REFUSED_IN: readonly ProjectStatus[] = ["quoted", "closed", "cancelled"];
+
+/**
+ * The priority a phase job is raised at when the caller does not say.
+ *
+ * Planned, because a phase is a plan. Construction work raised from a
+ * programme is scheduled work with a date on it, not a fault reported by a
+ * tenant, and giving it a P2 clock by default would fill the SLA board with
+ * breaches that describe nothing.
+ */
+const DEFAULT_PHASE_JOB_PRIORITY: JobPriority = "p4_planned";
+
+export interface RaiseJobForPhaseInput {
+  readonly phaseId: string;
+  readonly title: string;
+  readonly description?: string | null;
+  /** Defaults to `p4_planned`. See `DEFAULT_PHASE_JOB_PRIORITY`. */
+  readonly priority?: JobPriority | undefined;
+  /** Defaults to the phase's own trade — that is what "assigned trades" means. */
+  readonly serviceSlug?: string | null | undefined;
+  readonly scheduledFor?: Date | null | undefined;
+  /**
+   * Whether the work is in direct sun. Defaults to **true**; see the function
+   * comment for why the default leans that way.
+   */
+  readonly isOutdoor?: boolean | undefined;
+}
+
+export interface RaisedPhaseJob {
+  readonly jobId: string;
+  readonly reference: string;
+  /** False when the job was somehow already linked. See `attachJobToPhase`. */
+  readonly attached: boolean;
+}
+
+/**
+ * `PRJ-2`, second half: a phase produces `Job`s for daily execution.
+ *
+ * Phases, weights and dependencies have existed since `PRJ-2` was first built
+ * and `attachJobToPhase` has existed alongside them — but nothing ever called
+ * it, so no phase had ever produced a job and every job count on the phase
+ * table rendered a truthful, useless zero. This is the function that closes
+ * that, and almost all of its length is about *not* being a second way to
+ * create a job.
+ *
+ * ── THE JOB IS CREATED THE ORDINARY WAY, AND THAT IS THE POINT ─────────────
+ *
+ * The tempting implementation is an `insert(schema.jobs)` with whatever columns
+ * the projects screen happens to need. It was found this week that exactly that
+ * shortcut on the web assignment path had been silently skipping the summer
+ * midday ban, which carries AED 5,000 per worker, capped at AED 50,000, plus a
+ * company classification downgrade. So this follows `materialisePpmJobs` in
+ * `contracts.ts` and `convertLead` in `leads.ts` field for field:
+ *
+ *  1. **`nextJobReference(tx)`** allocates the reference through
+ *     `app_next_reference('JOB', …)`. Never `count(*) + 1`: that races, and
+ *     under the customer-scope policies a portal read cannot even see the
+ *     number another customer already took.
+ *  2. **`loadWorkingCalendar(tx)`** — the *stored* calendar (`ADM-10`), not
+ *     `DEFAULT_CALENDAR`. `computeSlaDeadlines` falls back to a default whose
+ *     public-holiday list is deliberately EMPTY, because a hardcoded one goes
+ *     stale in January. Taking that fallback silently would mean an
+ *     administrator could enter every UAE public holiday and every deadline
+ *     computed here would still schedule straight through Eid.
+ *  3. **`computeSlaDeadlines`** writes `respond_by_at` and `resolve_by_at` onto
+ *     the row. Stored once, never recomputed on read, for the reason `JOB-3`
+ *     gives: a job must keep being judged by the terms it was raised under.
+ *  4. **A `job_events` row** naming the project reference and the phase, so the
+ *     job's own timeline answers "where did this come from" without anybody
+ *     needing to know `project_phase_jobs` exists.
+ *  5. **`attachJobToPhase`** does the linking. The insert is not duplicated
+ *     here; that function already owns the `onConflictDoNothing` that makes a
+ *     double click a no-op instead of a 500.
+ *
+ * ── WHY `source = 'internal'` AND NOT A PROJECT SOURCE ────────────────────
+ *
+ * `job_source` has no project value and one is not added here. Adding an enum
+ * value is `ALTER TYPE ... ADD VALUE`, which is a migration, and a migration is
+ * owned by whoever is sequencing them — not by a feature branch that needed a
+ * word. `internal` is truthful: the work was raised by staff rather than
+ * arriving from a customer, which is what every other value in that enum is
+ * distinguishing. The provenance that actually matters is carried by
+ * `project_phase_jobs` (the link the phase panel reads), by the `job_events`
+ * note (the sentence a person reads), and by `jobs.project_id` (denormalised,
+ * no foreign key, so it is a hint for filtering rather than the authority).
+ *
+ * ── WHY `is_outdoor` DEFAULTS TO TRUE HERE ────────────────────────────────
+ *
+ * `jobs.is_outdoor` defaults to `false` at the column, which is right for the
+ * table as a whole: most jobs in this system are a leaking tap in a villa or an
+ * AC service in an apartment, and those are indoors.
+ *
+ * A job raised from a construction phase is not that job. It is site work on a
+ * fit-out, a hoarding, a facade, a roof plant deck or a car-park deck, and the
+ * ban applies to work in direct sun rather than to a trade — painting a
+ * stairwell is indoors, painting the elevation of the same building is not.
+ *
+ * The two errors are not symmetric, and that asymmetry is the whole argument:
+ *
+ *  * Flagged outdoor when it was indoors: between 15 June and 15 September the
+ *    scheduler refuses a visit placed between 12:30 and 15:00 and offers 15:00
+ *    instead. The operator reads a refusal that names the ban, unticks the box
+ *    because the work is inside, and re-books. Cost: one form submission, and
+ *    the mistake is visible at the moment it is made.
+ *  * Not flagged when it was outdoors: the ban check in `checkOutdoorWindow`
+ *    is never consulted, the visit is placed at 13:00 in July, and the first
+ *    anybody hears of it is an inspector on site. Cost: AED 5,000 per worker up
+ *    to AED 50,000, plus a classification downgrade that reprices every tender
+ *    the company bids for the following year. The mistake is invisible until it
+ *    is expensive.
+ *
+ * So the default leans to the refusable error, and the caller can always say
+ * otherwise. The UI ticks the box and lets the operator untick it, which is the
+ * same bargain in the other direction: a decision that has to be taken rather
+ * than one that is taken by omission.
+ *
+ * Note what this function does *not* do: it does not check the ban itself. Job
+ * creation never has, in any of the three ordinary paths, because a job has no
+ * end instant to check a window against — `scheduled_for` is an intention, not
+ * a booking. The ban is enforced where the work is actually placed, in
+ * `scheduleVisit` (`jobs.ts`) and `assignTechnician` (`assignment.ts`), both of
+ * which read `jobs.is_outdoor` off the row this function writes. Setting the
+ * flag correctly *is* the contribution.
+ */
+export async function raiseJobForPhase(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: RaiseJobForPhaseInput,
+): Promise<RaisedPhaseJob> {
+  const title = input.title.trim();
+  if (title.length < 3) {
+    throw new UserFacingError("Give the job a title — it is what the technician reads first.");
+  }
+
+  // One query for the phase and the project it belongs to. Under RLS a phase in
+  // another tenant is simply absent, which is why "not found" and "not yours"
+  // are the same sentence below and deliberately so.
+  const rows = await tx
+    .select({
+      phaseId: schema.projectPhases.id,
+      phaseName: schema.projectPhases.name,
+      phaseSequence: schema.projectPhases.sequence,
+      phaseStatus: schema.projectPhases.status,
+      phaseServiceSlug: schema.projectPhases.serviceSlug,
+      projectId: schema.projects.id,
+      projectReference: schema.projects.reference,
+      projectName: schema.projects.name,
+      projectStatus: schema.projects.status,
+      customerId: schema.projects.customerId,
+      propertyId: schema.projects.propertyId,
+    })
+    .from(schema.projectPhases)
+    .innerJoin(schema.projects, eq(schema.projects.id, schema.projectPhases.projectId))
+    .where(
+      and(
+        eq(schema.projectPhases.id, input.phaseId),
+        isNull(schema.projectPhases.deletedAt),
+        isNull(schema.projects.deletedAt),
+      ),
+    )
+    .limit(1);
+
+  const phase = rows[0];
+  if (!phase) throw new UserFacingError("Phase not found in this tenant.");
+
+  // A cancelled phase is descoped work. `setPhaseProgress` refuses it for the
+  // same reason: recording anything against it produces a number that the
+  // weighted completion figure has already excluded.
+  if (phase.phaseStatus === "cancelled") {
+    throw new UserFacingError(
+      `Phase ${phase.phaseSequence} "${phase.phaseName}" is cancelled. ` +
+        "Work descoped from the programme does not raise jobs — reinstate the phase, or raise " +
+        "the job against the phase that now owns the work.",
+    );
+  }
+
+  const projectStatus = phase.projectStatus as ProjectStatus;
+  if (PHASE_JOBS_REFUSED_IN.includes(projectStatus)) {
+    throw new UserFacingError(
+      `${phase.projectReference} is ${PROJECT_STATUS_LABEL[projectStatus].toLowerCase()}, so a ` +
+        "job cannot be raised against its phases. " +
+        (projectStatus === "quoted"
+          ? "Nothing has been instructed yet — award the project first, and the phase will raise " +
+            "work the moment it has."
+          : "This project is finished. Further work is a new project or a variation on a live " +
+            "one, not a job attached to a closed programme."),
+    );
+  }
+
+  // `projects.property_id` is nullable on purpose: a tender is priced long
+  // before the unit is identified, and forcing a building onto a quoted project
+  // would mean inventing one. A job is a different matter — it dispatches a
+  // technician to an address — so the nullable column becomes a refusal at the
+  // exact point the address is first genuinely needed.
+  if (!phase.propertyId) {
+    throw new UserFacingError(
+      `${phase.projectReference} has no property on it, and a job needs a site to send a ` +
+        "technician to. Set the project's property first — open the project, edit it, and " +
+        "choose the building or unit this work happens in.",
+    );
+  }
+
+  // "Assigned trades", as `PRJ-2` puts it. The phase's own trade is the default
+  // because that is where the assignment was recorded; the caller may override
+  // it for the phase that covers more than one. Neither means the job cannot be
+  // raised blind — `jobs.service_slug` is what the dispatch board matches a
+  // technician's skills against, and a wrong guess sends the wrong trade.
+  const serviceSlug = (input.serviceSlug ?? "").trim() || phase.phaseServiceSlug;
+  if (!serviceSlug) {
+    throw new UserFacingError(
+      `Phase ${phase.phaseSequence} "${phase.phaseName}" has no trade assigned, and none was ` +
+        "chosen for this job. Pick the trade — it is what the dispatch board matches against a " +
+        "technician's skills, and a job with the wrong one sends the wrong person.",
+    );
+  }
+
+  const priority = input.priority ?? DEFAULT_PHASE_JOB_PRIORITY;
+  const now = new Date();
+
+  // ADM-10. The stored calendar, not DEFAULT_CALENDAR. See the function comment
+  // above, point 2: the default's public-holiday list is empty by design, and
+  // taking the fallback silently ignores every holiday an administrator entered.
+  const calendar = await loadWorkingCalendar(tx);
+  const { respondByAt, resolveByAt } = computeSlaDeadlines(priority, now, undefined, calendar);
+  const reference = await nextJobReference(tx);
+
+  const [job] = await tx
+    .insert(schema.jobs)
+    .values({
+      tenantId: ctx.tenantId,
+      reference,
+      customerId: phase.customerId,
+      propertyId: phase.propertyId,
+      serviceSlug,
+      title,
+      description: input.description?.trim() || null,
+      // Triaged, not submitted. Somebody with `projects:write` has already
+      // chosen the trade, the priority and the phase this belongs to, which is
+      // the decision triage exists to take. Landing it in `submitted` would put
+      // it back in a queue to be re-decided by somebody with less context.
+      status: "triaged",
+      priority,
+      source: "internal",
+      projectId: phase.projectId,
+      isOutdoor: input.isOutdoor ?? true,
+      scheduledFor: input.scheduledFor ?? null,
+      respondByAt,
+      resolveByAt,
+      createdById: ctx.userId ?? null,
+    })
+    .returning({ id: schema.jobs.id });
+
+  if (!job) throw new Error("Failed to create the phase job");
+
+  await tx.insert(schema.jobEvents).values({
+    tenantId: ctx.tenantId,
+    jobId: job.id,
+    fromStatus: null,
+    toStatus: "triaged",
+    // Where this came from, on the job's own timeline. A technician who opens
+    // the job on a phone sees the project reference and the phase name without
+    // knowing that a link table exists, and the person who finds the job on the
+    // dispatch board tomorrow can tell it apart from a reactive call-out.
+    note:
+      `Raised from ${phase.projectReference} phase ${phase.phaseSequence} ` +
+      `"${phase.phaseName}" (PRJ-2).` +
+      ((input.isOutdoor ?? true) ? " Flagged as outdoor work: the summer midday ban applies." : ""),
+    actorId: ctx.userId ?? null,
+    // `system` when a scheduler or the seed raised it; `user` otherwise. The
+    // timeline distinguishes the two because "who did this" is the first
+    // question asked of a job nobody remembers creating.
+    actorKind: ctx.actorKind === "system" ? "system" : "user",
+  });
+
+  await writeAuditNote(tx, ctx, {
+    tableName: "jobs",
+    recordId: job.id,
+    // `audit_log.action` is varchar(16). The existing entries in this module
+    // abbreviate for the same reason — `prj_ret_rel`, `prj_progress`.
+    action: "prj_job",
+    detail: {
+      projectId: phase.projectId,
+      projectReference: phase.projectReference,
+      phaseId: phase.phaseId,
+      phaseSequence: phase.phaseSequence,
+      jobReference: reference,
+      serviceSlug,
+      priority,
+      isOutdoor: input.isOutdoor ?? true,
+    },
+  });
+
+  // The link, through the function that already owns it. Duplicating the insert
+  // here is what the comment on `attachJobToPhase` warns against, and it is
+  // also how the two would drift.
+  const { attached } = await attachJobToPhase(tx, ctx, {
+    phaseId: phase.phaseId,
+    jobId: job.id,
+  });
+
+  return { jobId: job.id, reference, attached };
+}
+
+export interface PhaseJobRow {
+  readonly phaseId: string;
+  readonly jobId: string;
+  readonly reference: string;
+  readonly title: string;
+  readonly status: string;
+  readonly priority: JobPriority;
+  readonly scheduledFor: Date | null;
+  readonly isOutdoor: boolean;
+}
+
+/**
+ * The jobs each phase of a project has raised.
+ *
+ * `getProject` already selects a `job_count` per phase — it has since `PRJ-2`
+ * was written, and it has always returned 0 because nothing called
+ * `attachJobToPhase`. That count now populates on its own and needs no change.
+ * What the panel cannot get from a count is *which* jobs, so this returns the
+ * rows: one flat list ordered by phase and then by when the work is due, which
+ * the screen groups by `phaseId`.
+ *
+ * Kept out of `getProject` rather than folded into it. The detail read is
+ * already six queries deep and every one of them is unconditional; a project
+ * with no phases has nothing to group, and the caller that wants a printable
+ * project summary has no use for this at all.
+ *
+ * Soft-deleted jobs are excluded. `project_phase_jobs` cascades from the job,
+ * so a hard-deleted job takes its link with it, but a soft-deleted one leaves
+ * the link standing — and a phase panel listing a job the jobs board has
+ * stopped showing is a phase panel nobody trusts.
+ */
+export async function listPhaseJobs(
+  tx: TenantScopedTx,
+  projectId: string,
+): Promise<readonly PhaseJobRow[]> {
+  const rows = (await tx.execute<{
+    phase_id: string;
+    job_id: string;
+    reference: string;
+    title: string;
+    status: string;
+    priority: string;
+    scheduled_for: string | null;
+    is_outdoor: boolean;
+  }>(sql`
+    select pj.phase_id,
+           j.id as job_id,
+           j.reference,
+           j.title,
+           j.status::text as status,
+           j.priority::text as priority,
+           j.scheduled_for::text as scheduled_for,
+           j.is_outdoor
+      from project_phase_jobs pj
+      join jobs j on j.id = pj.job_id
+      join project_phases ph on ph.id = pj.phase_id
+     where pj.project_id = ${projectId}::uuid
+       and j.deleted_at is null
+     order by ph.sequence, j.scheduled_for nulls last, j.reference
+  `)) as unknown as {
+    phase_id: string;
+    job_id: string;
+    reference: string;
+    title: string;
+    status: string;
+    priority: string;
+    scheduled_for: string | null;
+    is_outdoor: boolean;
+  }[];
+
+  return rows.map((r) => ({
+    phaseId: r.phase_id,
+    jobId: r.job_id,
+    reference: r.reference,
+    title: r.title,
+    status: r.status,
+    priority: r.priority as JobPriority,
+    // A timestamp out of `tx.execute` is a string, whatever the type parameter
+    // says. See `_rows.ts` — the annotation is an assertion, not a check.
+    scheduledFor: rowDate(r.scheduled_for),
+    isOutdoor: r.is_outdoor,
+  }));
 }
 
 // ── PRJ-3: milestone billing ─────────────────────────────────────────────────
@@ -1368,6 +1794,355 @@ export async function markRetentionReminded(
   return result.length;
 }
 
+// ── PRJ-5 / PRJ-6 / PRJ-9: the chase sweep ───────────────────────────────────
+//
+// Everything above this line produces a state; nothing above it ever tells
+// anybody. `listRetention({ dueWithinDays })` and `markRetentionReminded` were
+// written for a caller that did not exist, `client_approval_state` defaults to
+// `pending` and nothing has ever asked about it, and `project_permits` carries
+// an expiry date whose only consumer is a gate that refuses a button. This
+// block is the reading half of `/api/cron/projects`.
+//
+// ── WHY SUPPRESSION IS DONE IN TWO DIFFERENT PLACES ─────────────────────────
+//
+// `listUnapprovedSubcontracts` and `listExpiringPermits` take a
+// `notRemindedWithinHours` filter and apply it in SQL; retention does not,
+// because `listRetention` is also the ledger the project screen reads and a
+// chase window has no meaning there. The sweep therefore filters retention in
+// TypeScript with `needsChasing`, which is the same predicate the SQL applies,
+// written once so the two cannot drift. The asymmetry is deliberate rather than
+// an oversight: the SQL-side filter is what lets the subcontract chase ride the
+// `project_subcontracts_approval_idx` index all the way through, and retention
+// is bounded by `dueWithinDays` long before it reaches memory.
+
+/**
+ * Has this row gone unchased for long enough to chase again?
+ *
+ * NULL is "never asked" and is always due. The window is hours rather than
+ * days because the sweep is daily and a scheduler that double-fires at 07:15
+ * and 07:16 must not send the same digest twice — the same reason
+ * `recentlyNotified` exists one layer up. This one gates the *rows*; that one
+ * gates the *recipient*. Both are needed: without this, a second run on the
+ * same day would re-mark every row and reset the clock; without that, a tenant
+ * whose row set changed by one entry would be emailed twice.
+ */
+export function needsChasing(
+  lastRemindedAt: Date | null,
+  withinHours: number,
+  now: Date = new Date(),
+): boolean {
+  if (lastRemindedAt === null) return true;
+  return now.getTime() - lastRemindedAt.getTime() >= withinHours * 60 * 60 * 1000;
+}
+
+/**
+ * Projects that are still ours, for the purposes of a chase.
+ *
+ * `cancelled` and `closed` and nothing else. Deliberately wider than
+ * `OPEN_PROJECT_STATUSES`, which stops at `snagging`: an engagement made
+ * without the employer's approval on a project now in defects liability is
+ * still the engagement whose paperwork is asked for in a dispute, and a permit
+ * that lapses during the defects period is still a permit somebody has to
+ * produce. The file closes when the project closes, not at handover.
+ */
+const CHASEABLE_PROJECT_STATUSES = sql`('quoted', 'awarded', 'mobilising', 'on_site', 'snagging', 'practical_completion', 'defects_liability')`;
+
+export interface UnapprovedSubcontractRow {
+  readonly id: string;
+  readonly projectId: string;
+  readonly projectReference: string;
+  readonly projectName: string;
+  readonly projectStatus: ProjectStatus;
+  readonly subcontractorName: string;
+  readonly scope: string;
+  readonly valueMinor: number;
+  /** "pending" or "refused". Never "approved" or "not_required" — see below. */
+  readonly approvalState: string;
+  readonly startsOn: string | null;
+  /**
+   * `starts_on` has arrived and the approval has not. Dubai Law No. 7 of 2025
+   * requires the employer's **prior** approval before subcontracting within the
+   * contracting sector, so this is not "running late" — it is already the wrong
+   * side of the line, and the only remaining question is how far.
+   */
+  readonly alreadyStarted: boolean;
+  /** Days since `starts_on`, in Dubai. Null when no start date is recorded. */
+  readonly daysSinceStart: number | null;
+  readonly lastRemindedAt: Date | null;
+}
+
+/**
+ * Engagements that lack the employer's approval (`PRJ-9`).
+ *
+ * ── WHY `refused` IS IN HERE AS WELL AS `pending` ───────────────────────────
+ *
+ * `pending` is the common case and the one the default produces. `refused` is
+ * rarer and strictly worse: the employer has been asked and has said no, and
+ * the engagement row is still there with a start date on it. Reporting only
+ * `pending` would mean the one state that is unambiguously unlawful to proceed
+ * under is the one state nothing ever mentions, which is the wrong way round.
+ * They are returned together and separated by `approvalState` so the message
+ * can put the refusals first rather than merging the two into one count.
+ *
+ * `not_required` is excluded, and that is not the same judgement. It is a
+ * recorded decision that this engagement falls outside the approval regime —
+ * a supply-only order, say — and chasing a decision somebody already made is
+ * how a chase list gets filtered into a folder.
+ *
+ * ── THE ORDER ───────────────────────────────────────────────────────────────
+ *
+ * Least-recently-chased first, NULLs first, which is both the fair order and
+ * the one `project_subcontracts_approval_idx (tenant_id, client_approval_state,
+ * last_reminded_at)` was added for. Ordering by value or by start date would
+ * mean a small engagement that nobody has ever asked about sits behind a large
+ * one that has been asked about four times.
+ */
+export async function listUnapprovedSubcontracts(
+  tx: TenantScopedTx,
+  filter: { projectId?: string; notRemindedWithinHours?: number } = {},
+): Promise<readonly UnapprovedSubcontractRow[]> {
+  const rows = (await tx.execute<{
+    id: string;
+    project_id: string;
+    project_reference: string;
+    project_name: string;
+    project_status: string;
+    subcontractor_name: string;
+    scope: string;
+    value: string;
+    client_approval_state: string;
+    starts_on: string | null;
+    already_started: boolean;
+    days_since_start: number | null;
+    last_reminded_at: string | null;
+  }>(sql`
+    select ps.id,
+           ps.project_id,
+           p.reference as project_reference,
+           p.name      as project_name,
+           p.status    as project_status,
+           s.name      as subcontractor_name,
+           ps.scope,
+           ps.value::text as value,
+           ps.client_approval_state,
+           ps.starts_on::text as starts_on,
+           (ps.starts_on is not null
+              and ps.starts_on <= (now() at time zone 'Asia/Dubai')::date) as already_started,
+           case
+             when ps.starts_on is null then null
+             else ((now() at time zone 'Asia/Dubai')::date - ps.starts_on)::int
+           end as days_since_start,
+           ps.last_reminded_at
+      from project_subcontracts ps
+      join projects       p on p.id = ps.project_id
+      join subcontractors s on s.id = ps.subcontractor_id
+     where ps.deleted_at is null
+       and ps.client_approval_state in ('pending', 'refused')
+       and p.deleted_at is null
+       and p.status in ${CHASEABLE_PROJECT_STATUSES}
+       ${filter.projectId ? sql`and ps.project_id = ${filter.projectId}::uuid` : sql``}
+       ${
+         filter.notRemindedWithinHours !== undefined
+           ? sql`and (ps.last_reminded_at is null
+                      or ps.last_reminded_at <= now() - make_interval(hours => ${filter.notRemindedWithinHours}))`
+           : sql``
+       }
+     order by ps.last_reminded_at asc nulls first, ps.starts_on asc nulls last, p.reference
+  `)) as unknown as {
+    id: string;
+    project_id: string;
+    project_reference: string;
+    project_name: string;
+    project_status: string;
+    subcontractor_name: string;
+    scope: string;
+    value: string;
+    client_approval_state: string;
+    starts_on: string | null;
+    already_started: boolean;
+    days_since_start: number | null;
+    last_reminded_at: string | null;
+  }[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    projectId: r.project_id,
+    projectReference: r.project_reference,
+    projectName: r.project_name,
+    projectStatus: r.project_status as ProjectStatus,
+    subcontractorName: r.subcontractor_name,
+    scope: r.scope,
+    // Text out of SQL, `toMinor` in TypeScript. A portfolio of subcontracts
+    // passes 2,147,483,647 fils long before a portfolio of anything else does,
+    // and `::int` on the way out is how that becomes an error nobody can read.
+    valueMinor: toMinor(r.value),
+    approvalState: r.client_approval_state,
+    startsOn: r.starts_on,
+    // `boolean` out of Postgres arrives as a real boolean through this driver,
+    // but the cast is free and the alternative is a truthy string.
+    alreadyStarted: r.already_started === true,
+    daysSinceStart: r.days_since_start === null ? null : Number(r.days_since_start),
+    lastRemindedAt: rowDate(r.last_reminded_at),
+  }));
+}
+
+/**
+ * Record that an approval chase has gone out about these engagements.
+ *
+ * Mirrors `markRetentionReminded` exactly, including the empty-array
+ * short-circuit, and for the same reason: what matters is only "have we asked
+ * recently", which one timestamp answers. A ladder of rungs would be the
+ * `contract_renewal_notices` shape, and that shape exists because a renewal is
+ * four different messages to possibly different people. This is the same
+ * question asked of the same project manager until somebody produces the
+ * employer's letter.
+ */
+export async function markSubcontractsReminded(
+  tx: TenantScopedTx,
+  subcontractIds: readonly string[],
+): Promise<number> {
+  if (subcontractIds.length === 0) return 0;
+
+  const result = await tx
+    .update(schema.projectSubcontracts)
+    .set({ lastRemindedAt: new Date(), updatedAt: new Date() })
+    .where(inArray(schema.projectSubcontracts.id, [...subcontractIds]))
+    .returning({ id: schema.projectSubcontracts.id });
+
+  return result.length;
+}
+
+export interface ExpiringPermitRow {
+  readonly id: string;
+  readonly projectId: string;
+  readonly projectReference: string;
+  readonly projectName: string;
+  readonly authorityCode: string;
+  readonly authorityLabel: string;
+  readonly permitType: string;
+  readonly referenceNumber: string | null;
+  readonly expiresOn: string;
+  /** Negative when it has already lapsed. */
+  readonly daysRemaining: number;
+  readonly lastRemindedAt: Date | null;
+}
+
+/**
+ * Required permits about to lapse, or already lapsed (`PRJ-6`).
+ *
+ * ── WHY THIS IS WORTH A MESSAGE AT ALL ──────────────────────────────────────
+ *
+ * `blockingPermits` treats a required permit that is approved and **expired**
+ * as blocking, which is right — an operator reads the word "Approved" and stops
+ * reading, and the authority does not. But the consequence of that rule, with
+ * nothing watching the date, is that a permit lapsing mid-project is discovered
+ * as a button that mysteriously refuses, by whoever happened to click it, on
+ * the morning the crew is already at the gate. This turns it back into a date
+ * somebody was told about in advance.
+ *
+ * Only `is_required` permits, and only `approved` ones. A permit that is not
+ * required blocks nothing, and a chase list containing items with no
+ * consequence is a chase list people learn to skim. A permit still `applied`
+ * for is already blocking today and is not an expiry problem — that one is on
+ * the project screen, in red, and does not need an email as well.
+ *
+ * Ordered by expiry rather than by last chased, unlike the subcontract list
+ * above: this list has a real deadline attached to each row, and the one that
+ * lapses on Sunday must be read before the one that lapses in six weeks
+ * however long ago either was mentioned. `project_permits_expiry_idx
+ * (tenant_id, expires_on)` is the index that serves it.
+ */
+export async function listExpiringPermits(
+  tx: TenantScopedTx,
+  filter: { withinDays: number; projectId?: string; notRemindedWithinHours?: number },
+): Promise<readonly ExpiringPermitRow[]> {
+  const rows = (await tx.execute<{
+    id: string;
+    project_id: string;
+    project_reference: string;
+    project_name: string;
+    authority_code: string;
+    authority_label: string;
+    permit_type: string;
+    reference_number: string | null;
+    expires_on: string;
+    days_remaining: number;
+    last_reminded_at: string | null;
+  }>(sql`
+    select pp.id,
+           pp.project_id,
+           p.reference as project_reference,
+           p.name      as project_name,
+           pa.code     as authority_code,
+           pa.label    as authority_label,
+           pp.permit_type,
+           pp.reference_number,
+           pp.expires_on::text as expires_on,
+           (pp.expires_on - (now() at time zone 'Asia/Dubai')::date)::int as days_remaining,
+           pp.last_reminded_at
+      from project_permits pp
+      join projects           p  on p.id = pp.project_id
+      join permit_authorities pa on pa.id = pp.authority_id
+     where pp.deleted_at is null
+       and pp.is_required
+       and pp.status = 'approved'
+       and pp.expires_on is not null
+       and pp.expires_on <= (now() at time zone 'Asia/Dubai')::date + ${filter.withinDays}::int
+       and p.deleted_at is null
+       and p.status in ${CHASEABLE_PROJECT_STATUSES}
+       ${filter.projectId ? sql`and pp.project_id = ${filter.projectId}::uuid` : sql``}
+       ${
+         filter.notRemindedWithinHours !== undefined
+           ? sql`and (pp.last_reminded_at is null
+                      or pp.last_reminded_at <= now() - make_interval(hours => ${filter.notRemindedWithinHours}))`
+           : sql``
+       }
+     order by pp.expires_on asc, p.reference
+  `)) as unknown as {
+    id: string;
+    project_id: string;
+    project_reference: string;
+    project_name: string;
+    authority_code: string;
+    authority_label: string;
+    permit_type: string;
+    reference_number: string | null;
+    expires_on: string;
+    days_remaining: number;
+    last_reminded_at: string | null;
+  }[];
+
+  return rows.map((r) => ({
+    id: r.id,
+    projectId: r.project_id,
+    projectReference: r.project_reference,
+    projectName: r.project_name,
+    authorityCode: r.authority_code,
+    authorityLabel: r.authority_label,
+    permitType: r.permit_type,
+    referenceNumber: r.reference_number,
+    expiresOn: r.expires_on,
+    daysRemaining: Number(r.days_remaining),
+    lastRemindedAt: rowDate(r.last_reminded_at),
+  }));
+}
+
+/** Record that a permit expiry chase has gone out. Same shape as the other two. */
+export async function markPermitsReminded(
+  tx: TenantScopedTx,
+  permitIds: readonly string[],
+): Promise<number> {
+  if (permitIds.length === 0) return 0;
+
+  const result = await tx
+    .update(schema.projectPermits)
+    .set({ lastRemindedAt: new Date(), updatedAt: new Date() })
+    .where(inArray(schema.projectPermits.id, [...permitIds]))
+    .returning({ id: schema.projectPermits.id });
+
+  return result.length;
+}
+
 // ── PRJ-6: permits ───────────────────────────────────────────────────────────
 
 export interface PermitRow {
@@ -1555,6 +2330,188 @@ export async function setPermitStatus(
   });
 }
 
+/**
+ * ── ATTACHING A FILE TO A RECORD: THE ONE RULE ─────────────────────────────
+ *
+ * A caller names an **upload session id**. It never names a storage key.
+ *
+ * The distinction is the whole of the security here. A storage key is just a
+ * string: by the time one arrives at a function like this, the question of who
+ * was allowed to produce it has already been lost, and nothing downstream can
+ * recover it. `uploads/<some other tenant>/candidate_document/<uuid>.pdf` is a
+ * perfectly well-formed key, and a permit register that accepted keys would
+ * serve that file to anybody who could read the permit.
+ *
+ * A session id is different because the row behind it carries its own
+ * provenance: row-level security says which tenant opened it, `purpose` says
+ * what it was authorised as, `status` says whether the bytes are all here and
+ * verified, and `scan_status` says whether anything has looked at them. So the
+ * key is *derived* from the session inside this transaction, and the four
+ * things above are checked first.
+ *
+ * ── WHICH SCAN VERDICTS ARE ACCEPTED, AND WHY ──────────────────────────────
+ *
+ * `clean` and `skipped`. Not `pending`, not `infected`.
+ *
+ *  * `infected` is obvious and needs no argument.
+ *  * `pending` means a scanner is configured and has not yet reached this
+ *    file. `/api/cron/scan` exists precisely so that nothing serves bytes in
+ *    that state, and it runs every ten minutes: refusing here costs the
+ *    operator one retry and is the difference between the sweep being a gate
+ *    and being decoration.
+ *  * `skipped` is written by `completeStagedUpload` only when
+ *    `virusScanner().configured` is false — a deployment with no scanner at
+ *    all. It is not a file that failed a check; it is a file in a deployment
+ *    where no check exists, and the same deployment is already storing job
+ *    photographs and candidate CVs on that footing. Refusing it would not make
+ *    such a deployment safer, it would make the permit register unusable there
+ *    and push the permit PDF into somebody's email. `/api/cron/scan` warns
+ *    about this state on every single run, which is the honest way to carry
+ *    it.
+ *
+ * Note that `skipped` uploads are never revisited — `pendingUploadScans`
+ * selects `scan_status = 'pending'` only — so accepting one is accepting a file
+ * nothing will ever scan. That is a deployment-configuration decision, made
+ * once by whoever left `CLAMAV_HOST` unset, and it is not this function's to
+ * relitigate per file.
+ */
+async function resolveUploadedFile(
+  tx: TenantScopedTx,
+  input: { uploadId: string; expectedPurpose: string; what: string },
+): Promise<{ storageKey: string; filename: string | null; contentType: string | null }> {
+  const session = await getUpload(tx, input.uploadId);
+
+  // Not-found and not-in-this-tenant are the same answer, because row-level
+  // security gives the same answer for both and telling them apart would
+  // confirm that an id exists somewhere else. The message says the same thing
+  // for the same reason.
+  if (!session) throw new UserFacingError("There is no such upload.");
+
+  if (session.status !== "complete") {
+    throw new UserFacingError(
+      `That upload is ${session.status}, not finished. Wait for it to finish before attaching it.`,
+    );
+  }
+
+  // The purpose is read from the row, never from the caller. A person who may
+  // upload a candidate's passport must not be able to name that session here
+  // and have it filed as a permit — which is the same file, under a different
+  // permission, read by a different set of people.
+  if (session.purpose !== input.expectedPurpose) {
+    throw new UserFacingError(
+      `That upload was not made as ${input.what}. Upload the file again from this screen.`,
+    );
+  }
+
+  if (session.scanStatus === "infected") {
+    throw new UserFacingError(
+      "That file failed the virus scan. It is not attached anywhere and will not be served.",
+    );
+  }
+  if (session.scanStatus !== "clean" && session.scanStatus !== "skipped") {
+    throw new UserFacingError(
+      "That file has not been scanned yet. The scan runs every ten minutes; try again shortly.",
+    );
+  }
+
+  // Only now, and from the row.
+  if (!session.storageKey) {
+    throw new Error(`Upload ${input.uploadId} is complete with no storage key`);
+  }
+
+  return {
+    storageKey: session.storageKey,
+    filename: session.filename,
+    contentType: session.contentType,
+  };
+}
+
+/**
+ * `PRJ-6`: put the permit itself behind the register entry.
+ *
+ * ── WHY REPLACING AN EXISTING DOCUMENT TAKES AN EXPLICIT ASK ───────────────
+ *
+ * Objects are write-once (`OPS-6`), and the reason that matters here is not
+ * storage hygiene. The on-site gate reads this register: a project passed into
+ * `on_site` because a permit said `approved`, and the document that was on file
+ * at that moment is the evidence of what the gate was told. A second attach
+ * that silently replaced the first would leave the register looking exactly as
+ * it does now while the thing it evidences had changed underneath — which is
+ * the shape of every document dispute that gets settled by whoever kept better
+ * records.
+ *
+ * So a first attach is free, and a replacement takes `replace: true` and is
+ * written into the audit log with **both** keys. The superseded object is not
+ * deleted — it stays in the store, cited by the audit row, which is what makes
+ * the trail worth having. The alternative designs were both worse: refusing
+ * outright means an operator who attached the wrong PDF cannot fix it without a
+ * developer, and overwriting silently means nobody can ever tell that they did.
+ */
+export async function attachPermitDocument(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    permitId: string;
+    /** An upload session id. Never a storage key — see `resolveUploadedFile`. */
+    uploadId: string;
+    replace?: boolean;
+  },
+): Promise<{ storageKey: string; replaced: string | null }> {
+  const rows = await tx
+    .select({
+      id: schema.projectPermits.id,
+      projectId: schema.projectPermits.projectId,
+      permitType: schema.projectPermits.permitType,
+      status: schema.projectPermits.status,
+      existing: schema.projectPermits.documentStorageKey,
+    })
+    .from(schema.projectPermits)
+    .where(and(eq(schema.projectPermits.id, input.permitId), isNull(schema.projectPermits.deletedAt)))
+    .limit(1);
+
+  const permit = rows[0];
+  if (!permit) throw new UserFacingError("Permit not found in this tenant.");
+
+  if (permit.existing && !input.replace) {
+    throw new UserFacingError(
+      "This permit already has a document on file. Tick 'replace the document on file' if the " +
+        "one there is wrong — the superseded file is kept and the swap is recorded.",
+    );
+  }
+
+  const file = await resolveUploadedFile(tx, {
+    uploadId: input.uploadId,
+    expectedPurpose: "project_permit_document",
+    what: "a permit document",
+  });
+
+  await tx
+    .update(schema.projectPermits)
+    .set({ documentStorageKey: file.storageKey, updatedAt: new Date() })
+    .where(eq(schema.projectPermits.id, input.permitId));
+
+  await writeAuditNote(tx, ctx, {
+    // `audit_log.action` is varchar(16); the abbreviations in this file are
+    // not stylistic.
+    tableName: "project_perms",
+    recordId: input.permitId,
+    action: "prj_permit_doc",
+    detail: {
+      projectId: permit.projectId,
+      permitType: permit.permitType,
+      permitStatus: permit.status,
+      uploadId: input.uploadId,
+      filename: file.filename,
+      contentType: file.contentType,
+      storageKey: file.storageKey,
+      // Named, not deleted. This is the whole point of taking `replace`.
+      supersededStorageKey: permit.existing,
+    },
+  });
+
+  return { storageKey: file.storageKey, replaced: permit.existing };
+}
+
 // ── PRJ-7: snags ─────────────────────────────────────────────────────────────
 
 export interface SnagRow {
@@ -1630,6 +2587,19 @@ export async function openCriticalSnags(
   return criticalSnagsBlockingCompletion(await listSnags(tx, projectId));
 }
 
+/**
+ * Raises a snag. It does **not** take a photograph.
+ *
+ * It used to accept a `photoStorageKey`, and no caller ever passed one --
+ * the server action does not collect it and never did. That is the safer
+ * of the two ways for a parameter like this to be wrong, but it is still
+ * wrong: a storage key arriving in an argument list is a key whose
+ * provenance has already been lost, and the next caller to wire the form
+ * up properly would have passed one straight from the browser. Evidence
+ * goes on afterwards through `attachSnagPhoto`, which resolves the key
+ * from an upload the session owns. See the note above that function for
+ * why the same parameter was taken off `closeSnag`.
+ */
 export async function raiseSnag(
   tx: TenantScopedTx,
   ctx: TenantContext,
@@ -1643,7 +2613,6 @@ export async function raiseSnag(
     responsibleParty?: string;
     subcontractorId?: string | null;
     targetOn?: string | null;
-    photoStorageKey?: string | null;
     raisedBy?: string | null;
   },
 ): Promise<{ snagId: string; sequence: number }> {
@@ -1684,7 +2653,6 @@ export async function raiseSnag(
       responsibleParty: input.responsibleParty ?? "us",
       subcontractorId: input.subcontractorId ?? null,
       targetOn: input.targetOn ?? null,
-      photoStorageKey: input.photoStorageKey ?? null,
       raisedById: ctx.userId ?? null,
       raisedBy: input.raisedBy ?? null,
     })
@@ -1710,7 +2678,6 @@ export async function closeSnag(
   input: {
     snagId: string;
     closureNote: string;
-    closurePhotoStorageKey?: string | null;
     status?: Extract<SnagStatus, "closed" | "rejected">;
   },
 ): Promise<{ status: SnagStatus }> {
@@ -1727,6 +2694,7 @@ export async function closeSnag(
       sequence: schema.projectSnags.sequence,
       severity: schema.projectSnags.severity,
       status: schema.projectSnags.status,
+      closurePhotoStorageKey: schema.projectSnags.closurePhotoStorageKey,
     })
     .from(schema.projectSnags)
     .where(eq(schema.projectSnags.id, input.snagId))
@@ -1740,12 +2708,36 @@ export async function closeSnag(
 
   const status = input.status ?? "closed";
 
+  // ── THIS DOES NOT TOUCH THE CLOSURE PHOTOGRAPH, AND THAT IS THE POINT ─────
+  //
+  // Two bugs lived on one line here, and removing the line removed both.
+  //
+  // It read `closurePhotoStorageKey: input.closurePhotoStorageKey ?? null`,
+  // which set the column to NULL on every closure that did not name a key —
+  // and since evidence is attached *before* the snag is closed (the upload is
+  // chunked and cannot happen inside a form post; see `attachSnagPhoto`),
+  // closing a snag silently discarded the photograph somebody had filed
+  // against it seconds earlier.
+  //
+  // The first fix was to write the column only when the caller named one. That
+  // was correct and still left the parameter, which is the second bug: a
+  // storage key in an argument list is a key whose provenance has already been
+  // lost, and no production caller ever passed one — the server action does not
+  // collect it and never did. It survived only because a test fixture used it
+  // as a shortcut. A parameter that exists is a parameter somebody eventually
+  // passes, and the one who wires the closure form up properly would have
+  // passed a key straight from the browser.
+  //
+  // So the parameter is gone, on the same argument as `raiseSnag`'s. Closure
+  // evidence goes on through `attachSnagPhoto`, which resolves the key from an
+  // upload session the tenant owns. Clobbering it here is now impossible rather
+  // than merely not done, which is the difference between a fixed bug and one
+  // that cannot recur.
   await tx
     .update(schema.projectSnags)
     .set({
       status,
       closureNote: input.closureNote.trim(),
-      closurePhotoStorageKey: input.closurePhotoStorageKey ?? null,
       closedAt: new Date(),
       closedById: ctx.userId ?? null,
       updatedAt: new Date(),
@@ -1761,7 +2753,9 @@ export async function closeSnag(
       sequence: snag.sequence,
       severity: snag.severity,
       status,
-      hasPhoto: Boolean(input.closurePhotoStorageKey),
+      // The row, and now there is nothing else it could read: evidence is
+      // attached before the closure rather than named in it.
+      hasPhoto: Boolean(snag.closurePhotoStorageKey),
     },
   });
 
@@ -1795,6 +2789,130 @@ export interface SubcontractorRow {
   readonly approvalReference: string | null;
   /** Engagements against projects. The one column this module contributes. */
   readonly engagements: number;
+}
+
+/** Which of the two photographs on a snag is being filed. */
+export type SnagPhotoSlot = "photo" | "closure";
+
+/**
+ * `PRJ-7`: the photograph of the snag, and the photograph that closes it.
+ *
+ * ── WHY TWO SLOTS AND NOT TWO ROWS ─────────────────────────────────────────
+ *
+ * `PRJ-7` names exactly two: the **photo** of the defect and the **closure
+ * evidence**. They are not a gallery; they are a before and an after, and the
+ * pair is what a handover meeting argues over. Two columns say that. A general
+ * attachments table would say "some number of photographs, in some order", and
+ * the question a supervisor actually asks — was there a photograph of this
+ * before it was signed off — would stop having an answer.
+ *
+ * The two slots are independent. Attaching the closure photograph leaves the
+ * original untouched, which sounds obvious and is exactly what a single
+ * `photoStorageKey` parameter threaded through `closeSnag` would have got
+ * wrong.
+ *
+ * ── WHY THIS IS NOT PART OF `closeSnag` ────────────────────────────────────
+ *
+ * Because the upload is chunked and asynchronous and the closure is a form
+ * post. Folding them together would mean either holding a form open across a
+ * multi-megabyte upload on site wifi — the exact failure the resumable
+ * transport exists to survive — or passing a storage key through the closure
+ * form, which is the thing that must never happen. So: attach first, close
+ * after. `closeSnag` cannot overwrite a closure photograph at all — it no
+ * longer takes a key — which is what makes that order safe rather than merely
+ * conventional.
+ *
+ * Attaching closure evidence to an already-closed snag is allowed, and
+ * deliberately: a supervisor who closed the snag from the site office and found
+ * the photograph on their phone afterwards is adding evidence, not changing a
+ * decision. Replacing one already on file is the case that takes `replace`,
+ * for the same reason as the permit above.
+ *
+ * ── WHAT IS DELIBERATELY NOT ENFORCED HERE ─────────────────────────────────
+ *
+ * Closing a **critical** snag still does not require a closure photograph.
+ * There is a real argument that it should — a critical snag is by definition
+ * one that makes the premises unsafe, and "we fixed it, trust us" is thin
+ * evidence for that — but it is a new refusal in front of the practical-
+ * completion gate, and changing what that gate demands is not a decision to
+ * take in a file about attaching files. Flagged, not built.
+ */
+export async function attachSnagPhoto(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    snagId: string;
+    /** An upload session id. Never a storage key — see `resolveUploadedFile`. */
+    uploadId: string;
+    slot: SnagPhotoSlot;
+    replace?: boolean;
+  },
+): Promise<{ storageKey: string; replaced: string | null }> {
+  const rows = await tx
+    .select({
+      id: schema.projectSnags.id,
+      projectId: schema.projectSnags.projectId,
+      sequence: schema.projectSnags.sequence,
+      severity: schema.projectSnags.severity,
+      status: schema.projectSnags.status,
+      photoStorageKey: schema.projectSnags.photoStorageKey,
+      closurePhotoStorageKey: schema.projectSnags.closurePhotoStorageKey,
+    })
+    .from(schema.projectSnags)
+    .where(and(eq(schema.projectSnags.id, input.snagId), isNull(schema.projectSnags.deletedAt)))
+    .limit(1);
+
+  const snag = rows[0];
+  if (!snag) throw new UserFacingError("Snag not found in this tenant.");
+
+  const existing = input.slot === "closure" ? snag.closurePhotoStorageKey : snag.photoStorageKey;
+
+  if (existing && !input.replace) {
+    throw new UserFacingError(
+      input.slot === "closure"
+        ? "This snag already has closure evidence. Tick 'replace' if the photograph on file is " +
+          "wrong — the superseded one is kept and the swap is recorded."
+        : "This snag already has a photograph. Tick 'replace' if the one on file is wrong — the " +
+          "superseded one is kept and the swap is recorded.",
+    );
+  }
+
+  const file = await resolveUploadedFile(tx, {
+    uploadId: input.uploadId,
+    expectedPurpose: "project_snag_photo",
+    what: "a snag photograph",
+  });
+
+  await tx
+    .update(schema.projectSnags)
+    .set(
+      input.slot === "closure"
+        ? { closurePhotoStorageKey: file.storageKey, updatedAt: new Date() }
+        : { photoStorageKey: file.storageKey, updatedAt: new Date() },
+    )
+    .where(eq(schema.projectSnags.id, input.snagId));
+
+  await writeAuditNote(tx, ctx, {
+    // varchar(16): "prj_snag_photo" is 14, and naming the slot in the detail
+    // rather than in the action is what keeps it that way.
+    tableName: "project_snags",
+    recordId: input.snagId,
+    action: "prj_snag_photo",
+    detail: {
+      projectId: snag.projectId,
+      sequence: snag.sequence,
+      severity: snag.severity,
+      snagStatus: snag.status,
+      slot: input.slot,
+      uploadId: input.uploadId,
+      filename: file.filename,
+      contentType: file.contentType,
+      storageKey: file.storageKey,
+      supersededStorageKey: existing,
+    },
+  });
+
+  return { storageKey: file.storageKey, replaced: existing };
 }
 
 /**

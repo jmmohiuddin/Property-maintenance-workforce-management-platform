@@ -82,9 +82,12 @@ export default async function RateCardPage({
             <p className="mt-1">
               Until there are, every quotation is priced from memory. Two people quoting the same
               callout differently is the visible symptom; the one that costs money is a price that
-              has not moved in three years because nobody could see what it was. Start with the
-              callout and the hourly rate for the trades that get called most, in all four bands —
-              an emergency at 02:00 on a Friday is not the standard rate.
+              has not moved in three years because nobody could see what it was. It also blocks a
+              second thing outright: a tender pack is assembled from this table at the moment it is
+              produced, so with nothing priced here, every tender pack refuses to build until at
+              least one rate exists. Start with the callout and the hourly rate for the trades that
+              get called most, in all four bands — an emergency at 02:00 on a Friday is not the
+              standard rate.
             </p>
           </div>
         ) : null}

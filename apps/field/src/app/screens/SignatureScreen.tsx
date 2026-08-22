@@ -41,7 +41,7 @@ export function SignatureScreen({
   database: Database;
   jobId: string;
   onDone: () => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const [strokes, setStrokes] = useState<readonly Stroke[]>([]);
   const [name, setName] = useState("");
   const [role, setRole] = useState("");

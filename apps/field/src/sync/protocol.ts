@@ -49,14 +49,26 @@
  *   9. **No PPE or RAMS templates**, for the same reason. `FLD-4`'s safety gate
  *      has no data to gate on, so it refuses everything - see JobCardScreen.
  *
- * ── STILL UNVERIFIED ───────────────────────────────────────────────────────
+ * ── NOW VERIFIED OVER HTTP, AND WHAT THAT FOUND ────────────────────────────
  *
- * **Nothing here has been exercised over HTTP by either side.** The API
- * author's verification is an integration suite against Postgres calling the
- * domain layer, not the routes; mine is unit tests against these types with no
- * network. Both halves are transcribed from the same documents and neither has
- * met the other. The first time the app points at a running server, expect
- * this file to be wrong somewhere.
+ * This block used to say that nothing here had ever been exercised over HTTP by
+ * either side, and that the first time the app pointed at a running server this
+ * file should be expected to be wrong somewhere.
+ *
+ * `test/wire-contract.ts` is that first time. It registers a real device against
+ * the real route with a real session cookie, pulls, pushes and rotates against a
+ * live `next start`, and runs the server's real bytes through the parsers below
+ * rather than reading them by eye. **Every shape declared in this file survived
+ * it**: the four result lists, the four-state `gaps`, absent-versus-null
+ * `taxonomies`, optional `scope`, the ISO timestamps, `deviceToken` rotation on
+ * the body of whatever request triggered it, and `device_unknown` /
+ * `device_revoked`.
+ *
+ * What the connection did find was in the *payloads*, which this file has no
+ * schema for and `payloads.ts` composes - see the two builders corrected there -
+ * and two defects on the server side of the contract, which
+ * `test/wire-contract.ts` asserts rather than works around, and which
+ * `README.md` names.
  */
 
 import { z } from "zod";
@@ -270,8 +282,25 @@ export const syncResponseSchema = z.object({
    * The authoritative membership of the working set: every job id in scope,
    * changed or not. **The device deletes anything not named here.** This is
    * what stops a job reassigned to somebody else living on the phone for ever.
+   *
+   * ── WHY THIS IS `optional()` AND NOT `default({ jobIds: [] })` ─────────────
+   *
+   * It was the default, and the default was a way to lose a technician's day.
+   *
+   * `{ jobIds: [] }` is a real and meaningful answer: *"you have nothing
+   * assigned"*, and the device is right to empty itself. **Absent** is a
+   * different statement: the server said nothing about membership, and the
+   * device must keep what it holds. Defaulting one to the other means any
+   * response that loses this key - an older server, a proxy that rewrites a
+   * body, a partial deserialisation - reads as "you have no jobs" and evicts
+   * the entire working set.
+   *
+   * This is the same absent-versus-empty distinction the route's own comment
+   * makes about `taxonomies`, on the one field where reading it wrongly is
+   * destructive rather than merely blank. `planRemovals` refuses to compute
+   * any removal at all when it is undefined.
    */
-  scope: z.object({ jobIds: z.array(z.string()).default([]) }).default({ jobIds: [] }),
+  scope: z.object({ jobIds: z.array(z.string()).default([]) }).optional(),
   unavailableOffline: z.array(record).default([]),
   notYetAvailable: z.array(record).default([]),
   device: z

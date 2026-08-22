@@ -5,11 +5,14 @@ import {
   withTenant,
   addMilestone,
   addPhase,
+  attachPermitDocument,
+  attachSnagPhoto,
   closeSnag,
   createProject,
   decideVariation,
   engageSubcontractor,
   markMilestoneReached,
+  raiseJobForPhase,
   raiseMilestoneInvoice,
   raiseSnag,
   raiseVariation,
@@ -23,11 +26,14 @@ import {
 import {
   ALL_PROJECT_STATUSES,
   COST_CATEGORIES,
+  fromDubai,
   MILESTONE_TRIGGERS,
   PERMIT_STATUSES,
+  PRIORITY_LABEL,
   SNAG_SEVERITIES,
   VARIATION_STATES,
   type CostCategory,
+  type JobPriority,
   type MilestoneTrigger,
   type PermitStatus,
   type ProjectStatus,
@@ -282,6 +288,104 @@ export async function setPhaseProgressAction(
   } catch (error) {
     return {
       error: userMessage(error, "The progress could not be recorded.", "projects:progress"),
+    };
+  }
+}
+
+/**
+ * A `datetime-local` field, read as Dubai wall-clock time.
+ *
+ * The browser sends a naive `YYYY-MM-DDTHH:mm` with no zone in it, so somebody
+ * has to decide what zone it meant. It meant the operator's, and every operator
+ * of this system is in Asia/Dubai — UTC+4, no daylight saving, ever — so
+ * `fromDubai` is exact rather than approximate. Parsing it with `new Date()`
+ * would use the SERVER's zone instead, and a server in UTC would move every
+ * date four hours earlier: outdoor work booked for 16:00 would be stored as
+ * 12:00, which is inside the summer midday ban. The same helper, and the same
+ * reasoning, as `jobs/[id]/actions.ts`.
+ */
+function dubaiDateTime(value: string): Date | null {
+  const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(value.trim());
+  if (!parts) return null;
+  const [, year, month, day, hour, minute] = parts;
+  return fromDubai(Number(year), Number(month), Number(day), Number(hour) * 60 + Number(minute));
+}
+
+/**
+ * `PRJ-2`: raise a job from a phase.
+ *
+ * `projects:write`, not `jobs:write`. Deciding that a phase of a project needs
+ * a day's work done is a project manager's act — the same person who entered
+ * the phase, its weight and its trade — and reaching for the jobs boundary here
+ * would have meant widening a grant to fill a gap in this module, which is the
+ * failure mode the header of this file exists to describe. The RBAC boundaries
+ * are asserted as whole sets in `packages/auth/test/rbac.test.ts`; nothing here
+ * touches them.
+ *
+ * ── WHY THE EXPOSURE FIELD IS THREE-VALUED IN THIS FUNCTION ────────────────
+ *
+ * `is_outdoor` drives the summer midday ban, which costs AED 5,000 per worker.
+ * A checkbox would have been the obvious control and it is the wrong one: an
+ * unticked checkbox and an absent field are the same POST, so a request that
+ * never mentioned exposure at all would arrive as "indoor" — the unsafe answer,
+ * reached by omission. A select with two named values makes the operator choose,
+ * and anything else (an empty string, a missing field, a hand-rolled `curl`)
+ * falls through as `undefined` to the domain default, which is outdoor. The
+ * safe direction has to be the one you get by not answering.
+ */
+export async function raiseJobForPhaseAction(
+  _prev: ProjectFormState,
+  formData: FormData,
+): Promise<ProjectFormState> {
+  const session = await write();
+  const projectId = text(formData, "projectId");
+  const phaseId = text(formData, "phaseId");
+  const title = text(formData, "title");
+  const priority = text(formData, "priority") as JobPriority;
+  const scheduledForRaw = text(formData, "scheduledFor");
+
+  if (!projectId) return { error: "Which project?" };
+  if (!phaseId) return { error: "Which phase?" };
+  if (title.length < 3) {
+    return { error: "Give the job a title — it is what the technician reads first." };
+  }
+  if (!(priority in PRIORITY_LABEL)) return { error: "Choose the job's priority." };
+
+  const scheduledFor = scheduledForRaw ? dubaiDateTime(scheduledForRaw) : null;
+  if (scheduledForRaw && !scheduledFor) {
+    return { error: "That date and time could not be read. Use the picker." };
+  }
+
+  // Three-valued on purpose. See the comment above: absent must not mean indoor.
+  const exposure = text(formData, "exposure");
+  const isOutdoor = exposure === "indoor" ? false : exposure === "outdoor" ? true : undefined;
+
+  try {
+    const raised = await withTenant(ctxOf(session), (tx) =>
+      raiseJobForPhase(tx, ctxOf(session), {
+        phaseId,
+        title,
+        description: text(formData, "description") || null,
+        priority,
+        serviceSlug: text(formData, "serviceSlug") || null,
+        scheduledFor,
+        isOutdoor,
+      }),
+    );
+
+    refresh(projectId);
+    // A job raised here appears on two boards this module knows nothing about,
+    // and a dispatcher looking at a stale cache is a dispatcher who does not
+    // know the work exists. Revalidated here rather than inside `refresh()`,
+    // which every other write in this file shares and none of the others needs
+    // this for.
+    revalidatePath("/jobs");
+    revalidatePath("/dispatch");
+
+    return { ok: `Job ${raised.reference} raised and attached to the phase.` };
+  } catch (error) {
+    return {
+      error: userMessage(error, "The job could not be raised.", "projects:phase-job"),
     };
   }
 }
@@ -609,6 +713,54 @@ export async function setPermitStatusAction(
   }
 }
 
+/**
+ * Staple an uploaded file to a permit (`PRJ-6`, "documents attached").
+ *
+ * ── WHAT THIS FORM CARRIES, AND WHAT IT REFUSES TO CARRY ───────────────────
+ *
+ * An **upload id**. Not a storage key, not a filename, not a path. The bytes
+ * went up through `/api/uploads`, which authorised them against
+ * `projects:write` for the purpose `project_permit_document` and recorded that
+ * purpose on the session row; `attachPermitDocument` reads the key off that row
+ * inside the tenant transaction. A hidden field holding a storage key would
+ * look identical on the screen and would let anyone who can post this form
+ * attach any object in the store to any permit they can see.
+ */
+export async function attachPermitDocumentAction(
+  _prev: ProjectFormState,
+  formData: FormData,
+): Promise<ProjectFormState> {
+  const session = await write();
+  const projectId = text(formData, "projectId");
+  const permitId = text(formData, "permitId");
+  const uploadId = text(formData, "uploadId");
+
+  if (!permitId) return { error: "Which permit?" };
+  if (!uploadId) return { error: "Choose a file — nothing was uploaded." };
+
+  try {
+    const result = await withTenant(ctxOf(session), (tx) =>
+      attachPermitDocument(tx, ctxOf(session), {
+        permitId,
+        uploadId,
+        replace: formData.get("replace") !== null,
+      }),
+    );
+
+    refresh(projectId);
+    return {
+      ok: result.replaced
+        ? "Document replaced. The superseded file is kept and the swap is on the audit log — the " +
+          "register has to be able to show what was on file when the site gate passed."
+        : "Document attached to the permit.",
+    };
+  } catch (error) {
+    return {
+      error: userMessage(error, "The document could not be attached.", "projects:permit-doc"),
+    };
+  }
+}
+
 // ── PRJ-7 ────────────────────────────────────────────────────────────────────
 
 export async function raiseSnagAction(
@@ -694,6 +846,58 @@ export async function closeSnagAction(
     return { ok: rejected ? "Snag rejected, with the reason recorded." : "Snag closed." };
   } catch (error) {
     return { error: userMessage(error, "The snag could not be closed.", "projects:snag-close") };
+  }
+}
+
+/**
+ * The snag photograph, or the photograph that closes it (`PRJ-7`).
+ *
+ * Same rule as the permit above: an upload id crosses the wire, never a storage
+ * key. The slot is a two-value vocabulary checked here rather than passed
+ * through, because `"photo" | "closure"` reaching the domain layer as an
+ * unchecked string is one typo away from writing a column nobody asked for.
+ *
+ * Attach, then close. The upload is chunked and can take a minute on site wifi;
+ * holding the closure form open across it would be the one thing the resumable
+ * transport exists to avoid.
+ */
+export async function attachSnagPhotoAction(
+  _prev: ProjectFormState,
+  formData: FormData,
+): Promise<ProjectFormState> {
+  const session = await write();
+  const projectId = text(formData, "projectId");
+  const snagId = text(formData, "snagId");
+  const uploadId = text(formData, "uploadId");
+  const slot = text(formData, "slot");
+
+  if (!snagId) return { error: "Which snag?" };
+  if (!uploadId) return { error: "Choose a photograph — nothing was uploaded." };
+  if (slot !== "photo" && slot !== "closure") {
+    return { error: "Say whether this is the snag photograph or the closure evidence." };
+  }
+
+  try {
+    const result = await withTenant(ctxOf(session), (tx) =>
+      attachSnagPhoto(tx, ctxOf(session), {
+        snagId,
+        uploadId,
+        slot,
+        replace: formData.get("replace") !== null,
+      }),
+    );
+
+    refresh(projectId);
+    const what = slot === "closure" ? "Closure evidence" : "Snag photograph";
+    return {
+      ok: result.replaced
+        ? `${what} replaced. The superseded photograph is kept and the swap is on the audit log.`
+        : `${what} attached.`,
+    };
+  } catch (error) {
+    return {
+      error: userMessage(error, "The photograph could not be attached.", "projects:snag-photo"),
+    };
   }
 }
 

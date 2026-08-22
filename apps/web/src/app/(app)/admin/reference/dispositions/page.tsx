@@ -4,7 +4,7 @@ import { listDispositionReasons } from "@meridian/db/domain";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 import { ReferenceTabs } from "../tabs";
-import { AddDispositionForm, RetireButton } from "../taxonomy-forms";
+import { AddDispositionForm, InstallDispositionsButton, RetireButton } from "../taxonomy-forms";
 
 export const metadata: Metadata = {
   title: "Lost and dormant reasons",
@@ -62,10 +62,14 @@ export default async function DispositionsPage() {
             <p className="font-medium">No reasons have been entered, so no lead can be closed.</p>
             <p className="mt-1">
               Marking a lead lost or dormant requires one of these, and the list is empty — the
-              stage change is refused until something is here. Add the four or five that actually
-              come up: price, chose a competitor, no response, work no longer needed, budget next
-              year.
+              stage change is refused until something is here. Six reasons that come up in nearly
+              every business are one click away: price, chose a competitor, stopped responding,
+              outside the service area, work no longer needed, budget deferred. Add, retire or
+              reword any of them afterwards.
             </p>
+            <div className="mt-4">
+              <InstallDispositionsButton label="Add the standard reasons" />
+            </div>
           </div>
         ) : !lostCovered || !dormantCovered ? (
           <div

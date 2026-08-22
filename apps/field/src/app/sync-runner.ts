@@ -3,10 +3,18 @@
  * network.
  *
  * **NOT TYPECHECKED BY THE ROOT GATE, AND NOT EXECUTED IN THIS SESSION.**
- * Everything it decides was moved into `engine.ts`, `outbox.ts` and
- * `conflicts.ts`, which are both typechecked and unit-tested. What is left
- * here - the ordering of the database calls, the error funnel, the scheduling -
- * is untested and unrun.
+ * Everything it decides was moved into `engine.ts`, `outbox.ts`,
+ * `conflicts.ts` and `download.ts`, which are both typechecked and
+ * unit-tested. What is left here - the ordering of the database calls, the
+ * error funnel, the scheduling - is untested and unrun.
+ *
+ * ── BOTH HALVES ARE HERE NOW ───────────────────────────────────────────────
+ *
+ * `drain()` sends the outbox; `pull()` fetches the working set and writes it.
+ * They share the `isRunning` guard, so they take turns rather than racing: a
+ * pull that landed a job's server state while a drain was folding a response
+ * onto the same row would give two writers to one record, and the one that
+ * wrote second would win for no reason anybody chose.
  *
  * ── ONE RUNNER, NEVER TWO ──────────────────────────────────────────────────
  *
@@ -20,13 +28,14 @@
 
 import type { Database } from "@nozbe/watermelondb";
 
-import { loadOutbox, persistOutbox } from "../db/watermelon";
+import { applySyncPlan, loadOutbox, persistOutbox, readDeviceHoldings, readPullCursor } from "../db/watermelon";
 import { applyMutationResponse, planDrain } from "../sync/engine";
 import { afterProtocolFailure, afterTransportFailure, kindOf, queueHealth, recoverInflight } from "../sync/outbox";
 import type { OutboxRow } from "../sync/outbox";
 import { toOutboundMutation } from "../sync/outbox";
 import { DeviceAuthError, NetworkError, RefusedError, ServerError, type FieldApiClient } from "../sync/client";
-import { ProtocolError } from "../sync/protocol";
+import { ProtocolError, type SyncResponse } from "../sync/protocol";
+import { SyncApplyError, planSyncApply, type SyncPlan } from "../sync/download";
 import { classifyConflict } from "../sync/conflicts";
 import type { ClockSources, SkewObservation } from "../domain/clock";
 import { newClientId } from "../domain/ids";
@@ -115,10 +124,67 @@ export class SyncRunner {
     }
   }
 
+  /**
+   * One pull pass: fetch the delta, write it, advance the cursor.
+   *
+   * Loops while the server says `truncated`, because a truncated page means the
+   * pull hit its cap and the rest of the working set is one request away -
+   * making the device wait for its next scheduled sync to see the job it is
+   * standing outside would be the app choosing to be wrong for fifteen minutes.
+   * The loop is bounded rather than trusting `truncated` to stop: a server that
+   * never clears the flag would otherwise spin a phone's radio flat, and a cap
+   * turns that into a slow sync instead of a dead battery.
+   *
+   * `SyncApplyError` is recorded and not retried, for the same reason
+   * `ProtocolError` is not: it is deterministic, so a retry loop would look
+   * busy for a week and achieve nothing (`FLD-17`).
+   */
+  async pull(maxPages = 20): Promise<void> {
+    if (this.isRunning) return;
+    this.isRunning = true;
+    try {
+      for (let page = 0; page < maxPages; page += 1) {
+        const cursor = await readPullCursor(this.database);
+        const result = await this.api.pull(cursor);
+        this.signedIn();
+        this.skew = result.skew;
+
+        const holdings = await readDeviceHoldings(this.database);
+        const plan = planSyncApply(result.data, holdings);
+        await applySyncPlan(this.database, plan);
+
+        // Only after the batch committed. `lastSyncedAt` is the server's own
+        // clock, not this phone's, which is the whole two-clock discipline.
+        this.lastSyncedAt = plan.serverTime;
+
+        for (const anomaly of plan.anomalies) console.warn(`[field] ${anomaly}`);
+        for (const jobId of plan.retainedForUnsyncedWork) {
+          // Not an error. The office no longer considers this job the
+          // technician's, and the phone is keeping it until their work reaches
+          // the office - which is the correct order of those two facts.
+          console.warn(`[field] job ${jobId} left the working set but still has queued work; kept`);
+        }
+
+        if (!plan.truncated) break;
+      }
+      this.lastError = null;
+    } catch (error) {
+      this.lastError = messageFor(error);
+      if (error instanceof DeviceAuthError) this.needsSignIn = true;
+      if (error instanceof SyncApplyError || error instanceof ProtocolError) {
+        console.error("[field] the office sent a sync response this build could not store", error);
+      }
+    } finally {
+      this.isRunning = false;
+      this.emit(await loadOutbox(this.database));
+    }
+  }
+
   private async sendBatch(batch: readonly OutboxRow[]): Promise<OutboxRow[]> {
     const now = this.clock.monotonic();
     try {
       const result = await this.api.push(newClientId(), batch.map(toOutboundMutation));
+      this.signedIn();
       this.skew = result.skew;
       this.lastSyncedAt = result.data.serverTime;
 
@@ -171,6 +237,32 @@ export class SyncRunner {
     }
   }
 
+  /**
+   * A device-authenticated request came back. The device is signed in.
+   *
+   * ── WHY THIS IS CALLED AT THE RESPONSE AND NOT AT THE END OF THE PASS ──────
+   *
+   * `needsSignIn` used to latch: it was set on the first `DeviceAuthError` and
+   * nothing ever cleared it, so a runner that had seen one 401 kept the
+   * sign-in gate shut for the rest of the process - including while holding a
+   * freshly registered token that worked. The screen said "sign in" and
+   * signing in changed nothing, which is the worst shape a gate can take.
+   *
+   * The clearing condition has to be *proof*, not optimism, and a 200 from a
+   * route behind `withDevice()` is exactly that: the server resolved this
+   * handset's token and ran the handler. `pull()` and `push()` throw
+   * `DeviceAuthError` on 401 and 403, so reaching the line after either of
+   * them means the credential was accepted.
+   *
+   * It is therefore called at the response and not in `drain()`'s `finally`,
+   * because a drain with an empty queue makes no request at all - clearing the
+   * flag there would be the runner declaring itself signed in on the strength
+   * of having done nothing.
+   */
+  private signedIn(): void {
+    this.needsSignIn = false;
+  }
+
   private status(rows: readonly OutboxRow[]): SyncStatus {
     const health = queueHealth(rows, this.lastSyncedAt);
     return {
@@ -195,22 +287,28 @@ function messageFor(error: unknown): string {
 }
 
 /**
- * **The pull half is not implemented.**
+ * Apply one pull to the local database.
  *
- * `FieldApiClient.pull()` exists and parses a sync response; nothing applies
- * that response to the local database. Writing it requires knowing the exact
- * column names the server sends for jobs, customers, properties, assets, parts,
- * taxonomies and certifications - and `apps/web/src/app/api/field/**` did not
- * exist when this was written, so any mapping written here would be a guess
- * that compiles.
+ * Two steps and one transaction. `planSyncApply` is pure - it reads the parsed
+ * response and the two facts about what the device already holds, decides every
+ * column value and every removal, and refuses the whole pull if any of it is
+ * unstorable. `applySyncPlan` then performs that plan in a single WatermelonDB
+ * batch, cursor included, so a pull either becomes true in full or does not
+ * happen at all.
  *
- * A guess that compiles is worse than a gap that does not, so this is a gap
- * that does not. It is the first thing the next session should build, against
- * the real route handlers.
+ * The ordering is not cosmetic: the holdings are read before the plan is built
+ * and the removals are computed from them, so a job that acquired queued work
+ * between the two would be at risk. Nothing can, because both live inside one
+ * synchronous stretch of a single-threaded runtime with no user interaction in
+ * between - but the guard in `planRemovals` is what makes it safe rather than
+ * lucky, and it is the same guard `evictionDecision` applies.
  */
-export function applySyncResponse(): never {
-  throw new Error(
-    "The download half of sync is not implemented. The field API's response shape is not yet known; " +
-      "see the note in sync-runner.ts.",
-  );
+export async function applySyncResponse(
+  database: Database,
+  response: SyncResponse,
+): Promise<SyncPlan> {
+  const holdings = await readDeviceHoldings(database);
+  const plan = planSyncApply(response, holdings);
+  await applySyncPlan(database, plan);
+  return plan;
 }

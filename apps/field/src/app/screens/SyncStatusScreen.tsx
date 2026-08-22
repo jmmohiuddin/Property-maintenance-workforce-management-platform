@@ -29,7 +29,7 @@ export function SyncStatusScreen({
   runner: SyncRunner;
   status: SyncStatus | null;
   onBack: () => void;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
       <Pressable onPress={onBack} style={styles.back} accessibilityRole="button">
@@ -133,7 +133,7 @@ function describeOffset(offsetMs: number): string {
   return `About ${hours} hour${hours === 1 ? "" : "s"} ${direction} the office`;
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }): JSX.Element {
+function Section({ title, children }: { title: string; children: React.ReactNode }): React.JSX.Element {
   return (
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>{title}</Text>

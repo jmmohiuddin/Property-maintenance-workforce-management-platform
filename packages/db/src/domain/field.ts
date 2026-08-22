@@ -8,6 +8,7 @@ import {
   UserFacingError,
   certState,
   type JobStatus,
+  type MaterialSource,
 } from "@meridian/core";
 import { transitionJob } from "./jobs";
 import { recordJobOutcome } from "./outcomes";
@@ -1510,6 +1511,21 @@ async function handleAppend(
         unitCostMinor: optionalInteger(payload, "unitCostMinor"),
         unitPriceMinor: optionalInteger(payload, "unitPriceMinor"),
         isBillable: payload["isBillable"] !== false,
+        // `FLD-9`. Both of these were on the wire and read by nothing: the
+        // client sent them, `job_materials` had no column, and the line was
+        // accepted with the provenance discarded. Nothing refused and nothing
+        // warned, which is the worst shape the loss could take — a refusal
+        // would have told the technician to try something else.
+        //
+        // Read with `optionalString` rather than `requireString`, even though
+        // `source` is required on the wire. A sync mutation was committed on
+        // the device before it was ever sent, so refusing one here does not
+        // undo it; it strands the queue behind a line that can never be
+        // accepted. An older client that predates the field's own picker
+        // records "not recorded", which is true, and `recordJobMaterial`
+        // still refuses a value that is present and wrong.
+        source: optionalString(payload, "source") as MaterialSource | null,
+        serialNumber: optionalString(payload, "serialNumber"),
       });
       return { kind: "accepted", result: { ...material } };
     }

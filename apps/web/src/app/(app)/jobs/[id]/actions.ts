@@ -22,13 +22,17 @@ import {
   declareNoMaterials,
   recordPhotoExemption,
   recordVisitLabour,
-  recordJobSignature,
   type AssignmentWarningType,
   type DraftLine,
 } from "@meridian/db";
 import { enqueue, dispatchPending } from "@meridian/notify";
 import { sendCustomerNotification } from "@/lib/customer-notifications";
-import { materialiseInvoiceDocument, materialiseQuoteDocument } from "@meridian/docs";
+import {
+  amendJobSheet,
+  materialiseInvoiceDocument,
+  materialiseQuoteDocument,
+  sealJobSheet,
+} from "@meridian/docs";
 import { MAX_OBJECT_BYTES, objectStore, sniffContentType } from "@meridian/files";
 import {
   InvalidTransitionError,
@@ -1067,12 +1071,30 @@ export async function recordLabourAction(
 }
 
 /**
- * The customer's signature (`OPS-6`).
+ * Take the customer's signature, and seal the job sheet with it (`FLD-14`).
  *
- * Not one of `JOB-15`'s four conditions and deliberately not gated on — see the
- * note on `recordJobSignature`. It is here because `job_signoffs` has carried a
- * comment about its legal weight since `0000` with nothing reading or writing
- * it, and a signature nobody can capture is not evidence of anything.
+ * ── WHY THIS IS ONE ACTION AND NOT TWO ──────────────────────────────────────
+ *
+ * There used to be a `captureSignatureAction` that stored an image and a name
+ * and did nothing else, and the field app's own source described what that was
+ * worth: *"a signature captured by this app today would prove that somebody
+ * drew on a screen and nothing about what they were agreeing to."* Leaving that
+ * path in place beside a sealing one would leave two ways to sign a job, one of
+ * which produces evidence and one of which does not — and the one that does not
+ * is the easier call to make.
+ *
+ * So there is one path. It renders the sheet, hashes it, stores an immutable
+ * snapshot, writes the signature, locks the card and queues the customer's copy
+ * — all inside a single transaction, in `sealJobSheet`.
+ *
+ * ── WHAT `presentedSha256` IS DOING IN A FORM ───────────────────────────────
+ *
+ * It is the digest of the sheet **this page displayed**. The server re-derives
+ * it from the record at the moment of signing and refuses if the two differ.
+ * Without it, an operator could have the sheet open in one tab while somebody
+ * else adds a part in another, and the signature would be recorded against a
+ * document nobody ever saw. The refusal says to show the sheet again, which is
+ * the correct instruction rather than an apology.
  */
 export async function captureSignatureAction(
   _prev: ActionState,
@@ -1083,8 +1105,10 @@ export async function captureSignatureAction(
   const visitId = String(formData.get("visitId") ?? "").trim();
   const signedByName = String(formData.get("signedByName") ?? "").trim();
   const signedByRole = String(formData.get("signedByRole") ?? "").trim();
+  const signerEmail = String(formData.get("signerEmail") ?? "").trim();
   const comments = String(formData.get("comments") ?? "").trim();
   const ratingRaw = String(formData.get("satisfactionRating") ?? "").trim();
+  const presentedSha256 = String(formData.get("presentedSha256") ?? "").trim();
 
   try {
     requirePermission(session.principal, "jobs:update");
@@ -1093,6 +1117,13 @@ export async function captureSignatureAction(
   }
 
   if (!signedByName) return { error: "Record the name of the person signing." };
+  if (!presentedSha256) {
+    return {
+      error:
+        "This form was opened before the job sheet was ready. Reload the job and open the sheet " +
+        "again — a signature has to be given to a sheet somebody has seen.",
+    };
+  }
   const satisfactionRating = ratingRaw ? Number(ratingRaw) : null;
   if (satisfactionRating !== null && !Number.isInteger(satisfactionRating)) {
     return { error: "A satisfaction rating is a whole number from one to five." };
@@ -1104,11 +1135,12 @@ export async function captureSignatureAction(
     return { error: "Attach the signature image — a name alone is not a signature." };
   }
 
+  let sealed: Awaited<ReturnType<typeof sealJobSheet>>;
   try {
-    await withTenant(
+    sealed = await withTenant(
       { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
       (tx) =>
-        recordJobSignature(
+        sealJobSheet(
           tx,
           { tenantId: session.principal.tenantId, userId: session.principal.userId },
           {
@@ -1116,9 +1148,11 @@ export async function captureSignatureAction(
             visitId: visitId || null,
             signedByName,
             signedByRole: signedByRole || null,
+            signerEmail: signerEmail || null,
             signatureStorageKey: stored.key,
             satisfactionRating,
             comments: comments || null,
+            presentedSha256,
           },
         ),
     );
@@ -1126,6 +1160,62 @@ export async function captureSignatureAction(
     return { error: userMessage(error, "Could not record the sign-off.", "jobs") };
   }
 
+  // Outside the transaction, deliberately. A provider timing out must not roll
+  // back a signature that has already been given — the ledger row is queued
+  // either way and the next drain picks it up.
+  await dispatchPending(session.principal.tenantId);
+
   revalidatePath(`/jobs/${jobId}`);
-  return { ok: `Signed by ${signedByName}.` };
+  return {
+    ok:
+      `Signed by ${signedByName}. Job sheet ${sealed.reference} is sealed and the job card is ` +
+      `now locked.` + (sealed.copyProblem ? ` ${sealed.copyProblem}` : " A copy has been emailed."),
+  };
 }
+
+/**
+ * Correct a signed job sheet, without touching it (`FLD-14`).
+ *
+ * The card stays locked and the original sheet stays on file with its digest
+ * intact. What this produces is a second document that says what was wrong and
+ * what the position now is. That is the whole of "corrections happen only as a
+ * new, linked, reason-coded amendment" — an unlock-and-edit would leave the
+ * copy in the customer's inbox evidencing a position the business no longer
+ * holds.
+ */
+export async function amendJobSheetAction(
+  _prev: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const session = await requireSession();
+  const jobId = String(formData.get("jobId") ?? "");
+  const reasonCode = String(formData.get("reasonCode") ?? "").trim();
+  const detail = String(formData.get("detail") ?? "").trim();
+
+  try {
+    requirePermission(session.principal, "jobs:update");
+  } catch {
+    return { error: "Your role cannot amend a signed job sheet." };
+  }
+
+  if (!reasonCode) return { error: "Choose why the sheet is being amended." };
+
+  try {
+    const amendment = await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId, actorKind: "user" },
+      (tx) =>
+        amendJobSheet(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          { jobId, reasonCode, detail },
+        ),
+    );
+    revalidatePath(`/jobs/${jobId}`);
+    return {
+      ok: `Amendment ${amendment.reference} raised. The signed sheet is unchanged, as it must be.`,
+    };
+  } catch (error) {
+    return { error: userMessage(error, "Could not raise the amendment.", "jobs") };
+  }
+}
+

@@ -7,7 +7,6 @@ import {
   addJobMaterialAction,
   declareNoMaterialsAction,
   recordLabourAction,
-  captureSignatureAction,
   type ActionState,
 } from "./actions";
 import { CheckCircle, Warning, Camera, Wrench, Clock, PenNib } from "@phosphor-icons/react/dist/ssr";
@@ -241,6 +240,19 @@ export function JobCardPanel({ card }: { card: JobCardView }) {
         </Block>
 
         {/* ── Sign-off ─────────────────────────────────────────────────── */}
+        {/*
+          Moved out of this panel and into `JobSheetPanel` (`FLD-14`).
+
+          It sat here as a fifth, optional block while a signature was a name
+          and an image — the whole of what `recordJobSignature` used to store.
+          Signing now seals a hashed, immutable job sheet, emails the customer
+          their copy, and closes this card to edits, and none of that is a field
+          on the card. Leaving a signature form here would have left two ways to
+          sign a job, one of which produces evidence and one of which does not.
+
+          The state stays visible below, because an operator reading the card
+          needs to know whether it is still theirs to change.
+        */}
         <Block
           icon={<PenNib size={16} weight="bold" aria-hidden />}
           title="Customer sign-off"
@@ -252,19 +264,20 @@ export function JobCardPanel({ card }: { card: JobCardView }) {
               : "Not signed"
           }
         >
-          <p className="mb-4 text-[13px]" style={{ color: "var(--text-muted)" }}>
-            Not one of the four things that gate completion. A technician who cannot find anybody to
-            sign — an empty villa, a night shift in a plant room — must still be able to close the
-            job.
-          </p>
           {card.signature ? (
-            <p className="mb-4 text-[13px]">
+            <p className="text-[13px]">
               {card.signature.signedByName}
               {card.signature.signedByRole ? `, ${card.signature.signedByRole}` : ""} —{" "}
-              {card.signature.signedAt}
+              {card.signature.signedAt}. This card is locked; corrections are amendments to the
+              signed job sheet below.
             </p>
           ) : (
-            <SignatureForm jobId={card.jobId} />
+            <p className="text-[13px]" style={{ color: "var(--text-muted)" }}>
+              Not one of the four things that gate completion — a technician who cannot find anybody
+              to sign, an empty villa, a night shift in a plant room, must still be able to close the
+              job. When there is somebody to sign, the signed job sheet section below is where it
+              happens.
+            </p>
           )}
         </Block>
       </div>
@@ -625,81 +638,3 @@ function LabourForm({ jobId, visit }: { jobId: string; visit: JobCardVisitLabour
   );
 }
 
-function SignatureForm({ jobId }: { jobId: string }) {
-  const [state, formAction, pending] = useActionState(captureSignatureAction, INITIAL);
-  return (
-    <form action={formAction} className="space-y-3 border-t pt-4">
-      <input type="hidden" name="jobId" value={jobId} />
-      <div className="grid gap-3 sm:grid-cols-2">
-        <div>
-          <label htmlFor="sign-name" className="block text-[13px] font-medium">
-            Signed by
-          </label>
-          <input
-            id="sign-name"
-            name="signedByName"
-            required
-            maxLength={160}
-            className={`${fieldClass} mt-1`}
-            style={fieldStyle}
-          />
-        </div>
-        <div>
-          <label htmlFor="sign-role" className="block text-[13px] font-medium">
-            Their role (optional)
-          </label>
-          <input
-            id="sign-role"
-            name="signedByRole"
-            maxLength={80}
-            placeholder="Building manager, tenant, security"
-            className={`${fieldClass} mt-1`}
-            style={fieldStyle}
-          />
-        </div>
-        <div>
-          <label htmlFor="sign-rating" className="block text-[13px] font-medium">
-            Satisfaction, 1–5 (optional)
-          </label>
-          <input
-            id="sign-rating"
-            name="satisfactionRating"
-            inputMode="numeric"
-            className={`${fieldClass} mt-1`}
-            style={fieldStyle}
-          />
-        </div>
-        <div>
-          <label htmlFor="sign-image" className="block text-[13px] font-medium">
-            Signature image
-          </label>
-          <input
-            id="sign-image"
-            name="signature"
-            type="file"
-            accept="image/png,image/jpeg,image/webp,image/heic"
-            required
-            className={`${fieldClass} mt-1`}
-            style={fieldStyle}
-          />
-        </div>
-      </div>
-      <div>
-        <label htmlFor="sign-comments" className="block text-[13px] font-medium">
-          Their comments (optional)
-        </label>
-        <textarea
-          id="sign-comments"
-          name="comments"
-          rows={2}
-          className={`${fieldClass} mt-1`}
-          style={fieldStyle}
-        />
-      </div>
-      <button type="submit" disabled={pending} className="btn btn-secondary !py-2 text-[13px] disabled:opacity-60">
-        {pending ? "Saving..." : "Record the sign-off"}
-      </button>
-      <Result state={state} />
-    </form>
-  );
-}

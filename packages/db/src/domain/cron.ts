@@ -63,6 +63,15 @@ export const CRON_JOBS = [
   // every uploaded CV simply stays undownloadable.
   "scan",
   "health",
+  // M5 / PRJ-5, PRJ-6, PRJ-9. The projects chase sweep: retention falling due,
+  // engagements still waiting on the employer's approval under Law No. 7 of
+  // 2025, and required permits about to lapse. Registered here AND in
+  // vercel.json, in the same commit, because the recruitment job above is the
+  // standing proof of what happens otherwise — it was in this list and absent
+  // from vercel.json, so it never ran in production and /api/cron/health simply
+  // red-lighted forever. This job fails the same way and quieter: retention
+  // stops being chased, and the first symptom is money that never arrives.
+  "projects",
 ] as const;
 export type CronJob = (typeof CRON_JOBS)[number];
 
@@ -92,6 +101,10 @@ export const CRON_MAX_AGE_MINUTES: Readonly<Record<CronJob, number>> = {
   // on one late invocation is an alert somebody mutes.
   scan: 35,
   health: 20, // every 5 minutes
+  // Daily, 07:15 Dubai. Same 26-hour allowance as the other daily jobs: an
+  // allowance tight enough to fire on one late invocation is an allowance
+  // somebody mutes, and a chase list that is a day old is still the same list.
+  projects: 26 * 60,
 };
 
 export async function startRun(job: CronJob): Promise<string> {

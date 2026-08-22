@@ -30,8 +30,34 @@
  * then locks itself out - so `onDeviceToken` is called before the response body
  * is handed to the caller, and its failure is not swallowed.
  *
- * **This client has not been run against the real routes.** The shapes are
- * transcribed from them; nothing has exercised them over a network.
+ * The rotated token is read off the **raw** response, in `request()`, rather
+ * than off each parsed body. `withDevice()` attaches `deviceToken` to whatever
+ * request happened to trigger the rotation, which includes the upload routes -
+ * and `uploadInitResponseSchema` and friends do not declare the field, so a
+ * token delivered on an upload would have been parsed away and lost. One place
+ * that reads it, before anything is parsed, is the only shape that cannot have
+ * that bug in it.
+ *
+ * ── AND A REVOKED DEVICE HAS TO FORGET ITS TOKEN HERE ──────────────────────
+ *
+ * `DeviceAuthError.clearsStoredToken` already encodes which refusals kill the
+ * credential and which merely end the session. This client acts on it, via
+ * `clearDeviceToken`, because it is the only layer that sees the error before
+ * the caller does; a phone that keeps a revoked token replays a retired
+ * credential on its next request, which `_device.ts` treats as theft.
+ *
+ * ── AND ALL OF THAT HAS NOW BEEN RUN AGAINST THE REAL ROUTES ───────────────
+ *
+ * This paragraph used to say the opposite. `test/wire-contract.ts` drives this
+ * client against a live server: it ages a device's `token_issued_at` past the
+ * seven-day rotation threshold and confirms the replacement arrives in the body
+ * and is persisted here **before** the caller sees it; it replays the retired
+ * token inside its ten-minute grace and gets served; it replays it after the
+ * grace and gets `device_revoked`, which `clearsStoredToken` correctly turns
+ * into a keystore wipe; and it presents an unissued token and no token at all
+ * and gets `device_unknown` classified as `DeviceAuthError` rather than as
+ * something to retry. `test/device-auth.test.ts` still covers the same
+ * behaviour against a fake `fetch`, without a server.
  */
 
 import {
@@ -43,6 +69,7 @@ import {
   UPLOAD_COMPLETE_PATH,
   UPLOAD_INIT_PATH,
   ProtocolError,
+  deviceTokenSchema,
   parseErrorEnvelope,
   parseMutationResponse,
   parseSyncResponse,
@@ -114,6 +141,14 @@ export interface FieldApiConfig {
   readonly getDeviceToken: () => Promise<string | null>;
   /** Persist a rotated token. Must not resolve until it is durably stored. */
   readonly onDeviceToken: (token: DeviceToken) => Promise<void>;
+  /**
+   * Destroy the stored token, because the office has revoked this device.
+   *
+   * Called only when `DeviceAuthError.clearsStoredToken` says so - never for
+   * `device_expired`, which leaves a merely old token alone. Optional so that a
+   * caller which holds no store at all still compiles; a real app supplies it.
+   */
+  readonly clearDeviceToken?: () => Promise<void>;
   readonly appVersion: string;
   readonly clock: ClockSources;
   /**
@@ -151,8 +186,10 @@ export class FieldApiClient {
   async pull(cursor: string | null): Promise<SyncResult<SyncResponse>> {
     const query = cursor === null ? "" : `?cursor=${encodeURIComponent(cursor)}`;
     const { raw, sent, received } = await this.request("GET", `${SYNC_PATH}${query}`, undefined);
+    // A rotated token was already persisted inside `request()`, before this
+    // line ran. Doing it here as well would be a second write of a value that
+    // is already durable.
     const data = parseSyncResponse(raw);
-    if (data.deviceToken) await this.config.onDeviceToken(data.deviceToken);
     return { data, skew: this.skewFrom(sent, received, data.serverTime) };
   }
 
@@ -187,7 +224,6 @@ export class FieldApiClient {
     });
 
     const data = parseMutationResponse(raw);
-    if (data.deviceToken) await this.config.onDeviceToken(data.deviceToken);
     return { data, skew: this.skewFrom(sent, received, data.serverTime) };
   }
 
@@ -270,7 +306,7 @@ export class FieldApiClient {
 
     if (response.status === 401 || response.status === 403) {
       const envelope = parseErrorEnvelope(await safeJson(response));
-      throw new DeviceAuthError(envelope.code, envelope.message);
+      throw await this.deviceRejected(envelope);
     }
     if (!response.ok) {
       const envelope = parseErrorEnvelope(await safeJson(response));
@@ -283,6 +319,10 @@ export class FieldApiClient {
     } catch (error) {
       throw new ProtocolError(path, `response was not JSON (${String(error)})`);
     }
+    // A chunk PUT is a device-authenticated request like any other, so it can
+    // be the one that triggers rotation. The chunk schema does not declare
+    // `deviceToken`, which is exactly why this is read off the raw body.
+    await this.persistRotation(raw);
     return parseUploadChunkResponse(raw, path);
   }
 
@@ -374,7 +414,7 @@ export class FieldApiClient {
     if (!response.ok) {
       const envelope = parseErrorEnvelope(await safeJson(response));
       if (response.status === 401 || response.status === 403) {
-        throw new DeviceAuthError(envelope.code, envelope.message);
+        throw await this.deviceRejected(envelope);
       }
       if (response.status === 400 && envelope.code === "refused") {
         throw new RefusedError(envelope.message);
@@ -389,7 +429,60 @@ export class FieldApiClient {
       throw new ProtocolError(path, `response was not JSON (${String(error)})`);
     }
 
+    await this.persistRotation(raw);
+
     return { raw, sent, received };
+  }
+
+  /**
+   * Store a rotated token, if the office sent one, before the caller sees the
+   * body.
+   *
+   * Order matters and this is the reason: once `_device.ts` has rotated, the
+   * old token is on a ten-minute fuse and the server will **not** rotate again
+   * for a device that comes back on its grace token. There is therefore exactly
+   * one delivery of each new token, and losing it is not recoverable by
+   * retrying. So the write is awaited here, ahead of the parse, and a failure
+   * propagates instead of being logged - a sync that "succeeded" while dropping
+   * the credential is the shape of failure that shows up ten minutes later as a
+   * revoked handset with a day's work on it.
+   */
+  private async persistRotation(raw: unknown): Promise<void> {
+    if (!raw || typeof raw !== "object") return;
+    const candidate = (raw as { deviceToken?: unknown }).deviceToken;
+    if (candidate === undefined) return;
+    const rotated = deviceTokenSchema.safeParse(candidate);
+    // An unreadable `deviceToken` is ignored rather than thrown on: the request
+    // itself succeeded, the token in hand still works for ten minutes, and
+    // failing the sync would lose the body as well as the rotation.
+    if (!rotated.success) return;
+    await this.config.onDeviceToken(rotated.data);
+  }
+
+  /**
+   * Turn a 401/403 into the error to throw, destroying the stored token first
+   * when the refusal says the credential is dead.
+   *
+   * The clear's own failure is deliberately not raised in place of the auth
+   * error: `DeviceStore.clear()` drops the in-memory copy before it touches the
+   * keystore, so this process has already stopped presenting the token either
+   * way, and the signal the app needs to act on is "sign in again" rather than
+   * "a keychain delete failed". The store retries the delete on its next read.
+   */
+  private async deviceRejected(envelope: {
+    code: FieldErrorCode;
+    message: string;
+  }): Promise<DeviceAuthError> {
+    const error = new DeviceAuthError(envelope.code, envelope.message);
+    if (error.clearsStoredToken && this.config.clearDeviceToken) {
+      try {
+        await this.config.clearDeviceToken();
+      } catch {
+        // See above. Intentionally not rethrown, and intentionally not logged:
+        // nothing useful can be printed here that does not risk the token.
+      }
+    }
+    return error;
   }
 
   private skewFrom(sent: number, received: number, serverTime: string): SkewObservation | null {

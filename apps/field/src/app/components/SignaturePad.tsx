@@ -33,7 +33,7 @@ export function SignaturePad({
 }: {
   onChange: (strokes: readonly Stroke[], aspectRatio: number) => void;
   height?: number;
-}): JSX.Element {
+}): React.JSX.Element {
   const [strokes, setStrokes] = useState<Stroke[]>([]);
   const [size, setSize] = useState({ width: 1, height });
   const current = useRef<StrokePoint[]>([]);

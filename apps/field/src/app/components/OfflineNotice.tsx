@@ -14,7 +14,7 @@ import { StyleSheet, Text, View } from "react-native";
 import { theme } from "../theme";
 import { offlineAvailability, type FieldResource } from "../../domain/working-set";
 
-export function OfflineNotice({ resource }: { resource: FieldResource }): JSX.Element | null {
+export function OfflineNotice({ resource }: { resource: FieldResource }): React.JSX.Element | null {
   const availability = offlineAvailability(resource);
   if (availability.kind === "available") return null;
 

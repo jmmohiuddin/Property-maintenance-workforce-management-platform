@@ -51,6 +51,10 @@ import {
   recordPhotoExemption,
   recordVisitLabour,
   recordJobSignature,
+  assertJobCardUnlocked,
+  getSealedJobSheet,
+  recordJobSheet,
+  purgeJobSheets,
   listPhotoExemptionReasons,
   addPhotoExemptionReason,
   setPhotoExemptionReasonActive,
@@ -672,9 +676,179 @@ async function main(): Promise<void> {
     ).includes("cannot be completed yet"),
   );
 
+
+  // ── FLD-14: the lock, and the door behind the door ───────────────────────
+  //
+  // `packages/docs/test/job-sheet-seal.test.ts` proves the whole of sealing:
+  // the digest comparison, the snapshot, the email and the amendment. What is
+  // proved HERE is the narrower thing this file is for — that the refusal lives
+  // in the domain layer and, behind it, in the database.
+  //
+  // The second half is the one that matters most. Every refusal a caller sees
+  // comes from `assertJobCardUnlocked`, which a caller has to reach in order to
+  // be refused by. `JOB-15`'s gate was found on exactly that: it was enforced
+  // in `recordJobOutcome` alone, and `transitionJob` was a second unguarded
+  // door into the same state. So this section also writes a raw INSERT that
+  // never touches this module at all, and asserts Postgres refuses it.
+  const locked = await makeJob("LOCK");
+  await withTenant(ctx, async (tx) => {
+    await recordJobAttachment(tx, ctx, {
+      jobId: locked.jobId,
+      visitId: locked.visitId,
+      kind: "photo_after",
+      storageKey: `tenants/x/jobs/${locked.jobId}/after-${RUN}.jpg`,
+    });
+    await declareNoMaterials(tx, ctx, { jobId: locked.jobId, visitId: locked.visitId });
+    await recordVisitLabour(tx, ctx, {
+      jobId: locked.jobId,
+      visitId: locked.visitId,
+      workMinutes: 40,
+    });
+  });
+
+  checkTrue(
+    "FLD-14: an unsealed job card is not locked",
+    (await refusal(() => withTenant(ctx, (tx) => assertJobCardUnlocked(tx, locked.jobId)))) ===
+      "(no error thrown)",
+  );
+
+  // Sealed directly through `recordJobSheet` rather than through
+  // `sealJobSheet`, on purpose: this file is the `@meridian/db` suite and must
+  // not reach into `@meridian/docs` for a fixture. The row is what locks the
+  // card, so writing the row is the whole of what this section needs.
+  const signoffId = await withTenant(ctx, (tx) =>
+    recordJobSignature(tx, ctx, {
+      jobId: locked.jobId,
+      visitId: locked.visitId,
+      signedByName: "Amira Khalil",
+      signedByRole: "Building manager",
+      signerEmail: `amira+${RUN}@example.ae`,
+      signatureStorageKey: `tenants/x/jobs/${locked.jobId}/sig-${RUN}.png`,
+      consentVersion: "sig-consent-2026-08-v1",
+      consentText: "Test consent wording.",
+    }),
+  ).then((r) => r.id);
+
+  const signature = await withTenant(ctx, (tx) => getJobCard(tx, locked.jobId)).then(
+    (c) => c.signature,
+  );
+  // Lower-cased on the way in. `RUN` is upper case, so this assertion is also
+  // the proof that the normalisation happens at all — the same address in two
+  // cases would otherwise be two recipients in every count that groups on it.
+  check(
+    "FLD-13: the signer's address is on the row, lower-cased",
+    signature?.signerEmail,
+    `amira+${RUN}@example.ae`.toLowerCase(),
+  );
+  check("FLD-13: so is the consent version", signature?.consentVersion, "sig-consent-2026-08-v1");
+  check("FLD-13: and the wording itself, so the row is self-describing", signature?.consentText, "Test consent wording.");
+
+  // Half a consent statement is refused. A version with no text is a pointer
+  // into a table that will have moved by the time anybody follows it.
+  const halfConsent = await withTenant(ctx, async (tx) => {
+    try {
+      await recordJobSignature(tx, ctx, {
+        jobId: locked.jobId,
+        signedByName: "Nobody",
+        signatureStorageKey: "tenants/x/none.png",
+        consentVersion: "v9",
+      });
+      return "(no error thrown)";
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  });
+  checkTrue(
+    "FLD-13: a consent version with no wording is refused",
+    halfConsent.includes("version and its text together"),
+  );
+
+  await withTenant(ctx, (tx) =>
+    recordJobSheet(tx, ctx, {
+      jobId: locked.jobId,
+      visitId: locked.visitId,
+      kind: "original",
+      reference: `ZZC-${RUN}-LOCK-JS`,
+      sequence: 0,
+      signoffId,
+      sheetFormat: "meridian-jobsheet-v1",
+      contentSha256: "a".repeat(64),
+      storageKey: `tenants/x/documents/job-sheet/2026/zzc-${RUN.toLowerCase()}-lock-js.pdf`,
+      pdfSha256: "b".repeat(64),
+      businessDate: "2026-08-14",
+      recordedAtText: "2026-08-14T11:42:00.000Z",
+    }),
+  );
+
+  const sealedRow = await withTenant(ctx, (tx) => getSealedJobSheet(tx, locked.jobId));
+  check("the sheet is on file", sealedRow?.reference, `ZZC-${RUN}-LOCK-JS`);
+
+  const lockedNow = await refusal(() =>
+    withTenant(ctx, (tx) => assertJobCardUnlocked(tx, locked.jobId)),
+  );
+  checkTrue("FLD-14: the domain layer now refuses", lockedNow.includes("card is locked"));
+  checkTrue("…naming the sheet, so the operator has somewhere to go", lockedNow.includes(`ZZC-${RUN}-LOCK-JS`));
+  checkTrue(
+    "…and saying what to do instead",
+    lockedNow.includes("reason-coded amendment"),
+  );
+
+  const cardBeforeLock = await withTenant(ctx, (tx) => getJobCard(tx, locked.jobId));
+
+  const lateMaterial = await refusal(() =>
+    withTenant(ctx, (tx) =>
+      recordJobMaterial(tx, ctx, {
+        jobId: locked.jobId,
+        description: "Too late",
+        quantity: "1",
+        unit: "ea",
+      }),
+    ),
+  );
+  checkTrue("FLD-14: a part cannot be added after signature", lateMaterial.includes("card is locked"));
+
+  const cardAfterLock = await withTenant(ctx, (tx) => getJobCard(tx, locked.jobId));
+  check("…and nothing moved", cardAfterLock.materials.length, cardBeforeLock.materials.length);
+
+  // THE DOOR BEHIND THE DOOR. A statement that never calls this module.
+  let rawRefusal = "(no error thrown)";
+  try {
+    await withTenant(ctx, (tx) =>
+      tx.insert(schema.jobAttachments).values({
+        tenantId,
+        jobId: locked.jobId,
+        kind: "photo_after",
+        storageKey: `tenants/x/jobs/${locked.jobId}/raw-${RUN}.jpg`,
+      }),
+    );
+  } catch (error) {
+    rawRefusal = messageChain(error);
+  }
+  checkTrue(
+    "FLD-14: a raw INSERT that bypasses the domain layer is refused by the database",
+    rawRefusal.includes("card is locked"),
+  );
+  check(
+    "…and no row reached the table",
+    (await withTenant(ctx, (tx) => getJobCard(tx, locked.jobId))).photos.length,
+    cardBeforeLock.photos.length,
+  );
+
   // ── Clean-up: anchored to the ids this run created ───────────────────────
   await withTenant(ctx, async (tx) => {
+    // FLD-14 first, through the one function permitted to delete a sealed
+    // sheet. Until it is gone the lock triggers refuse every delete below —
+    // which is the behaviour under test, and is why the clean-up has to say
+    // deliberately that it means to purge.
+    for (const jobId of createdJobs) {
+      await purgeJobSheets(tx, { jobId });
+    }
     if (createdJobs.length > 0) {
+      await tx
+        .delete(schema.notifications)
+        .where(
+          eq(schema.notifications.recipientAddress, `amira+${RUN}@example.ae`.toLowerCase()),
+        );
       await tx
         .delete(schema.jobCardDeclarations)
         .where(inArray(schema.jobCardDeclarations.jobId, createdJobs));

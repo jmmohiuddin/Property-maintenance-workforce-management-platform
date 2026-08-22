@@ -17,8 +17,12 @@ import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import { hash } from "@node-rs/argon2";
 import * as schema from "./schema";
-import { STANDARD_JOB_OUTCOMES } from "./domain/reference";
-import { STANDARD_PHOTO_EXEMPTION_REASONS } from "./domain/jobcard";
+import { STANDARD_DISPOSITION_REASONS, STANDARD_JOB_OUTCOMES } from "./domain/reference";
+import {
+  STANDARD_JOB_SHEET_AMENDMENT_REASONS,
+  STANDARD_PHOTO_EXEMPTION_REASONS,
+  purgeJobSheets,
+} from "./domain/jobcard";
 // M3 (`CON-13`). Same reasoning as the HR import below: a separate statement,
 // because several streams are editing this file at once.
 import { and, eq } from "drizzle-orm";
@@ -96,6 +100,21 @@ async function main(): Promise<void> {
   // foreign key. Commerce tables come first because they reference both jobs
   // and customers.
   console.log("  clearing existing data");
+
+  // FLD-14. Before everything below, and through its own function rather than
+  // the loop, because `0037` refuses a DELETE on `job_sheets` unless the
+  // transaction has said it means to purge — and a seed run that took a signed
+  // job sheet with it by accident is exactly what that refusal is for.
+  //
+  // It has to go first for a second reason: a sealed sheet locks the job card,
+  // and the triggers `0037` puts on `job_attachments`, `job_materials`,
+  // `job_card_declarations`, `job_fault_codes` and `job_signoffs` refuse every
+  // write — deletes included — while one exists. Clearing the sheets is what
+  // unlocks the rest of this list.
+  await db.transaction(async (tx) => {
+    await purgeJobSheets(tx);
+  });
+
   for (const table of [
     // Counters go first: a stale counter would keep allocating above the
     // references this seed writes, which is harmless but makes the seeded
@@ -161,6 +180,12 @@ async function main(): Promise<void> {
     schema.contracts,
     schema.communications,
     schema.leads,
+    // After `leads`, which references it. `leads.disposition_reason_id` is ON
+    // DELETE restrict against this table, which does not cascade at all, so
+    // clearing it before the leads that cite it would fail the clear-down on a
+    // foreign key the moment anybody had closed a lead. `credit_notes` is the
+    // precedent, and it is why this file names everything it writes.
+    schema.leadDispositionReasons,
     // Before the jobs and visits it hangs off. It cascades from both, so the
     // clear-down would work without it — but this file's rule is that anything
     // referencing a seeded row is named, and its reference to `fault_codes` is
@@ -170,6 +195,11 @@ async function main(): Promise<void> {
     // vocabulary it cites — that reference is ON DELETE restrict, which does
     // not cascade at all, so leaving it out would fail the clear-down here.
     schema.jobCardDeclarations,
+    // FLD-14. After `job_sheets`, which is purged above and which references
+    // this vocabulary ON DELETE restrict — that does not cascade at all, so
+    // listing it here without the purge above would fail the clear-down the
+    // first time anybody had amended a sheet. `credit_notes` is the precedent.
+    schema.jobSheetAmendmentReasons,
     schema.jobEvents,
     schema.jobVisits,
     schema.jobReports,
@@ -602,9 +632,13 @@ async function main(): Promise<void> {
   // a free-text note instead — which is the exact failure the table exists to
   // prevent, and it cannot be retrofitted once the history is written.
   //
-  // The other three vocabularies (disposition reasons, fault codes, rate card)
-  // have no standard list on purpose: they are genuinely per-business, and
-  // inventing one would be putting words in an operator's mouth.
+  // Fault codes and the rate card have no standard list on purpose: what
+  // "no cooling" is diagnosed as and what a callout is priced at are genuinely
+  // per-business, and inventing either would be putting words — or a price —
+  // in an operator's mouth. Disposition reasons are seeded below despite living
+  // in the same admin section, because the judgement call is different: the six
+  // reasons a lead is lost or parked are near-universal categories, the same
+  // way the seven `JOB-13` outcomes are, not an invented specific.
   //
   // `do nothing` on conflict so re-seeding an existing database is a no-op and
   // an administrator's edits to a label survive it.
@@ -625,6 +659,30 @@ async function main(): Promise<void> {
       .onConflictDoNothing();
   }
   console.log(`  ${STANDARD_JOB_OUTCOMES.length} standard job outcomes per tenant`);
+
+  // ── The controlled vocabulary every tenant starts with (LEAD-6) ───────────
+  //
+  // Seeded for the same reason the outcomes above are: `leads_disposition_
+  // required` refuses `lost` or `dormant` without a coded reason, so a tenant
+  // whose picker is empty on day one cannot close a single lead — not because a
+  // real reason was missing, but because nobody had typed the vocabulary in
+  // yet. `do nothing` on conflict, so re-seeding leaves an edited label alone.
+  for (const tenantId of [T1, T2]) {
+    await db
+      .insert(schema.leadDispositionReasons)
+      .values(
+        STANDARD_DISPOSITION_REASONS.map((r) => ({
+          tenantId,
+          code: r.code,
+          label: r.label,
+          appliesTo: r.appliesTo,
+          guidance: r.guidance,
+          sortOrder: r.sortOrder,
+        })),
+      )
+      .onConflictDoNothing();
+  }
+  console.log(`  ${STANDARD_DISPOSITION_REASONS.length} standard disposition reasons per tenant`);
 
   // ── Why an "after" photo may be missing (JOB-15) ──────────────────────────
   //
@@ -650,6 +708,32 @@ async function main(): Promise<void> {
   }
   console.log(
     `  ${STANDARD_PHOTO_EXEMPTION_REASONS.length} photo exemption reasons per tenant`,
+  );
+
+  // ── Why a signed job sheet may be amended (FLD-14) ────────────────────────
+  //
+  // Seeded for the same reason, and with the same thing at stake: this list is
+  // the ONLY way to correct a signed sheet. A tenant whose picker is empty on
+  // day one has a locked job card and no legitimate way to state that it is
+  // wrong — at which point somebody either edits around the lock or the record
+  // stays wrong, and both of those are worse than the mistake being corrected.
+  // `on conflict do nothing`, so re-seeding leaves an edited label be.
+  for (const tenantId of [T1, T2]) {
+    await db
+      .insert(schema.jobSheetAmendmentReasons)
+      .values(
+        STANDARD_JOB_SHEET_AMENDMENT_REASONS.map((r) => ({
+          tenantId,
+          code: r.code,
+          label: r.label,
+          description: r.description,
+          sortOrder: r.sortOrder,
+        })),
+      )
+      .onConflictDoNothing();
+  }
+  console.log(
+    `  ${STANDARD_JOB_SHEET_AMENDMENT_REASONS.length} job sheet amendment reasons per tenant`,
   );
 
   // ── The project vocabularies (PRJ-6, PRJ-7) ──────────────────────────────

@@ -12,6 +12,7 @@ import {
   addPhotoExemption,
   addRate,
   installAssetKinds,
+  installDispositions,
   installOutcomes,
   installPhotoExemptions,
   stopRate,
@@ -95,6 +96,19 @@ export function RetireButton({
 }
 
 // ── Lead disposition reasons (LEAD-6) ───────────────────────────────────────
+
+export function InstallDispositionsButton({ label }: { label: string }) {
+  const [state, formAction, pending] = useActionState(installDispositions, INITIAL);
+
+  return (
+    <form action={formAction} className="space-y-3">
+      <Feedback state={state} />
+      <SubmitButton pending={pending} pendingLabel="Adding…" className="btn btn-primary disabled:opacity-60">
+        {label}
+      </SubmitButton>
+    </form>
+  );
+}
 
 export function AddDispositionForm() {
   const [state, formAction, pending] = useActionState(addDisposition, INITIAL);

@@ -4,16 +4,20 @@ import { notFound } from "next/navigation";
 import {
   withTenant,
   getProject,
+  listPhaseJobs,
   listSubcontractors,
   projectVocabularies,
 } from "@meridian/db";
 import {
   allowedProjectTransitions,
   dubaiDateKey,
+  PRIORITY_LABEL,
+  STATUS_LABEL,
   phaseWeightGap,
   subcontractorComplianceState,
   COST_CATEGORY_LABEL,
   OPEN_SNAG_STATUSES,
+  type JobStatus,
   type SnagStatus,
 } from "@meridian/core";
 import { can } from "@meridian/auth";
@@ -76,10 +80,16 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
   const canWrite = can(session.principal, "projects:write");
   const canInvoice = can(session.principal, "invoices:create");
 
-  const { project, vocab, subcontractors } = await withTenant(
+  const { project, phaseJobs, vocab, subcontractors } = await withTenant(
     { tenantId: session.principal.tenantId, userId: session.principal.userId },
     async (tx) => ({
       project: await getProject(tx, id),
+      // `PRJ-2`. The phase table's Jobs column has always been a count and the
+      // count has always been 0, because nothing raised work from a phase. It
+      // populates on its own now; what a count cannot say is *which* jobs, and
+      // the phase who raised what is the question an operator opening this
+      // screen actually has.
+      phaseJobs: await listPhaseJobs(tx, id),
       vocab: canWrite
         ? await projectVocabularies(tx)
         : { snagTrades: [], permitAuthorities: [] },
@@ -111,6 +121,16 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
   );
 
   const margin = project.financials.margin;
+
+  // Grouped once here rather than filtered inside the table's map, which would
+  // walk the whole list once per phase. Small numbers either way, and the
+  // shape the rows want is a lookup.
+  const jobsByPhase = new Map<string, typeof phaseJobs>();
+  for (const job of phaseJobs) {
+    const existing = jobsByPhase.get(job.phaseId);
+    if (existing) jobsByPhase.set(job.phaseId, [...existing, job]);
+    else jobsByPhase.set(job.phaseId, [job]);
+  }
 
   return (
     <AppShell session={session} active="projects">
@@ -292,7 +312,7 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
                   </tr>
                 </thead>
                 <tbody>
-                  {project.phases.map((p) => (
+                  {project.phases.flatMap((p) => [
                     <tr key={p.id} className="border-b">
                       <td className="py-2.5 pr-4 tnum">{p.sequence}</td>
                       <td className="py-2.5 pr-4 font-medium">{p.name}</td>
@@ -307,8 +327,35 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
                         </span>
                       </td>
                       <td className="py-2.5 tnum">{p.jobCount}</td>
-                    </tr>
-                  ))}
+                    </tr>,
+                    // The jobs this phase raised, on their own row under it.
+                    // `PRJ-2`'s second half — "phases produce Jobs for daily
+                    // execution" — is only visible if the jobs are, and a
+                    // reference nobody can click is a reference somebody has to
+                    // retype into the jobs board.
+                    ...(jobsByPhase.get(p.id) ?? []).map((job) => (
+                      <tr key={job.jobId} className="border-b">
+                        <td />
+                        <td className="py-1.5 pr-4" colSpan={5}>
+                          <span className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                            <Link
+                              href={`/jobs/${job.jobId}`}
+                              className="tnum hover:underline"
+                              style={{ color: "var(--text-primary)" }}
+                            >
+                              {job.reference}
+                            </Link>{" "}
+                            {job.title} &middot; {STATUS_LABEL[job.status as JobStatus] ?? job.status}{" "}
+                            &middot; {PRIORITY_LABEL[job.priority]}
+                            {job.scheduledFor
+                              ? ` · ${formatDay(dubaiDateKey(job.scheduledFor))}`
+                              : ""}
+                            {job.isOutdoor ? " · outdoor" : ""}
+                          </span>
+                        </td>
+                      </tr>
+                    )),
+                  ])}
                 </tbody>
               </table>
             </div>
@@ -323,6 +370,7 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
                   sequence: p.sequence,
                   name: p.name,
                   percentComplete: p.percentComplete,
+                  serviceSlug: p.serviceSlug,
                 }))}
                 weightGap={weightGap}
               />
@@ -625,6 +673,7 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
                     <th className="py-2 pr-4 font-medium">Reference</th>
                     <th className="py-2 pr-4 font-medium">Status</th>
                     <th className="py-2 pr-4 font-medium">Expires</th>
+                    <th className="py-2 pr-4 font-medium">Document</th>
                     <th className="py-2 text-right font-medium">Fee</th>
                   </tr>
                 </thead>
@@ -650,6 +699,27 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
                         />
                       </td>
                       <td className="py-2.5 pr-4">{formatDay(p.expiresOn)}</td>
+                      <td className="py-2.5 pr-4">
+                        {/*
+                          A link to a permission-checked route, never the
+                          storage key. `SEC-8` has no public URLs and the key is
+                          an internal name whose only protection is that nobody
+                          outside the server knows it; rendered into HTML it
+                          would be in every screenshot of this screen.
+                        */}
+                        {p.documentStorageKey ? (
+                          <Link
+                            className="underline underline-offset-2"
+                            href={`/projects/${project.id}/permits/${p.id}/document`}
+                          >
+                            on file
+                          </Link>
+                        ) : (
+                          <span style={{ color: "var(--text-muted)" }}>
+                            {p.isRequired ? "none attached" : "—"}
+                          </span>
+                        )}
+                      </td>
                       <td className="py-2.5 text-right tnum">{money(p.feePaidMinor)}</td>
                     </tr>
                   ))}
@@ -668,6 +738,9 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
                   authorityLabel: p.authorityLabel,
                   permitType: p.permitType,
                   status: p.status,
+                  // Whether, not where. The panel needs to say "document on
+                  // file" in a picker; it never needs the key.
+                  hasDocument: p.documentStorageKey !== null,
                 }))}
               />
             </div>
@@ -703,6 +776,7 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
                     <th className="py-2 pr-4 font-medium">Trade</th>
                     <th className="py-2 pr-4 font-medium">Severity</th>
                     <th className="py-2 pr-4 font-medium">Status</th>
+                    <th className="py-2 pr-4 font-medium">Photographs</th>
                     <th className="py-2 font-medium">Target</th>
                   </tr>
                 </thead>
@@ -731,6 +805,30 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
                           </span>
                         ) : null}
                       </td>
+                      <td className="py-2.5 pr-4">
+                        {/* Routes, not keys — see the permit column above. */}
+                        <span className="flex gap-3 text-[13px]">
+                          {s.photoStorageKey ? (
+                            <Link
+                              className="underline underline-offset-2"
+                              href={`/projects/${project.id}/snags/${s.id}/photo/photo`}
+                            >
+                              snag
+                            </Link>
+                          ) : null}
+                          {s.closurePhotoStorageKey ? (
+                            <Link
+                              className="underline underline-offset-2"
+                              href={`/projects/${project.id}/snags/${s.id}/photo/closure`}
+                            >
+                              closure
+                            </Link>
+                          ) : null}
+                          {!s.photoStorageKey && !s.closurePhotoStorageKey ? (
+                            <span style={{ color: "var(--text-muted)" }}>none</span>
+                          ) : null}
+                        </span>
+                      </td>
                       <td className="py-2.5">{formatDay(s.targetOn)}</td>
                     </tr>
                   ))}
@@ -749,6 +847,13 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
                   sequence: s.sequence,
                   locationText: s.locationText,
                   severity: s.severity,
+                }))}
+                allSnags={project.snags.map((s) => ({
+                  id: s.id,
+                  sequence: s.sequence,
+                  locationText: s.locationText,
+                  hasPhoto: s.photoStorageKey !== null,
+                  hasClosure: s.closurePhotoStorageKey !== null,
                 }))}
               />
             </div>

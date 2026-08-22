@@ -86,7 +86,52 @@ export type TemplateId =
   // `technicianName`; sending it about a talent-pool member would tell an owner
   // that a technician they do not employ has a lapsing ticket. A message that
   // misdescribes who somebody is, is worse than no message.
-  | "talent_pool_certification_expiring";
+  | "talent_pool_certification_expiring"
+  // M5 / PRJ-5, PRJ-6, PRJ-9. The projects chase sweep, and it is TWO templates
+  // rather than one digest — the opposite call from `wps_payroll_countdown`,
+  // and for the reason that decided that one the other way.
+  //
+  // `wps_payroll_countdown` is one template because the alarm on the 2nd is the
+  // countdown of the 1st, one day later: same fact, same recipient, same
+  // action, and two templates would have meant two suppression windows with the
+  // louder message silenced by the quieter one that arrived first.
+  //
+  // These two share none of that. Retention is money the client is holding that
+  // is now due back to us, and it is actioned by an accountant raising a
+  // release invoice. An engagement without the employer's prior approval is a
+  // Law No. 7 of 2025 exposure on a site that is already running, and it is
+  // actioned by an operations manager getting a letter or stopping the crew.
+  // Different recipient sets, different deadlines, different verbs. Folded into
+  // one message, each reader would be scrolling past a section they cannot act
+  // on — and this file's own rule, stated on `contract_renewal_due` and again
+  // on `invoice_issuance_due`, is that an alert reaching someone who cannot act
+  // on it teaches everyone to skim these.
+  //
+  // Neither is a section inside `compliance_expiry`, which already carries
+  // subcontractor obligations from `HR-19`. That message is about whether an
+  // organisation's licence and insurance are current, and it goes to HR. This
+  // one is about whether one engagement was approved before it started. Same
+  // supplier, entirely different question, and merging them would put both
+  // behind one `recentlyNotified` window keyed on template and recipient — so
+  // whichever fired second would be dropped for the rest of the day.
+  | "retention_release_due"
+  // `PRJ-6`'s expiring permits ride in with `PRJ-9`'s approvals rather than
+  // taking a third template, and that IS the `wps_payroll_countdown` argument
+  // applied properly: both go to the operations manager and the owner, both say
+  // "this project is about to be stopped on site", and both are answered by the
+  // same person in the same half-hour. A third template would be a third
+  // suppression window and a third email to one inbox on one morning.
+  | "project_approvals_due"
+  // FLD-14. The contemporaneous copy of the signed job sheet.
+  //
+  // Separate from `job_completed`, and it has to be. That message announces
+  // that work finished and points at the account; this one is evidence — it is
+  // sent at the moment of signature, names the sheet, and quotes the digest of
+  // exactly what was signed. Folding it into `job_completed` would put both
+  // behind one ledger row, so a customer who had merely been told the job was
+  // done would count as having been sent what they signed. Those are different
+  // claims and only one of them is evidential.
+  | "job_sheet_signed";
 
 export interface RenderedMessage {
   readonly subject: string;
@@ -117,6 +162,29 @@ export interface TemplatePayloads {
     customerName: string;
     jobReference: string;
     jobTitle: string;
+  };
+  /**
+   * `FLD-14`: *"A copy is emailed to the customer immediately — a
+   * contemporaneous unrebutted copy is powerful evidence and is also what
+   * customers want."*
+   *
+   * The digest is in the payload because it is in the body, and it is in the
+   * body because that is the whole point of sending this now rather than later:
+   * the customer ends up holding a message, timestamped by their own mail
+   * provider, stating the fingerprint of the document they signed. If the
+   * record is ever said to have changed, the copy in their inbox settles it —
+   * without anybody having to trust this system's clock or this system's
+   * database.
+   */
+  job_sheet_signed: {
+    customerName: string;
+    signedByName: string;
+    jobReference: string;
+    jobTitle: string;
+    sheetReference: string;
+    /** SHA-256 of the canonical sheet content, lower-case hex. */
+    contentSha256: string;
+    signedAt: PayloadDate;
   };
   invoice_issued: {
     customerName: string;
@@ -564,6 +632,105 @@ export interface TemplatePayloads {
       lapsed: boolean;
     }[];
   };
+  /**
+   * `PRJ-5`. Retention falling due, or already past its due date.
+   *
+   * "Retention nobody chases is a gift to the client" is the requirement's own
+   * sentence, and it is the whole justification for this template existing:
+   * the ledger, the two-stage split and the due dates were all built, and
+   * nothing ever told anyone. Five per cent of a fit-out contract sits with the
+   * client for a year after handover, and the half that comes back at the end
+   * of the defects liability period is the half that goes unclaimed.
+   *
+   * ── WHY THE MONEY IS MINOR UNITS AND NOT A DECIMAL STRING ─────────────────
+   *
+   * Same rule as `weekly_owner_digest`. The payload is stored as JSONB and
+   * comes back out of the queue as plain JSON; a decimal string that has been
+   * through JSON is a decimal string somebody will eventually do arithmetic on.
+   * It is also, specifically here, a portfolio total — retention across a large
+   * contractor passes 2,147,483,647 fils, so it must never have been an `int4`
+   * anywhere on the way, including in the query that produced it.
+   *
+   * `daysToDue` goes negative rather than the message stopping at the due date,
+   * for the reason `contract_renewal_due` does the same: the day it falls due
+   * is the day it starts being ignored, and the message that matters is the one
+   * that arrives in March about money that fell due in January.
+   */
+  retention_release_due: {
+    recipientName: string;
+    currency: string;
+    /** Integer minor units. The sum of `entries`, computed by the caller. */
+    totalMinor: number;
+    entries: readonly {
+      projectReference: string;
+      projectName: string;
+      customerName: string;
+      /** The invoice the money was withheld from. The evidence for the claim. */
+      invoiceReference: string;
+      /** `practical_completion` releases at handover; `defects_liability` a year later. */
+      stage: "practical_completion" | "defects_liability";
+      amountMinor: number;
+      /** ISO date, as stored. Day-valued end to end. */
+      dueOn: string;
+      /** Negative means it is already overdue. */
+      daysToDue: number;
+    }[];
+  };
+  /**
+   * `PRJ-9` and `PRJ-6`. What is unapproved, and what is about to lapse.
+   *
+   * ── THE SUBCONTRACT HALF ─────────────────────────────────────────────────
+   *
+   * Dubai Law No. 7 of 2025 requires the employer's **prior** approval before
+   * subcontracting within the contracting sector. `client_approval_state`
+   * defaults to `pending` precisely so an engagement cannot be recorded as
+   * approved by accident — and until this template existed, that default was a
+   * value nothing ever read. `alreadyStarted` is the field that carries the
+   * severity: an engagement still `pending` whose start date has arrived is not
+   * late paperwork, it is work already being done on the wrong side of a
+   * statutory line, and the message says so in those words.
+   *
+   * `refused` is carried alongside `pending` rather than filtered out. It is
+   * rarer and worse — the employer was asked and said no, and the row still has
+   * a start date on it.
+   *
+   * ── THE PERMIT HALF ──────────────────────────────────────────────────────
+   *
+   * `blockingPermits` treats a required permit that is approved and expired as
+   * blocking. With nothing watching the date, the way that rule is discovered
+   * is as a button that refuses on the morning the crew is at the gate. Here it
+   * is a date somebody was told about in advance instead.
+   */
+  project_approvals_due: {
+    recipientName: string;
+    currency: string;
+    subcontracts: readonly {
+      projectReference: string;
+      projectName: string;
+      subcontractorName: string;
+      scope: string;
+      valueMinor: number;
+      /** `pending` — never asked or never answered. `refused` — asked and refused. */
+      approvalState: "pending" | "refused";
+      /** ISO date, or null where the engagement has no start date recorded. */
+      startsOn: string | null;
+      /** The start date has passed and the approval has not arrived. */
+      alreadyStarted: boolean;
+      /** Days since `startsOn`. Null when there is no start date. */
+      daysSinceStart: number | null;
+    }[];
+    permits: readonly {
+      projectReference: string;
+      projectName: string;
+      authorityLabel: string;
+      permitType: string;
+      referenceNumber: string | null;
+      /** ISO date, as stored. */
+      expiresOn: string;
+      /** Negative means it has already lapsed and is blocking work today. */
+      daysRemaining: number;
+    }[];
+  };
 }
 
 /**
@@ -678,6 +845,41 @@ export const TEMPLATES: {
       `${absoluteUrl("/portal")}\n\n` +
       `If anything is not right, tell us within the workmanship warranty period and we will return ` +
       `and put it right at no charge.` +
+      sign,
+  }),
+
+  /**
+   * `FLD-14`'s copy.
+   *
+   * ── WHAT THIS MESSAGE DOES NOT DO, SAID RATHER THAN IMPLIED ───────────────
+   *
+   * It does not attach the PDF. `Transport` in `transport.ts` carries a channel,
+   * an address, a subject and a body, and has no attachment concept — so there
+   * is nowhere to put one, and inventing a transport field from inside one
+   * template would change every provider's contract for the sake of one
+   * message.
+   *
+   * The body is therefore written so the message is evidence without it: it
+   * names the sheet, quotes the digest, and says the sheet cannot be edited. A
+   * customer who keeps or forwards this email holds a dated statement of what
+   * they signed. That is weaker than the attachment and it is a long way from
+   * nothing — and the gap is written down here rather than left for a reader to
+   * infer from an attachment that never arrives.
+   */
+  job_sheet_signed: (p) => ({
+    subject: `Your signed job sheet ${p.sheetReference} — ${p.jobReference}`,
+    body:
+      `Dear ${p.customerName},\n\n` +
+      `Thank you. ${p.signedByName} signed for "${p.jobTitle}" (${p.jobReference}) on ` +
+      `${dateTime(p.signedAt)}.\n\n` +
+      `Job sheet: ${p.sheetReference}\n` +
+      `Content fingerprint (SHA-256): ${p.contentSha256}\n\n` +
+      `That fingerprint was taken from the exact sheet that was on screen at the moment it was ` +
+      `signed. The sheet is stored unchanged and cannot be edited by us or by anyone else; if ` +
+      `something on it needs correcting we raise a separate, reason-coded amendment and send you ` +
+      `that as well. Keep this email — it is your own dated copy of what was agreed.\n\n` +
+      `The sheet is on your account here:\n${absoluteUrl("/portal")}\n\n` +
+      `If anything on it is not right, reply to this message and tell us what is wrong.` +
       sign,
   }),
 
@@ -1449,6 +1651,139 @@ export const TEMPLATES: {
       `${absoluteUrl("/recruitment/pool")}` +
       sign,
   }),
+
+  retention_release_due: (p) => {
+    // Consequence order, the same rule as `compliance_expiry` and
+    // `invoice_issuance_due`: money already overdue first, money about to fall
+    // due after it. A list sorted by date alone puts a claim that fell due last
+    // week above one that fell due last February whenever the older project
+    // started later, and the older one is the one nobody has chased.
+    const overdue = p.entries.filter((e) => e.daysToDue < 0);
+    const upcoming = p.entries.filter((e) => e.daysToDue >= 0);
+
+    const line = (e: TemplatePayloads["retention_release_due"]["entries"][number]): string =>
+      `  ${e.projectReference}  ${e.projectName}\n` +
+      `    ${e.customerName} · withheld on ${e.invoiceReference} · ` +
+      `${e.stage === "practical_completion" ? "practical completion" : "end of defects liability"}\n` +
+      `    ${formatMoney(e.amountMinor, p.currency)} · ` +
+      (e.daysToDue < 0
+        ? `DUE ${Math.abs(e.daysToDue)} day${Math.abs(e.daysToDue) === 1 ? "" : "s"} AGO ` +
+          `(${date(e.dueOn)})`
+        : e.daysToDue === 0
+          ? `due today (${date(e.dueOn)})`
+          : `due in ${e.daysToDue} day${e.daysToDue === 1 ? "" : "s"} (${date(e.dueOn)})`);
+
+    return {
+      subject:
+        overdue.length > 0
+          ? `${formatMoney(p.totalMinor, p.currency)} retention to claim — ` +
+            `${overdue.length} already overdue`
+          : `${formatMoney(p.totalMinor, p.currency)} retention falling due`,
+      body:
+        `${p.recipientName},\n` +
+        (overdue.length > 0
+          ? `\nALREADY DUE (${overdue.length})\n` +
+            overdue.map(line).join("\n") +
+            `\n  Nothing here is released by the system. It is released when somebody invoices ` +
+            `for it and the client pays.\n`
+          : "") +
+        (upcoming.length > 0
+          ? `\nFALLING DUE (${upcoming.length})\n` + upcoming.map(line).join("\n") + "\n"
+          : "") +
+        `\nTotal outstanding on this list: ${formatMoney(p.totalMinor, p.currency)}\n\n` +
+        // The sentence the requirement itself uses, said plainly to the person
+        // who can act on it. This is the whole reason the template exists.
+        `Retention nobody chases is a gift to the client. The second half of every withholding ` +
+        `comes back at the end of the defects liability period, twelve months after handover, ` +
+        `which is long enough for it to have been forgotten by everyone except the client.\n\n` +
+        `${absoluteUrl("/projects")}` +
+        sign,
+    };
+  },
+
+  project_approvals_due: (p) => {
+    // The refusals first, then the engagements already running without an
+    // answer, then the ones not yet started, then the permits. Strict
+    // consequence order: a refused engagement on site is unlawful today, a
+    // pending one that has started is unlawful today and arguably worse because
+    // nobody has even been asked, and a pending one starting next month is
+    // still ordinary paperwork.
+    const refused = p.subcontracts.filter((s) => s.approvalState === "refused");
+    const running = p.subcontracts.filter(
+      (s) => s.approvalState === "pending" && s.alreadyStarted,
+    );
+    const pending = p.subcontracts.filter(
+      (s) => s.approvalState === "pending" && !s.alreadyStarted,
+    );
+
+    const subLine = (
+      s: TemplatePayloads["project_approvals_due"]["subcontracts"][number],
+    ): string =>
+      `  ${s.projectReference}  ${s.projectName}\n` +
+      `    ${s.subcontractorName} · ${formatMoney(s.valueMinor, p.currency)}\n` +
+      `    ${s.scope.length > 120 ? `${s.scope.slice(0, 117)}...` : s.scope}\n` +
+      `    ${
+        s.startsOn === null
+          ? "no start date recorded"
+          : s.alreadyStarted
+            ? `started ${date(s.startsOn)}` +
+              (s.daysSinceStart === null
+                ? ""
+                : ` — ${s.daysSinceStart} day${s.daysSinceStart === 1 ? "" : "s"} ago`)
+            : `starts ${date(s.startsOn)}`
+      }`;
+
+    const permitLine = (
+      q: TemplatePayloads["project_approvals_due"]["permits"][number],
+    ): string =>
+      `  ${q.projectReference}  ${q.projectName}\n` +
+      `    ${q.authorityLabel} · ${q.permitType}` +
+      (q.referenceNumber ? ` · ${q.referenceNumber}` : "") +
+      `\n    ${remaining(q.daysRemaining)} (${date(q.expiresOn)})`;
+
+    const unlawful = refused.length + running.length;
+    const lapsed = p.permits.filter((q) => q.daysRemaining < 0).length;
+
+    return {
+      subject:
+        unlawful > 0
+          ? `URGENT: ${unlawful} subcontract${unlawful === 1 ? "" : "s"} running without the ` +
+            `client's approval`
+          : lapsed > 0
+            ? `${lapsed} required permit${lapsed === 1 ? "" : "s"} have lapsed`
+            : `${p.subcontracts.length} subcontract approval(s) and ${p.permits.length} ` +
+              `permit(s) to chase`,
+      body:
+        `${p.recipientName},\n` +
+        (refused.length > 0
+          ? `\nAPPROVAL REFUSED (${refused.length}) — the client has said no and the engagement ` +
+            `is still on the project\n` +
+            refused.map(subLine).join("\n") +
+            `\n  Either the scope moves to somebody the client will accept, or the refusal is ` +
+            `overturned in writing. Continuing on a refusal is the one state with no defence.\n`
+          : "") +
+        (running.length > 0
+          ? `\nSTARTED WITHOUT APPROVAL (${running.length})\n` +
+            running.map(subLine).join("\n") +
+            `\n  Dubai Law No. 7 of 2025 requires the employer's PRIOR approval before ` +
+            `subcontracting. These start dates have passed, so the approval cannot be prior any ` +
+            `more — get it in writing today and record the reference against the engagement.\n`
+          : "") +
+        (pending.length > 0
+          ? `\nAWAITING APPROVAL, NOT YET STARTED (${pending.length})\n` +
+            pending.map(subLine).join("\n") +
+            `\n  Still in time. This is the cheap half of this email.\n`
+          : "") +
+        (p.permits.length > 0
+          ? `\nREQUIRED PERMITS EXPIRING (${p.permits.length})\n` +
+            p.permits.map(permitLine).join("\n") +
+            `\n  A required permit that has expired blocks the project from going on site, even ` +
+            `though it still reads as approved. Renew it before somebody finds out at the gate.\n`
+          : "") +
+        `\n${absoluteUrl("/projects")}` +
+        sign,
+    };
+  },
 };
 
 /**

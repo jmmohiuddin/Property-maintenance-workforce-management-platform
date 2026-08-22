@@ -466,6 +466,12 @@ export const projectPermits = pgTable(
     /** Object-storage key for the permit itself. Files never live in Postgres. */
     documentStorageKey: text("document_storage_key"),
     notes: text("notes"),
+    /**
+     * `PRJ-6`. When the expiry chase last went out about this permit. NULL is
+     * "never asked" and sorts first. See 0036 for why this is one timestamp
+     * rather than a ladder of rungs.
+     */
+    lastRemindedAt: timestamp("last_reminded_at", { withTimezone: true }),
     ...timestamps,
   },
   (t) => [
@@ -617,12 +623,26 @@ export const projectSubcontracts = pgTable(
     startsOn: date("starts_on"),
     endsOn: date("ends_on"),
     notes: text("notes"),
+    /**
+     * `PRJ-9`. When the approval chase last went out about this engagement.
+     * NULL is "never asked". The default on `client_approval_state` is
+     * `pending` precisely so an engagement cannot slip through unrecorded, and
+     * this column is what turns that default into something anybody hears
+     * about.
+     */
+    lastRemindedAt: timestamp("last_reminded_at", { withTimezone: true }),
     ...timestamps,
   },
   (t) => [
     uniqueIndex("project_subcontracts_key").on(t.tenantId, t.projectId, t.subcontractorId, t.scope),
     index("project_subcontracts_project_idx").on(t.tenantId, t.projectId),
     index("project_subcontracts_sub_idx").on(t.tenantId, t.subcontractorId),
+    // The chase list: unapproved engagements, least recently asked about first.
+    index("project_subcontracts_approval_idx").on(
+      t.tenantId,
+      t.clientApprovalState,
+      t.lastRemindedAt,
+    ),
   ],
 );
 

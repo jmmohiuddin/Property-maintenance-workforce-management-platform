@@ -2,7 +2,13 @@ import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
 import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
 import { writeAuditNote } from "./staff";
-import { UserFacingError, toDecimalString } from "@meridian/core";
+import {
+  MATERIAL_SOURCES,
+  UserFacingError,
+  isMaterialSource,
+  toDecimalString,
+  type MaterialSource,
+} from "@meridian/core";
 
 /**
  * The job card, and the gate on completing a job (`JOB-15`).
@@ -326,6 +332,11 @@ export interface JobSignature {
   readonly satisfactionRating: number | null;
   readonly comments: string | null;
   readonly signedAt: Date;
+  /** Where the `FLD-14` copy was sent. Null on a signature captured before 0037. */
+  readonly signerEmail: string | null;
+  /** The wording the signer agreed to, and its version (`FLD-13`). */
+  readonly consentVersion: string | null;
+  readonly consentText: string | null;
 }
 
 /** Which of `JOB-15`'s conditions is not yet met. */
@@ -472,6 +483,9 @@ export async function getJobCard(tx: TenantScopedTx, jobId: string): Promise<Job
       satisfactionRating: schema.jobSignoffs.satisfactionRating,
       comments: schema.jobSignoffs.comments,
       signedAt: schema.jobSignoffs.signedAt,
+      signerEmail: schema.jobSignoffs.signerEmail,
+      consentVersion: schema.jobSignoffs.consentVersion,
+      consentText: schema.jobSignoffs.consentText,
     })
     .from(schema.jobSignoffs)
     .where(and(eq(schema.jobSignoffs.jobId, jobId), isNull(schema.jobSignoffs.deletedAt)))
@@ -517,6 +531,9 @@ export async function getJobCard(tx: TenantScopedTx, jobId: string): Promise<Job
           satisfactionRating: signature.satisfactionRating,
           comments: signature.comments,
           signedAt: signature.signedAt,
+          signerEmail: signature.signerEmail,
+          consentVersion: signature.consentVersion,
+          consentText: signature.consentText,
         }
       : null,
     gaps,
@@ -627,6 +644,7 @@ export async function recordJobAttachment(
   }
 
   await requireJob(tx, input.jobId);
+  await assertJobCardUnlocked(tx, input.jobId);
   await requireVisitOnJob(tx, input.jobId, input.visitId);
 
   const inserted = await tx
@@ -675,6 +693,16 @@ export interface RecordMaterialInput {
   readonly unitPriceMinor?: number | null;
   readonly currency?: string;
   readonly isBillable?: boolean;
+  /**
+   * `FLD-9`: where the part came from. One of `MATERIAL_SOURCES`.
+   *
+   * Optional here and nullable in the column, because the web console's
+   * material form has never collected it. Undefined means "not recorded"; it
+   * does NOT mean van stock, and nothing below supplies a default.
+   */
+  readonly source?: MaterialSource | null;
+  /** `FLD-9`. Null for anything without one, which is most consumables. */
+  readonly serialNumber?: string | null;
 }
 
 /**
@@ -698,7 +726,22 @@ export async function recordJobMaterial(
     throw new UserFacingError("A material line needs a quantity greater than zero.");
   }
 
+  // Refused rather than dropped. The column is CHECKed, so an unknown value
+  // would fail at the driver with a constraint name and no explanation; this
+  // is the same refusal with a sentence attached. It is deliberately NOT a
+  // silent coercion to null — that is the exact failure this whole change
+  // exists to undo, and reintroducing it one layer up would be worse, because
+  // the value would now be dropped by code that visibly knows about it.
+  const source = input.source ?? null;
+  if (source !== null && !isMaterialSource(source)) {
+    throw new UserFacingError(
+      `"${source}" is not somewhere a part can come from. Expected one of: ` +
+        `${MATERIAL_SOURCES.join(", ")}.`,
+    );
+  }
+
   await requireJob(tx, input.jobId);
+  await assertJobCardUnlocked(tx, input.jobId);
   await requireVisitOnJob(tx, input.jobId, input.visitId);
 
   const inserted = await tx
@@ -708,6 +751,8 @@ export async function recordJobMaterial(
       jobId: input.jobId,
       visitId: input.visitId ?? null,
       sku: input.sku?.trim() || null,
+      source,
+      serialNumber: input.serialNumber?.trim() || null,
       description,
       quantity: input.quantity,
       unit: input.unit?.trim() || "ea",
@@ -740,7 +785,17 @@ export async function recordJobMaterial(
     tableName: "job_materials",
     recordId: row.id,
     action: "material",
-    detail: { jobId: input.jobId, description, quantity: input.quantity, sku: input.sku ?? null },
+    detail: {
+      jobId: input.jobId,
+      description,
+      quantity: input.quantity,
+      sku: input.sku ?? null,
+      // `FLD-9`. On the audit row as well as the column, because provenance is
+      // the thing a warranty argument reaches for and the argument arrives
+      // after somebody has edited or voided the job card.
+      source,
+      serialNumber: input.serialNumber?.trim() || null,
+    },
   });
 
   return { id: row.id };
@@ -764,6 +819,7 @@ export async function declareNoMaterials(
   input: { jobId: string; visitId?: string | null; note?: string | null },
 ): Promise<void> {
   await requireJob(tx, input.jobId);
+  await assertJobCardUnlocked(tx, input.jobId);
   await requireVisitOnJob(tx, input.jobId, input.visitId);
 
   const existing = await tx
@@ -819,6 +875,7 @@ export async function recordPhotoExemption(
   input: { jobId: string; visitId?: string | null; reasonCode: string; note?: string | null },
 ): Promise<{ reasonCode: string; reasonLabel: string }> {
   await requireJob(tx, input.jobId);
+  await assertJobCardUnlocked(tx, input.jobId);
   await requireVisitOnJob(tx, input.jobId, input.visitId);
 
   const reasonRows = await tx
@@ -905,6 +962,7 @@ export async function recordVisitLabour(
   },
 ): Promise<void> {
   await requireJob(tx, input.jobId);
+  await assertJobCardUnlocked(tx, input.jobId);
   await requireVisitOnJob(tx, input.jobId, input.visitId);
 
   if (!Number.isInteger(input.workMinutes) || input.workMinutes < 0) {
@@ -971,12 +1029,53 @@ export async function recordJobSignature(
     signatureStorageKey: string;
     satisfactionRating?: number | null;
     comments?: string | null;
+    /**
+     * Where the contemporaneous copy goes (`FLD-13`, `FLD-14`).
+     *
+     * Captured at the pad rather than taken from the customer record, because
+     * the person signing at a site is frequently not the person the invoices go
+     * to. Optional, because a signer who declines to give an address must still
+     * be able to sign — `sealJobSheet` falls back to the customer's billing
+     * address and reports when there was nowhere at all to send the copy.
+     */
+    signerEmail?: string | null;
+    /**
+     * The consent statement rendered above the pad (`FLD-13`), versioned.
+     *
+     * Both halves or neither. A version with no text is a pointer into a table
+     * that will have moved by the time anybody follows it; text with no version
+     * cannot be grouped when the wording changes and somebody needs to know
+     * which signatures were given under which. The pair is what makes the row
+     * self-describing, and it is what the sheet prints and the digest covers.
+     */
+    consentVersion?: string | null;
+    consentText?: string | null;
   },
 ): Promise<{ id: string }> {
   const name = input.signedByName.trim();
   if (!name) throw new UserFacingError("A signature needs the name of the person who gave it.");
   if (!input.signatureStorageKey.trim()) {
     throw new Error("A signature needs a storage key; the image is written before the row is.");
+  }
+
+  const consentVersion = input.consentVersion?.trim() || null;
+  const consentText = input.consentText?.trim() || null;
+  if (Boolean(consentVersion) !== Boolean(consentText)) {
+    throw new Error(
+      "A consent statement is a version and its text together. Half of one records what somebody " +
+        "agreed to in a form nobody can read back.",
+    );
+  }
+
+  const signerEmail = input.signerEmail?.trim().toLowerCase() || null;
+  // Deliberately shallow. A full address grammar here would reject real
+  // addresses at a signature pad, and the queue reports an undeliverable
+  // message honestly; what this catches is the field having collected a name or
+  // a phone number, which would silently send the copy nowhere.
+  if (signerEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(signerEmail)) {
+    throw new UserFacingError(
+      `"${input.signerEmail?.trim()}" is not an email address. The signed copy has to go somewhere.`,
+    );
   }
   if (
     input.satisfactionRating !== null &&
@@ -989,6 +1088,7 @@ export async function recordJobSignature(
   }
 
   await requireJob(tx, input.jobId);
+  await assertJobCardUnlocked(tx, input.jobId);
   await requireVisitOnJob(tx, input.jobId, input.visitId);
 
   const inserted = await tx
@@ -1002,6 +1102,9 @@ export async function recordJobSignature(
       signatureStorageKey: input.signatureStorageKey,
       satisfactionRating: input.satisfactionRating ?? null,
       comments: input.comments?.trim() || null,
+      signerEmail,
+      consentVersion,
+      consentText,
     })
     .returning({ id: schema.jobSignoffs.id });
 
@@ -1016,4 +1119,751 @@ export async function recordJobSignature(
   });
 
   return { id: row.id };
+}
+
+// ── The signed job sheet (FLD-14) ───────────────────────────────────────────
+
+/**
+ * `FLD-14`, and what it turns a signature into.
+ *
+ * "Store a SHA-256 hash of the exact rendered job sheet that was on screen at
+ * the moment of signing, plus an immutable PDF snapshot of it. Without this the
+ * signature proves nothing, because 'signed a job sheet' is meaningless if the
+ * job sheet is mutable afterwards. After signature the job record is locked;
+ * corrections happen only as a new, linked, reason-coded amendment. Written to
+ * versioned, immutable object storage. A copy is emailed to the customer
+ * immediately."
+ *
+ * The rendering, the hashing, the storing and the email are in
+ * `@meridian/docs` — `job-sheet.ts` and `job-sheet-seal.ts` — because they need
+ * a PDF writer, an object store and the notification queue, and none of those
+ * belong in the database package. What lives here is the part that has to be
+ * true regardless of which client is calling: what the sheet is made of, the
+ * row that records it, and **the lock**.
+ *
+ * ── WHY THE LOCK IS HERE AND NOT IN A FORM ──────────────────────────────────
+ *
+ * The same reason `JOB-15`'s gate ended up on `transitionJob` itself. The field
+ * app reaches these rows through an API, so a rule living in a React component
+ * protects nothing from the client that matters most. `assertJobCardUnlocked`
+ * below is called by every write path in this file, and `0037` puts triggers on
+ * the underlying tables as the backstop for the caller that has not been
+ * written yet.
+ *
+ * ── WHY AN AMENDMENT DOES NOT UNLOCK ANYTHING ───────────────────────────────
+ *
+ * "Corrections happen only as a new, linked, reason-coded amendment" is
+ * satisfied by a second document, not by a temporary unlock. Unlock-edit-reseal
+ * would leave the first artefact — the one the customer holds, the one whose
+ * hash was recorded — evidencing a position the business no longer claims. That
+ * is the mutable job sheet the requirement exists to forbid, arrived at by a
+ * more respectable-looking route.
+ */
+
+/**
+ * The list every tenant starts with.
+ *
+ * Seeded rather than left to an administrator, for the reason
+ * `STANDARD_PHOTO_EXEMPTION_REASONS` gives: a controlled list that ships empty
+ * is a picker with nothing in it, and the operator faced with one writes the
+ * reason into the note field instead — which is the free text the vocabulary
+ * exists to prevent, and `FLD-14` says "reason-coded" precisely to forbid it.
+ *
+ * Six entries. Each is a genuinely different thing to have gone wrong, because
+ * the question this vocabulary is for is *which* of them is happening: a
+ * company amending sheets because parts were mis-recorded has a stock problem,
+ * one amending them because the work was described wrongly has a training
+ * problem, and one amending them because the customer disputes what they signed
+ * has neither — it has a dispute, and it needs to be countable separately.
+ *
+ * There is no "other". An amendment vocabulary with an escape hatch collects
+ * every amendment in the escape hatch within a quarter.
+ */
+export const STANDARD_JOB_SHEET_AMENDMENT_REASONS: readonly {
+  code: string;
+  label: string;
+  description: string;
+  sortOrder: number;
+}[] = [
+  {
+    code: "materials_misrecorded",
+    label: "Parts recorded wrongly",
+    description:
+      "A part, quantity or unit on the signed sheet does not match what was actually fitted or consumed.",
+    sortOrder: 10,
+  },
+  {
+    code: "labour_misrecorded",
+    label: "Time recorded wrongly",
+    description: "The time on the tools or travelling was entered incorrectly against the visit.",
+    sortOrder: 20,
+  },
+  {
+    code: "work_described_wrongly",
+    label: "Work described wrongly",
+    description:
+      "The description of the fault or of the work carried out does not match what was done.",
+    sortOrder: 30,
+  },
+  {
+    code: "wrong_outcome_or_fault_code",
+    label: "Wrong outcome or fault code",
+    description: "The outcome, reported fault or diagnosed fault on the sheet is the wrong code.",
+    sortOrder: 40,
+  },
+  {
+    code: "customer_dispute",
+    label: "Customer disputes what was signed",
+    description:
+      "The customer has challenged the record after signing and the company's position is being stated on file.",
+    sortOrder: 50,
+  },
+  {
+    code: "signed_in_error",
+    label: "Signed against the wrong job or by the wrong person",
+    description:
+      "The sheet was signed against a job it does not describe, or by somebody without authority to accept the work.",
+    sortOrder: 60,
+  },
+];
+
+export interface JobSheetAmendmentReason {
+  readonly id: string;
+  readonly code: string;
+  readonly label: string;
+  readonly description: string | null;
+  readonly isActive: boolean;
+}
+
+/** The picker, or the whole list. Active only by default — see `listPhotoExemptionReasons`. */
+export async function listJobSheetAmendmentReasons(
+  tx: TenantScopedTx,
+  options: { activeOnly?: boolean } = {},
+): Promise<readonly JobSheetAmendmentReason[]> {
+  const rows = await tx
+    .select({
+      id: schema.jobSheetAmendmentReasons.id,
+      code: schema.jobSheetAmendmentReasons.code,
+      label: schema.jobSheetAmendmentReasons.label,
+      description: schema.jobSheetAmendmentReasons.description,
+      isActive: schema.jobSheetAmendmentReasons.isActive,
+    })
+    .from(schema.jobSheetAmendmentReasons)
+    .where(
+      options.activeOnly === false
+        ? sql`true`
+        : eq(schema.jobSheetAmendmentReasons.isActive, true),
+    )
+    .orderBy(
+      asc(schema.jobSheetAmendmentReasons.sortOrder),
+      asc(schema.jobSheetAmendmentReasons.label),
+    );
+
+  return rows.map((r) => ({
+    id: r.id,
+    code: r.code,
+    label: r.label,
+    description: r.description,
+    isActive: r.isActive,
+  }));
+}
+
+/** Add a reason, or reword one that is already there (`ADM-10`). */
+export async function addJobSheetAmendmentReason(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: { code: string; label: string; description?: string | null; sortOrder?: number },
+): Promise<void> {
+  await tx.execute(sql`
+    insert into job_sheet_amendment_reasons
+      (tenant_id, code, label, description, sort_order)
+    values (
+      ${ctx.tenantId}::uuid,
+      ${input.code},
+      ${input.label},
+      ${input.description ?? null},
+      ${input.sortOrder ?? 100}
+    )
+    on conflict (tenant_id, code) do update
+      set label = excluded.label,
+          description = excluded.description,
+          sort_order = excluded.sort_order,
+          is_active = true
+  `);
+}
+
+/**
+ * Retire or restore a reason. Never delete one.
+ *
+ * `job_sheets` carries a composite foreign key to this table with ON DELETE
+ * restrict, so a reason cited by a sealed amendment cannot be removed without
+ * rewriting that amendment — and a sealed amendment cannot be rewritten at all.
+ */
+export async function setJobSheetAmendmentReasonActive(
+  tx: TenantScopedTx,
+  reasonId: string,
+  isActive: boolean,
+): Promise<void> {
+  await tx.execute(sql`
+    update job_sheet_amendment_reasons set is_active = ${isActive} where id = ${reasonId}::uuid
+  `);
+}
+
+/** Install the standard list for a tenant that has none. `on conflict do nothing`. */
+export async function installStandardJobSheetAmendmentReasons(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+): Promise<number> {
+  let added = 0;
+  for (const reason of STANDARD_JOB_SHEET_AMENDMENT_REASONS) {
+    const inserted = (await tx.execute<{ id: string }>(sql`
+      insert into job_sheet_amendment_reasons
+        (tenant_id, code, label, description, sort_order)
+      values (
+        ${ctx.tenantId}::uuid,
+        ${reason.code},
+        ${reason.label},
+        ${reason.description},
+        ${reason.sortOrder}
+      )
+      on conflict (tenant_id, code) do nothing
+      returning id
+    `)) as unknown as { id: string }[];
+    if (inserted.length > 0) added++;
+  }
+  return added;
+}
+
+/** One sealed sheet — the original, or an amendment linked to it. */
+export interface JobSheetRow {
+  readonly id: string;
+  readonly jobId: string;
+  readonly visitId: string | null;
+  readonly kind: "original" | "amendment";
+  readonly reference: string;
+  readonly sequence: number;
+  readonly signoffId: string | null;
+  readonly sheetFormat: string;
+  readonly contentSha256: string;
+  readonly storageKey: string;
+  readonly pdfSha256: string;
+  readonly businessDate: string;
+  /** The `recordedOfflineAt` line the digest covers, verbatim. */
+  readonly recordedAtText: string;
+  readonly amendsSheetId: string | null;
+  readonly amendmentReasonCode: string | null;
+  /** From the vocabulary, left-joined: a retired reason still renders. */
+  readonly amendmentReasonLabel: string | null;
+  readonly amendmentDetail: string | null;
+  readonly sealedAt: Date;
+}
+
+/**
+ * Every sheet on a job, original first.
+ *
+ * Ordered by `sequence` rather than by `sealed_at`. Two amendments raised in
+ * the same second would otherwise render in an order that depends on how the
+ * timestamps rounded, and the numbered sequence is the thing the references
+ * (`-A1`, `-A2`) are built from.
+ */
+export async function listJobSheets(
+  tx: TenantScopedTx,
+  jobId: string,
+): Promise<readonly JobSheetRow[]> {
+  const rows = await tx
+    .select({
+      id: schema.jobSheets.id,
+      jobId: schema.jobSheets.jobId,
+      visitId: schema.jobSheets.visitId,
+      kind: schema.jobSheets.kind,
+      reference: schema.jobSheets.reference,
+      sequence: schema.jobSheets.sequence,
+      signoffId: schema.jobSheets.signoffId,
+      sheetFormat: schema.jobSheets.sheetFormat,
+      contentSha256: schema.jobSheets.contentSha256,
+      storageKey: schema.jobSheets.storageKey,
+      pdfSha256: schema.jobSheets.pdfSha256,
+      businessDate: schema.jobSheets.businessDate,
+      recordedAtText: schema.jobSheets.recordedAtText,
+      amendsSheetId: schema.jobSheets.amendsSheetId,
+      amendmentReasonCode: schema.jobSheets.amendmentReasonCode,
+      // Left, not inner: an amendment raised before somebody retired the code
+      // must still render. Retiring a vocabulary entry rewrites the picker,
+      // never the history.
+      amendmentReasonLabel: schema.jobSheetAmendmentReasons.label,
+      amendmentDetail: schema.jobSheets.amendmentDetail,
+      sealedAt: schema.jobSheets.sealedAt,
+    })
+    .from(schema.jobSheets)
+    .leftJoin(
+      schema.jobSheetAmendmentReasons,
+      and(
+        eq(schema.jobSheetAmendmentReasons.tenantId, schema.jobSheets.tenantId),
+        eq(schema.jobSheetAmendmentReasons.code, schema.jobSheets.amendmentReasonCode),
+      ),
+    )
+    .where(eq(schema.jobSheets.jobId, jobId))
+    .orderBy(asc(schema.jobSheets.sequence));
+
+  return rows.map((r) => ({
+    id: r.id,
+    jobId: r.jobId,
+    visitId: r.visitId,
+    kind: r.kind as "original" | "amendment",
+    reference: r.reference,
+    sequence: r.sequence,
+    signoffId: r.signoffId,
+    sheetFormat: r.sheetFormat,
+    contentSha256: r.contentSha256,
+    storageKey: r.storageKey,
+    pdfSha256: r.pdfSha256,
+    businessDate: r.businessDate,
+    recordedAtText: r.recordedAtText,
+    amendsSheetId: r.amendsSheetId,
+    amendmentReasonCode: r.amendmentReasonCode,
+    amendmentReasonLabel: r.amendmentReasonLabel,
+    amendmentDetail: r.amendmentDetail,
+    sealedAt: r.sealedAt,
+  }));
+}
+
+/** The signed original, or null when this job has never been signed off. */
+export async function getSealedJobSheet(
+  tx: TenantScopedTx,
+  jobId: string,
+): Promise<JobSheetRow | null> {
+  const sheets = await listJobSheets(tx, jobId);
+  return sheets.find((s) => s.kind === "original") ?? null;
+}
+
+/**
+ * Refuse to change a job card that has been signed for (`FLD-14`).
+ *
+ * Called by every write path in this file. The refusal names the sheet, because
+ * "this job is locked" without a reference is a sentence that leaves the
+ * operator with nowhere to go — and the next thing they need is the document,
+ * so that they can decide whether an amendment is warranted.
+ *
+ * `0037` puts the same rule on the tables themselves. That is not redundancy
+ * for its own sake: this function produces the sentence, and the trigger
+ * produces the guarantee. A caller written next year that does not know this
+ * function exists still cannot write.
+ */
+export async function assertJobCardUnlocked(tx: TenantScopedTx, jobId: string): Promise<void> {
+  const sealed = await getSealedJobSheet(tx, jobId);
+  if (!sealed) return;
+
+  throw new UserFacingError(
+    `This job was signed off on job sheet ${sealed.reference} and its card is locked. ` +
+      `What was signed cannot be changed — that is what makes the signature worth anything. ` +
+      `Record a reason-coded amendment instead; it is filed alongside the original, which stands.`,
+  );
+}
+
+export interface RecordJobSheetInput {
+  readonly jobId: string;
+  readonly visitId?: string | null;
+  readonly kind: "original" | "amendment";
+  readonly reference: string;
+  readonly sequence: number;
+  readonly signoffId?: string | null;
+  readonly sheetFormat: string;
+  readonly contentSha256: string;
+  readonly storageKey: string;
+  readonly pdfSha256: string;
+  /** `YYYY-MM-DD`, Dubai. Never derived from `new Date().toISOString()`. */
+  readonly businessDate: string;
+  /** The `recordedOfflineAt` line that went into `contentSha256`, verbatim. */
+  readonly recordedAtText: string;
+  readonly amendsSheetId?: string | null;
+  readonly amendmentReasonCode?: string | null;
+  readonly amendmentDetail?: string | null;
+}
+
+/**
+ * Write the row that records a sealed sheet.
+ *
+ * Called from `@meridian/docs` inside the same transaction as the signature, so
+ * a sheet cannot exist without the signature it seals and a signature cannot
+ * exist without the sheet that gives it meaning. The bytes are already in
+ * object storage by the time this runs — see the order-of-operations note in
+ * `issue.ts`, which applies here for the same reason: the object store is not
+ * transactional and the database is.
+ *
+ * Inserting this row is what locks the card. Every statement after it in the
+ * same transaction that touches the card is refused by `0037`'s triggers, which
+ * is correct and is why the signature row is written first.
+ */
+export async function recordJobSheet(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: RecordJobSheetInput,
+): Promise<{ id: string }> {
+  if (!/^[0-9a-f]{64}$/.test(input.contentSha256) || !/^[0-9a-f]{64}$/.test(input.pdfSha256)) {
+    // Checked here as well as by the CHECK constraint, because the failure this
+    // catches is an upper-case digest from a client library — which compares
+    // unequal to every digest this system stores and would surface much later
+    // as a signature that cannot be verified.
+    throw new Error("A job sheet digest is 64 lower-case hex characters");
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(input.businessDate)) {
+    throw new Error("A job sheet's business date is a YYYY-MM-DD calendar date");
+  }
+
+  await requireJob(tx, input.jobId);
+  await requireVisitOnJob(tx, input.jobId, input.visitId);
+
+  // Deliberately NOT `assertJobCardUnlocked`. This is the one write in this
+  // file that is legitimate on a locked job: an amendment exists precisely
+  // because the card is locked, and refusing it here would leave a signed sheet
+  // with no correction mechanism at all — which is the state `FLD-14` is
+  // written to get out of. The original is protected by
+  // `job_sheets_one_original`, so this cannot quietly re-seal a job either.
+  const inserted = await tx
+    .insert(schema.jobSheets)
+    .values({
+      tenantId: ctx.tenantId,
+      jobId: input.jobId,
+      visitId: input.visitId ?? null,
+      kind: input.kind,
+      reference: input.reference,
+      sequence: input.sequence,
+      signoffId: input.signoffId ?? null,
+      sheetFormat: input.sheetFormat,
+      contentSha256: input.contentSha256,
+      storageKey: input.storageKey,
+      pdfSha256: input.pdfSha256,
+      businessDate: input.businessDate,
+      recordedAtText: input.recordedAtText,
+      amendsSheetId: input.amendsSheetId ?? null,
+      amendmentReasonCode: input.amendmentReasonCode ?? null,
+      amendmentDetail: input.amendmentDetail?.trim() || null,
+      sealedById: ctx.userId ?? null,
+    })
+    .returning({ id: schema.jobSheets.id });
+
+  const row = inserted[0];
+  if (!row) throw new Error("The job sheet row was not written");
+
+  await writeAuditNote(tx, ctx, {
+    tableName: "job_sheets",
+    recordId: row.id,
+    // 11 characters. `audit_log.action` is varchar(16), and a longer literal
+    // fails at runtime on every call.
+    action: input.kind === "original" ? "sheet_seal" : "sheet_amend",
+    detail: {
+      jobId: input.jobId,
+      reference: input.reference,
+      contentSha256: input.contentSha256,
+      pdfSha256: input.pdfSha256,
+      storageKey: input.storageKey,
+      amendmentReasonCode: input.amendmentReasonCode ?? null,
+    },
+  });
+
+  return { id: row.id };
+}
+
+/**
+ * Check an amendment reason against the tenant's own vocabulary.
+ *
+ * The same shape as `recordPhotoExemption`'s check and for the same reason: a
+ * code the picker does not offer came from a stale form or a hand-crafted POST,
+ * and accepting one puts a value in the column that no report can group. The
+ * database agrees — `0037` adds a composite foreign key — but the sentence a
+ * person can act on comes from here.
+ */
+export async function resolveJobSheetAmendmentReason(
+  tx: TenantScopedTx,
+  reasonCode: string,
+): Promise<{ code: string; label: string }> {
+  const rows = await tx
+    .select({
+      code: schema.jobSheetAmendmentReasons.code,
+      label: schema.jobSheetAmendmentReasons.label,
+      isActive: schema.jobSheetAmendmentReasons.isActive,
+    })
+    .from(schema.jobSheetAmendmentReasons)
+    .where(eq(schema.jobSheetAmendmentReasons.code, reasonCode))
+    .limit(1);
+
+  const reason = rows[0];
+  if (!reason) {
+    throw new UserFacingError(
+      `"${reasonCode}" is not one of this company's job sheet amendment reasons. ` +
+        `An amendment has to come from the list — that is what "reason-coded" means.`,
+    );
+  }
+  if (!reason.isActive) {
+    throw new UserFacingError(
+      `"${reason.label}" has been retired and cannot be used on new amendments. Choose a current reason.`,
+    );
+  }
+  return { code: reason.code, label: reason.label };
+}
+
+/**
+ * Everything the job sheet renders, in one read.
+ *
+ * One function rather than five, for the same reason `getJobCard` is one
+ * function: the sheet that is presented for signature and the sheet that is
+ * hashed have to be built from the same query, or the digest describes a
+ * document nobody saw.
+ *
+ * The `content` half is exactly the field set the canonicalisation covers, and
+ * its member order is part of a contract shared with `apps/field`. See
+ * `JobSheetContent` in `@meridian/docs`.
+ */
+export interface JobSheetSource {
+  readonly jobId: string;
+  readonly jobReference: string;
+  readonly jobTitle: string;
+  readonly customerId: string;
+  readonly customerName: string;
+  readonly customerEmail: string | null;
+  readonly propertyAddress: string;
+  readonly reportedFault: string;
+  readonly diagnosedFault: string;
+  readonly workCarriedOut: string;
+  readonly materials: readonly { description: string; quantity: string; unit: string }[];
+  readonly labourMinutes: number;
+  /**
+   * When the work this sheet describes was recorded, as an ISO instant.
+   *
+   * Derived from the record — the visit's completion, then its arrival, then
+   * the job's completion, then the job's creation — and never from the clock at
+   * the moment of rendering. That distinction is load-bearing: the digest is
+   * computed over this value, so a render-time clock would give the same
+   * unchanged record a different digest every second and make the comparison in
+   * `sealJobSheet` impossible to satisfy from a browser.
+   *
+   * A handset overrides it with the device clock reading it actually displayed,
+   * because on that path the value the customer saw is the one the hash has to
+   * cover. `ADR 0004` is why there are two clocks at all.
+   */
+  readonly recordedAt: string;
+  readonly outcomeLabel: string;
+  readonly technicianName: string;
+  readonly photoCounts: readonly { label: string; count: number }[];
+  readonly declarations: readonly { label: string; note: string | null }[];
+  readonly visits: readonly {
+    sequence: number;
+    technicianName: string;
+    workMinutes: number | null;
+    travelMinutes: number | null;
+  }[];
+}
+
+/** How each attachment kind is described to a customer on the sheet. */
+const ATTACHMENT_KIND_LABEL: Readonly<Record<string, string>> = {
+  photo_before: "'before' photograph",
+  photo_after: "'after' photograph",
+  photo_recommendation: "photograph of recommended further work",
+  signature: "signature image",
+  document: "document",
+  video: "video",
+};
+
+export async function getJobSheetSource(
+  tx: TenantScopedTx,
+  jobId: string,
+): Promise<JobSheetSource> {
+  const jobRows = await tx
+    .select({
+      id: schema.jobs.id,
+      reference: schema.jobs.reference,
+      title: schema.jobs.title,
+      description: schema.jobs.description,
+      outcomeCode: schema.jobs.outcomeCode,
+      outcomeLabel: schema.jobOutcomeCodes.label,
+      completedAt: schema.jobs.completedAt,
+      createdAt: schema.jobs.createdAt,
+      customerId: schema.customers.id,
+      customerName: schema.customers.name,
+      customerEmail: schema.customers.billingEmail,
+      propertyName: schema.properties.name,
+      propertyAddressLine: schema.properties.addressLine,
+      propertyArea: schema.properties.area,
+      propertyCity: schema.properties.city,
+    })
+    .from(schema.jobs)
+    .innerJoin(schema.customers, eq(schema.customers.id, schema.jobs.customerId))
+    .innerJoin(schema.properties, eq(schema.properties.id, schema.jobs.propertyId))
+    // Left, not inner: an outcome recorded before somebody deactivated the code
+    // must still render on the sheet.
+    .leftJoin(
+      schema.jobOutcomeCodes,
+      and(
+        eq(schema.jobOutcomeCodes.tenantId, schema.jobs.tenantId),
+        eq(schema.jobOutcomeCodes.code, schema.jobs.outcomeCode),
+      ),
+    )
+    .where(eq(schema.jobs.id, jobId))
+    .limit(1);
+
+  const job = jobRows[0];
+  if (!job) throw new Error(`Job ${jobId} not found in this tenant`);
+
+  const faultRows = await tx
+    .select({
+      kind: schema.jobFaultCodes.kind,
+      label: schema.faultCodes.label,
+      code: schema.faultCodes.code,
+    })
+    .from(schema.jobFaultCodes)
+    .innerJoin(schema.faultCodes, eq(schema.faultCodes.id, schema.jobFaultCodes.faultCodeId))
+    .where(eq(schema.jobFaultCodes.jobId, jobId))
+    .orderBy(asc(schema.jobFaultCodes.createdAt));
+
+  // `FLD-6` keeps the reported fault and the diagnosed fault as separate
+  // fields, and the sheet keeps them separate too. Collapsing them would hide
+  // the single most useful comparison on the document: what the customer
+  // thought was wrong against what was actually wrong.
+  const reported = faultRows.filter((f) => f.kind === "symptom").map((f) => f.label);
+  const diagnosed = faultRows.filter((f) => f.kind === "cause").map((f) => f.label);
+  const remedies = faultRows.filter((f) => f.kind === "remedy").map((f) => f.label);
+
+  const card = await getJobCard(tx, jobId);
+
+  // When the work was recorded, from the record. See `JobSheetSource.recordedAt`
+  // for why this must not be the render clock.
+  const timingRows = await tx
+    .select({
+      completedAt: schema.jobVisits.completedAt,
+      arrivedAt: schema.jobVisits.arrivedAt,
+      sequence: schema.jobVisits.sequence,
+    })
+    .from(schema.jobVisits)
+    .where(eq(schema.jobVisits.jobId, jobId))
+    .orderBy(desc(schema.jobVisits.sequence))
+    .limit(1);
+  const lastVisit = timingRows[0];
+  const recordedAt =
+    lastVisit?.completedAt ?? lastVisit?.arrivedAt ?? job.completedAt ?? job.createdAt;
+
+  const photoCounts = Object.entries(
+    card.photos.reduce<Record<string, number>>((acc, p) => {
+      acc[p.kind] = (acc[p.kind] ?? 0) + 1;
+      return acc;
+    }, {}),
+  )
+    // Sorted by kind so the same job always produces the same sentence. An
+    // insertion-ordered object would make the rendered bytes depend on the
+    // order rows came back, which is exactly what determinism forbids.
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([kind, count]) => ({ label: ATTACHMENT_KIND_LABEL[kind] ?? kind, count }));
+
+  const declarations: { label: string; note: string | null }[] = [];
+  if (card.photoExemption) {
+    declarations.push({
+      label: `No 'after' photograph — ${card.photoExemption.reasonLabel}`,
+      note: card.photoExemption.note,
+    });
+  }
+  if (card.materialsNone) {
+    declarations.push({
+      label: "No parts or consumables were used",
+      note: card.materialsNone.note,
+    });
+  }
+
+  // The job's own description is what the customer reported; the remedy codes
+  // and the technician's report are what was done. Both are joined rather than
+  // picked between, because a sheet that silently prefers one source is a sheet
+  // whose content depends on which fields happened to be filled in.
+  const reportRows = await tx
+    .select({
+      workCarriedOut: schema.jobReports.workCarriedOut,
+      faultFound: schema.jobReports.faultFound,
+    })
+    .from(schema.jobReports)
+    .where(and(eq(schema.jobReports.jobId, jobId), isNull(schema.jobReports.deletedAt)))
+    .orderBy(asc(schema.jobReports.createdAt));
+
+  // `ai_summary` is deliberately not read here. It is a generated customer-
+  // facing paraphrase that `M11` requires a human to approve, and a sheet the
+  // customer signs must carry what the technician wrote, not a rewrite of it.
+  const workCarriedOut = [
+    ...reportRows.map((r) => [r.workCarriedOut, r.faultFound].filter(Boolean).join(" ")),
+    ...remedies,
+  ]
+    .filter((s) => s && s.trim())
+    .join(" ")
+    .trim();
+
+  return {
+    jobId,
+    jobReference: job.reference,
+    jobTitle: job.title,
+    customerId: job.customerId,
+    customerName: job.customerName,
+    customerEmail: job.customerEmail,
+    propertyAddress: [job.propertyName, job.propertyAddressLine, job.propertyArea, job.propertyCity]
+      .filter((p): p is string => Boolean(p && p.trim()))
+      .join(", "),
+    reportedFault: reported.length > 0 ? reported.join("; ") : job.description?.trim() || job.title,
+    diagnosedFault: diagnosed.length > 0 ? diagnosed.join("; ") : "Not coded",
+    workCarriedOut: workCarriedOut || job.title,
+    materials: card.materials.map((m) => ({
+      description: m.description,
+      quantity: m.quantity,
+      unit: m.unit,
+    })),
+    // Zero, not null. `JOB-15` has already refused a job card with no labour
+    // recorded at all, and the sheet cannot carry a null into a hash that has
+    // to be reproducible on a handset.
+    labourMinutes: card.labourMinutes ?? 0,
+    recordedAt: recordedAt.toISOString(),
+    outcomeLabel: job.outcomeLabel ?? job.outcomeCode ?? "Not recorded",
+    technicianName:
+      card.labour.map((l) => l.technicianName).join(", ") || "Not recorded",
+    photoCounts,
+    declarations,
+    visits: card.labour.map((l) => ({
+      sequence: l.sequence,
+      technicianName: l.technicianName,
+      workMinutes: l.workMinutes,
+      travelMinutes: l.travelMinutes,
+    })),
+  };
+}
+
+/**
+ * Delete sealed sheets, deliberately.
+ *
+ * `0037` puts a trigger on `job_sheets` that refuses UPDATE outright and
+ * refuses DELETE unless the transaction has said it means to purge. This is the
+ * only place in the codebase that says it, and it exists so that the two
+ * callers which legitimately need it — the development seed's clear-down, and
+ * the retention purge that will one day age out closed jobs and their objects
+ * together — go through one function rather than each remembering a GUC name.
+ *
+ * It is not a correction mechanism and must never be used as one. A signed
+ * sheet that is wrong is corrected by `amendJobSheet` in `@meridian/docs`; a
+ * signed sheet that is deleted takes with it the only evidence of what a
+ * customer agreed to.
+ *
+ * `set_config(..., true)` — transaction-local, the same third argument
+ * `withTenant` relies on for `app.tenant_id`. Without it the setting would
+ * survive on the pooled connection and the next checkout would inherit
+ * permission to delete signed job sheets, which is the failure this whole
+ * arrangement is trying to avoid.
+ */
+export async function purgeJobSheets(
+  tx: TenantScopedTx,
+  where: { jobId?: string } = {},
+): Promise<void> {
+  await tx.execute(sql`select set_config('app.job_sheet_purge', 'on', true)`);
+  try {
+    if (where.jobId) {
+      await tx.delete(schema.jobSheets).where(eq(schema.jobSheets.jobId, where.jobId));
+    } else {
+      await tx.delete(schema.jobSheets);
+    }
+  } finally {
+    // Cleared even on the way out of a failure. The transaction-local scope
+    // already bounds it, and turning it off explicitly means the rest of this
+    // transaction cannot delete a sheet it did not intend to.
+    await tx.execute(sql`select set_config('app.job_sheet_purge', 'off', true)`);
+  }
 }

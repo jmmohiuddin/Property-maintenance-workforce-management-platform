@@ -48,6 +48,44 @@ jobs:
         env:
           POSTGRES_PASSWORD: ci_only_not_a_secret
           POSTGRES_DB: meridian_ci
+          # Pins the container's (and therefore the server's default session)
+          # timezone to the business's calendar — Dubai — not the CI runner's
+          # host timezone (UTC on GitHub-hosted runners) and not any individual
+          # developer's machine. `TZ` on the official postgres image sets the
+          # OS timezone at container start, which the server then uses as the
+          # default `timezone` setting for any session that doesn't override it
+          # itself. Neither `packages/db/src/index.ts` (the app pool) nor
+          # `packages/db/src/seed.ts` (the seed/migrate client) passes a
+          # client-side `timezone`/PGTZ, and the migration/RLS/seed steps below
+          # connect over plain `psql` with none set either — so nothing here
+          # overrides the server default, and this pin is not just reducing the
+          # surface, it is deterministic for every connection this workflow
+          # makes, both as `postgres` and as `meridian_app`.
+          #
+          # Why this matters: `current_date` and `now()` are evaluated in the
+          # session's timezone. With the runner's UTC default, any boundary
+          # test that checks "is it after midnight in Dubai yet" is correct for
+          # ~22 hours a day and wrong for the ~2-hour window where UTC and
+          # Dubai (UTC+4) disagree on what day it is — a flake that depends on
+          # what wall-clock time the CI run happens to land at, not on the code
+          # under test. Pinning removes that window in CI specifically.
+          #
+          # This does NOT fix a developer's local machine — a laptop set to
+          # Asia/Dhaka (or anything else) still has this exact bug locally, and
+          # pinning CI's Postgres container has no effect on it; the developer
+          # still needs their own Postgres session timezone set correctly, or
+          # the code needs to not depend on it at all.
+          #
+          # That's the real, durable fix, and it already exists as the
+          # convention in `packages/db/src/domain/compliance.ts`, `cron.ts` and
+          # `hr.ts`: every date-boundary comparison takes Dubai's day
+          # explicitly (`now() at time zone 'Asia/Dubai'`, or an explicit
+          # Dubai-day argument) instead of trusting `current_date` or the
+          # session's default timezone. This env var is a determinism/flake
+          # guard for the test suite that exercises that convention — it is not
+          # a substitute for it, and no code should ever come to rely on the CI
+          # database happening to be in Dubai time.
+          TZ: Asia/Dubai
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U postgres"

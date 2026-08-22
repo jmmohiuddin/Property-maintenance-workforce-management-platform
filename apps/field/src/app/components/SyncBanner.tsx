@@ -21,7 +21,7 @@ export function SyncBanner({
 }: {
   status: SyncStatus | null;
   onPress: () => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const tone = bannerTone(status);
   return (
     <Pressable onPress={onPress} accessibilityRole="button" accessibilityLabel="Sync status">

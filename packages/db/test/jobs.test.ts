@@ -50,8 +50,9 @@ import {
   dispatchBoardCounts,
   loadSchedule,
   rescheduleVisit,
+  transitionJob,
 } from "../src/index";
-import { slaState, UserFacingError, DEFAULT_MIDDAY_BAN, formatMinute } from "@meridian/core";
+import { slaState, UserFacingError, DEFAULT_MIDDAY_BAN, formatMinute, type JobStatus } from "@meridian/core";
 import { testTenantId } from "./_tenant";
 
 const RUN = Date.now().toString(36).slice(-6).toUpperCase();
@@ -156,7 +157,14 @@ async function main(): Promise<void> {
   async function makeJob(input: {
     suffix: string;
     title: string;
-    status: "triaged" | "closed";
+    /*
+     * The whole status union, not the two this helper happened to be used with.
+     * It read `"triaged" | "closed"` because nothing had ever made a job in any
+     * other state, so the first fixture that needed `dispatched` broke the
+     * compile -- and did so silently under `tsx`, which transpiles without
+     * typechecking, so the test ran and passed while the gate was red.
+     */
+    status: JobStatus;
     createdAt?: Date;
     resolveByAt?: Date | null;
     completedAt?: Date | null;
@@ -561,6 +569,37 @@ async function main(): Promise<void> {
         .delete(schema.technicians)
         .where(and(eq(schema.technicians.id, technicianId), eq(schema.technicians.tenantId, tenantId)));
     }
+  });
+
+  /*
+   * ── on_site sets first_response_at, and the call does not throw ──────────
+   *
+   * transitionJob(to: "on_site") threw for EVERY caller. The branch built
+   * `sql`coalesce(col, ${now})`` with a JS Date, which the driver stringifies
+   * as "Sat Aug 22 2026 08:59:33" and then refuses to bind -- an
+   * ERR_INVALID_ARG_TYPE raised before the statement reaches Postgres, and not
+   * a UserFacingError, so a field sync batch lost every mutation queued behind
+   * the arrival and a dispatcher marking somebody on site got a 500.
+   *
+   * It survived because no suite moved a job to on_site: this one did not,
+   * assignment.test.ts did not, and projects.test.ts's `to: "on_site"` is
+   * `transitionProject`, a different function entirely. It was found by
+   * connecting the field client to a real server over HTTP.
+   *
+   * The second assertion is the one that matters. A broken expression that
+   * quietly wrote NULL would satisfy "it did not throw", and first_response_at
+   * is what every SLA response figure is measured from.
+   */
+  const arriving = await makeJob({ suffix: "ONSITE", title: `${TOKEN} arriving`, status: "dispatched" });
+  await withTenant({ tenantId }, async (tx) => {
+    await transitionJob(tx, { tenantId }, { jobId: arriving, to: "en_route" });
+    await transitionJob(tx, { tenantId }, { jobId: arriving, to: "on_site" });
+    const [row] = (await tx
+      .select({ status: schema.jobs.status, firstResponseAt: schema.jobs.firstResponseAt })
+      .from(schema.jobs)
+      .where(eq(schema.jobs.id, arriving))) as { status: string; firstResponseAt: Date | null }[];
+    check("a job can be moved on site at all", row?.status, "on_site");
+    checkTrue("and arriving stamps first_response_at rather than leaving it null", row?.firstResponseAt != null);
   });
 
   console.log(fail === 0 ? "\nall jobs checks passed" : `\n${fail} check(s) failed`);

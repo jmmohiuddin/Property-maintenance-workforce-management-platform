@@ -99,7 +99,26 @@ export async function transitionJob(
   // Timestamp columns other queries depend on. Set here so they cannot drift
   // from the status they describe.
   if (input.to === "on_site") {
-    patch["firstResponseAt"] = sql`coalesce(${schema.jobs.firstResponseAt}, ${now})`;
+    /*
+     * `${now.toISOString()}::timestamptz`, NOT `${now}`.
+     *
+     * A JS Date interpolated into a raw `sql` template is stringified by the
+     * driver as "Sat Aug 22 2026 08:59:33" and then refused before the
+     * statement is ever sent -- ERR_INVALID_ARG_TYPE, not a database error.
+     * Drizzle converts a Date correctly in a `.set({ col: date })` position;
+     * inside a tagged template it does not, and the two look identical.
+     *
+     * So every call to transitionJob(to: "on_site") threw. Not a UserFacingError
+     * either, so a field sync batch lost every mutation queued behind the
+     * arrival, and a dispatcher marking a technician on site got a 500. Found by
+     * connecting the field client to a real server over HTTP -- no unit test
+     * reached this line, because none of them moved a job to on_site.
+     *
+     * The regression test is in jobs.test.ts, and it asserts the column is set
+     * rather than merely that the call returned: an expression that silently
+     * wrote NULL would satisfy "it did not throw".
+     */
+    patch["firstResponseAt"] = sql`coalesce(${schema.jobs.firstResponseAt}, ${now.toISOString()}::timestamptz)`;
   }
   if (input.to === "work_complete") patch["completedAt"] = now;
   if (input.to === "closed" || input.to === "cancelled") patch["closedAt"] = now;

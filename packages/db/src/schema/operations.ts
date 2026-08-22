@@ -9,6 +9,7 @@ import {
   uuid,
   jsonb,
   numeric,
+  date,
   doublePrecision,
   index,
   uniqueIndex,
@@ -243,9 +244,200 @@ export const jobSignoffs = pgTable(
     signedLat: doublePrecision("signed_lat"),
     signedLng: doublePrecision("signed_lng"),
     ipAddress: varchar("ip_address", { length: 45 }),
+    /**
+     * Where the contemporaneous copy goes (`FLD-13`, `FLD-14`).
+     *
+     * Captured at the pad rather than taken from the customer record, because
+     * the person signing at a site is frequently not the person the invoices go
+     * to. Emailing the sheet to the billing address would be both useless as a
+     * contemporaneous copy — the signer never receives what they signed — and a
+     * disclosure to somebody who was not there.
+     */
+    signerEmail: varchar("signer_email", { length: 200 }),
+    /**
+     * The consent statement rendered above the pad, versioned (`FLD-13`).
+     *
+     * Version and text, not one or the other. The version is what reports group
+     * on and what tells you a signature was given under the old wording; the
+     * text is what makes the row self-describing in a dispute two years later,
+     * when the lookup table has moved on. It is also what the sheet prints, and
+     * therefore what the sheet's hash covers.
+     */
+    consentVersion: varchar("consent_version", { length: 48 }),
+    consentText: text("consent_text"),
     ...timestamps,
   },
   (t) => [index("job_signoffs_job_idx").on(t.tenantId, t.jobId)],
+);
+
+/**
+ * The reasons a signed job sheet may be amended (`FLD-14`).
+ *
+ * A controlled vocabulary, by the requirement's own wording — "corrections
+ * happen only as a new, linked, **reason-coded** amendment". Tenant-scoped like
+ * `job_outcome_codes`, `fault_codes` and `job_photo_exemption_reasons`, so a
+ * company can reword a label without changing what reports group on and retire
+ * an entry without rewriting the amendments that cite it.
+ *
+ * The reason it is a code rather than a text box is the question the data is
+ * for: are sheets being amended because the world moved after the visit, or
+ * because one crew's sheets are routinely wrong at the moment the customer
+ * signs them? A free-text field collects "correction", "-", "as discussed" and
+ * "see note" for both, and nobody can tell them apart afterwards.
+ */
+export const jobSheetAmendmentReasons = pgTable(
+  "job_sheet_amendment_reasons",
+  {
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    id: idCol(),
+    /** Stable machine key. Reports group on this, so labels can be reworded. */
+    code: varchar("code", { length: 48 }).notNull(),
+    label: varchar("label", { length: 120 }).notNull(),
+    description: varchar("description", { length: 400 }),
+    sortOrder: integer("sort_order").notNull().default(100),
+    /** Retirement, never deletion — sealed amendments still cite this row. */
+    isActive: boolean("is_active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("job_sheet_amendment_reasons_code_key").on(t.tenantId, t.code),
+    index("job_sheet_amendment_reasons_pick_idx").on(t.tenantId, t.isActive, t.sortOrder),
+  ],
+);
+
+/**
+ * The signed job sheet and its amendments (`FLD-14`).
+ *
+ * ── WHY THERE ARE TWO DIGESTS ───────────────────────────────────────────────
+ *
+ * The requirement asks for the SHA-256 of "the exact rendered job sheet that
+ * was **on screen** at the moment of signing". The sheet on screen at that
+ * moment does not yet carry the signature, so hashing only the stored PDF would
+ * record the digest of a document the signer never saw.
+ *
+ *  * `contentSha256` is the digest of the canonical sheet text — the byte
+ *    sequence `apps/field/src/domain/signature.ts` builds as `canonicalSheet()`
+ *    and stamps `meridian-jobsheet-v1`. The device computes it, the server
+ *    re-derives it from its own copy of the record, and a mismatch refuses the
+ *    signature rather than storing one against a sheet that had already moved.
+ *    This is the evidential anchor.
+ *
+ *  * `pdfSha256` is the digest of the immutable snapshot actually stored: the
+ *    same sheet plus the signature block, which prints `contentSha256` on its
+ *    own face so the chain is readable by anybody holding the paper and
+ *    `shasum`.
+ *
+ * `sheetFormat` is stored rather than assumed. When the canonicalisation
+ * changes it becomes v2, and a sheet sealed under v1 stays verifiable because
+ * the row says which rules produced its digest.
+ *
+ * ── WHY ONE TABLE FOR ORIGINALS AND AMENDMENTS ──────────────────────────────
+ *
+ * They are the same object — a rendered sheet, hashed, stored once, never
+ * edited — the way `job_card_declarations` holds two kinds of assertion in one
+ * table. What differs is that an amendment names the sheet it corrects and the
+ * reason it exists, and that only an original carries a signature.
+ *
+ * An amendment never rewrites the sheet it corrects and never unlocks the card.
+ * The original and its hash stand. An unlock-edit-reseal cycle would leave the
+ * first artefact evidencing a position the business no longer holds, which is
+ * the mutable job sheet the requirement exists to forbid.
+ *
+ * The whole row is immutable and undeletable — `0037` puts a trigger on it.
+ * `0010` froze three columns on the financial documents because those rows
+ * carry a status that legitimately keeps moving; every column here describes
+ * the artefact, and none of them has a later event that should change it.
+ */
+export const jobSheets = pgTable(
+  "job_sheets",
+  {
+    id: idCol(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    jobId: uuid("job_id")
+      .notNull()
+      .references(() => jobs.id, { onDelete: "cascade" }),
+    /** Which visit's work, where the job took several. Null on a single-visit job. */
+    visitId: uuid("visit_id").references(() => jobVisits.id, { onDelete: "set null" }),
+    /** `original` | `amendment`. */
+    kind: varchar("kind", { length: 16 }).notNull(),
+    /** Human-quotable: `SATS-JOB-2026-0042-JS`, then `-A1`, `-A2`. */
+    reference: varchar("reference", { length: 64 }).notNull(),
+    /** 0 for the original, 1..n for amendments. Order without relying on a clock. */
+    sequence: integer("sequence").notNull(),
+    /**
+     * The signature that sealed this sheet — on the original, and only there.
+     * An amendment is the company correcting its own record, not the customer
+     * signing a second time.
+     *
+     * ON DELETE restrict: the signature is the reason the sheet is evidence.
+     */
+    signoffId: uuid("signoff_id").references(() => jobSignoffs.id, { onDelete: "restrict" }),
+    sheetFormat: varchar("sheet_format", { length: 32 })
+      .notNull()
+      .default("meridian-jobsheet-v1"),
+    contentSha256: varchar("content_sha256", { length: 64 }).notNull(),
+    storageKey: text("storage_key").notNull(),
+    pdfSha256: varchar("pdf_sha256", { length: 64 }).notNull(),
+    /**
+     * The date the PDF's metadata is pinned to — a Dubai calendar date, never a
+     * wall clock. The stored hash is only evidence if the same sheet renders to
+     * the same bytes, and a creation timestamp taken from the clock makes every
+     * re-render a different file.
+     */
+    businessDate: date("business_date").notNull(),
+    /**
+     * The canonical sheet's `recordedOfflineAt` line, verbatim.
+     *
+     * Text, not a timestamp, and stored rather than derived. Every other input
+     * to `contentSha256` can be re-read from the record; this one cannot. A
+     * handset sends the device clock reading it actually displayed — `ADR 0004`
+     * keeps both clocks precisely because device clocks are wrong and users
+     * change them — so what went into the hash is the device's string, not
+     * anything the server would compute.
+     *
+     * Without it the stored digest is unverifiable on exactly the path that
+     * matters most: nobody could re-derive the canonical string a technician
+     * captured in a basement, which leaves the hash a number with nothing to
+     * compare it against. Kept as text so it is reproduced byte for byte;
+     * parsing and re-formatting would change the bytes and so the digest.
+     */
+    recordedAtText: varchar("recorded_at_text", { length: 64 }).notNull(),
+    amendsSheetId: uuid("amends_sheet_id"),
+    amendmentReasonCode: varchar("amendment_reason_code", { length: 48 }),
+    /** What the code does not say. Beside it, never instead of it. */
+    amendmentDetail: text("amendment_detail"),
+    sealedById: uuid("sealed_by_id").references(() => users.id, { onDelete: "set null" }),
+    sealedAt: timestamp("sealed_at", { withTimezone: true }).notNull().defaultNow(),
+    // Written out rather than the shared `timestamps` spread, for the reason
+    // `job_card_declarations` gives: this table has no soft delete and must not
+    // gain one. A soft-deleted sheet would keep satisfying the lock while
+    // reading as withdrawn, and the lock is the one question this table exists
+    // to answer without ambiguity.
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("job_sheets_job_idx").on(t.tenantId, t.jobId, t.sequence),
+    uniqueIndex("job_sheets_reference_key").on(t.tenantId, t.reference),
+    uniqueIndex("job_sheets_sequence_key").on(t.tenantId, t.jobId, t.sequence),
+    index("job_sheets_content_digest_idx").on(t.tenantId, t.contentSha256),
+    // `job_sheets_one_original` — one sealed original per job — is a partial
+    // unique index and so lives in `0037_signed_job_sheet.sql` only, the way
+    // `job_card_declarations_one_per_kind` lives in `0025`. It is the lock's
+    // own foundation: "is this job sealed" has to be a question with one
+    // answer, and two originals would make it depend on which row a query
+    // happened to find first.
+    //
+    // The self-reference on `amends_sheet_id` and the composite foreign key on
+    // `(tenant_id, amendment_reason_code)` are likewise in the migration only —
+    // Drizzle cannot express either, and the composite one is what stops an
+    // amendment citing another company's vocabulary.
+  ],
 );
 
 /** Parts and consumables consumed on a job — feeds costing and reordering. */
@@ -268,6 +460,18 @@ export const jobMaterials = pgTable(
     unitPrice: money("unit_price"),
     currency: currencyCol(),
     isBillable: boolean("is_billable").notNull().default(true),
+    /**
+     * `FLD-9`: where the part came from. `MaterialSource` in core, CHECKed in
+     * 0036 against the field client's own three values.
+     *
+     * Nullable, and NULL means "not recorded" rather than "van stock". The
+     * field client has always sent this and the column has not existed since
+     * 0000, so every row written before 0036 lost it silently — which is why
+     * the migration argues at length against giving it a default.
+     */
+    source: varchar("source", { length: 24 }),
+    /** `FLD-9`. Legitimately absent: a metre of cable has no serial number. */
+    serialNumber: varchar("serial_number", { length: 120 }),
     ...timestamps,
   },
   (t) => [index("job_materials_job_idx").on(t.tenantId, t.jobId)],

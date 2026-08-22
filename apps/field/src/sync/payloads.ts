@@ -293,10 +293,27 @@ export function exemptFromPhoto(input: {
  * type below takes `number`, not `number | null`, so the collapse cannot be
  * expressed - `labourToRecord()` in `domain/attendance.ts` is where the
  * null-vs-zero decision is made, and a null never reaches here.
+ *
+ * ── AND `visitId` IS REQUIRED FOR THE SAME KIND OF REASON ──────────────────
+ *
+ * It used to be `string | null`. `optional()` drops a null, and the server's
+ * `visit_labour/record` handler reads it with `requireString` - so a null
+ * produced a payload the office **always** refuses, from a builder whose type
+ * said it was allowed. The outbox would have held it, the drain planner would
+ * have sent it, and the technician would have learnt at the end of a shift they
+ * had already worked that the hours on it were not filed.
+ *
+ * Labour is recorded against a visit and not against a job, which is not an
+ * accident of the schema: `job_visits.work_minutes` is per visit because a job
+ * with two visits has two answers, and `JOB-15`'s labour condition sums them.
+ * There is no such thing as time on the tools that belongs to no visit, so the
+ * type now says so and the guard below makes the type's promise real for a
+ * caller coming from untyped data.
  */
 export function recordLabour(input: {
   readonly jobId: string;
-  readonly visitId: string | null;
+  /** Never null: labour belongs to a visit, and the server refuses it without one. */
+  readonly visitId: string;
   readonly workMinutes: number;
   readonly travelMinutes?: number | null;
   readonly overrideReason?: string | null;
@@ -304,14 +321,17 @@ export function recordLabour(input: {
   if (!Number.isFinite(input.workMinutes)) {
     throw new Error("Labour must be a recorded number of minutes. Zero is allowed; nothing is not.");
   }
+  if (!input.visitId.trim()) {
+    throw new Error("Time on the tools is recorded against a visit. This one names none.");
+  }
   return {
     entity: "visit_labour",
     op: "record",
     jobId: input.jobId,
     payload: {
       jobId: input.jobId,
+      visitId: input.visitId,
       workMinutes: input.workMinutes,
-      ...optional("visitId", input.visitId),
       ...optional("travelMinutes", input.travelMinutes),
       ...optional("overrideReason", input.overrideReason),
     },
@@ -393,19 +413,59 @@ export function upsertNote(input: {
 
 // ── Attendance ──────────────────────────────────────────────────────────────
 
+/**
+ * `attendance/append`. **`occurredAt` is required, and it is required because
+ * the server refuses the record without it.**
+ *
+ * ── HOW THIS WAS MISSED BY TWO GREEN SUITES ────────────────────────────────
+ *
+ * This builder used to send `{ kind, jobId?, lat?, lng?, accuracyMetres? }` and
+ * nothing else. `handleAttendance` in `packages/db/src/domain/field.ts` reads
+ * `payload.occurredAt` first and throws *"This attendance record has no usable
+ * time on it"* when it is absent - so **every clock-in and clock-out this app
+ * could build was rejected**, deterministically, on arrival. The device would
+ * have marked each one `dead` and shown the technician an error at the end of a
+ * shift they had already worked.
+ *
+ * Neither suite could see it. `test/payloads.test.ts` asserts that the built
+ * spec is a kind the server accepts and that it carries no `jobId`, which is
+ * true of a payload the server then refuses; `packages/db/test/field.test.ts`
+ * calls `applyFieldMutations` with a payload it composed itself, which of
+ * course included the field the handler reads. It took one HTTP request to
+ * find - see `test/wire-contract.ts`.
+ *
+ * The envelope's `recordedOfflineAt` is *not* the same value and could not
+ * stand in for it: that is when the row was queued, and a shift that ended in a
+ * basement is queued when the phone next has a hand free. `occurredAt` is when
+ * the technician actually clocked out. The server keeps both - it corrects this
+ * one by the measured skew into `attendance_events.occurred_at` and keeps the
+ * raw claim in `recorded_offline_at` - which is the whole two-clock discipline
+ * ADR 0004 asks for, and it needs both values to do it.
+ *
+ * Required rather than defaulted to `new Date().toISOString()`, because a
+ * default would be the device's clock at *drain* time silently standing in for
+ * its clock at *capture* time, which is the one substitution this protocol
+ * exists to prevent.
+ */
 export function appendAttendance(input: {
   readonly kind: string;
+  /** Device wall-clock ISO-8601 of the event itself, not of the queueing. */
+  readonly occurredAt: string;
   readonly jobId?: string | null;
   readonly lat?: number | null;
   readonly lng?: number | null;
   readonly accuracyMetres?: number | null;
 }): MutationSpec {
+  if (!input.occurredAt.trim()) {
+    throw new Error("An attendance event needs the time it happened, not the time it was sent.");
+  }
   return {
     entity: "attendance",
     op: "append",
     jobId: input.jobId ?? null,
     payload: {
       kind: input.kind,
+      occurredAt: input.occurredAt,
       ...optional("jobId", input.jobId),
       ...optional("lat", input.lat),
       ...optional("lng", input.lng),

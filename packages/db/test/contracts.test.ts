@@ -33,7 +33,7 @@
  */
 
 import { sql } from "drizzle-orm";
-import { withTenant, withCustomerScope, closeConnection, db } from "../src/index";
+import { withTenant, withCustomerScope, closeConnection } from "../src/index";
 import { testTenantId } from "./_tenant";
 import {
   activateContract,
@@ -1154,24 +1154,42 @@ async function main(): Promise<void> {
     // Notifications are not written by anything in this file — the CON-9 email
     // is enqueued by the cron route, not by the domain layer — so there is
     // nothing to sweep there. Said out loud rather than left as an assumption.
-    const leftovers = (await db.execute<{ count: number }>(sql`
-      select count(*)::int as count from contracts where name like ${`${TAG}%`}
-    `)) as unknown as { count: number }[];
-    check("no test contract survived cleanup", leftovers[0]?.count, 0);
+    //
+    // ── WHY THESE THREE COUNTS RUN INSIDE withTenant AND NOT ON `db` ────────
+    //
+    // Every table below is FORCE ROW LEVEL SECURITY, policied on
+    // `app_current_tenant()`. Outside a tenant transaction `app.tenant_id` is
+    // unset, so a count taken on the bare `db` handle matches zero rows
+    // whether or not the cleanup above actually worked — a check that cannot
+    // fail. Same trap `_tenant.ts` documents for `otherTenantId`, and the one
+    // `projects.test.ts` found sitting under a table still holding fixtures.
+    const survivors = await withTenant(ctx, async (tx) => {
+      const leftovers = (await tx.execute<{ count: number }>(sql`
+        select count(*)::int as count from contracts where name like ${`${TAG}%`}
+      `)) as unknown as { count: number }[];
 
-    const strayJobs = (await db.execute<{ count: number }>(sql`
-      select count(*)::int as count from jobs
-       where id = any(${sql`array[${sql.join(
-         [...materialisedAll.map((m) => sql`${m.jobId}`), sql`'00000000-0000-0000-0000-000000000000'`],
-         sql`, `,
-       )}]::uuid[]`})
-    `)) as unknown as { count: number }[];
-    check("and no job it raised survived either", strayJobs[0]?.count, 0);
+      const strayJobs = (await tx.execute<{ count: number }>(sql`
+        select count(*)::int as count from jobs
+         where id = any(${sql`array[${sql.join(
+           [...materialisedAll.map((m) => sql`${m.jobId}`), sql`'00000000-0000-0000-0000-000000000000'`],
+           sql`, `,
+         )}]::uuid[]`})
+      `)) as unknown as { count: number }[];
 
-    const strayHolidays = (await db.execute<{ count: number }>(sql`
-      select count(*)::int as count from public_holidays where name like ${`${TAG}%`}
-    `)) as unknown as { count: number }[];
-    check("and the synthetic holidays are gone", strayHolidays[0]?.count, 0);
+      const strayHolidays = (await tx.execute<{ count: number }>(sql`
+        select count(*)::int as count from public_holidays where name like ${`${TAG}%`}
+      `)) as unknown as { count: number }[];
+
+      return {
+        contracts: leftovers[0]?.count,
+        jobs: strayJobs[0]?.count,
+        holidays: strayHolidays[0]?.count,
+      };
+    });
+
+    check("no test contract survived cleanup", survivors.contracts, 0);
+    check("and no job it raised survived either", survivors.jobs, 0);
+    check("and the synthetic holidays are gone", survivors.holidays, 0);
   }
 
   console.log(fail === 0 ? "\nAll contract checks passed.\n" : `\n${fail} check(s) FAILED.\n`);
