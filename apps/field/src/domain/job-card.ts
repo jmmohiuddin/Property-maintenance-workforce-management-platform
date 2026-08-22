@@ -46,7 +46,7 @@
  * lies.
  */
 
-import type { MaterialSource } from "@meridian/core";
+import type { MaterialSource, PhotoRole } from "@meridian/core";
 
 import type { OfflineStamp } from "./clock";
 import type { LabourOverride, LabourSplit } from "./attendance";
@@ -80,30 +80,60 @@ export interface FaultCapture {
 
 // ── Photos (FLD-7) ──────────────────────────────────────────────────────────
 
-/** `FLD-7`'s role vocabulary. A photo without a role is a photo nobody can find. */
-export type PhotoRole =
-  | "before"
-  | "after"
-  | "defect"
-  | "serial_plate"
-  | "meter_reading"
-  | "parts_used"
-  | "site_access";
-
-export const PHOTO_ROLE_LABEL: Readonly<Record<PhotoRole, string>> = {
-  before: "Before",
-  after: "After",
-  defect: "Defect",
-  serial_plate: "Serial plate",
-  meter_reading: "Meter reading",
-  parts_used: "Parts used",
-  site_access: "Site access",
-};
+/**
+ * `FLD-7`'s role vocabulary. A photo without a role is a photo nobody can find.
+ *
+ * ── THE DECLARATION IS `@meridian/core`'s, FOR THE SAME REASON `MaterialSource`
+ *    BELOW IS ────────────────────────────────────────────────────────────────
+ *
+ * It was declared here and nowhere else, which was survivable only because **no
+ * photograph has ever crossed the wire** — the upload pipeline is the one part
+ * of the field protocol that has never been exercised. The moment it is, a
+ * seven-value vocabulary that only this app has heard of has to reach a
+ * six-value one that only the server has heard of, and the two do not even
+ * share a spelling: this app says `before`, `job_attachments.kind` says
+ * `photo_before`.
+ *
+ * That gap is `FLD-9` waiting to happen one layer over. So both vocabularies
+ * and the mapping between them now live in `core`, where the server can read
+ * them too, and this module re-exports rather than restates — there is no
+ * second opinion left to drift.
+ *
+ * `attachmentKindForPhotoRole` is the mapping, and it is a mapping rather than
+ * a merge on purpose. `core` carries the argument in full; the short version is
+ * that a role says what is in the frame and a kind says what the row is
+ * evidence of, and only the `after` role produces the `photo_after` that
+ * `JOB-15` counts.
+ */
+export {
+  PHOTO_ROLES,
+  PHOTO_ROLE_LABEL,
+  PHOTO_ROLE_ATTACHMENT_KIND,
+  attachmentKindForPhotoRole,
+  isPhotoRole,
+  type PhotoRole,
+} from "@meridian/core";
 
 export interface CapturedPhoto {
   readonly clientId: string;
   readonly jobId: string;
-  readonly role: PhotoRole;
+  /**
+   * `null` means **this build could not read the role**, not "before".
+   *
+   * `job_photos.role` is a plain `@text` column (`db/schema.ts`), so what comes
+   * back out of SQLite is only a `PhotoRole` if something checked. The reader
+   * checks, with `isPhotoRole` — the same predicate `attachmentKindForPhotoRole`
+   * is safe behind — and an unrecognised value arrives here as `null` rather
+   * than being asserted into the union.
+   *
+   * Null rather than a default, because a default would be this app deciding
+   * what a photograph is of. A role it cannot read has no destination kind, so
+   * `attachmentKindForPhotoRole` cannot be called for it and the photograph
+   * cannot be filed against the job — which is the correct outcome: the office
+   * receiving a picture of a meter dial labelled as evidence of the state
+   * before the work is worse than the office not receiving it yet.
+   */
+  readonly role: PhotoRole | null;
   /** Local file URI of the compressed copy queued for upload. */
   readonly localUri: string;
   /** Local file URI of the original, kept until the compressed copy is confirmed synced. */

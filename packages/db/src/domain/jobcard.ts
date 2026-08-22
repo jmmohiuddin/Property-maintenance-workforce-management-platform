@@ -3,10 +3,13 @@ import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
 import { writeAuditNote } from "./staff";
 import {
+  JOB_ATTACHMENT_KINDS,
   MATERIAL_SOURCES,
   UserFacingError,
+  isJobAttachmentKind,
   isMaterialSource,
   toDecimalString,
+  type JobAttachmentKind,
   type MaterialSource,
 } from "@meridian/core";
 
@@ -281,16 +284,22 @@ export async function installStandardPhotoExemptionReasons(
  * illustrates — never a general-purpose "other" bucket, and never counted
  * towards `JOB-15`'s after-photo gap (`getJobCard` below reads `photo_after`
  * only, on purpose: a sales observation is not evidence the work was done).
+ *
+ * ── THE DECLARATION IS `@meridian/core`'s, NOT A COPY ──────────────────────
+ *
+ * It used to live here, and living here put it out of reach of the client most
+ * able to get it wrong: `apps/field` depends on `core` and never on `db`, so
+ * `appendAttachment` typed its `kind` as a bare `string` and listed the six
+ * permitted values in a doc comment instead. Two readings of one document is
+ * how `FLD-9` happened. There is one declaration now and this re-exports it,
+ * so every existing importer — including `packages/db/test/jobcard.test.ts`,
+ * which reaches it through the package barrel — is unaffected.
  */
-export const JOB_ATTACHMENT_KINDS = [
-  "photo_before",
-  "photo_after",
-  "signature",
-  "document",
-  "video",
-  "photo_recommendation",
-] as const;
-export type JobAttachmentKind = (typeof JOB_ATTACHMENT_KINDS)[number];
+export {
+  JOB_ATTACHMENT_KINDS,
+  isJobAttachmentKind,
+  type JobAttachmentKind,
+} from "@meridian/core";
 
 export interface JobPhoto {
   readonly id: string;
@@ -1654,8 +1663,15 @@ export interface JobSheetSource {
   }[];
 }
 
-/** How each attachment kind is described to a customer on the sheet. */
-const ATTACHMENT_KIND_LABEL: Readonly<Record<string, string>> = {
+/**
+ * How each attachment kind is described to a customer on the sheet.
+ *
+ * `Record<JobAttachmentKind, ...>` and not `Record<string, ...>`: `0037` seals
+ * this sheet under a hash, so a kind with no wording here would be published to
+ * a customer as its raw database spelling and then made permanent. A seventh
+ * kind must now come with a sentence a customer can read.
+ */
+const ATTACHMENT_KIND_LABEL: Readonly<Record<JobAttachmentKind, string>> = {
   photo_before: "'before' photograph",
   photo_after: "'after' photograph",
   photo_recommendation: "photograph of recommended further work",
@@ -1751,7 +1767,14 @@ export async function getJobSheetSource(
     // insertion-ordered object would make the rendered bytes depend on the
     // order rows came back, which is exactly what determinism forbids.
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    .map(([kind, count]) => ({ label: ATTACHMENT_KIND_LABEL[kind] ?? kind, count }));
+    // `Object.entries` widens the key back to `string`, so it is narrowed with
+    // the vocabulary's own predicate rather than asserted into the union. A row
+    // written before `0025` constrained the column falls through as its raw
+    // spelling, which is ugly and true, rather than crashing the sheet.
+    .map(([kind, count]) => ({
+      label: isJobAttachmentKind(kind) ? ATTACHMENT_KIND_LABEL[kind] : kind,
+      count,
+    }));
 
   const declarations: { label: string; note: string | null }[] = [];
   if (card.photoExemption) {

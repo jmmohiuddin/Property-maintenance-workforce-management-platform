@@ -45,6 +45,8 @@ import {
   completionReadiness,
   interpretRefusal,
   isMaterialSource,
+  isPhotoRole,
+  PHOTO_ROLE_LABEL,
   type JobCardDraft,
 } from "../../domain/job-card";
 import {
@@ -108,10 +110,19 @@ export function JobCardScreen({
         diagnosisNote: card?.diagnosisNote ?? null,
       },
       workCarriedOut: card?.workCarriedOut ?? null,
+      // `JobPhoto.role` is a `@text` column, so WatermelonDB hands back a plain
+      // `string`. This used to be `photo.role as never` — the same assertion
+      // `material.source` carried until `FLD-9` showed what it costs: the
+      // compiler being told to stop objecting at precisely the seam where the
+      // device's vocabulary meets the server's. It is a real narrowing now,
+      // through `core`'s own predicate, and an unreadable role becomes `null`
+      // rather than being guessed. A photograph with no readable role has no
+      // destination `job_attachments.kind`, so it cannot be filed — see
+      // `CapturedPhoto.role`.
       photos: photos.map((photo) => ({
         clientId: photo.id,
         jobId,
-        role: photo.role as never,
+        role: isPhotoRole(photo.role) ? photo.role : null,
         localUri: photo.localUri,
         originalUri: photo.originalUri ?? null,
         thumbnailUri: photo.thumbnailUri ?? null,
@@ -262,7 +273,9 @@ export function JobCardScreen({
         <Text style={styles.muted}>
           {photos.length === 0
             ? "None yet. At least one 'after' photo is required, or a recorded reason why there isn't one."
-            : photos.map((p) => p.role).join(", ")}
+            : photos
+                .map((p) => (isPhotoRole(p.role) ? PHOTO_ROLE_LABEL[p.role] : "Role not recognised"))
+                .join(", ")}
         </Text>
         <Stub label="Take a photo" setNotice={setNotice} />
       </Section>

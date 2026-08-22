@@ -7,9 +7,15 @@ import {
   interpretRefusal,
   recordingMaterialClearsDeclaration,
   refusalDisposition,
+  attachmentKindForPhotoRole,
+  isPhotoRole,
+  PHOTO_ROLES,
+  PHOTO_ROLE_ATTACHMENT_KIND,
   type CapturedPhoto,
   type JobCardDraft,
+  type PhotoRole,
 } from "../src/domain/job-card";
+import { JOB_ATTACHMENT_KINDS, isJobAttachmentKind } from "@meridian/core";
 import {
   deriveLabour,
   isLabourRecorded,
@@ -346,5 +352,90 @@ check("an attested unsigned visit can close", canCloseWithoutSignature(attestati
 check("an unsigned visit with no note cannot", !canCloseWithoutSignature({ ...attestation, note: "  " }));
 check("nor can one with no attestation at all", !canCloseWithoutSignature(null));
 check("an attested visit locks the record too", isLocked(null, attestation));
+
+// ── FLD-7: a photo's ROLE and an attachment's KIND, and the map between ─────
+//
+// Two vocabularies, deliberately. A role says what is in the frame; a kind says
+// what the row is evidence of. They do not even share a spelling — the handset
+// says `before`, `job_attachments.kind` says `photo_before` — and nothing
+// mapped between them for as long as no photograph had ever crossed the wire.
+//
+// These checks are the contract that mapping has to keep. The exhaustiveness
+// half is the compiler's (`Record<PhotoRole, JobAttachmentKind>` in
+// `@meridian/core`, so an eighth role does not build until somebody decides
+// where it goes); what a type cannot say is *which* kind is right, and that is
+// what is asserted here.
+
+check(
+  "every role in the picker is a key of the map, and vice versa",
+  [...PHOTO_ROLES].sort().join(",") === Object.keys(PHOTO_ROLE_ATTACHMENT_KIND).sort().join(","),
+);
+
+// The whole mapping, restated independently. Asserting each role against
+// `attachmentKindForPhotoRole(role)` would be asserting the map against itself
+// - true for any map, including a wrong one - so the expected destinations are
+// written out here and compared wholesale. Every entry below is a decision, and
+// changing one in `core` without changing it here is meant to fail.
+deepEqual("each role has the destination it was decided to have", PHOTO_ROLE_ATTACHMENT_KIND, {
+  before: "photo_before",
+  after: "photo_after",
+  defect: "photo_before",
+  serial_plate: "photo_before",
+  meter_reading: "photo_before",
+  parts_used: "photo_before",
+  site_access: "photo_before",
+});
+
+for (const role of PHOTO_ROLES) {
+  check(
+    `a ${role} photograph has a destination the server accepts`,
+    isJobAttachmentKind(attachmentKindForPhotoRole(role)),
+  );
+}
+
+// The load-bearing assertion. `photo_after` is not "taken later" - it is the
+// one kind `assertJobCardComplete` counts as evidence the work was done. A
+// picture of a box of parts or a meter dial reaching it would satisfy JOB-15
+// with no photograph of the finished work on file, which is exactly the failure
+// 0025's CHECK was added to prevent, arriving from the client instead.
+const afterProducing = PHOTO_ROLES.filter((r) => attachmentKindForPhotoRole(r) === "photo_after");
+deepEqual("only the 'after' role produces JOB-15's evidence kind", afterProducing, ["after"]);
+equal("and 'before' produces the kind that justifies the work", attachmentKindForPhotoRole("before"), "photo_before");
+
+// Three kinds are unreachable from a photograph on a handset, each for its own
+// reason: FLD-12's recommendation photo is filed only by `job_note/upsert` in
+// the same savepoint as the note it illustrates; `document` is the free-text
+// bucket 0034 refused to reuse; `signature` has its own mutation and table.
+for (const closed of ["photo_recommendation", "document", "signature", "video"] as const) {
+  check(
+    `no role files a photograph as ${closed}`,
+    !PHOTO_ROLES.some((r) => attachmentKindForPhotoRole(r) === closed),
+  );
+}
+
+// The two vocabularies must not be confusable at runtime either. A build that
+// accepted the server's spelling as a role, or a role as a kind, would put the
+// bug back where it started with the types still green.
+for (const kind of JOB_ATTACHMENT_KINDS) {
+  check(`the server's "${kind}" is not a photo role`, !isPhotoRole(kind));
+}
+for (const role of PHOTO_ROLES) {
+  check(`the handset's "${role}" is not an attachment kind`, !isJobAttachmentKind(role));
+}
+
+check("an unrecognised role is not narrowed into the union", !isPhotoRole("selfie"));
+check("nor is a missing one", !isPhotoRole(null));
+
+// `CapturedPhoto.role` is nullable because `job_photos.role` is a plain text
+// column: a role this build cannot read has no destination kind, and there is
+// no default that would not amount to this app deciding what a photograph is
+// of. The draft carries the null rather than a guess.
+const unreadable: CapturedPhoto = { ...photo("before"), role: null };
+equal("a photograph whose role could not be read carries null, not a default", unreadable.role, null);
+
+// A guard that keeps the mapping honest as the union grows: the `never` here
+// only type-checks while every role is accounted for by the map above.
+const exhaustive: (r: PhotoRole) => string = (r) => PHOTO_ROLE_ATTACHMENT_KIND[r];
+equal("the map is indexable by every member of the union", exhaustive("site_access"), "photo_before");
 
 done("jobcard");

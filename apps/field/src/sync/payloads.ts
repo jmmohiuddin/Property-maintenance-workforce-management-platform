@@ -15,7 +15,7 @@
  * whether a difference is deliberate.
  */
 
-import type { MaterialSource } from "@meridian/core";
+import type { JobAttachmentKind, MaterialSource } from "@meridian/core";
 
 import type { MutationEntity, MutationOp } from "./protocol";
 
@@ -144,12 +144,28 @@ export function recordOutcome(input: {
  * The pipeline sniffed the bytes and extracted EXIF into columns; the phone
  * only ever guessed at them. Sending them would be ignored, and sending a
  * value that is ignored is how a reader comes to believe it matters.
+ *
+ * ── WHY `kind` IS A UNION AND NOT A `string` ───────────────────────────────
+ *
+ * It was a `string`, and the six permitted values were listed in this comment.
+ * `recordJobAttachment` refuses anything outside them **by name**, so that was
+ * one document read twice: this builder could compose a payload the office
+ * always rejects, and the rejection would arrive hours later, in a plant room,
+ * rather than here at compile time. That is the arrangement that produced
+ * `FLD-9` — a vocabulary owned by one end of a wire is a vocabulary the other
+ * end can silently disagree with.
+ *
+ * The union is `@meridian/core`'s, the same declaration `packages/db` now
+ * re-exports, so both ends refuse the same six words. A photograph gets its
+ * kind from `attachmentKindForPhotoRole(role)` rather than from a literal here:
+ * the handset's seven-value `PhotoRole` and the server's six-value kind are two
+ * vocabularies, and the mapping between them is written down once, in `core`.
  */
 export function appendAttachment(input: {
   readonly jobId: string;
   readonly visitId?: string | null;
-  /** `photo_before` | `photo_after` | ... - the server's `job_attachments.kind`. */
-  readonly kind: string;
+  /** The server's `job_attachments.kind`. For a photograph, use `attachmentKindForPhotoRole`. */
+  readonly kind: JobAttachmentKind;
   readonly uploadId: string;
   readonly caption?: string | null;
   /** The upload must have completed before this is applied. */

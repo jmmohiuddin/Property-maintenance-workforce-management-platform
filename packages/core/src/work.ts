@@ -186,6 +186,176 @@ export function isMaterialSource(value: unknown): value is MaterialSource {
   return typeof value === "string" && (MATERIAL_SOURCES as readonly string[]).includes(value);
 }
 
+// ── Attachments and photographs (FLD-7) ──────────────────────────────────────
+
+/**
+ * What a `job_attachments` row **is**, as storage. The database agrees: a CHECK
+ * constraint named `job_attachments_kind`, added by `0025` with five values and
+ * recreated by `0034` with a sixth.
+ *
+ * ── WHY THIS MOVED OUT OF `db` ─────────────────────────────────────────────
+ *
+ * It was declared in `packages/db/src/domain/jobcard.ts` and nowhere else,
+ * which put it out of reach of the one client most likely to get it wrong:
+ * `apps/field` depends on `@meridian/core` and never on `@meridian/db`, so
+ * `appendAttachment` in `apps/field/src/sync/payloads.ts` typed its `kind` as a
+ * bare `string` and named the six permitted values **in a doc comment**. That
+ * is two readings of one document, and it is precisely the arrangement that
+ * produced `FLD-9`: a handset could compose a payload the office always
+ * refuses, and find out hours later, in a plant room, rather than at compile
+ * time. There is one declaration now, in the package both ends already depend
+ * on, and `db` re-exports it so every existing importer is unaffected.
+ *
+ * ── WHAT EACH KIND IS FOR, BECAUSE THEY ARE NOT INTERCHANGEABLE ────────────
+ *
+ *   `photo_before`   the state that justified the work. Customer-visible
+ *                    (`PORTAL_PHOTO_KINDS`).
+ *   `photo_after`    the state that proves it. **The only kind `JOB-15`
+ *                    counts** — `getJobCard` filters on it by name.
+ *   `photo_recommendation`  `FLD-12`. Filed only by `job_note/upsert`, in the
+ *                    same savepoint as the recommendation text it illustrates.
+ *                    Never a general-purpose "other" bucket, never counted
+ *                    towards the after-photo gap.
+ *   `signature`      a reusable credential. Has its own mutation and its own
+ *                    table; withheld from the portal for that reason.
+ *   `document`       whatever the office attached. Nothing constrains it, which
+ *                    is why `0034` refused to file a recommendation photograph
+ *                    here rather than admit a sixth kind.
+ *   `video`          no writer yet.
+ */
+export const JOB_ATTACHMENT_KINDS = [
+  "photo_before",
+  "photo_after",
+  "signature",
+  "document",
+  "video",
+  "photo_recommendation",
+] as const;
+export type JobAttachmentKind = (typeof JOB_ATTACHMENT_KINDS)[number];
+
+export function isJobAttachmentKind(value: unknown): value is JobAttachmentKind {
+  return typeof value === "string" && (JOB_ATTACHMENT_KINDS as readonly string[]).includes(value);
+}
+
+/**
+ * `FLD-7`'s role vocabulary: **why the technician took the photograph.**
+ * A photo without a role is a photo nobody can find.
+ *
+ * The seven values are the requirement's own list, verbatim.
+ */
+export type PhotoRole =
+  | "before"
+  | "after"
+  | "defect"
+  | "serial_plate"
+  | "meter_reading"
+  | "parts_used"
+  | "site_access";
+
+/** The wire spelling, in the order a picker should offer them. */
+export const PHOTO_ROLES: readonly PhotoRole[] = [
+  "before",
+  "after",
+  "defect",
+  "serial_plate",
+  "meter_reading",
+  "parts_used",
+  "site_access",
+];
+
+export const PHOTO_ROLE_LABEL: Readonly<Record<PhotoRole, string>> = {
+  before: "Before",
+  after: "After",
+  defect: "Defect",
+  serial_plate: "Serial plate",
+  meter_reading: "Meter reading",
+  parts_used: "Parts used",
+  site_access: "Site access",
+};
+
+export function isPhotoRole(value: unknown): value is PhotoRole {
+  return typeof value === "string" && (PHOTO_ROLES as readonly string[]).includes(value);
+}
+
+/**
+ * Where a photograph taken on a handset is **stored** on the server.
+ *
+ * ── THESE ARE TWO VOCABULARIES, NOT ONE SPELLED TWICE ──────────────────────
+ *
+ * The tempting reading is that `before`/`after` are just short for
+ * `photo_before`/`photo_after` and the other five are kinds nobody got round to
+ * adding. Three pieces of evidence say otherwise:
+ *
+ *   1. `JOB_ATTACHMENT_KINDS` is not a photo vocabulary. Three of its six
+ *      values — `signature`, `document`, `video` — are not photographs at all.
+ *      A role is a property of a photograph; a kind is the class of an
+ *      attachment. They do not range over the same things.
+ *   2. `PHOTO_ROLES` is not a storage vocabulary. `serial_plate` and
+ *      `meter_reading` say what is *in the frame*; `photo_after` says what the
+ *      row is *evidence of*. `JOB-15`, `PORTAL_PHOTO_KINDS` and the sealed job
+ *      sheet all read the second question and none of them ask the first.
+ *   3. The specification treats them as two axes and says so: the technical
+ *      requirements list `job_attachments` as "Build, reshape — add `role` tag,
+ *      `scan_status`, SHA-256, extracted EXIF columns". A `role` *tag*, beside
+ *      `kind`, not instead of it.
+ *
+ * So this is a mapping and not a merge, and it is total by construction: the
+ * annotation below is `Record<PhotoRole, JobAttachmentKind>`, so an eighth role
+ * added to the union does not compile until somebody has decided where it goes.
+ * That is the entire point of writing it as a table rather than a switch with a
+ * default.
+ *
+ * ── WHY ONLY `after` REACHES `photo_after` ─────────────────────────────────
+ *
+ * `photo_after` is not "a photograph taken later". It is the one kind
+ * `assertJobCardComplete` counts, by name, as evidence the work was done. A
+ * `parts_used` photograph is a picture of a box on a van floor; a
+ * `meter_reading` is a dial. Letting either satisfy the completion gate would
+ * reproduce exactly the failure `0025` added its CHECK to prevent — "the job
+ * completes, the gate reports itself as satisfied, and no photo is on file" —
+ * except from the client rather than from a typo.
+ *
+ * Everything else is a record of what was found, so it lands in
+ * `photo_before`: the state that justified the work, customer-visible,
+ * counting towards nothing.
+ *
+ * Three kinds are deliberately unreachable from here. `photo_recommendation`
+ * belongs to `FLD-12` and is filed only by `job_note/upsert`, in the same
+ * savepoint as the note it illustrates — an attachment mutation naming it would
+ * produce a recommendation photograph attached to no recommendation. `document`
+ * is the free-text bucket `0034` refused to use for exactly this purpose.
+ * `signature` has its own mutation and its own table.
+ *
+ * ── WHAT THIS MAPPING COSTS, STATED PLAINLY ────────────────────────────────
+ *
+ * Five roles collapse into one kind, so today the role does **not** survive the
+ * wire: the office learns that a photograph was taken before the work, not that
+ * it was of the serial plate. That is a real loss and it is not this function's
+ * to fix — `job_attachments` has no column to put a role in. The mapping is
+ * what is correct *until* that column exists, and having it in one place is
+ * what makes adding the column a one-file change rather than an excavation.
+ */
+export const PHOTO_ROLE_ATTACHMENT_KIND: Readonly<Record<PhotoRole, JobAttachmentKind>> = {
+  before: "photo_before",
+  after: "photo_after",
+  defect: "photo_before",
+  serial_plate: "photo_before",
+  meter_reading: "photo_before",
+  parts_used: "photo_before",
+  site_access: "photo_before",
+};
+
+/**
+ * The one destination kind for a photograph with this role.
+ *
+ * Takes a `PhotoRole` and not a `string` on purpose: a role this build could
+ * not read has no destination, and inventing one would be the same confident
+ * wrong answer `FLD-9` was. Callers narrow with `isPhotoRole` first.
+ */
+export function attachmentKindForPhotoRole(role: PhotoRole): JobAttachmentKind {
+  return PHOTO_ROLE_ATTACHMENT_KIND[role];
+}
+
 // ── Priority and SLA ─────────────────────────────────────────────────────────
 
 export type JobPriority = "p1_emergency" | "p2_urgent" | "p3_standard" | "p4_planned";

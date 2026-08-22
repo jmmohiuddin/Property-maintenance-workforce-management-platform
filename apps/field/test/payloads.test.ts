@@ -14,6 +14,7 @@ import {
   transition,
   upsertNote,
 } from "../src/sync/payloads";
+import { attachmentKindForPhotoRole, PHOTO_ROLES } from "../src/domain/job-card";
 import { isKnownMutationKind, mutationKind } from "../src/sync/protocol";
 import { needsBaseVersion } from "../src/sync/conflicts";
 import type { FieldMutationKind } from "../src/sync/protocol";
@@ -82,6 +83,34 @@ for (const guessed of ["mimeType", "sizeBytes", "capturedAt", "capturedLat", "ca
   check(`the phone does not send ${guessed} - the server extracted it`, !(guessed in attachment.payload));
 }
 equal("an attachment is append-only, so it carries no baseVersion", attachment.baseVersion, null);
+
+// A photograph's kind comes from the role it was taken with, not from a literal
+// typed at the call site. `kind` was a bare `string` here with the six
+// permitted values written out in a doc comment, which let this builder compose
+// a payload `recordJobAttachment` always refuses - hours later, in a plant
+// room. The union is `@meridian/core`'s now, so the compiler refuses it here.
+// The destinations themselves are asserted in `jobcard.test.ts`, against a
+// table written out by hand - comparing them to `attachmentKindForPhotoRole`
+// here would be comparing the map to itself. What this checks is the seam: the
+// builder carries the mapped kind onto the wire unaltered, for every role, and
+// produces a mutation kind the server's closed list accepts.
+for (const role of PHOTO_ROLES) {
+  const filed = appendAttachment({ jobId: "j1", kind: attachmentKindForPhotoRole(role), uploadId: "u1" });
+  check(
+    `job_attachment/append is a kind the server accepts for a ${role} photograph`,
+    isKnownMutationKind(filed.entity, filed.op),
+  );
+}
+equal(
+  "a photograph of the parts fitted goes on the wire as photo_before",
+  appendAttachment({ jobId: "j1", kind: attachmentKindForPhotoRole("parts_used"), uploadId: "u1" }).payload["kind"],
+  "photo_before",
+);
+equal(
+  "and only the finished work goes on as photo_after",
+  appendAttachment({ jobId: "j1", kind: attachmentKindForPhotoRole("after"), uploadId: "u1" }).payload["kind"],
+  "photo_after",
+);
 
 const signature = recordSignature({ jobId: "j1", uploadId: "u2", signedByName: "A. Customer" });
 equal("a signature cites the upload id too", signature.payload["uploadId"], "u2");
