@@ -11,15 +11,22 @@ import {
 import { Section, AnswerBlock } from "@/components/ui";
 import { JsonLd } from "@/components/json-ld";
 import { MapPin } from "@phosphor-icons/react/dist/ssr";
+import { hreflangAlternates } from "@/lib/i18n";
 
+// "Median emergency arrival" is the exact claim `tenant.ts` says was removed
+// from this codebase once already: `emergencyResponseMinutes` is JOB-4's P1
+// COMMITMENT -- a promise the SLA clock then holds the business to -- and not
+// a measured median, which nobody has measured. Calling it a median here put
+// it back into the meta description, the JSON-LD and the visible answer
+// block. It is worded as the commitment it is.
 const ANSWER = `${tenant.brandName} covers ${areas.length} areas across ${tenant.serviceAreas
   .map((a) => a.name)
-  .join(", ")}, with technicians based in the communities they serve rather than dispatched from a single depot. Median emergency arrival is ${tenant.emergencyResponseMinutes} minutes inside ${tenant.address.city}.`;
+  .join(", ")}, with technicians based in the communities they serve rather than dispatched from a single depot. Emergency callouts inside ${tenant.address.city} carry a committed response within ${tenant.emergencyResponseMinutes} minutes.`;
 
 export const metadata: Metadata = {
   title: "Areas We Cover",
   description: ANSWER,
-  alternates: { canonical: "/areas" },
+  alternates: { canonical: "/areas", languages: hreflangAlternates("/areas") },
 };
 
 export default function AreasIndexPage() {
