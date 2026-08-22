@@ -13,6 +13,7 @@ import { LanguageSwitcher } from "@/components/language-switcher";
  */
 const NAV = [
   { href: "/services", label: "Services" },
+  { href: "/rates", label: "Rates" },
   { href: "/contracts", label: "Contracts & AMC" },
   { href: "/emergency", label: "Emergency" },
   { href: "/about", label: "About" },

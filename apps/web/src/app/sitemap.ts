@@ -26,6 +26,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
       alternates: { languages: hreflangAlternates("/services") },
     },
     { url: absoluteUrl("/emergency"), changeFrequency: "monthly", priority: 0.9 },
+    { url: absoluteUrl("/rates"), changeFrequency: "weekly", priority: 0.9 },
     { url: absoluteUrl("/contracts"), changeFrequency: "monthly", priority: 0.9 },
     {
       url: absoluteUrl("/areas"),

@@ -933,3 +933,67 @@ GRANT EXECUTE ON FUNCTION app_public_request_interview_reschedule(text, text) TO
 -- and it had been open since 0017.
 REVOKE ALL ON FUNCTION app_product_event(uuid, text, text, uuid, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION app_product_event(uuid, text, text, uuid, jsonb) TO meridian_app;
+
+-- =============================================================================
+-- WEB-16 — the published schedule of rates.
+-- =============================================================================
+--
+-- The public rate-card page reads through here rather than through
+-- `withTenant()` + `listRateCard()`, for the same reason the careers site reads
+-- through `app_public_open_roles`: an anonymous visitor's request never carries
+-- a session, and there is no reason to hand it the tenant's full RLS scope
+-- merely to read ten public prices.
+--
+-- The function enforces both rules that make this table safe to publish at
+-- all, so a caller cannot get either one wrong:
+--
+--  1. `is_published` — not every rate is a public rate. The materials-handling
+--     line on every service is deliberately unpublished (see
+--     `packages/db/src/domain/reference.ts`'s `STANDARD_RATE_CARD_ITEMS`), and
+--     an operator may unpublish anything else from the admin screen.
+--  2. In force *today, in Dubai* — computed here with
+--     `(now() AT TIME ZONE 'Asia/Dubai')::date`, never `current_date`.
+--     `current_date` reads the session's `TimeZone` GUC, which this deployment
+--     sets to Asia/Dhaka (two hours ahead of Dubai). For roughly two hours a
+--     day that difference is a wrong day, which for a dated price table means
+--     showing a rate before it takes effect or hiding one before it actually
+--     lapses — a published price the business will not honour.
+CREATE OR REPLACE FUNCTION app_public_rate_card(p_tenant uuid)
+RETURNS TABLE (
+  code text,
+  service_slug text,
+  label text,
+  unit text,
+  rate_band text,
+  unit_price numeric,
+  currency text,
+  min_quantity numeric,
+  notes text,
+  effective_from text
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+  SELECT r.code::text,
+         r.service_slug::text,
+         r.label::text,
+         r.unit::text,
+         r.rate_band::text,
+         r.unit_price,
+         r.currency::text,
+         r.min_quantity,
+         r.notes::text,
+         to_char(r.effective_from, 'YYYY-MM-DD')
+    FROM rate_card_items r
+    JOIN tenants t ON t.id = r.tenant_id AND t.is_active AND t.deleted_at IS NULL
+   WHERE r.tenant_id = p_tenant
+     AND r.is_published
+     AND r.effective_from <= (now() AT TIME ZONE 'Asia/Dubai')::date
+     AND (r.effective_to IS NULL OR r.effective_to > (now() AT TIME ZONE 'Asia/Dubai')::date)
+   ORDER BY r.service_slug, r.code, r.rate_band;
+$$;
+
+REVOKE ALL ON FUNCTION app_public_rate_card(uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app_public_rate_card(uuid) TO meridian_app;

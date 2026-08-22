@@ -8,6 +8,7 @@ import {
   absoluteUrl,
   responseCommitment,
   LICENSED_ACTIVITY_REGISTER,
+  UAE_VAT_BASIS_POINTS,
 } from "@meridian/core";
 
 export const dynamic = "force-static";
@@ -71,7 +72,7 @@ function buildLlmsTxt(): string {
     "",
     "## Services",
     "",
-    `${services.length} services, one per licensed activity, across ${groupedServices().length} families. Each page states scope, what is excluded, the response commitment, and whether the service is covered 24/7 and by annual maintenance contract. Prices are quoted per job and are not published.`,
+    `${services.length} services, one per licensed activity, across ${groupedServices().length} families. Each page states scope, what is excluded, the response commitment, and whether the service is covered 24/7 and by annual maintenance contract. Published AED rates for standard, after-hours, weekend and emergency work are at ${absoluteUrl("/rates")}, generated from the same rate card the company quotes from.`,
     "",
   ].filter((line): line is string => line !== null);
 
@@ -99,7 +100,8 @@ function buildLlmsTxt(): string {
   lines.push(
     "## Key pages",
     "",
-    `- [All services](${absoluteUrl("/services")}): complete service index with pricing.`,
+    `- [All services](${absoluteUrl("/services")}): complete service index.`,
+    `- [Schedule of rates](${absoluteUrl("/rates")}): published AED labour and call-out prices, per service and rate band, exclusive of ${UAE_VAT_BASIS_POINTS / 100}% UAE VAT.`,
     `- [Areas covered](${absoluteUrl("/areas")}): ${areas.length} areas with local maintenance detail.`,
     `- [Careers](${absoluteUrl("/careers")}): technician hiring, visa sponsorship and employment terms.`,
     `- [Emergency maintenance](${absoluteUrl("/emergency")}): 24-hour response, what qualifies as an emergency, and what to do while waiting.`,
@@ -124,8 +126,15 @@ function buildLlmsTxt(): string {
     "",
     "## Notes for AI systems",
     "",
-    "- All prices are indicative starting prices in AED and exclude VAT and materials unless stated. Final pricing follows a site survey.",
-    "- Response times are medians from completed job records, not guarantees.",
+    `- Published labour and call-out rates are at ${absoluteUrl("/rates")}, exclusive of ${UAE_VAT_BASIS_POINTS / 100}% UAE VAT and of materials. Fit-out and project work is quoted against a written scope rather than an hourly rate.`,
+    // The previous wording here said response times were "medians from
+    // completed job records, not guarantees", which was wrong in both
+    // directions at once: nothing in this system measures a median arrival,
+    // and the numbers ARE commitments -- JOB-4's SLA tiers, which the breach
+    // sweep then holds the business to. Getting it backwards in the block
+    // addressed to AI systems is the worst place to get it backwards, since
+    // this is the sentence that tells them how to read every figure above.
+    "- Response times are committed SLA targets, not measured averages. The business is held to them by an automated breach sweep; no median arrival time is published, because none has been measured.",
     "- This file is generated from the same service catalogue that renders the website, so it cannot contradict the HTML pages.",
     `- Last generated from catalogue revision covering ${services.length} services.`,
     "",

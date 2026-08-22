@@ -38,6 +38,7 @@ import {
   listDispositionReasons,
   listFaultCodes,
   listJobOutcomeCodes,
+  listPublicRateCard,
   listRateCard,
   listRateHistory,
   rateOn,
@@ -606,6 +607,95 @@ async function referenceDataChecks(ctx: { tenantId: string }): Promise<void> {
         plumbingEmergency.unitPriceMinor > plumbingLabour.unitPriceMinor,
     );
   });
+
+  // ── WEB-16: the public schedule of rates sees only published, in-force rows ──
+  //
+  // `listPublicRateCard` reads through `app_public_rate_card`, a SECURITY
+  // DEFINER function, not through `withTenant()` — this is the one place in
+  // this file that calls it with a bare tenant id rather than a `tx`. The two
+  // rules that make the table safe to publish live in that function's SQL, so
+  // this proves them from the outside: an unpublished row must never surface,
+  // a rate that has not taken effect yet must never surface, and a superseded
+  // version must never surface once a newer one is current.
+  const PUBLIC_CODE = `${TAG}_public_published`;
+  const UNPUBLISHED_CODE = `${TAG}_public_unpublished`;
+  const FUTURE_CODE = `${TAG}_public_future`;
+  const SUPERSEDED_CODE = `${TAG}_public_superseded`;
+
+  await withTenant(ctx, async (tx) => {
+    await addRateVersion(tx, ctx, {
+      code: PUBLIC_CODE,
+      serviceSlug: "plumbing-sanitary",
+      label: "__test public published",
+      unit: "hour",
+      rateBand: "standard",
+      unitPriceMinor: 11_100,
+      isPublished: true,
+      effectiveFrom: "2020-01-01",
+    });
+    await addRateVersion(tx, ctx, {
+      code: UNPUBLISHED_CODE,
+      serviceSlug: "plumbing-sanitary",
+      label: "__test public unpublished",
+      unit: "hour",
+      rateBand: "standard",
+      unitPriceMinor: 22_200,
+      isPublished: false,
+      effectiveFrom: "2020-01-01",
+    });
+    await addRateVersion(tx, ctx, {
+      code: FUTURE_CODE,
+      serviceSlug: "plumbing-sanitary",
+      label: "__test public not yet effective",
+      unit: "hour",
+      rateBand: "standard",
+      unitPriceMinor: 33_300,
+      isPublished: true,
+      effectiveFrom: "2099-01-01",
+    });
+    // Two versions of one code: the first is superseded by the second and must
+    // never show through the public function, even though it is published.
+    await addRateVersion(tx, ctx, {
+      code: SUPERSEDED_CODE,
+      serviceSlug: "plumbing-sanitary",
+      label: "__test public superseded v1",
+      unit: "hour",
+      rateBand: "standard",
+      unitPriceMinor: 44_400,
+      isPublished: true,
+      effectiveFrom: "2020-01-01",
+    });
+    await addRateVersion(tx, ctx, {
+      code: SUPERSEDED_CODE,
+      serviceSlug: "plumbing-sanitary",
+      label: "__test public superseded v2 (current)",
+      unit: "hour",
+      rateBand: "standard",
+      unitPriceMinor: 55_500,
+      isPublished: true,
+      effectiveFrom: "2020-06-01",
+    });
+  });
+
+  const publicRates = await listPublicRateCard(ctx.tenantId);
+  const publicCodes = new Set(publicRates.map((r) => r.code));
+
+  checkTrue("the public schedule includes a published, in-force rate", publicCodes.has(PUBLIC_CODE));
+  checkTrue(
+    "the public schedule never includes an unpublished rate",
+    !publicCodes.has(UNPUBLISHED_CODE),
+  );
+  checkTrue(
+    "the public schedule never includes a rate that has not taken effect yet",
+    !publicCodes.has(FUTURE_CODE),
+  );
+
+  const supersededRow = publicRates.find((r) => r.code === SUPERSEDED_CODE);
+  check(
+    "a superseded version never shows through the public schedule — only the current price does",
+    supersededRow?.unitPriceMinor,
+    55_500,
+  );
 
   await clearTestReferenceData(ctx, TAG);
 }

@@ -9,7 +9,7 @@ import {
   type CompanyIdentity,
   type WorkingCalendar,
 } from "@meridian/core";
-import type { TenantScopedTx, TenantContext } from "../index";
+import { db, type TenantScopedTx, type TenantContext } from "../index";
 
 /**
  * Reference data, and the seam where it meets `packages/core` (`ADM-9`, `ADM-10`).
@@ -1216,6 +1216,72 @@ export async function listRateHistory(
   `)) as unknown as RateCardSqlRow[];
 
   return rows.map(toRateRow);
+}
+
+/** One published, in-force line, as an unauthenticated visitor may see it. */
+export interface PublicRateCardRow {
+  readonly code: string;
+  readonly serviceSlug: string;
+  readonly label: string;
+  readonly unit: RateUnit;
+  readonly rateBand: RateBand;
+  /** Integer minor units — fils. Never a float. */
+  readonly unitPriceMinor: number;
+  readonly currency: string;
+  readonly minQuantity: string | null;
+  readonly notes: string | null;
+  readonly effectiveFrom: string;
+}
+
+// A type alias, not an `interface`: `db.execute<T>` constrains `T` to
+// `Record<string, unknown>`, and only an object type literal gets the implicit
+// index signature that satisfies that constraint — an `interface` never does,
+// even when structurally identical. `RateCardSqlRow` above is a type alias
+// (`Parameters<typeof toRateRow>[0]`) for the same reason.
+type PublicRateCardSqlRow = {
+  code: string;
+  service_slug: string;
+  label: string;
+  unit: string;
+  rate_band: string;
+  unit_price: string;
+  currency: string;
+  min_quantity: string | null;
+  notes: string | null;
+  effective_from: string;
+};
+
+/**
+ * The published schedule of rates (`WEB-16`), for the public marketing site.
+ *
+ * Takes a bare `tenantId` rather than a `TenantScopedTx`, and goes through
+ * `app_public_rate_card` — a `SECURITY DEFINER` function, not `withTenant()` —
+ * on purpose. A public page's request never has a session, and there is no
+ * reason to hand an unauthenticated request the tenant's full row-level-
+ * security scope merely to read ten prices; see
+ * `resolvePublicTenantId`/`listPublicRoles` for the same pattern. The
+ * `is_published` filter and the "in force today, in Dubai" date check both live
+ * inside the SQL function, so this can only ever return what is safe to
+ * publish — never checked in this file, and never checked in the component
+ * that renders it.
+ */
+export async function listPublicRateCard(tenantId: string): Promise<readonly PublicRateCardRow[]> {
+  const rows = (await db.execute<PublicRateCardSqlRow>(
+    sql`select * from app_public_rate_card(${tenantId}::uuid)`,
+  )) as unknown as PublicRateCardSqlRow[];
+
+  return rows.map((r) => ({
+    code: r.code,
+    serviceSlug: r.service_slug,
+    label: r.label,
+    unit: r.unit as RateUnit,
+    rateBand: r.rate_band as RateBand,
+    unitPriceMinor: toMinor(r.unit_price),
+    currency: r.currency,
+    minQuantity: r.min_quantity,
+    notes: r.notes,
+    effectiveFrom: r.effective_from,
+  }));
 }
 
 /**
