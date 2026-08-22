@@ -44,6 +44,7 @@ import {
   canDeclareNoMaterials,
   completionReadiness,
   interpretRefusal,
+  isMaterialSource,
   type JobCardDraft,
 } from "../../domain/job-card";
 import {
@@ -132,15 +133,29 @@ export function JobCardScreen({
       })),
       photoExemptionCode: card?.photoExemptionCode ?? null,
       photoExemptionNote: card?.photoExemptionNote ?? null,
+      // `JobMaterial.source` is a `@text` column, so WatermelonDB hands back a
+      // plain `string` - the local schema constrains nothing. This used to be
+      // `material.source as never`, which is the compiler being told to stop
+      // objecting at precisely the seam that broke: an assertion that every row
+      // in this device's SQLite holds one of three values, with nothing
+      // anywhere enforcing it. The server does enforce it now (a CHECK
+      // constraint, and `isMaterialSource` in `recordJobMaterial`), so an
+      // unrecognised value is not a display problem - it is a mutation the
+      // office refuses.
+      //
+      // So it is checked with the office's own predicate rather than asserted.
+      // An unreadable provenance becomes `null` - never a guessed default - and
+      // the line is flagged for the office, which is what that flag is for.
       materials: materials.map((material) => ({
         clientId: material.id,
         sku: material.sku ?? null,
         description: material.description,
         quantity: material.quantity,
         unit: material.unit,
-        source: material.source as never,
+        source: isMaterialSource(material.source) ? material.source : null,
         serialNumber: material.serialNumber ?? null,
-        needsOfficeReconciliation: material.needsOfficeReconciliation,
+        needsOfficeReconciliation:
+          material.needsOfficeReconciliation || !isMaterialSource(material.source),
       })),
       materialsDeclaredNone: card?.materialsNoneAt
         ? { at: new Date(card.materialsNoneAt).toISOString(), note: card.materialsNoneNote ?? null }

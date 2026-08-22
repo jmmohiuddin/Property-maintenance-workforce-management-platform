@@ -15,6 +15,7 @@ import {
   installDispositions,
   installOutcomes,
   installPhotoExemptions,
+  installRateCard,
   stopRate,
   toggleAssetKind,
   toggleDisposition,
@@ -387,6 +388,19 @@ const BANDS = [
  * the whole design of the table, so the form says so rather than hiding it
  * behind an "edit" button that would imply the old number is gone.
  */
+export function InstallRateCardButton({ label }: { label: string }) {
+  const [state, formAction, pending] = useActionState(installRateCard, INITIAL);
+
+  return (
+    <form action={formAction} className="space-y-3">
+      <Feedback state={state} />
+      <SubmitButton pending={pending} pendingLabel="Adding…" className="btn btn-primary disabled:opacity-60">
+        {label}
+      </SubmitButton>
+    </form>
+  );
+}
+
 export function AddRateForm({ today, defaultCode }: { today: string; defaultCode?: string }) {
   const [state, formAction, pending] = useActionState(addRate, INITIAL);
 

@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import {
   company,
   DEFAULT_CALENDAR,
+  services,
   toDecimalString,
   toMinor,
   UserFacingError,
@@ -1354,4 +1355,241 @@ export async function endRate(
        and effective_to is null
        and effective_from < ${endsOn}::date
   `);
+}
+
+/**
+ * A starting rate card, priced against the ten licensed services (`ADM-12`).
+ *
+ * `rate_card_items` is otherwise empty on a fresh install, and a tender pack
+ * (`packages/db/sql/customer-scope.sql`) and the published schedule of rates
+ * (`WEB-16`) both refuse to build with nothing priced. `installStandardRateCardItems`
+ * exists so a new tenant can get past that in one click, the same way
+ * `installStandardJobOutcomes` and `installStandardDispositionReasons` do.
+ *
+ * Built *from* `services` rather than as a hand-typed list, on purpose: the
+ * comment at the top of `catalog.ts` says the DET licence permits exactly ten
+ * activities and that quoting outside it is a licensing exposure. Deriving the
+ * rate card from the same array means a service that is ever removed from the
+ * licence disappears from here too, automatically, rather than leaving a priced
+ * line for work the company is no longer licensed to do.
+ *
+ * ── WHAT EACH LINE IS ───────────────────────────────────────────────────────
+ *
+ *  - Labour, per hour: the trade's hourly rate. Every service gets one.
+ *  - Call-out, per visit: covers the visit and the diagnosis; labour and
+ *    materials are additional lines. Every service gets one.
+ *  - Materials — handling and markup, per visit: `rate_card_items.unit_price`
+ *    is money, not a percentage, and the schema has no unit for "per cent" —
+ *    so rather than store a number that would misread as fifteen dirhams on
+ *    the rate card page, this is priced as a flat AED amount added when
+ *    materials are bought in for the job. A judgement call: a business that
+ *    prices materials as a straight percentage of cost will want to change
+ *    the number, and once a quoting engine exists this may want its own field
+ *    rather than living on the rate card at all.
+ *
+ * Only the three services the catalogue marks `emergency: true` — plumbing,
+ * electrical repair, HVAC — get the three out-of-hours bands (`after_hours`,
+ * `weekend`, `emergency`) on top of `standard`, at 1.5x for after-hours and
+ * weekend work and 2x for a true emergency dispatch. The other seven are
+ * project or scheduled work (fit-out, finishes, cleaning) and are priced
+ * `standard` only; nothing stops an operator adding an after-hours line for
+ * one of them by hand if their business actually needs it.
+ *
+ * Labour and call-out lines are marked for publication — every band, not only
+ * `standard`. `WEB-16`'s schedule of rates is the place a customer finds out
+ * what a 2am call costs before they make it, and an uplift a customer only
+ * meets on the invoice is what generates the argument the schedule exists to
+ * prevent. The materials line is the one exception and is not published,
+ * matching this screen's own guidance that "work bought in at cost normally
+ * stays off" the public schedule.
+ *
+ * Note that the four bands of a trade share one `code` and differ by
+ * `rate_band`; that is deliberate and is the shape `rateOn(code, band, date)`
+ * reads. It is not four competing definitions of the same rate.
+ */
+interface StandardRateLine {
+  readonly code: string;
+  readonly serviceSlug: string;
+  readonly label: string;
+  readonly unit: RateUnit;
+  readonly rateBand: RateBand;
+  /** A decimal AED string, e.g. `"120.00"` — never a float. */
+  readonly unitPriceAed: string;
+  readonly minQuantity: string | null;
+  readonly notes: string | null;
+  readonly isPublished: boolean;
+}
+
+const STANDARD_LABOUR_RATE_AED: Readonly<Record<string, string>> = {
+  "plumbing-sanitary": "120.00",
+  "electrical-fittings-repair": "130.00",
+  "hvac-installation-maintenance": "150.00",
+  "electromechanical-installation": "160.00",
+  "false-ceilings": "90.00",
+  tiling: "90.00",
+  carpentry: "100.00",
+  painting: "80.00",
+  wallpaper: "85.00",
+  "building-cleaning": "45.00",
+};
+
+const STANDARD_CALLOUT_FEE_AED: Readonly<Record<string, string>> = {
+  "plumbing-sanitary": "150.00",
+  "electrical-fittings-repair": "150.00",
+  "hvac-installation-maintenance": "180.00",
+  "electromechanical-installation": "200.00",
+  "false-ceilings": "150.00",
+  tiling: "150.00",
+  carpentry: "150.00",
+  painting: "120.00",
+  wallpaper: "120.00",
+  "building-cleaning": "100.00",
+};
+
+const STANDARD_MATERIALS_HANDLING_AED: Readonly<Record<string, string>> = {
+  "plumbing-sanitary": "30.00",
+  "electrical-fittings-repair": "30.00",
+  "hvac-installation-maintenance": "40.00",
+  "electromechanical-installation": "50.00",
+  "false-ceilings": "50.00",
+  tiling: "50.00",
+  carpentry: "40.00",
+  painting: "30.00",
+  wallpaper: "30.00",
+  "building-cleaning": "15.00",
+};
+
+/** Out-of-hours uplift over the standard rate. `standard` itself is 1x. */
+const BAND_MULTIPLIER: Readonly<Partial<Record<RateBand, number>>> = {
+  after_hours: 1.5,
+  weekend: 1.5,
+  emergency: 2,
+};
+
+function bandPriceAed(standardAed: string, band: RateBand): string {
+  const multiplier = BAND_MULTIPLIER[band];
+  if (!multiplier) return standardAed;
+  // Two decimal places, computed once here rather than carried as a float
+  // anywhere else — this is the only place an AED amount is ever multiplied.
+  return (Number(standardAed) * multiplier).toFixed(2);
+}
+
+export const STANDARD_RATE_CARD_ITEMS: readonly StandardRateLine[] = (() => {
+  const lines: StandardRateLine[] = [];
+
+  for (const service of services) {
+    const labourAed = STANDARD_LABOUR_RATE_AED[service.slug];
+    const calloutAed = STANDARD_CALLOUT_FEE_AED[service.slug];
+    const materialsAed = STANDARD_MATERIALS_HANDLING_AED[service.slug];
+    // Guards catalogue drift: a service added to `catalog.ts` without a price
+    // here is skipped rather than installed at AED 0, which would be a real
+    // (wrong) price rather than a missing one.
+    if (!labourAed || !calloutAed || !materialsAed) continue;
+
+    const bands: readonly RateBand[] = service.emergency
+      ? ["standard", "after_hours", "weekend", "emergency"]
+      : ["standard"];
+
+    for (const band of bands) {
+      const bandSuffix = band === "standard" ? "" : ` — ${RATE_BAND_LABEL[band]}`;
+
+      lines.push({
+        code: `${service.slug}-labour`,
+        serviceSlug: service.slug,
+        label: `${service.shortName} labour${bandSuffix}`,
+        unit: "hour",
+        rateBand: band,
+        unitPriceAed: bandPriceAed(labourAed, band),
+        minQuantity: "1",
+        notes:
+          band === "standard"
+            ? null
+            : `${RATE_BAND_LABEL[band]} uplift over the standard hourly rate.`,
+        isPublished: true,
+      });
+
+      lines.push({
+        code: `${service.slug}-callout`,
+        serviceSlug: service.slug,
+        label: `${service.shortName} call-out${bandSuffix}`,
+        unit: "visit",
+        rateBand: band,
+        unitPriceAed: bandPriceAed(calloutAed, band),
+        minQuantity: null,
+        notes:
+          band === "standard"
+            ? "Covers the visit and the diagnosis. Labour and materials are additional."
+            : `${RATE_BAND_LABEL[band]} uplift over the standard call-out fee.`,
+        isPublished: true,
+      });
+    }
+
+    lines.push({
+      code: `${service.slug}-materials`,
+      serviceSlug: service.slug,
+      label: `${service.shortName} materials — handling and markup`,
+      unit: "visit",
+      rateBand: "standard",
+      unitPriceAed: materialsAed,
+      minQuantity: null,
+      notes:
+        "A flat amount added when materials are bought in for the job, on top of " +
+        "their cost. Not published on the public schedule of rates.",
+      isPublished: false,
+    });
+  }
+
+  return lines;
+})();
+
+/**
+ * Put the standard rate card in place, leaving any price an operator has
+ * already entered alone.
+ *
+ * Unlike the other `install*` helpers, `rate_card_items` has no unique index
+ * to hang an `on conflict do nothing` off — a code and a band can legitimately
+ * repeat across time, that is the whole point of the table. So "already here"
+ * is checked explicitly: a currently-open row (`effective_to is null`) for the
+ * same code and band means a price already exists, and it is left exactly as
+ * it is, priced or not. Running this twice adds nothing the second time.
+ */
+export async function installStandardRateCardItems(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  effectiveFrom: string,
+): Promise<number> {
+  let added = 0;
+  for (const line of STANDARD_RATE_CARD_ITEMS) {
+    const existing = (await tx.execute<{ id: string }>(sql`
+      select id
+        from rate_card_items
+       where tenant_id = ${ctx.tenantId}::uuid
+         and code = ${line.code}
+         and rate_band = ${line.rateBand}
+         and effective_to is null
+       limit 1
+    `)) as unknown as { id: string }[];
+    if (existing.length > 0) continue;
+
+    await tx.execute(sql`
+      insert into rate_card_items
+        (tenant_id, code, service_slug, label, unit, rate_band, unit_price,
+         min_quantity, notes, is_published, effective_from)
+      values (
+        ${ctx.tenantId}::uuid,
+        ${line.code},
+        ${line.serviceSlug},
+        ${line.label},
+        ${line.unit},
+        ${line.rateBand},
+        ${line.unitPriceAed}::numeric,
+        ${line.minQuantity},
+        ${line.notes},
+        ${line.isPublished},
+        ${effectiveFrom}::date
+      )
+    `);
+    added += 1;
+  }
+  return added;
 }

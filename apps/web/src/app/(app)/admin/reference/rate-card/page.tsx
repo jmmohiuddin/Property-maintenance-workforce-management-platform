@@ -5,7 +5,7 @@ import { formatMoney, getService, toDubai } from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
 import { ReferenceTabs } from "../tabs";
-import { AddRateForm, StopRateButton } from "../taxonomy-forms";
+import { AddRateForm, InstallRateCardButton, StopRateButton } from "../taxonomy-forms";
 
 export const metadata: Metadata = {
   title: "Rate card",
@@ -87,8 +87,15 @@ export default async function RateCardPage({
               produced, so with nothing priced here, every tender pack refuses to build until at
               least one rate exists. Start with the callout and the hourly rate for the trades that
               get called most, in all four bands — an emergency at 02:00 on a Friday is not the
-              standard rate.
+              standard rate. A starting rate card priced against the ten licensed services — labour
+              and a call-out fee for each, out-of-hours and emergency uplifts for the three trades
+              that take emergency callouts, and a materials line for the rest — is one click away.
             </p>
+            {onDate ? null : (
+              <div className="mt-4">
+                <InstallRateCardButton label="Add the standard rate card" />
+              </div>
+            )}
           </div>
         ) : null}
 

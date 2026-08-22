@@ -46,6 +46,8 @@
  * lies.
  */
 
+import type { MaterialSource } from "@meridian/core";
+
 import type { OfflineStamp } from "./clock";
 import type { LabourOverride, LabourSplit } from "./attendance";
 import { effectiveWorkMinutes } from "./attendance";
@@ -121,13 +123,29 @@ export interface CapturedPhoto {
 
 // ── Materials (FLD-9) ───────────────────────────────────────────────────────
 
-export type MaterialSource = "van_stock" | "purchased" | "customer_supplied";
-
-export const MATERIAL_SOURCE_LABEL: Readonly<Record<MaterialSource, string>> = {
-  van_stock: "Van stock",
-  purchased: "Purchased",
-  customer_supplied: "Customer supplied",
-};
+/**
+ * The provenance vocabulary is `@meridian/core`'s, not a copy - the same rule
+ * `working-set.ts` follows for `OPEN_STATUSES`.
+ *
+ * It was declared here and nowhere else, and that is exactly how the server
+ * came not to know `source` existed: the handset sent it on every
+ * `job_material/append`, `job_materials` had no column for it and
+ * `recordJobMaterial` read no such key, so the line was accepted and the
+ * provenance was gone. Nothing refused and nothing warned. A vocabulary owned
+ * by one end of a wire is a vocabulary the other end can silently disagree
+ * with, and two copies that agree today drift the first time one is edited.
+ *
+ * So there is one declaration, in the package both ends already depend on, and
+ * it is re-exported here rather than restated: every existing importer of
+ * `MaterialSource` from this module keeps working, and there is no second
+ * opinion left to drift.
+ */
+export {
+  MATERIAL_SOURCES,
+  MATERIAL_SOURCE_LABEL,
+  isMaterialSource,
+  type MaterialSource,
+} from "@meridian/core";
 
 export interface MaterialLine {
   readonly clientId: string;
@@ -137,7 +155,23 @@ export interface MaterialLine {
   /** Decimal string. Fractional quantities are real: 2.5 m of cable. */
   readonly quantity: string;
   readonly unit: string;
-  readonly source: MaterialSource;
+  /**
+   * `null` means **this build could not read the provenance**, not "van stock".
+   *
+   * The local column is a plain `string` (`db/schema.ts`), so what comes back
+   * out of SQLite is only a `MaterialSource` if something checked. The reader
+   * checks - `isMaterialSource` from `@meridian/core`, the same predicate the
+   * server refuses the mutation with - and a value it does not recognise
+   * arrives here as `null` rather than being asserted into the union.
+   *
+   * Null rather than a default, because a default would be this app inventing
+   * an answer to "where did this part come from", which is the one question
+   * `FLD-9` exists to answer and the one a warranty claim turns on. A line
+   * whose provenance cannot be read is a line for the office to check, so the
+   * reader also raises `needsOfficeReconciliation`. `appendMaterial` still
+   * requires a real `MaterialSource`, so an unreadable line cannot be sent.
+   */
+  readonly source: MaterialSource | null;
   readonly serialNumber: string | null;
   /**
    * `FLD-9`: *"with a free-text escape hatch flagged for office

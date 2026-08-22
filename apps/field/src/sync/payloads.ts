@@ -15,6 +15,8 @@
  * whether a difference is deliberate.
  */
 
+import type { MaterialSource } from "@meridian/core";
+
 import type { MutationEntity, MutationOp } from "./protocol";
 
 export interface MutationSpec {
@@ -201,6 +203,16 @@ export function recordSignature(input: {
 
 // ── Materials ───────────────────────────────────────────────────────────────
 
+/**
+ * `job_material/append` (`FLD-9`).
+ *
+ * `source` is `MaterialSource` and not `string`. The server validates it with
+ * `isMaterialSource` and refuses anything else by name, so a builder that
+ * accepted a free string could compose a payload the office always rejects -
+ * and it would be rejected hours later in a plant room rather than here at
+ * compile time, which is the whole reason these builders exist. The union is
+ * `@meridian/core`'s, so both ends refuse the same three words.
+ */
 export function appendMaterial(input: {
   readonly jobId: string;
   readonly visitId?: string | null;
@@ -208,7 +220,7 @@ export function appendMaterial(input: {
   readonly description: string;
   readonly quantity: string;
   readonly unit: string;
-  readonly source: string;
+  readonly source: MaterialSource;
   readonly serialNumber?: string | null;
 }): MutationSpec {
   return {

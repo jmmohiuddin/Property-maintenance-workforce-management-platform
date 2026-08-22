@@ -14,6 +14,7 @@ import {
   installStandardDispositionReasons,
   installStandardJobOutcomes,
   installStandardPhotoExemptionReasons,
+  installStandardRateCardItems,
   setAssetCategoryActive,
   setDispositionReasonActive,
   setFaultCodeActive,
@@ -25,7 +26,7 @@ import {
   type RateBand,
   type RateUnit,
 } from "@meridian/db/domain";
-import { toMinor, UserFacingError } from "@meridian/core";
+import { dubaiDateKey, toMinor, UserFacingError } from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
 import type { ReferenceState } from "./actions";
 
@@ -526,6 +527,38 @@ function priceToMinor(value: string): number | null {
   const cleaned = value.trim().replace(/,/g, "");
   if (!/^\d{1,12}(\.\d{1,2})?$/.test(cleaned)) return null;
   return toMinor(cleaned);
+}
+
+export async function installRateCard(
+  _prev: ReferenceState,
+  _formData: FormData,
+): Promise<ReferenceState> {
+  const { session, ctx } = await context();
+  const effectiveFrom = dubaiDateKey(new Date());
+
+  let added = 0;
+  try {
+    await withTenant(ctx, async (tx) => {
+      added = await installStandardRateCardItems(tx, ctx, effectiveFrom);
+      await writeAuditNote(tx, ctx, {
+        tableName: "rate_card_items",
+        // 11 characters. See the note at the top of this file.
+        action: "rates_added",
+        detail: { added, effectiveFrom, changedBy: session.user.email },
+      });
+    });
+  } catch (error) {
+    console.error("[admin] install standard rate card failed", error);
+    return fail("Could not add the standard rate card.");
+  }
+
+  revalidatePath("/admin/reference/rate-card");
+  return {
+    success:
+      added === 0
+        ? "Every standard line was already here. Nothing was changed or overwritten."
+        : `${added} standard ${added === 1 ? "line" : "lines"} priced from ${effectiveFrom}. Existing prices were left alone.`,
+  };
 }
 
 export async function addRate(_prev: ReferenceState, formData: FormData): Promise<ReferenceState> {

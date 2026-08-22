@@ -20,7 +20,7 @@
  */
 
 import { eq, inArray, sql } from "drizzle-orm";
-import { UserFacingError } from "@meridian/core";
+import { dubaiDateKey, UserFacingError } from "@meridian/core";
 import {
   withTenant,
   withCustomerScope,
@@ -34,6 +34,7 @@ import {
   createLeadFromEnquiry,
   installStandardDispositionReasons,
   installStandardJobOutcomes,
+  installStandardRateCardItems,
   listDispositionReasons,
   listFaultCodes,
   listJobOutcomeCodes,
@@ -43,6 +44,7 @@ import {
   resolveDispositionReason,
   setLeadStage,
   STANDARD_DISPOSITION_REASONS,
+  STANDARD_RATE_CARD_ITEMS,
 } from "../src/index";
 
 const TENANT = "11111111-1111-4111-8111-111111111111";
@@ -517,6 +519,91 @@ async function referenceDataChecks(ctx: { tenantId: string }): Promise<void> {
     checkTrue(
       "the card as it stood in March contains exactly one version of the line",
       asOfMarch.filter((r) => r.code === RATE_CODE).length === 1,
+    );
+  });
+
+  // ── ADM-12: an installed disposition reason actually closes a lead ───────
+  //
+  // The idempotency check above proves the installer is safe to click twice.
+  // It does not by itself prove `LEAD-6` is unblocked — that needs a lead
+  // closed as lost using a reason that came from the installer, not one this
+  // file hand-typed with `addDispositionReason`.
+  await withTenant(ctx, async (tx) => {
+    await installStandardDispositionReasons(tx, ctx);
+    const installed = await listDispositionReasons(tx, { stage: "lost", activeOnly: true });
+    const priceReason = installed.find((r) => r.code === "lost_on_price");
+    if (!priceReason) throw new Error("the standard disposition reasons were not installed");
+
+    const closedByInstall = await createLeadFromEnquiry(ctx.tenantId, {
+      name: `${TAG} attribution closed via an installed reason`,
+      phone: "+971 50 000 0011",
+      serviceSlug: "plumbing-sanitary",
+      urgency: "routine",
+      propertyType: "apartment",
+      city: "Dubai",
+      area: "Dubai Marina",
+      details: "__test lead closed as lost using an installed standard reason.",
+    });
+
+    await setLeadStage(tx, closedByInstall.leadId, "lost", { dispositionReasonId: priceReason.id });
+
+    const row = (
+      (await tx.execute<{ stage: string }>(sql`
+        select stage from leads where id = ${closedByInstall.leadId}::uuid
+      `)) as unknown as { stage: string }[]
+    )[0];
+    check(
+      "a fresh lead closes as lost using a reason the installer, not this file, created",
+      row?.stage,
+      "lost",
+    );
+  });
+
+  // ── ADM-12: the standard rate card installs idempotently and actually prices work ──
+  //
+  // Same shape as the disposition-reason check above: install, prove the
+  // second call adds nothing, and prove the result is not just rows in a
+  // table but a price the quote builder could actually read back.
+  await withTenant(ctx, async (tx) => {
+    const effectiveFrom = dubaiDateKey(new Date());
+
+    const firstAdded = await installStandardRateCardItems(tx, ctx, effectiveFrom);
+    checkTrue(
+      "the first install adds at least one standard line (or they were already there)",
+      firstAdded >= 0,
+    );
+    const secondAdded = await installStandardRateCardItems(tx, ctx, effectiveFrom);
+    check("installing the standard rate card twice adds nothing the second time", secondAdded, 0);
+
+    const card = await listRateCard(tx, { onDate: effectiveFrom });
+    const presentCodes = new Set(card.map((r) => `${r.serviceSlug}::${r.code}::${r.rateBand}`));
+    checkTrue(
+      "every standard line is present after install",
+      STANDARD_RATE_CARD_ITEMS.every((l) =>
+        presentCodes.has(`${l.serviceSlug}::${l.code}::${l.rateBand}`),
+      ),
+    );
+
+    // The positive case a tender pack and a quotation actually rely on: a
+    // licensed service's standard labour rate resolves to a real price, not
+    // to null — which is what an unpriced band would return.
+    const plumbingLabour = await rateOn(tx, "plumbing-sanitary-labour", "standard", effectiveFrom);
+    checkTrue(
+      "plumbing labour prices at standard band after install",
+      plumbingLabour !== null && plumbingLabour.unitPriceMinor > 0,
+    );
+
+    // Only the three emergency-eligible trades get the out-of-hours bands; a
+    // fit-out trade priced only `standard` must not answer for `emergency`.
+    const paintingEmergency = await rateOn(tx, "painting-labour", "emergency", effectiveFrom);
+    check("a non-emergency trade has no emergency band", paintingEmergency, null);
+
+    const plumbingEmergency = await rateOn(tx, "plumbing-sanitary-labour", "emergency", effectiveFrom);
+    checkTrue(
+      "an emergency-eligible trade's emergency rate costs more than its standard rate",
+      plumbingEmergency !== null &&
+        plumbingLabour !== null &&
+        plumbingEmergency.unitPriceMinor > plumbingLabour.unitPriceMinor,
     );
   });
 
