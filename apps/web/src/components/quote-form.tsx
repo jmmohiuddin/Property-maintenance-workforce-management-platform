@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useId } from "react";
+import { useActionState, useEffect, useId, useRef } from "react";
 import {
   tenant,
   services,
@@ -65,6 +65,37 @@ const inputClass =
 export function QuoteForm({ defaultService }: { defaultService?: string }) {
   const [state, formAction, pending] = useActionState(submitQuoteRequest, INITIAL);
   const id = useId();
+  const referrerRef = useRef<HTMLInputElement>(null);
+
+  /**
+   * Where the visitor came from (`LEAD-4`).
+   *
+   * `document.referrer` is the only place this exists — the browser does not
+   * send a Referer naming another site on the POST, so without this field the
+   * question "which search or which directory produced this enquiry" has no
+   * answer at all, which is precisely the gap `LEAD-4` was written about.
+   *
+   * Same-origin referrers are dropped rather than recorded: a visitor moving
+   * from a service page to this one did not come from that page, and filling
+   * the column with internal navigation would make every row look attributed
+   * and none of them be. The page the form was sent from is already known from
+   * the request itself.
+   *
+   * In an effect, and therefore skipped entirely without JavaScript. The rest
+   * of the form still works, and the enquiry is still recorded with whatever
+   * the request headers carry.
+   */
+  useEffect(() => {
+    const input = referrerRef.current;
+    if (!input || !document.referrer) return;
+    try {
+      if (new URL(document.referrer).origin !== window.location.origin) {
+        input.value = document.referrer;
+      }
+    } catch {
+      // An unparseable referrer is not worth a thrown error on a quote form.
+    }
+  }, []);
 
   if (state.status === "success") {
     return (
@@ -87,6 +118,9 @@ export function QuoteForm({ defaultService }: { defaultService?: string }) {
 
   return (
     <form action={formAction} className="space-y-6" noValidate>
+      {/* Attribution, not input. Never shown, never focusable, and empty when
+          the browser has nothing to say. See the effect above. */}
+      <input ref={referrerRef} type="hidden" name="referrer" defaultValue="" />
       {state.status === "error" && state.message ? (
         <div
           role="alert"

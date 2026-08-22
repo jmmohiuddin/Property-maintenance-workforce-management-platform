@@ -49,11 +49,12 @@ Two deployment-specific notes worth keeping:
 
 | Package | What it is | State |
 | --- | --- | --- |
-| `apps/web` | Public site (60 static routes), operational app, and customer portal | Built, verified in browser |
+| `apps/web` | Public site (30 static pages), operational app, and customer portal | Built, verified in browser |
 | `packages/core` | Service catalogue, area data, tenant profile, JSON-LD, exact-decimal money, validation, QR encoder | Built |
-| `packages/db` | Schema (31 tables), tenant + customer RLS, audit triggers, job/SLA/commerce/workforce domain, seed | Built, verified against real Postgres |
+| `packages/db` | Schema (111 tables), tenant + customer RLS, audit triggers, job/SLA/commerce/workforce/contracts/recruitment/HR/assets domain, seed | Built, verified against real Postgres |
 | `packages/auth` | Argon2id hashing, revocable sessions, 10-role RBAC, TOTP two-factor with recovery codes | Built, verified end to end |
 | `packages/notify` | Templates, transactional queue, retry with attempt limits, pluggable transport | Built, verified — console transport only |
+| `packages/files` | Object store (local driver only), magic-byte sniffing, resumable chunked upload, EXIF extraction and stripping, image compression, ClamAV virus scanning | Built — **no scanner and no S3 bucket configured on this deployment**, and both say so |
 | `docs/` | Architecture, ADRs, security model, AEO/GEO playbook, roadmap | Written |
 
 ## Quick start
@@ -68,11 +69,20 @@ Create the database, apply the schema, the security policies and the authenticat
 prove the tenant boundary holds:
 
 ```bash
-createdb meridian_dev && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/drizzle/0000_init.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/drizzle/0001_huge_stardust.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/drizzle/0002_futuristic_joshua_kane.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/rls.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/auth-functions.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/public-functions.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/customer-scope.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/reference.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/mfa-functions.sql && psql -d meridian_dev -v ON_ERROR_STOP=1 -f packages/db/sql/verify-rls.sql
+createdb meridian_dev
+for f in packages/db/drizzle/*.sql; do psql -d meridian_dev -v ON_ERROR_STOP=1 -f "$f"; done
+for f in rls auth-functions public-functions customer-scope reference mfa-functions cron-functions reset-functions verify-rls; do \
+  psql -d meridian_dev -v ON_ERROR_STOP=1 -f "packages/db/sql/$f.sql"; done
 ```
 
-That last file runs twelve isolation checks and exits non-zero if any fail. **Run it in CI on every
-migration** — it is the gate that matters most in this repo.
+That last file runs fourteen isolation checks and exits non-zero if any fail. It now runs in CI on
+every push (`.github/workflows/ci.yml`) — it is the gate that matters most in this repo.
+
+**The order of the `sql/` files is load-bearing, not stylistic.** `rls.sql` ends with a blanket
+`GRANT ... ON ALL TABLES`, so every `REVOKE` a later file depends on has to come after it. Applying
+`rls.sql` on its own re-opens direct access to `rate_limits`, which makes the rate limiter
+bypassable by the application role — `packages/db/test/ratelimit.test.ts` is what catches that, and
+it is how the trap was found. Apply the whole list, in this order, every time.
 
 Give the application role a password, then load demo data:
 
@@ -137,6 +147,92 @@ Many AI crawlers do not execute JavaScript. Anything an answer engine needs to r
 the HTML response, so structured data, FAQ answers and the per-page answer paragraph are all
 server-rendered. The FAQ uses native `<details>` rather than a JS accordion for the same reason.
 
+## Four traps that have each caught more than one person
+
+Each is silent, each survives a careless read, and none of them is a mistake you make once and
+learn from — three different people hit the first independently before it was written down, and the
+fourth caught two more the same night this list grew to hold it.
+
+**1. A backtick inside a SQL comment terminates the template.**
+
+```ts
+tx.execute(sql`
+  -- Joined to invoices rather than read alone. `payments` has no customer_id
+  select ...
+`);
+```
+
+That is valid JavaScript. The backtick before `payments` closes the template literal early, and
+TypeScript then reports something like `TS1005: ',' expected` **tens of lines further down**, at a
+character that is not the problem. The error never points at the backtick.
+
+Write identifiers in SQL comments as bare prose — `payments has no customer_id`. To check a file:
+
+```bash
+grep -n -- "--.*\`" path/to/file.ts
+```
+
+Because it is a parse error, it breaks the **whole workspace** for everyone, not just the file's
+owner. If you are about to leave one broken for more than a moment, say so.
+
+**2. `tx.execute<T>()`'s type parameter is an assertion, not a check — and timestamps come back as
+strings.**
+
+```ts
+// Compiles cleanly. Throws "getTime is not a function" at runtime.
+const rows = await tx.execute<{ x: Date }>(sql`select now() as x`);
+rows[0].x.getTime();
+```
+
+The driver returns `timestamptz` as a string; the angle brackets only tell the compiler what to
+believe. A comparison against an ISO string does not throw — it silently returns false, which is
+worse. Declare timestamp columns as `string` and convert through `rowDate` / `requiredRowDate` in
+`packages/db/src/domain/_rows.ts`.
+
+The returned string is **space-separated, not ISO** — `2026-08-21 20:01:34.899379+06`, not
+`2026-08-21T20:01:34Z`. `new Date()` happens to parse that in V8, which is why the bug survives
+casual testing, but it is not a format to rely on. That accidental success is the reason this one is
+worth sweeping for deliberately rather than waiting for it to fail.
+
+Where a column is a *day* rather than an instant — a permit expiry, a wage due date — prefer keeping
+it a `YYYY-MM-DD` string end to end. Round-tripping a date through a JS `Date` shifts it by the
+local offset, and it shifts in the direction that reports a lapsed permit as still valid.
+
+This one is invisible unless a fixture exercises the branch, so it survives exactly on the paths the
+tests do not reach. When you add raw SQL with a date in it, sweep for it rather than waiting for a
+failure.
+
+**3. A Postgres constraint name is on the error's `cause`, not its `message`.**
+
+Drizzle wraps a driver error in a `DrizzleQueryError` whose own `message` is only
+`Failed query: ...`. The constraint name — the entire reason Postgres refused — is on `.cause`.
+
+```ts
+// Silently matches nothing. The check fails while the database behaves perfectly.
+checkTrue("refused by the constraint", err.message.includes("leave_requests_kind_check"));
+```
+
+This matters because a test proving a CHECK constraint refuses bad data is one of the strongest
+assertions in this repo — several suites rely on exactly that shape — and this failure mode makes
+such a test fail for a reason unrelated to what it is testing. Walk the cause chain instead;
+`packages/db/test/jobcard.test.ts` has a `messageChain()` helper that does it.
+
+Same family as trap 2: the type system says one thing, the runtime hands you another.
+
+**4. `db.execute<T>` takes a type alias, never an `interface`.**
+
+    interface RateRow { code: string }            // TS2344, every time
+    type RateRow = { code: string }               // fine
+    interface RateRow extends Record<string, unknown> { code: string }   // also fine
+
+`db.execute<T>` constrains `T` to `Record<string, unknown>`. TypeScript gives an object *type
+alias* an implicit index signature and a declared `interface` none — even when the two are
+structurally identical, character for character. The error names the constraint and never mentions
+that the alias-versus-interface distinction is what decides it, so the natural response is to stare
+at the fields. Two people hit this within ten minutes of each other, in different files, and each
+reached for a different one of the two valid fixes.
+
+
 ## Documentation
 
 | Document | Read it when |
@@ -158,10 +254,21 @@ server-rendered. The FAQ uses native `<details>` rather than a JS accordion for 
 
 Claims in this README that have been executed rather than asserted:
 
-- `npm run typecheck` passes across all six workspaces; `npm run test` passes 216 checks across ten suites
-- `npm run check:contrast` passes 36/36 token pairings at WCAG AA
-- `next build` produces 66 routes: 24 prerendered service pages, 19 area pages, the rest static or dynamic
-- Schema applied to PostgreSQL 16; all 12 RLS isolation checks pass
+- `npm run typecheck` passes across all eight workspaces — `apps/web` and `apps/field` included,
+  which are easy to assume are skipped and are not; npm runs `apps/*` first, so their banners are
+  the ones that scroll off the top of a truncated log. There is a second typecheck — `npm run
+  typecheck:native -w ./apps/field` — and it is not optional: the field workspace's own
+  `tsconfig.json` excludes `src/app/**`, so the root gate never sees a single one of the screens a
+  technician touches. CI runs both. `npm run test` passes 4,252 checks across 77 suites, no skips
+- `npm run check:contrast --workspace=@meridian/web` passes 72/72 token pairings at WCAG AA, light
+  and dark. It is workspace-scoped: there is no root `check:contrast`, and CI invokes it this way
+- `next build` produces 128 routes — 106 server-rendered, 18 static, and 4 prerendered from
+  `generateStaticParams`, expanding to 57 static HTML pages. 26 of those are the Arabic half of the
+  public site, served from `/ar` with reciprocal `hreflang` alternates.
+  The route count grows with the operational app; the public half stays small on purpose: `WEB-1`
+  rebuilt the service pages one-to-one against the licensed activities and removed the rest, and
+  `WEB-6` cut the area pages to the ones the company will genuinely travel to
+- Schema applied to PostgreSQL 16; all 14 RLS isolation checks pass
 - JSON-LD parsed and validated across 10 blocks on 9 pages, 0 invalid
 - Quote form submitted end to end in a browser: success path and validation-failure path both confirmed
 - Full internal link crawl from `/`: 59 URLs, zero dead links

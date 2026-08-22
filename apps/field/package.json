@@ -1,0 +1,39 @@
+{
+  "name": "@meridian/field",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Technician field application (M11). Expo / React Native + WatermelonDB, per ADR 0009.",
+  "main": "index.js",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx test/ids.test.ts && tsx test/clock.test.ts && tsx test/outbox.test.ts && tsx test/engine.test.ts && tsx test/conflicts.test.ts && tsx test/jobcard.test.ts && tsx test/working-set.test.ts && tsx test/media.test.ts && tsx test/schema.test.ts && tsx test/protocol.test.ts && tsx test/payloads.test.ts && tsx test/apply-sync.test.ts && tsx test/device-auth.test.ts && tsx test/hash.test.ts && tsx test/base64.test.ts && tsx test/raster.test.ts && tsx test/material-entry.test.ts && tsx test/outcome-entry.test.ts && tsx test/upload-orchestrator.test.ts && tsx test/geofence.test.ts && tsx test/shift-clock.test.ts && tsx test/location-tracking.test.ts",
+    "check": "npm run typecheck && npm run test",
+    "typecheck:native": "tsc -p tsconfig.native.json --noEmit",
+    "start:expo": "expo start",
+    "ios": "expo run:ios",
+    "android": "expo run:android"
+  },
+  "dependencies": {
+    "@meridian/core": "*",
+    "@nozbe/watermelondb": "^0.28.0",
+    "expo": "~54.0.0",
+    "expo-application": "~7.0.0",
+    "expo-camera": "~17.0.0",
+    "expo-file-system": "~19.0.0",
+    "expo-image-manipulator": "~14.0.0",
+    "expo-location": "~19.0.0",
+    "expo-network": "~8.0.0",
+    "expo-secure-store": "~15.0.0",
+    "expo-status-bar": "~3.0.0",
+    "react": "19.1.0",
+    "react-native": "0.81.4",
+    "react-native-svg": "15.12.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/react": "~19.1.0",
+    "tsx": "^4.20.6",
+    "typescript": "^7.0.2"
+  }
+}

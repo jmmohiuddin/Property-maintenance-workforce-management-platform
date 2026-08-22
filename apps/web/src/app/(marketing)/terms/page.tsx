@@ -2,11 +2,12 @@ import type { Metadata } from "next";
 import { tenant, graph, webPageSchema, breadcrumbSchema } from "@meridian/core";
 import { JsonLd } from "@/components/json-ld";
 import { LegalPage, LegalSection, ReviewBanner } from "@/components/legal";
+import { hreflangAlternates } from "@/lib/i18n";
 
 export const metadata: Metadata = {
   title: "Terms of Service",
   description: `Terms on which ${tenant.legalName} provides maintenance services.`,
-  alternates: { canonical: "/terms" },
+  alternates: { canonical: "/terms", languages: hreflangAlternates("/terms") },
   robots: { index: false, follow: true },
 };
 
@@ -145,9 +146,22 @@ export default function TermsPage() {
         </LegalSection>
 
         <LegalSection title="Liability">
+          {/*
+            "third-party public liability insurance to AED 10,000,000" was a
+            figure nobody held a policy for, published in a document a customer
+            may later rely on in a dispute. WEB-2 removes it rather than
+            replacing it with "fully insured", which asserts the same thing with
+            less information and is no easier to stand behind.
+
+            HR-14 builds a company accreditation register holding the real
+            policies with their cover levels and expiry dates. When there is a
+            certificate on file, the figure comes back — read from that register
+            rather than typed into a paragraph.
+          */}
           <p>
-            We carry third-party public liability insurance to AED 10,000,000 and workmen's compensation
-            cover for our staff. We are responsible for damage caused by our own negligence.
+            We are responsible for damage caused by our own negligence. Current insurance certificates,
+            including public liability and workmen&apos;s compensation cover, are provided on request and
+            with any tender or contract submission.
           </p>
           <p>
             We are not responsible for pre-existing defects we did not cause, for consequential loss such

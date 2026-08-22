@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useActionState, useId } from "react";
 import { signIn, type LoginState } from "./actions";
 import { Warning } from "@phosphor-icons/react/dist/ssr";
@@ -71,6 +72,21 @@ export function LoginForm() {
       <button type="submit" disabled={pending} className="btn btn-primary w-full !py-3 disabled:opacity-60">
         {pending ? "Signing in..." : "Sign in"}
       </button>
+
+      {/*
+        Under the button, not above it. Somebody who knows their password should
+        not have to read past a recovery link to sign in — and somebody who does
+        not know it has already failed once and is looking for exactly this.
+      */}
+      <p className="text-center text-[13px]">
+        <Link
+          href="/forgot-password"
+          style={{ color: "var(--accent-text)" }}
+          className="underline underline-offset-2"
+        >
+          Forgotten your password?
+        </Link>
+      </p>
     </form>
   );
 }

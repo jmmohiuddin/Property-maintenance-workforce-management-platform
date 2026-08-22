@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { tenant, telLink } from "@meridian/core";
 import { PhoneCall, List } from "@phosphor-icons/react/dist/ssr";
+import { LanguageSwitcher } from "@/components/language-switcher";
 
 /**
  * Single-line desktop nav, 68px tall. Five items is the ceiling before labels
@@ -12,8 +13,8 @@ import { PhoneCall, List } from "@phosphor-icons/react/dist/ssr";
  */
 const NAV = [
   { href: "/services", label: "Services" },
+  { href: "/rates", label: "Rates" },
   { href: "/contracts", label: "Contracts & AMC" },
-  { href: "/industries", label: "Industries" },
   { href: "/emergency", label: "Emergency" },
   { href: "/about", label: "About" },
 ] as const;
@@ -31,7 +32,7 @@ export function SiteHeader() {
             className="grid h-8 w-8 place-items-center rounded-sm font-mono text-[15px] font-bold"
             style={{ backgroundColor: "var(--accent)", color: "var(--accent-contrast)" }}
           >
-            M
+            S
           </span>
           <span className="text-[15px] font-semibold tracking-tight">{tenant.brandName}</span>
         </Link>
@@ -50,6 +51,10 @@ export function SiteHeader() {
         </nav>
 
         <div className="flex items-center gap-3">
+          <LanguageSwitcher
+            locale="en"
+            className="hidden lg:inline text-[14px] font-medium transition-colors hover:text-[var(--accent)]"
+          />
           <a
             href={telLink(tenant.emergencyPhone)}
             className="hidden sm:inline-flex items-center gap-2 text-[14px] font-semibold tabular-nums"
@@ -83,6 +88,10 @@ export function SiteHeader() {
                   {item.label}
                 </Link>
               ))}
+              <LanguageSwitcher
+                locale="en"
+                className="block rounded-sm px-3 py-2.5 text-[15px] font-medium"
+              />
             </nav>
           </details>
         </div>

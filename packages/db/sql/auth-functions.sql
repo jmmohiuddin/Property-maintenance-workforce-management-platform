@@ -43,11 +43,19 @@
 -- ── Look up a user by email, with their memberships ─────────────────────────
 -- Returns one row per membership, or one row with NULL membership columns when
 -- the user exists but belongs to no tenant. Zero rows means no such user.
+--
+-- DROP before CREATE: the return type changed in migration 0004 (the failure
+-- counter became an integer and `locked_until` was added), and CREATE OR
+-- REPLACE cannot change a function's output columns. Without the DROP this file
+-- fails to re-apply against a database that already has the old signature.
+DROP FUNCTION IF EXISTS app_auth_lookup(text);
+
 CREATE OR REPLACE FUNCTION app_auth_lookup(p_email text)
 RETURNS TABLE (
   user_id uuid,
   password_hash text,
-  failed_login_count text,
+  failed_login_count integer,
+  locked_until timestamptz,
   mfa_enabled boolean,
   tenant_id uuid,
   role text,
@@ -62,6 +70,7 @@ AS $$
     u.id,
     u.password_hash,
     u.failed_login_count,
+    u.locked_until,
     (u.mfa_enabled_at IS NOT NULL),
     m.tenant_id,
     m.role::text,
@@ -75,16 +84,39 @@ AS $$
 $$;
 
 -- ── Record the outcome of an attempt ────────────────────────────────────────
-CREATE OR REPLACE FUNCTION app_auth_record_failure(p_user_id uuid)
-RETURNS void
+--
+-- SEC-4. Lockout was previously permanent: the counter crossed a threshold and
+-- nothing except a database client could clear it, while the sign-in screen
+-- said "temporarily locked". Two things follow from that being wrong.
+--
+-- First, the lock now expires. The caller passes the backoff it has computed
+-- (packages/auth/src/lockout.ts owns the curve, so the policy is testable
+-- without a database and is stated in exactly one place). Zero or NULL means
+-- "count this failure but do not lock yet".
+--
+-- Second, the *later* of the existing and the new expiry wins. Otherwise a
+-- burst of attempts arriving while a lock is already in force would each
+-- recompute a shorter window from a stale count and shorten the lockout.
+DROP FUNCTION IF EXISTS app_auth_record_failure(uuid);
+
+CREATE OR REPLACE FUNCTION app_auth_record_failure(p_user_id uuid, p_lock_seconds integer DEFAULT 0)
+RETURNS TABLE (failed_login_count integer, locked_until timestamptz)
 LANGUAGE sql
 SECURITY DEFINER
 SET search_path = public
 AS $$
   UPDATE users
-     SET failed_login_count = (COALESCE(NULLIF(failed_login_count, '')::int, 0) + 1)::text,
+     SET failed_login_count = failed_login_count + 1,
+         locked_until = CASE
+           WHEN COALESCE(p_lock_seconds, 0) <= 0 THEN locked_until
+           ELSE GREATEST(
+             COALESCE(locked_until, now()),
+             now() + make_interval(secs => p_lock_seconds)
+           )
+         END,
          updated_at = now()
-   WHERE id = p_user_id;
+   WHERE id = p_user_id
+  RETURNING failed_login_count, locked_until;
 $$;
 
 CREATE OR REPLACE FUNCTION app_auth_record_success(p_user_id uuid)
@@ -94,39 +126,101 @@ SECURITY DEFINER
 SET search_path = public
 AS $$
   UPDATE users
-     SET failed_login_count = '0',
+     SET failed_login_count = 0,
+         locked_until = NULL,
          last_login_at = now(),
          updated_at = now()
    WHERE id = p_user_id;
 $$;
 
+-- Administrator unlock (ADM-1, ADM-3). The one action that previously required
+-- someone to open a database client during an incident. Authorisation is the
+-- caller's job — this function only performs the clear, and the audit row is
+-- written by the server action so it carries the acting administrator.
+CREATE OR REPLACE FUNCTION app_auth_unlock(p_user_id uuid)
+RETURNS void
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  UPDATE users
+     SET failed_login_count = 0,
+         locked_until = NULL,
+         updated_at = now()
+   WHERE id = p_user_id;
+$$;
+
 -- ── Sessions ────────────────────────────────────────────────────────────────
+--
+-- These live here, with the rest of the authentication surface, and NOWHERE
+-- else. They were briefly declared in reset-functions.sql as well, when sliding
+-- expiry was added, and two files declaring the same function produced two
+-- distinct failures that are worth recording because neither is obvious:
+--
+--   * `app_auth_resolve_session` gained a column, and CREATE OR REPLACE cannot
+--     change a function's return type. Re-applying the files in the documented
+--     order aborted partway through auth-functions.sql, so every statement
+--     after it — including the grants at the foot of this file — silently did
+--     not run.
+--
+--   * `app_auth_create_session` gained an argument, and a different argument
+--     list does not replace a function, it OVERLOADS it. Both versions existed
+--     in the database at once. The six-argument one writes a session with a
+--     NULL `absolute_expires_at`, and `app_auth_touch_session` COALESCEs a NULL
+--     ceiling to "now plus the slide" — so a session created through the older
+--     overload renews forever. That is exactly the "sliding degrades into never
+--     expires" failure the absolute cap was added to prevent, reintroduced by a
+--     duplicate declaration rather than by a change in logic.
+--
+-- Hence the explicit DROPs below. They are not decoration: without them this
+-- file cannot be re-applied, and the dead overload stays reachable.
+
+DROP FUNCTION IF EXISTS app_auth_create_session(uuid, uuid, text, text, text, timestamptz);
+DROP FUNCTION IF EXISTS app_auth_create_session(uuid, uuid, text, text, text, timestamptz, timestamptz);
+
 -- The raw token never reaches the database; only its SHA-256 hash does.
+--
+-- Two expiry clocks (SEC-11). `expires_at` slides forward on activity;
+-- `absolute_expires_at` never moves and is what stops a stolen token being
+-- renewed indefinitely.
 CREATE OR REPLACE FUNCTION app_auth_create_session(
   p_user_id uuid,
   p_tenant_id uuid,
   p_token_hash text,
   p_user_agent text,
   p_ip_address text,
-  p_expires_at timestamptz
+  p_expires_at timestamptz,
+  p_absolute_expires_at timestamptz
 )
 RETURNS uuid
 LANGUAGE sql
 SECURITY DEFINER
 SET search_path = public
 AS $$
-  INSERT INTO sessions (user_id, tenant_id, token_hash, user_agent, ip_address, expires_at)
-  VALUES (p_user_id, p_tenant_id, p_token_hash, p_user_agent, p_ip_address, p_expires_at)
+  INSERT INTO sessions (
+    user_id, tenant_id, token_hash, user_agent, ip_address,
+    expires_at, absolute_expires_at, last_seen_at
+  )
+  VALUES (
+    p_user_id, p_tenant_id, p_token_hash, p_user_agent, p_ip_address,
+    p_expires_at, p_absolute_expires_at, now()
+  )
   RETURNING id;
 $$;
 
 -- Resolves a token to everything the application needs to build a principal.
--- Deliberately enforces the liveness conditions in SQL (not revoked, not
--- expired, membership active, tenant active) so a caller cannot forget one.
+-- Deliberately enforces the liveness conditions in SQL (not revoked, neither
+-- clock elapsed, membership active, tenant active) so a caller cannot forget
+-- one. The absolute cap is checked on READ as well as on renewal: a session
+-- whose sliding expiry is still ahead but whose ceiling has passed must not
+-- resolve.
+DROP FUNCTION IF EXISTS app_auth_resolve_session(text);
+
 CREATE OR REPLACE FUNCTION app_auth_resolve_session(p_token_hash text)
 RETURNS TABLE (
   session_id uuid,
   expires_at timestamptz,
+  absolute_expires_at timestamptz,
   user_id uuid,
   full_name text,
   email text,
@@ -144,6 +238,7 @@ AS $$
   SELECT
     s.id,
     s.expires_at,
+    s.absolute_expires_at,
     u.id,
     u.full_name::text,
     u.email::text,
@@ -164,10 +259,36 @@ AS $$
   WHERE s.token_hash = p_token_hash
     AND s.revoked_at IS NULL
     AND s.expires_at > now()
+    AND (s.absolute_expires_at IS NULL OR s.absolute_expires_at > now())
     AND m.is_active
     AND t.is_active
     AND u.deleted_at IS NULL
   LIMIT 1;
+$$;
+
+-- Extend a live session on activity, bounded by its ceiling.
+--
+-- LEAST(..., absolute_expires_at) is the whole safety property: the sliding
+-- window can never push past the hard ceiling set when the session was created.
+-- Only live rows are touched, so a revoked or expired session is not
+-- resurrected by activity on it.
+CREATE OR REPLACE FUNCTION app_auth_touch_session(p_token_hash text, p_slide_seconds integer)
+RETURNS timestamptz
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  UPDATE sessions
+     SET expires_at = LEAST(
+           now() + make_interval(secs => p_slide_seconds),
+           COALESCE(absolute_expires_at, now() + make_interval(secs => p_slide_seconds))
+         ),
+         last_seen_at = now()
+   WHERE token_hash = p_token_hash
+     AND revoked_at IS NULL
+     AND expires_at > now()
+     AND (absolute_expires_at IS NULL OR absolute_expires_at > now())
+  RETURNING expires_at;
 $$;
 
 CREATE OR REPLACE FUNCTION app_auth_revoke_session(p_token_hash text)
@@ -201,6 +322,118 @@ BEGIN
 END;
 $$;
 
+-- ── Field devices (SEC-7, TRD 8.5) ──────────────────────────────────────────
+--
+-- A technician's phone is not a browser session, and this is the one function
+-- that lets it authenticate. It lives here, with the rest of the authentication
+-- surface, rather than in a file of its own, for two reasons: the bootstrap
+-- problem is identical -- resolving a device token happens before a tenant is
+-- known, so RLS matches zero rows -- and the order of the sql/ files is
+-- load-bearing, so a new file is a change to the README's list and one more
+-- thing to get wrong during a restore.
+--
+-- ── WHY THIS IS THE ONLY DEFINER FUNCTION THE FIELD API NEEDS ───────────────
+--
+-- Everything else a device does -- rotating its token, recording its clock
+-- skew, revoking itself on sign-out, pulling work, pushing mutations -- happens
+-- AFTER this call, by which point the tenant is known and withTenant() can open
+-- an ordinary RLS-scoped transaction. So the privileged surface is one function
+-- with one argument, and every write the field app performs is subject to the
+-- same policies as the dispatch board.
+--
+-- Registration is deliberately absent too: a device is registered from an
+-- already-authenticated session, inside the tenant, under RLS. There is no path
+-- by which a phone acquires a credential without a human first signing in.
+--
+-- ── WHAT `match` MEANS, AND WHY IT IS NOT A BOOLEAN ─────────────────────────
+--
+-- Four outcomes, and collapsing them to "valid / not valid" throws away the two
+-- that matter operationally:
+--
+--   current  the live token. Ordinary case.
+--   grace    the token this one replaced, still inside its grace window. The
+--            rotation response was lost in transit -- the commonest failure on
+--            a mobile network -- and the phone is retrying with what it has.
+--            Accept it and re-send the current token.
+--   expired  the live token, past its expiry. The handset has been in a drawer.
+--            The person signs in again; nothing is wrong with the device.
+--   reuse    the replaced token, presented after its successor was issued and
+--            its grace has passed. This did not come from the phone. The caller
+--            revokes the device.
+--
+-- Liveness is enforced here rather than by the caller, exactly as
+-- app_auth_resolve_session does it: not revoked, membership active, tenant
+-- active, technician active, user not deleted. A revoked device therefore
+-- returns ZERO rows and is indistinguishable from an unknown token, which is
+-- the intended answer to somebody holding a stolen credential.
+DROP FUNCTION IF EXISTS app_auth_resolve_device(text);
+
+CREATE OR REPLACE FUNCTION app_auth_resolve_device(p_token_hash text)
+RETURNS TABLE (
+  device_id uuid,
+  match text,
+  tenant_id uuid,
+  technician_id uuid,
+  user_id uuid,
+  full_name text,
+  email text,
+  brand_name text,
+  role text,
+  overrides jsonb,
+  label text,
+  token_issued_at timestamptz,
+  token_expires_at timestamptz
+)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  -- Two index scans unioned, not an OR. `token_hash` is a unique index and
+  -- `previous_token_hash` has its own; an OR across the pair plans as a
+  -- sequential scan over every device in the estate, on the hottest path in
+  -- the field API.
+  WITH presented AS (
+    SELECT d.*, 'current'::text AS how
+      FROM field_devices d
+     WHERE d.token_hash = p_token_hash
+    UNION ALL
+    SELECT d.*, 'previous'::text AS how
+      FROM field_devices d
+     WHERE d.previous_token_hash = p_token_hash
+  )
+  SELECT
+    p.id,
+    CASE
+      WHEN p.how = 'current' AND p.token_expires_at > now() THEN 'current'
+      WHEN p.how = 'current' THEN 'expired'
+      WHEN p.previous_token_grace_until > now() THEN 'grace'
+      ELSE 'reuse'
+    END,
+    p.tenant_id,
+    p.technician_id,
+    p.user_id,
+    u.full_name::text,
+    u.email::text,
+    t.brand_name::text,
+    m.role::text,
+    m.permission_overrides,
+    p.label::text,
+    p.token_issued_at,
+    p.token_expires_at
+  FROM presented p
+  JOIN users u        ON u.id = p.user_id
+  JOIN tenants t      ON t.id = p.tenant_id
+  JOIN memberships m  ON m.user_id = p.user_id AND m.tenant_id = p.tenant_id
+  JOIN technicians te ON te.id = p.technician_id
+  WHERE p.revoked_at IS NULL
+    AND p.deleted_at IS NULL
+    AND m.is_active
+    AND t.is_active
+    AND te.is_active
+    AND u.deleted_at IS NULL
+  LIMIT 1;
+$$;
+
 -- ── Grants ──────────────────────────────────────────────────────────────────
 -- EXECUTE is public by default on new functions, which would let any role call
 -- them. Lock that down and grant explicitly.
@@ -209,12 +442,15 @@ DECLARE fn text;
 BEGIN
   FOREACH fn IN ARRAY ARRAY[
     'app_auth_lookup(text)',
-    'app_auth_record_failure(uuid)',
+    'app_auth_record_failure(uuid, integer)',
     'app_auth_record_success(uuid)',
-    'app_auth_create_session(uuid,uuid,text,text,text,timestamptz)',
+    'app_auth_unlock(uuid)',
+    'app_auth_create_session(uuid,uuid,text,text,text,timestamptz,timestamptz)',
+    'app_auth_touch_session(text, integer)',
     'app_auth_resolve_session(text)',
     'app_auth_revoke_session(text)',
-    'app_auth_revoke_all_sessions(uuid, uuid)'
+    'app_auth_revoke_all_sessions(uuid, uuid)',
+    'app_auth_resolve_device(text)'
   ] LOOP
     EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', fn);
     EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO meridian_app', fn);

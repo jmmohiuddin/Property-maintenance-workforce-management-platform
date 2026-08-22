@@ -26,3 +26,26 @@ drizzle/meta/_journal.json.bak
 # Re-stated after the wildcard above: the negation has to come last to win, and
 # this file is the only record of which variables a deployment needs.
 !.env.example
+
+# Playwright MCP scratch output: console logs and page snapshots written during
+# browser verification. Evidence for one session, not a record worth keeping.
+.playwright-mcp/
+
+# Screenshots taken while verifying a screen by hand. Name them and move them
+# into docs/ if one is ever worth keeping; the root is not a scrapbook.
+/seeded-*.png
+
+# Browser accessibility-tree snapshots. The MCP tool writes these under
+# .playwright-mcp/, but a verification run can be told to put one anywhere —
+# one reached a commit as `audit-feed.yml`. Snapshots are evidence for a
+# session, not a record; name and move one into docs/ if it is ever worth
+# keeping.
+/*-feed.yml
+/page-*.yml
+/console-*.log
+
+# Raw doc-tool exports of the v2 specification, dropped at the repo root. The
+# specs themselves live in docs/spec-v2/ as markdown and ARE tracked; these are
+# the intermediate exports they came from. Excluded pending a decision rather
+# than decided against — delete these three lines to track them.
+/*.cd

@@ -3,6 +3,7 @@ import {
   varchar,
   text,
   boolean,
+  date,
   integer,
   timestamp,
   uuid,
@@ -13,6 +14,8 @@ import {
 } from "drizzle-orm/pg-core";
 import { idCol, timestamps, money, currencyCol, propertyType, leadStage, assetCondition } from "./_shared";
 import { tenants, users } from "./tenancy";
+import { leadDispositionReasons } from "./reference";
+import { assetCategories } from "./assets";
 
 /**
  * A customer is the paying entity — a developer, an owners association, a
@@ -31,8 +34,17 @@ export const customers = pgTable(
     name: varchar("name", { length: 200 }).notNull(),
     isCompany: boolean("is_company").notNull().default(true),
     industry: varchar("industry", { length: 80 }),
+    /** 15 digits. Null means not VAT-registered, which under `INV-6` permits a
+     *  simplified tax invoice at any value. */
     taxRegistrationNumber: varchar("trn", { length: 32 }),
     billingEmail: varchar("billing_email", { length: 200 }),
+    /** Article 59 requires the recipient's address on a full tax invoice, and
+     *  it is not the property address — for an owners association the site is
+     *  not the counterparty. Null until entered; the render check refuses the
+     *  full invoice rather than substituting a plausible address. */
+    billingAddress: text("billing_address"),
+    billingCity: varchar("billing_city", { length: 80 }),
+    billingCountry: varchar("billing_country", { length: 2 }).notNull().default("AE"),
     phone: varchar("phone", { length: 24 }),
     /** Days. Drives invoice due dates and the overdue report. */
     paymentTermsDays: integer("payment_terms_days").notNull().default(30),
@@ -126,8 +138,25 @@ export const propertyUnits = pgTable(
 );
 
 /**
- * Asset register. Building maintenance and AMC pricing both depend on knowing
- * what plant exists, so this is a first-class table rather than a JSON blob.
+ * The asset register (`CON-13`).
+ *
+ * Building maintenance and AMC pricing both depend on knowing what plant
+ * exists, so this is a first-class table rather than a JSON blob.
+ *
+ * ── WHY THE DAY-VALUED COLUMNS ARE `date` AND NOT `timestamptz` ─────────────
+ *
+ * `installed_on` and `warranty_expires_on` are days, not instants. They were
+ * declared `timestamptz` and 0021 narrows them, because a day stored as an
+ * instant is read back through whatever offset the reader happens to be in: a
+ * warranty expiring on 1 July becomes 30 June at 20:00 UTC, and a check written
+ * against "today" reports an expired warranty as still valid for four hours
+ * every day. The direction of that error is the expensive one — it authorises a
+ * free repair the manufacturer will not pay for. As `date`, the value that comes
+ * back is the string that was stored, and the comparison happens in Postgres
+ * against `current_date`.
+ *
+ * `last_serviced_at` and `next_service_due_at` stay `timestamptz`: a PPM visit
+ * is scheduled to a time, and the dispatch board reads them as instants.
  */
 export const assets = pgTable(
   "assets",
@@ -140,6 +169,13 @@ export const assets = pgTable(
       .notNull()
       .references(() => properties.id, { onDelete: "cascade" }),
     unitId: uuid("unit_id").references(() => propertyUnits.id, { onDelete: "set null" }),
+    /**
+     * What kind of plant this is, from the controlled vocabulary in
+     * `./assets.ts`. Nullable in the column and required by a `NOT VALID` check
+     * added in 0021 — see the migration for why that is the shape rather than
+     * `NOT NULL`.
+     */
+    categoryId: uuid("category_id").references(() => assetCategories.id, { onDelete: "restrict" }),
     tag: varchar("tag", { length: 48 }).notNull(),
     name: varchar("name", { length: 160 }).notNull(),
     /** Matches a catalogue service slug, e.g. "hvac-ac-maintenance". */
@@ -148,8 +184,8 @@ export const assets = pgTable(
     model: varchar("model", { length: 120 }),
     serialNumber: varchar("serial_number", { length: 120 }),
     location: varchar("location", { length: 160 }),
-    installedOn: timestamp("installed_on", { withTimezone: true }),
-    warrantyExpiresOn: timestamp("warranty_expires_on", { withTimezone: true }),
+    installedOn: date("installed_on"),
+    warrantyExpiresOn: date("warranty_expires_on"),
     condition: assetCondition("condition").notNull().default("good"),
     /** Days between planned maintenance visits for this asset. */
     ppmIntervalDays: integer("ppm_interval_days"),
@@ -163,6 +199,10 @@ export const assets = pgTable(
     index("assets_property_idx").on(t.tenantId, t.propertyId),
     // Drives the "what PPM is due" job generator.
     index("assets_due_idx").on(t.tenantId, t.nextServiceDueAt),
+    // The register sorts and filters on the kind, and the AMC pricing question
+    // ("how many chillers do we cover") is this index.
+    index("assets_category_idx").on(t.tenantId, t.categoryId),
+    index("assets_warranty_idx").on(t.tenantId, t.warrantyExpiresOn),
   ],
 );
 
@@ -190,19 +230,80 @@ export const leads = pgTable(
     estimatedValue: money("estimated_value"),
     currency: currencyCol(),
     source: varchar("source", { length: 64 }).notNull().default("website"),
-    /** utm_source / medium / campaign / gclid, kept for attribution reporting. */
+    /**
+     * Attribution (`LEAD-4`, `DB-5`).
+     *
+     * `channel` is the constrained one — `LEAD-1`'s list, checked in the
+     * database — and it covers the manual paths as well as the web form,
+     * because an enquiry that arrives by phone or WhatsApp is a lead like any
+     * other and a funnel missing them is a funnel measuring the website rather
+     * than the business.
+     *
+     * `attribution` below stays. These columns are what a report can group by;
+     * the blob is where the unanticipated goes — `gclid`, a user agent, the
+     * next platform's identifier — and dropping it would trade one gap for
+     * another.
+     */
+    channel: varchar("channel", { length: 24 }).notNull().default("website"),
+    utmSource: varchar("utm_source", { length: 120 }),
+    utmMedium: varchar("utm_medium", { length: 120 }),
+    utmCampaign: varchar("utm_campaign", { length: 160 }),
+    landingPage: varchar("landing_page", { length: 512 }),
+    referrer: varchar("referrer", { length: 512 }),
+    /** Which advertised number was dialled, so a tracked number is separable. */
+    calledNumber: varchar("called_number", { length: 32 }),
     attribution: jsonb("attribution").notNull().default({}),
     message: text("message"),
     ownerId: uuid("owner_id").references(() => users.id, { onDelete: "set null" }),
     convertedCustomerId: uuid("converted_customer_id").references(() => customers.id, { onDelete: "set null" }),
+    /**
+     * `LEAD-6`. Required by a CHECK whenever the stage is `lost` or `dormant`,
+     * and `ON DELETE restrict` so a reason cannot be deleted out from under the
+     * leads that cite it — the admin screen deactivates instead.
+     */
+    dispositionReasonId: uuid("disposition_reason_id").references(
+      () => leadDispositionReasons.id,
+      { onDelete: "restrict" },
+    ),
+    /** Optional colour *alongside* the coded reason, never instead of it. */
     lostReason: text("lost_reason"),
     nextFollowUpAt: timestamp("next_follow_up_at", { withTimezone: true }),
+    /**
+     * `LEAD-5`. An existing customer this enquiry appears to be from.
+     *
+     * Deliberately not `convertedCustomerId`: that one means "this lead became
+     * this customer and the lead is won", so writing a *match* into it would
+     * book revenue for an enquiry nobody has spoken to yet.
+     */
+    matchedCustomerId: uuid("matched_customer_id").references(() => customers.id, {
+      onDelete: "set null",
+    }),
+    /**
+     * `LEAD-5`. The earlier lead this one repeats.
+     *
+     * The duplicate row is kept rather than rejected. An enquiry that arrives
+     * twice is still an enquiry, and a form that silently swallows the second
+     * submission is indistinguishable from a form that is broken.
+     */
+    duplicateOfLeadId: uuid("duplicate_of_lead_id"),
+    /**
+     * `LEAD-9`, and the column `LEAD-7`'s retention clock needs.
+     *
+     * When a person last actually touched this lead. Distinct from `updatedAt`,
+     * which a backfill moves without anybody having spoken to anyone, and from
+     * `nextFollowUpAt`, which is an intention rather than a fact.
+     */
+    lastInteractionAt: timestamp("last_interaction_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
     ...timestamps,
   },
   (t) => [
     index("leads_tenant_stage_idx").on(t.tenantId, t.stage),
     index("leads_followup_idx").on(t.tenantId, t.nextFollowUpAt),
     index("leads_tenant_created_idx").on(t.tenantId, t.createdAt),
+    // The index the attribution report reads: leads by channel over a period.
+    index("leads_channel_idx").on(t.tenantId, t.channel, t.createdAt),
   ],
 );
 
@@ -221,6 +322,18 @@ export const communications = pgTable(
     direction: varchar("direction", { length: 8 }).notNull(),
     subject: varchar("subject", { length: 240 }),
     body: text("body"),
+    /**
+     * `LEAD-9`'s fourth word: who, when, what, **outcome**.
+     *
+     * Coded, from `COMMUNICATION_OUTCOMES`, for the same reason
+     * `lead_disposition_reasons` exists — a follow-up report cannot group "no
+     * answer", "No Answer", "n/a" and "didn't pick up", and the whole value of
+     * logging the call is being able to count how many went unanswered.
+     *
+     * Null is allowed: an outbound email has no outcome at the moment it is
+     * logged, and forcing one would mean inventing a value.
+     */
+    outcome: varchar("outcome", { length: 32 }),
     authorId: uuid("author_id").references(() => users.id, { onDelete: "set null" }),
     /** True when generated by an AI agent rather than a person. */
     isAutomated: boolean("is_automated").notNull().default(false),

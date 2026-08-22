@@ -65,7 +65,18 @@ export const users = pgTable(
     emailVerifiedAt: timestamp("email_verified_at", { withTimezone: true }),
     lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
     /** Consecutive failures; reset on success. Drives lockout. */
-    failedLoginCount: varchar("failed_login_count", { length: 8 }).notNull().default("0"),
+    failedLoginCount: integer("failed_login_count").notNull().default(0),
+    /**
+     * When the current lockout lifts. NULL means not locked.
+     *
+     * Lockout used to be permanent — the count crossed a threshold and only a
+     * database client could clear it, while the sign-in screen promised
+     * "temporarily locked". A false promise is worse than the missing feature,
+     * because the user waits instead of asking for help. Backoff is
+     * exponential and capped (see packages/auth/src/lockout.ts); an
+     * administrator can also clear it outright.
+     */
+    lockedUntil: timestamp("locked_until", { withTimezone: true }),
     ...timestamps,
   },
   (t) => [uniqueIndex("users_email_key").on(t.email), index("users_phone_idx").on(t.phone)],

@@ -1,25 +1,70 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { withTenant, listCustomers } from "@meridian/db";
+import { withTenant, searchCustomers, customerPortfolioTotals } from "@meridian/db";
 import { formatMoney } from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
-import { Buildings, Warning } from "@phosphor-icons/react/dist/ssr";
+import { Buildings, MagnifyingGlass, Warning } from "@phosphor-icons/react/dist/ssr";
 
 export const metadata: Metadata = { title: "Customers" };
 export const dynamic = "force-dynamic";
 
-export default async function CustomersPage() {
+/**
+ * The customer list (`LEAD-8`, closing `TD-10` here).
+ *
+ * This screen read `listCustomers`, which has no `LIMIT` of any kind — every
+ * customer, then every open job and every unpaid invoice belonging to them,
+ * joined in memory to render twenty rows somebody actually looks at. It works
+ * on a seeded database and stops working on a real one, quietly, by getting
+ * slower.
+ *
+ * It now uses the same indexed keyset search the leads list uses, and
+ * deliberately the same shape: search and paging state in the query string, one
+ * box that matches a name, a phone number or an email, a cursor rather than an
+ * offset. Somebody who learns that a phone number works on one screen must not
+ * find it silently failing on the other.
+ *
+ * The totals above the list are a separate aggregate rather than a sum of the
+ * page. "Outstanding" that silently means "on this page" is a number somebody
+ * would quote to a customer.
+ */
+export default async function CustomersPage({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
   const session = await requireSessionWith("customers:read");
 
-  const customers = await withTenant(
+  const params = await searchParams;
+  const q = typeof params["q"] === "string" ? params["q"].trim() : "";
+  const cursor = typeof params["after"] === "string" ? params["after"] : undefined;
+  const showInactive = params["inactive"] === "1";
+
+  // Active accounts by default, as this list has always shown. A search, though,
+  // looks across everything: somebody typing a phone number is asking "do we
+  // know this person", and answering "no" because the account was deactivated
+  // last year is the wrong answer.
+  const includeInactive = showInactive || Boolean(q);
+
+  const { page, totals } = await withTenant(
     { tenantId: session.principal.tenantId, userId: session.principal.userId },
-    (tx) => listCustomers(tx),
+    async (tx) => ({
+      page: await searchCustomers(tx, { q: q || undefined, cursor, limit: 25, includeInactive }),
+      totals: await customerPortfolioTotals(tx, { includeInactive }),
+    }),
   );
 
-  const outstandingMinor = customers.reduce((sum, c) => sum + c.outstandingMinor, 0);
-  const overdueMinor = customers.reduce((sum, c) => sum + c.overdueMinor, 0);
-  const withOverdue = customers.filter((c) => c.overdueMinor > 0);
+  const customers = page.rows;
+
+  /** Preserve the current filters when building a "next page" link. */
+  const pageHref = (after: string | null) => {
+    const next = new URLSearchParams();
+    if (q) next.set("q", q);
+    if (showInactive) next.set("inactive", "1");
+    if (after) next.set("after", after);
+    const query = next.toString();
+    return query ? `/customers?${query}` : "/customers";
+  };
 
   return (
     <AppShell session={session} active="customers">
@@ -30,14 +75,65 @@ export default async function CustomersPage() {
           decides whether the next job gets scheduled or held.
         </p>
 
+        {/* GET, not a server action. The result is a URL, which is the whole
+            point: a filtered list can be bookmarked, sent to a colleague and
+            reached with the back button. */}
+        <form method="get" action="/customers" className="mt-6 flex flex-wrap items-center gap-2">
+          <div className="relative min-w-[16rem] flex-1">
+            <MagnifyingGlass
+              size={16}
+              aria-hidden
+              className="absolute left-3 top-1/2 -translate-y-1/2"
+              style={{ color: "var(--text-muted)" }}
+            />
+            <input
+              type="search"
+              name="q"
+              defaultValue={q}
+              placeholder="Name, phone or email"
+              aria-label="Search customers"
+              className="w-full rounded-sm border py-2 pl-9 pr-3 text-[14px] outline-none focus:border-[var(--accent)]"
+            />
+          </div>
+          <label
+            className="flex items-center gap-2 text-[13px]"
+            style={{ color: "var(--text-secondary)" }}
+          >
+            <input
+              type="checkbox"
+              name="inactive"
+              value="1"
+              defaultChecked={showInactive}
+              className="h-4 w-4"
+            />
+            Include inactive
+          </label>
+          <button type="submit" className="btn btn-secondary !py-2 text-[14px]">
+            Search
+          </button>
+          {q ? (
+            <Link href="/customers" className="text-[13px] underline" style={{ color: "var(--text-muted)" }}>
+              Clear
+            </Link>
+          ) : null}
+        </form>
+
         <dl
           className="mt-8 grid gap-px overflow-hidden rounded border sm:grid-cols-3"
           style={{ backgroundColor: "var(--border-hairline)" }}
         >
           {[
-            { label: "Active accounts", value: String(customers.length), tone: false },
-            { label: "Outstanding", value: formatMoney(outstandingMinor), tone: false },
-            { label: "Overdue", value: formatMoney(overdueMinor), tone: overdueMinor > 0 },
+            {
+              label: includeInactive ? "Accounts" : "Active accounts",
+              value: String(totals.customerCount),
+              tone: false,
+            },
+            { label: "Outstanding", value: formatMoney(totals.outstandingMinor), tone: false },
+            {
+              label: "Overdue",
+              value: formatMoney(totals.overdueMinor),
+              tone: totals.overdueMinor > 0,
+            },
           ].map((s) => (
             <div key={s.label} className="p-5" style={{ backgroundColor: "var(--surface-raised)" }}>
               <dt className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
@@ -53,7 +149,7 @@ export default async function CustomersPage() {
           ))}
         </dl>
 
-        {withOverdue.length > 0 ? (
+        {totals.overdueCount > 0 ? (
           <p
             className="mt-6 flex items-start gap-3 rounded p-4 text-[14px]"
             style={{ backgroundColor: "var(--accent-wash)", color: "var(--text-primary)" }}
@@ -66,11 +162,16 @@ export default async function CustomersPage() {
               style={{ color: "var(--accent-text)" }}
             />
             <span>
-              {withOverdue.length} {withOverdue.length === 1 ? "account is" : "accounts are"} past
+              {totals.overdueCount} {totals.overdueCount === 1 ? "account is" : "accounts are"} past
               due:{" "}
-              {withOverdue
+              {totals.overdueAccounts
                 .map((c) => `${c.name} (${formatMoney(c.overdueMinor, c.currency)})`)
                 .join(" · ")}
+              {/* The list is capped and the count is not, so say so rather than
+                  letting the reader assume the banner is complete. */}
+              {totals.overdueCount > totals.overdueAccounts.length
+                ? ` — and ${totals.overdueCount - totals.overdueAccounts.length} more`
+                : ""}
             </span>
           </p>
         ) : null}
@@ -80,13 +181,17 @@ export default async function CustomersPage() {
             className="mt-8 rounded border p-12 text-center"
             style={{ backgroundColor: "var(--surface-raised)" }}
           >
-            <h2 className="text-lg font-semibold">No customers yet</h2>
+            <h2 className="text-lg font-semibold">{q ? "Nothing matched" : "No customers yet"}</h2>
             <p className="prose-body mx-auto mt-2 text-[14px]">
-              Converting a lead creates the customer, the property and the first job together.
+              {q
+                ? "No account has that name, phone number or email address. A phone number matches however it is written — the country code and the trunk zero do not matter."
+                : "Converting a lead creates the customer, the property and the first job together."}
             </p>
-            <Link href="/leads" className="btn btn-secondary mt-5">
-              Go to leads
-            </Link>
+            {q ? null : (
+              <Link href="/leads" className="btn btn-secondary mt-5">
+                Go to leads
+              </Link>
+            )}
           </div>
         ) : (
           <ul
@@ -107,6 +212,14 @@ export default async function CustomersPage() {
                           {c.industry}
                         </span>
                       ) : null}
+                      {c.isActive ? null : (
+                        <span
+                          className="rounded-sm px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide"
+                          style={{ backgroundColor: "var(--surface)", color: "var(--text-secondary)" }}
+                        >
+                          Inactive
+                        </span>
+                      )}
                     </div>
                     <div className="flex flex-wrap items-baseline gap-4 text-[13px]">
                       {c.outstandingMinor > 0 ? (
@@ -146,6 +259,25 @@ export default async function CustomersPage() {
             ))}
           </ul>
         )}
+
+        {page.nextCursor ? (
+          <div className="mt-6">
+            {/* Keyset, so this is "everything after the last row on this page"
+                rather than "skip 25". A customer created while somebody pages
+                cannot push a row past the boundary and out of sight. */}
+            <Link href={pageHref(page.nextCursor)} className="btn btn-secondary">
+              Show older accounts
+            </Link>
+          </div>
+        ) : null}
+
+        {cursor ? (
+          <p className="mt-4 text-[13px]">
+            <Link href={pageHref(null)} className="underline" style={{ color: "var(--text-muted)" }}>
+              Back to the newest
+            </Link>
+          </p>
+        ) : null}
       </div>
     </AppShell>
   );

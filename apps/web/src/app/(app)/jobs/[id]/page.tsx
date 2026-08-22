@@ -8,22 +8,85 @@ import {
   listQuotes,
   getQuoteWithLines,
   listInvoices,
+  jobContractScope,
+  loadWorkingCalendar,
+  listJobOutcomeCodes,
+  faultCodeOptions,
+  getJobOutcome,
+  getJobCard,
+  listPhotoExemptionReasons,
+  listJobSheets,
+  listJobSheetAmendmentReasons,
+  schema,
+  ASSIGNMENT_WARNING_LABEL,
   QUOTE_STATUS_LABEL,
   INVOICE_STATUS_LABEL,
+  REVISABLE_QUOTE_STATUSES,
+  type AssignmentWarningType,
 } from "@meridian/db";
-import { getService, allowedTransitions, STATUS_LABEL, PRIORITY_LABEL, SLA_STATE_LABEL, minutesUntil, formatDuration, formatMoney, toMinor } from "@meridian/core";
+import { eq } from "drizzle-orm";
+import {
+  getService,
+  allowedTransitions,
+  nextWorkingWindow,
+  toDubai,
+  STATUS_LABEL,
+  PRIORITY_LABEL,
+  SLA_STATE_LABEL,
+  minutesUntil,
+  formatDuration,
+  formatMoney,
+  toMinor,
+  UserFacingError,
+  type JobStatus,
+} from "@meridian/core";
+import { jobSheetPresentation } from "@meridian/docs";
 import { can } from "@meridian/auth";
 import { requireSessionWith } from "@/lib/session";
 import { AppShell } from "@/components/app-shell";
-import { StatusActions, AssignPanel } from "./job-actions";
-import { QuotePanel, SendQuoteButton } from "./quote-panel";
+import { StatusActions, AssignPanel, type CandidateOption } from "./job-actions";
+import { OutcomePanel, RaiseReturnVisitButton } from "./outcome-panel";
+import { JobCardPanel, type JobCardView } from "./job-card-panel";
+import { JobSheetPanel, type JobSheetView } from "./job-sheet-panel";
+import { QuotePanel, SendQuoteButton, QuoteDocumentLink, ReviseQuoteButton } from "./quote-panel";
 import { InvoicePanel } from "./invoice-panel";
-import { MapPin, Key, Clock } from "@phosphor-icons/react/dist/ssr";
+import { OutOfScopePanel } from "./out-of-scope-panel";
+import { MapPin, Key, Clock, ShieldCheck, Warning } from "@phosphor-icons/react/dist/ssr";
 
 export const dynamic = "force-dynamic";
 
 /** Statuses where adding a technician is a sensible next action. */
 const ASSIGNABLE_STATUSES: readonly string[] = ["triaged", "scheduled", "paused"];
+
+/**
+ * Statuses where the outcome can still be recorded or corrected (`JOB-13`).
+ *
+ * `on_site` records it and completes the work in one move. `work_complete`
+ * allows a correction before sign-off, which is the only window in which one is
+ * honest: after sign-off the customer has agreed to a version of events, and
+ * editing it afterwards changes what they signed for.
+ */
+const OUTCOME_STATUSES: readonly string[] = ["on_site", "work_complete"];
+
+/**
+ * `datetime-local` wants Dubai wall-clock, and so does the server that reads it
+ * back. Formatting through `toDubai` rather than `toISOString` is what keeps
+ * the two ends agreeing on what 16:00 means.
+ */
+function dubaiFieldValue(instant: Date): string {
+  const t = toDubai(instant);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${t.year}-${pad(t.month)}-${pad(t.day)}T${pad(t.hour)}:${pad(t.minute)}`;
+}
+
+/** Dubai wall-clock, short. Used for "when was this photograph taken". */
+function dubaiStamp(instant: Date): string {
+  return instant.toLocaleString("en-GB", {
+    timeZone: "Asia/Dubai",
+    dateStyle: "short",
+    timeStyle: "short",
+  });
+}
 
 export async function generateMetadata({
   params,
@@ -32,6 +95,35 @@ export async function generateMetadata({
 }): Promise<Metadata> {
   const { id } = await params;
   return { title: `Job ${id.slice(0, 8)}` };
+}
+
+/**
+ * The shape the client panel takes. The warning label is resolved here rather
+ * than in the browser: `ASSIGNMENT_WARNING_LABEL` lives in `@meridian/db`, and
+ * importing that package into a client component would drag the Postgres
+ * driver into the bundle.
+ */
+function toCandidateOption(c: {
+  technicianId: string;
+  fullName: string;
+  grade: string;
+  score: number;
+  reason: string;
+  warnings: readonly { type: string; detail: string; requiresOverride: boolean }[];
+}): CandidateOption {
+  return {
+    technicianId: c.technicianId,
+    fullName: c.fullName,
+    grade: c.grade,
+    score: c.score,
+    reason: c.reason,
+    warnings: c.warnings.map((w) => ({
+      type: w.type,
+      label: ASSIGNMENT_WARNING_LABEL[w.type as AssignmentWarningType] ?? w.type,
+      detail: w.detail,
+      requiresOverride: w.requiresOverride,
+    })),
+  };
 }
 
 export default async function JobDetailPage({ params }: { params: Promise<{ id: string }> }) {
@@ -45,14 +137,85 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
       const job = await getJobDetail(tx, id, now);
       if (!job) return null;
 
+      // The tenant's own calendar, once, and passed to everything that needs
+      // it. `JOB-6` is explicit that this is a single service rather than a
+      // rule duplicated per screen — and `DEFAULT_CALENDAR` would get the
+      // weekend, the holidays and the working day wrong for any tenant that has
+      // configured them, which is the point of configuring them.
+      const calendar = await loadWorkingCalendar(tx);
+
+      const flags = await tx
+        .select({ isOutdoor: schema.jobs.isOutdoor })
+        .from(schema.jobs)
+        .where(eq(schema.jobs.id, id))
+        .limit(1);
+      const isOutdoor = flags[0]?.isOutdoor ?? false;
+
+      // JOB-8. Availability is a question about a window, so the panel opens on
+      // one: the next legal working slot, skipping the summer midday ban when
+      // the work is outdoors. "Now, for two hours" was the old implicit answer
+      // and it is wrong for every job booked for tomorrow morning.
+      const windowStart = nextWorkingWindow(now, { outdoor: isOutdoor, calendar });
+      const windowEnd = new Date(windowStart.getTime() + 2 * 60 * 60 * 1000);
+
       // Only look for candidates when the job could actually take one.
       const needsAssignment = ASSIGNABLE_STATUSES.includes(job.status);
       const candidates = needsAssignment
         ? await findCandidates(tx, {
             serviceSlug: job.serviceSlug,
             property: { lat: job.propertyLat, lng: job.propertyLng, city: job.propertyCity },
+            from: windowStart,
+            to: windowEnd,
+            calendar,
           })
-        : { candidates: [], disqualified: [] };
+        : { candidates: [], warned: [], disqualified: [], blocked: [] };
+
+      // JOB-13 and JOB-14. Loaded for every job rather than only for the ones
+      // being completed, because a closed job's outcome is the answer to "was
+      // this fixed first time" and hiding it behind a status check would make
+      // the record invisible exactly where it is being read.
+      const outcome = await getJobOutcome(tx, id);
+      const outcomeCodes = OUTCOME_STATUSES.includes(job.status)
+        ? await listJobOutcomeCodes(tx, { activeOnly: true })
+        : [];
+      const faults = OUTCOME_STATUSES.includes(job.status)
+        ? await faultCodeOptions(tx, job.serviceSlug)
+        : { symptom: [], cause: [], remedy: [] };
+
+      // JOB-15. Loaded for every job, not only completable ones: a signed-off
+      // job's card is the record of what was done, and hiding it behind a
+      // status check would make it invisible exactly where somebody is reading
+      // back what happened.
+      const card = await getJobCard(tx, id);
+      const exemptionReasons = await listPhotoExemptionReasons(tx);
+
+      // FLD-14. The sheets on file, and — when none is signed yet — the digest
+      // of the sheet this page is about to offer for signature.
+      //
+      // `jobSheetPresentation` rather than `presentJobSheet`: the screen needs
+      // the 64-character digest to put in the signature form, not a PDF, and
+      // rendering one on every page view to obtain a string nobody reads would
+      // be work for its own sake. The preview route renders when somebody asks
+      // to see the sheet.
+      //
+      // It throws rather than returning null when the card is not ready — the
+      // `JOB-15` gate is what refuses — and the sentence it throws is the one
+      // the operator needs. Caught here rather than pre-checked, so the screen
+      // and the server cannot disagree about what "ready" means.
+      const sheets = await listJobSheets(tx, id);
+      const amendmentReasons = await listJobSheetAmendmentReasons(tx);
+      let presentedSha256: string | null = null;
+      let sheetNotReady: string | null = null;
+      if (!sheets.some((sheet) => sheet.kind === "original")) {
+        try {
+          presentedSha256 = (await jobSheetPresentation(tx, id)).contentSha256;
+        } catch (error) {
+          sheetNotReady =
+            error instanceof UserFacingError
+              ? error.message
+              : "The job sheet cannot be produced yet.";
+        }
+      }
 
       const quotes = await listQuotes(tx, { jobId: id });
       const invoices = await listInvoices(tx, { jobId: id });
@@ -62,7 +225,33 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
       const approved = quotes.find((q) => q.status === "approved");
       const approvedQuote = approved ? await getQuoteWithLines(tx, approved.id) : null;
 
-      return { job, candidates, needsAssignment, quotes, invoices, approvedQuote };
+      // CON-6, automatically. Null when the job is not contract work, which is
+      // most jobs. Computed here rather than behind a button on purpose: a
+      // check somebody has to remember to run is a check that gets forgotten on
+      // exactly the job that needed it, and the work is then absorbed. See the
+      // note on `jobContractScope`.
+      const contractScope = await jobContractScope(tx, id);
+
+      return {
+        job,
+        candidates,
+        needsAssignment,
+        quotes,
+        invoices,
+        approvedQuote,
+        contractScope,
+        outcome,
+        outcomeCodes,
+        faults,
+        card,
+        exemptionReasons,
+        sheets,
+        amendmentReasons,
+        presentedSha256,
+        sheetNotReady,
+        windowStart,
+        windowEnd,
+      };
     },
   );
 
@@ -70,11 +259,110 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
   // here, which is exactly the intended behaviour.
   if (!data) notFound();
 
-  const { job, candidates, needsAssignment, quotes, invoices, approvedQuote } = data;
+  const {
+    job,
+    candidates,
+    needsAssignment,
+    quotes,
+    invoices,
+    approvedQuote,
+    contractScope,
+    outcome,
+    outcomeCodes,
+    faults,
+    card,
+    exemptionReasons,
+    sheets,
+    amendmentReasons,
+    presentedSha256,
+    sheetNotReady,
+    windowStart,
+    windowEnd,
+  } = data;
   const service = getService(job.serviceSlug);
   const remaining = job.resolveByAt ? minutesUntil(job.resolveByAt, now) : null;
   const canUpdate = can(session.principal, "jobs:update");
   const canAssign = can(session.principal, "jobs:assign");
+
+  // Formatted on the server. `formatMoney` and `formatDuration` live in
+  // `@meridian/core`, and the panel is a client component — shaping the values
+  // here keeps the money helpers out of the browser bundle and, more to the
+  // point, keeps one implementation of "what does 90 minutes look like".
+  const jobCardView: JobCardView = {
+    jobId: job.id,
+    photos: card.photos.map((p) => ({
+      id: p.id,
+      kind: p.kind,
+      caption: p.caption,
+      capturedAt: p.capturedAt ? dubaiStamp(p.capturedAt) : null,
+    })),
+    afterPhotoCount: card.afterPhotoCount,
+    exemption: card.photoExemption
+      ? { label: card.photoExemption.reasonLabel, note: card.photoExemption.note }
+      : null,
+    materials: card.materials.map((m) => ({
+      id: m.id,
+      sku: m.sku,
+      description: m.description,
+      quantity: m.quantity,
+      unit: m.unit,
+      cost: m.unitCostMinor === null ? null : formatMoney(m.unitCostMinor, m.currency),
+      isBillable: m.isBillable,
+    })),
+    materialsNone: card.materialsNone ? { note: card.materialsNone.note } : null,
+    labour: card.labour.map((l) => ({
+      visitId: l.visitId,
+      sequence: l.sequence,
+      technicianName: l.technicianName,
+      worked: l.workMinutes === null ? null : formatDuration(l.workMinutes),
+      travel: l.travelMinutes === null ? null : formatDuration(l.travelMinutes),
+    })),
+    labourTotal: card.labourMinutes === null ? null : formatDuration(card.labourMinutes),
+    signature: card.signature
+      ? {
+          signedByName: card.signature.signedByName,
+          signedByRole: card.signature.signedByRole,
+          signedAt: dubaiStamp(card.signature.signedAt),
+        }
+      : null,
+    gaps: [...card.gaps],
+    reasons: exemptionReasons.map((r) => ({
+      code: r.code,
+      label: r.label,
+      description: r.description,
+    })),
+  };
+
+  const jobSheetView: JobSheetView = {
+    jobId: id,
+    sheets: sheets.map((sheet) => ({
+      id: sheet.id,
+      kind: sheet.kind,
+      reference: sheet.reference,
+      sequence: sheet.sequence,
+      contentSha256: sheet.contentSha256,
+      pdfSha256: sheet.pdfSha256,
+      sealedAt: dubaiStamp(sheet.sealedAt),
+      amendmentReasonLabel: sheet.amendmentReasonLabel,
+      amendmentDetail: sheet.amendmentDetail,
+    })),
+    signature: card.signature
+      ? {
+          signedByName: card.signature.signedByName,
+          signedByRole: card.signature.signedByRole,
+          signerEmail: card.signature.signerEmail,
+          signedAt: dubaiStamp(card.signature.signedAt),
+          consentVersion: card.signature.consentVersion,
+        }
+      : null,
+    presentedSha256,
+    notReady: sheetNotReady,
+    reasons: amendmentReasons.map((r) => ({
+      code: r.code,
+      label: r.label,
+      description: r.description,
+    })),
+  };
 
   return (
     <AppShell session={session} active="jobs">
@@ -115,6 +403,26 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
             </div>
 
             <h1 className="mt-3 text-2xl font-semibold tracking-tight md:text-3xl">{job.title}</h1>
+            {/* Revisit tracking. Only ever set by `raiseReturnVisit`, never backfilled — a job
+                raised before that existed shows nothing here, which is honest: this codebase
+                genuinely cannot tell whether it was a return visit or not. */}
+            {job.isRevisit ? (
+              <p
+                className="mt-2 flex items-center gap-1.5 text-[13px] font-medium"
+                style={{ color: "var(--status-warning-text)" }}
+              >
+                <ShieldCheck size={14} aria-hidden />
+                Return visit
+                {job.parentJobReference ? (
+                  <>
+                    {" for "}
+                    <Link href={`/jobs/${job.parentJobId}`} className="underline">
+                      {job.parentJobReference}
+                    </Link>
+                  </>
+                ) : null}
+              </p>
+            ) : null}
             {job.description ? <p className="prose-body mt-4">{job.description}</p> : null}
 
             <dl className="mt-8 grid gap-6 sm:grid-cols-2">
@@ -185,6 +493,34 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
               </ul>
             )}
 
+            {/*
+              ── The job card (JOB-15) ─────────────────────────────────────
+
+              In the main column rather than the sidebar, and above the
+              timeline, because it is the record of the work rather than a
+              control beside it — and because the four things it collects are
+              what the completion gate in `assertJobCardComplete` refuses
+              without. `canUpdate` gates the panel: a reader sees the card
+              through the same component, with the forms it renders refused by
+              the server rather than merely hidden.
+            */}
+            {canUpdate ? <JobCardPanel card={jobCardView} /> : null}
+
+            {/*
+              FLD-14. Below the job card, because it is what happens at the end
+              of filling one in — and because a reader working down the page
+              meets the record before the thing that freezes it.
+
+              Rendered for readers as well as editors when a sheet exists: the
+              digest and the signed document are the record of what the customer
+              agreed to, and a role that can read the job can read that. The
+              forms inside it are the part `canUpdate` gates, and the server
+              refuses them regardless.
+            */}
+            {canUpdate || jobSheetView.sheets.length > 0 ? (
+              <JobSheetPanel sheet={jobSheetView} />
+            ) : null}
+
             {/* ── Timeline ──────────────────────────────────────────────── */}
             <h2 className="mt-10 text-lg font-semibold tracking-tight">Timeline</h2>
             <ol className="mt-4">
@@ -234,8 +570,132 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
               ) : null}
             </div>
 
+            {/*
+              ── CON-6, stated whether or not anybody asked ────────────────
+
+              Beside the SLA banner, and for the same reason it is: both are
+              facts about this job that decide what happens to it, and both are
+              worthless if reading them is optional. The verdict here is the
+              automatic one — service coverage and remaining entitlement — so
+              it is true of every contract job on first render. What it cannot
+              know is what the technician found, which is what the panel below
+              collects.
+            */}
+            {contractScope ? (
+              <div
+                className="rounded border p-5"
+                style={{
+                  backgroundColor: "var(--surface-raised)",
+                  borderColor: contractScope.decision.isCovered
+                    ? undefined
+                    : "var(--accent)",
+                }}
+              >
+                <h2 className="text-[14px] font-semibold">Contract</h2>
+                <p className="mt-3 flex items-start gap-2 text-[15px] font-semibold">
+                  {contractScope.decision.isCovered ? (
+                    <ShieldCheck
+                      size={15}
+                      weight="fill"
+                      aria-hidden
+                      className="mt-0.5 shrink-0"
+                      style={{ color: "var(--accent)" }}
+                    />
+                  ) : (
+                    <Warning
+                      size={15}
+                      weight="fill"
+                      aria-hidden
+                      className="mt-0.5 shrink-0"
+                      style={{ color: "var(--accent-text)" }}
+                    />
+                  )}
+                  {contractScope.decision.isCovered
+                    ? `Covered by ${contractScope.contractReference}`
+                    : `NOT COVERED by ${contractScope.contractReference}`}
+                </p>
+                <p className="prose-body mt-2 text-[13px]">{contractScope.decision.reason}</p>
+                <p className="tnum mt-2 text-[12px]" style={{ color: "var(--text-muted)" }}>
+                  {contractScope.contractName}
+                </p>
+              </div>
+            ) : null}
+
+            {/*
+              `work_complete` is deliberately not in this list (`JOB-13`).
+
+              It is still a legal transition and the graph still allows it; what
+              changed is that on this screen it goes through the outcome panel,
+              which cannot complete the work without recording what happened.
+              Leaving the bare button here would leave the old door open, and a
+              job that reaches `work_complete` with a null outcome has lost that
+              fact permanently — `G11` is computed from that column and nobody
+              reconstructs a Tuesday in January from memory in March. The server
+              action refuses it too; this only stops it being offered.
+            */}
             {canUpdate ? (
-              <StatusActions jobId={job.id} allowed={[...allowedTransitions(job.status)]} />
+              <StatusActions
+                jobId={job.id}
+                allowed={allowedTransitions(job.status).filter(
+                  (t): t is JobStatus => t !== "work_complete",
+                )}
+              />
+            ) : null}
+
+            {canUpdate && OUTCOME_STATUSES.includes(job.status) ? (
+              <OutcomePanel
+                jobId={job.id}
+                outcomes={outcomeCodes.map((o) => ({
+                  code: o.code,
+                  label: o.label,
+                  description: o.description,
+                  requiresReturnVisit: o.requiresReturnVisit,
+                }))}
+                symptoms={faults.symptom.map((f) => ({ id: f.id, label: f.label }))}
+                causes={faults.cause.map((f) => ({ id: f.id, label: f.label }))}
+                remedies={faults.remedy.map((f) => ({ id: f.id, label: f.label }))}
+                visits={job.visits.map((v) => ({
+                  id: v.id,
+                  sequence: v.sequence,
+                  technicianName: v.technicianName,
+                }))}
+                recordedOutcome={
+                  outcome.outcomeCode
+                    ? { code: outcome.outcomeCode, label: outcome.outcomeLabel ?? outcome.outcomeCode }
+                    : null
+                }
+                recordedFaults={outcome.faultCodes.map((f) => ({ kind: f.kind, label: f.label }))}
+                isComplete={job.status === "work_complete"}
+                jobCardGaps={[...card.gaps]}
+              />
+            ) : null}
+
+            {/* Past sign-off the outcome is no longer editable, and it is still
+                the answer to "was this fixed first time". Read-only beats
+                absent. */}
+            {outcome.outcomeCode && !OUTCOME_STATUSES.includes(job.status) ? (
+              <div className="rounded border p-5" style={{ backgroundColor: "var(--surface-raised)" }}>
+                <h2 className="text-[14px] font-semibold">Outcome</h2>
+                <p className="mt-2 text-[15px] font-medium">
+                  {outcome.outcomeLabel ?? outcome.outcomeCode}
+                </p>
+                {outcome.faultCodes.length > 0 ? (
+                  <ul className="mt-2 space-y-0.5">
+                    {outcome.faultCodes.map((f) => (
+                      <li key={f.id} className="text-[12px]" style={{ color: "var(--text-muted)" }}>
+                        {f.kind}: {f.label}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
+            ) : null}
+
+            {/* Revisit tracking. Offered whenever the recorded outcome calls for one,
+                regardless of whether the job itself has moved on — an operator may only
+                notice the note a day later. `raiseReturnVisit` re-checks the same fact. */}
+            {canUpdate && outcome.requiresReturnVisit && can(session.principal, "jobs:create") ? (
+              <RaiseReturnVisitButton jobId={job.id} />
             ) : null}
 
             {can(session.principal, "quotes:read") ? (
@@ -255,17 +715,54 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
                         </div>
                         <p className="mt-0.5 text-[12px]" style={{ color: "var(--text-muted)" }}>
                           {QUOTE_STATUS_LABEL[q.status]}
+                          {q.supersedesQuoteId ? " · new version" : ""}
                         </p>
-                        {q.status === "draft" && can(session.principal, "quotes:send") ? (
-                          <div className="mt-1.5">
-                            <SendQuoteButton quoteId={q.id} reference={q.reference} />
-                          </div>
+                        {/* QTE-5: the discount is stated with where it came from, not left as a
+                            bare number the customer has to take on trust. */}
+                        {q.discountSource ? (
+                          <p className="mt-0.5 text-[12px]" style={{ color: "var(--text-muted)" }}>
+                            Discount: {q.discountSource}
+                          </p>
                         ) : null}
+                        <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1">
+                          {q.status === "draft" && can(session.principal, "quotes:send") ? (
+                            <SendQuoteButton quoteId={q.id} reference={q.reference} />
+                          ) : null}
+                          <QuoteDocumentLink quoteId={q.id} reference={q.reference} />
+                          {/* QTE-10. Never offered for `approved` or `superseded` — the
+                              server's own list, not a re-derived one, so the button and
+                              the refusal can never disagree about which states qualify. */}
+                          {REVISABLE_QUOTE_STATUSES.includes(q.status) &&
+                          can(session.principal, "quotes:create") ? (
+                            <ReviseQuoteButton jobId={job.id} quoteId={q.id} reference={q.reference} />
+                          ) : null}
+                        </div>
                       </li>
                     ))}
                   </ul>
                 )}
               </div>
+            ) : null}
+
+            {/*
+              The on-demand half, and only on contract work. `quotes:create` is
+              the same permission an ordinary quote needs, because what this
+              produces is an ordinary quote — priced by the contract rather than
+              by whoever is filling the form in.
+            */}
+            {contractScope && can(session.principal, "quotes:create") ? (
+              <OutOfScopePanel
+                jobId={job.id}
+                contractId={contractScope.contractId}
+                contractReference={contractScope.contractReference}
+                coverageType={contractScope.coverageType}
+                exclusions={contractScope.exclusions.map((e) => ({
+                  code: e.code,
+                  label: e.label,
+                  description: e.description,
+                }))}
+                verdict={contractScope.decision.verdict}
+              />
             ) : null}
 
             {can(session.principal, "quotes:create") ? <QuotePanel jobId={job.id} /> : null}
@@ -313,14 +810,17 @@ export default async function JobDetailPage({ params }: { params: Promise<{ id: 
               <AssignPanel
                 jobId={job.id}
                 serviceName={service?.shortName ?? job.serviceSlug}
-                candidates={candidates.candidates.map((c) => ({
-                  technicianId: c.technicianId,
-                  fullName: c.fullName,
-                  grade: c.grade,
-                  score: c.score,
-                  reason: c.reason,
-                }))}
+                candidates={candidates.candidates.map(toCandidateOption)}
+                warned={candidates.warned.map(toCandidateOption)}
                 disqualified={[...candidates.disqualified]}
+                blocked={candidates.blocked.map((b) => ({
+                  technicianId: b.technicianId,
+                  technicianName: b.technicianName,
+                  detail: b.detail,
+                  penalty: b.penalty,
+                }))}
+                defaultStart={dubaiFieldValue(windowStart)}
+                defaultEnd={dubaiFieldValue(windowEnd)}
               />
             ) : null}
           </aside>

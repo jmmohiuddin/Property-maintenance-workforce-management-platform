@@ -20,6 +20,7 @@ import { Section, Eyebrow, ServiceCard, AnswerBlock } from "@/components/ui";
 import { FaqList } from "@/components/faq";
 import { JsonLd } from "@/components/json-ld";
 import { PhoneCall, Wrench, MapPin } from "@phosphor-icons/react/dist/ssr";
+import { hreflangAlternates } from "@/lib/i18n";
 
 type Params = { slug: string };
 
@@ -42,7 +43,7 @@ export async function generateMetadata({ params }: { params: Promise<Params> }):
       `AC repair ${area.name}`,
       `handyman ${area.name}`,
     ],
-    alternates: { canonical: `/areas/${area.slug}` },
+    alternates: { canonical: `/areas/${area.slug}`, languages: hreflangAlternates(`/areas/${area.slug}`) },
     openGraph: {
       type: "article",
       title: `Property Maintenance in ${area.name}`,
@@ -68,7 +69,10 @@ export default async function AreaPage({ params }: { params: Promise<Params> }) 
   const faqs = [
     {
       q: `How quickly can you reach ${area.name}?`,
-      a: `Our median emergency arrival time in ${area.name} is ${area.responseMinutes} minutes, 24 hours a day including public holidays. Standard non-emergency work is attended the same day when logged before 15:00.`,
+      // The commitment, not an invented median. Identical in every area we
+      // travel to, because it is the SLA tier the job is raised at (JOB-4) and
+      // the same deadline the dispatch board and the SLA sweep measure.
+      a: `${area.name} is inside our Dubai service area, so the standard commitments apply: a P1 emergency — an active leak, total loss of cooling, an electrical fault — gets a response within 30 to 60 minutes, 24 hours a day including public holidays. Urgent work is 2 to 4 hours in working hours and routine work is within 24 hours.`,
     },
     {
       q: `What maintenance problems are most common in ${area.name}?`,
@@ -76,7 +80,11 @@ export default async function AreaPage({ params }: { params: Promise<Params> }) 
     },
     {
       q: `Do you offer annual maintenance contracts in ${area.name}?`,
-      a: `Yes. AMC coverage is available across all of ${area.city}, from AED 1,200 per year for a one-bedroom apartment and from AED 3,500 for villas. Contracts include four preventive visits and unlimited emergency call-outs with no attendance charge.`,
+      // No prices. Every figure in the previous version of this answer was
+      // invented; WEB-16 publishes a real schedule of rates generated from the
+      // rate card, and until it exists this answer describes the shape of a
+      // contract rather than pretending to a price.
+      a: `Yes, across ${area.city}. A contract sets out which services are covered, how many scheduled visits a year each one gets, what your callout entitlement is, and — in writing — what is excluded. It is priced from the property, its assets and the visit schedule, so we survey before quoting rather than quoting from a table.`,
     },
   ] as const;
 
@@ -146,9 +154,9 @@ export default async function AreaPage({ params }: { params: Promise<Params> }) 
               <dl className="mt-5 space-y-4 text-[14px]">
                 <div className="border-b pb-4">
                   <dt style={{ color: "var(--text-secondary)" }}>Emergency response</dt>
-                  <dd className="tnum mt-1 text-xl font-semibold">under {area.responseMinutes} min</dd>
+                  <dd className="tnum mt-1 text-xl font-semibold">30&ndash;60 min</dd>
                   <dd className="text-[13px]" style={{ color: "var(--text-muted)" }}>
-                    median arrival, 24/7
+                    P1 commitment, 24/7
                   </dd>
                 </div>
                 <div className="border-b pb-4">

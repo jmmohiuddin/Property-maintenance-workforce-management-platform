@@ -34,16 +34,23 @@ const config: NextConfig = {
   // The marketing site is statically rendered. AI crawlers frequently do not
   // execute JavaScript, so anything they need to read has to exist in the HTML
   // response, not be hydrated in.
-  transpilePackages: ["@meridian/core", "@meridian/auth", "@meridian/db", "@meridian/notify"],
+  transpilePackages: [
+    "@meridian/core",
+    "@meridian/auth",
+    "@meridian/db",
+    "@meridian/notify",
+    "@meridian/files",
+    "@meridian/docs",
+  ],
   // Native module; must not be bundled into the server build.
   serverExternalPackages: ["@node-rs/argon2", "postgres"],
   images: {
     formats: ["image/avif", "image/webp"],
-    remotePatterns: [
-      // Placeholder photography. Replace with the client's own asset host
-      // before launch: see docs/ops/03-launch-checklist.md.
-      { protocol: "https", hostname: "picsum.photos" },
-    ],
+    // No remote patterns. The picsum.photos placeholders are gone (WEB-3), and
+    // an empty allow-list is the correct default: a remote host added here is
+    // a host the site will fetch from on every page view, and it must also be
+    // added to `img-src` in src/middleware.ts or the browser will block it.
+    remotePatterns: [],
   },
   async headers() {
     return [

@@ -138,6 +138,8 @@ DO $$
 DECLARE
   permissive_ones text;
   secdef_unpinned text;
+  unbounded_writes text;
+  public_definers text;
 BEGIN
   -- 11. Every customer_scope policy must be RESTRICTIVE. A PERMISSIVE policy is
   -- OR-ed with the tenant policy, so getting this wrong WIDENS access instead of
@@ -167,6 +169,84 @@ BEGIN
     RAISE EXCEPTION
       'FAIL 12: SECURITY DEFINER without a pinned search_path: %', secdef_unpinned;
   END IF;
+
+  -- 13. An unbounded write check may only sit on a table that names no customer.
+  --
+  -- `customer-scope.sql` closes every unscoped table to portal reads, and lets
+  -- the write check stay `true` where the table has no `customer_id` — those are
+  -- the append-only ledgers a portal session must write but never read
+  -- (`audit_log`, `notifications`).
+  --
+  -- A table that *does* carry `customer_id` and still has an unbounded write
+  -- check is the dangerous combination: the database would accept a row naming
+  -- somebody else's customer, and only application code would be standing in the
+  -- way. The first run of this check found exactly that on `memberships` — the
+  -- table that grants portal access — and on `user_invitations`.
+  --
+  -- The reason this is a permanent check and not a one-off fix: the failure it
+  -- catches is a *future* one. Someone adds a portal feature that writes a
+  -- customer-owned table, the backstop covers the read side, and nothing at all
+  -- covers the write side. Nobody would see it. This will.
+  SELECT string_agg(c.relname, ', ') INTO unbounded_writes
+  FROM pg_policy p
+  JOIN pg_class c ON c.oid = p.polrelid
+  WHERE p.polname LIKE 'customer\_scope%'
+    AND pg_get_expr(p.polwithcheck, p.polrelid) = 'true'
+    AND EXISTS (
+      SELECT 1 FROM information_schema.columns col
+       WHERE col.table_schema = 'public'
+         AND col.table_name = c.relname
+         AND col.column_name = 'customer_id'
+    );
+
+  IF unbounded_writes IS NOT NULL THEN
+    RAISE EXCEPTION
+      'FAIL 13: customer_scope has WITH CHECK (true) on customer-owned table(s): %. '
+      'A portal session could write a row naming another customer.',
+      unbounded_writes;
+  END IF;
+
+  -- 14. Every SECURITY DEFINER function is closed to PUBLIC.
+  --
+  -- These functions exist to cross the tenant boundary deliberately: they run as
+  -- their owner, so RLS does not constrain them. That is the whole point of
+  -- app_auth_resolve_session and its siblings, and it is why the last thing
+  -- auth-functions.sql does is REVOKE ALL FROM PUBLIC and GRANT EXECUTE to
+  -- meridian_app alone.
+  --
+  -- That grants loop sits at the FOOT of a 470-line file, and this check exists
+  -- because of what happens when the file does not reach it. On 2026-08-22 the
+  -- file aborted partway through, on a function referencing a table whose
+  -- migration had not been applied yet. Every statement before the abort took
+  -- effect; the grants block did not. The result was a database where every
+  -- SECURITY DEFINER function in the authentication surface was executable by
+  -- PUBLIC, and nothing anywhere said so.
+  --
+  -- That is the failure this catches: a half-applied auth file is
+  -- indistinguishable from a complete one from the outside. The functions all
+  -- exist, they all work, and the boundary they were built to enforce is simply
+  -- not there. It is a worse state than an outright failure, because everything
+  -- appears to run.
+  SELECT string_agg(p.proname, ', ' ORDER BY p.proname) INTO public_definers
+  FROM pg_proc p
+  JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'public'
+    AND p.prosecdef
+    -- Trigger functions are excluded: Postgres refuses a direct call to a
+    -- function returning `trigger`, so an EXECUTE grant on one confers nothing.
+    -- Flagging them would make this check noisy, and a noisy check is one people
+    -- learn to scroll past -- which is how the thing it guards gets missed.
+    AND p.prorettype <> 'trigger'::regtype
+    AND has_function_privilege('public', p.oid, 'EXECUTE');
+
+  IF public_definers IS NOT NULL THEN
+    RAISE EXCEPTION
+      'FAIL 14: SECURITY DEFINER function(s) executable by PUBLIC: %. '
+      'These cross the tenant boundary by design. Re-run the whole sql/ list in '
+      'README order — a mid-file abort leaves the grants block at the foot of '
+      'auth-functions.sql unapplied, and nothing else reports it.',
+      public_definers;
+  END IF;
 END
 $$;
 
@@ -175,4 +255,4 @@ DELETE FROM public.customers
  WHERE tenant_id IN ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222');
 DELETE FROM public.tenants WHERE slug IN ('alpha-fm', 'beta-fm');
 
-\echo '── RLS verification: all 12 checks passed ──'
+\echo '── RLS verification: all 14 checks passed ──'

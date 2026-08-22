@@ -564,9 +564,9 @@ Extensions required:
 
 ## 8\. Field application architecture
 
-### 8\.1 Platform decision — reversing the earlier ADR
+### 8\.1 Platform decision — confirming the earlier ADR
 
-**Recommendation: React Native (Expo), not a PWA.** The earlier architecture decision selected an offline\-first PWA. The evidence does not support it, and the reasons are specific:
+**Decision: React Native (Expo), not a PWA.** ADR 0004 already selected Expo (React Native) \+ WatermelonDB and explicitly rejected a PWA on the grounds that background GPS and camera access are weak on mobile browsers. An earlier draft of this section described that ADR as having chosen a PWA; it did not, and the framing of this as a reversal was wrong \(see [ADR 0009](../adr/0009-field-app-platform-confirmed.md)\). The evidence below is kept because it is a sharper statement of why, not because anything is being overturned:
 
 | Blocker | Detail | Consequence |
 | --- | --- | --- |
@@ -581,7 +581,7 @@ Extensions required:
 
 **Cost of the reversal:** one additional build target and app\-store distribution. **Cost of not reversing it:** silent data loss on a technician's phone, which is the one failure this product cannot survive.
 
-This is `OPEN-1` and should be confirmed before Phase 3 begins.
+This was `OPEN-1`. It is **closed** — confirmed 2026\-08\-21, consistent with ADR 0004 rather than reversing it \([ADR 0009](../adr/0009-field-app-platform-confirmed.md)\).
 
 ### 8\.2 Bounded working set
 

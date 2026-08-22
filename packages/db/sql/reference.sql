@@ -86,6 +86,25 @@ BEGIN
       SELECT coalesce(max((regexp_match(reference, '(\d+)$'))[1]::int), 0) INTO v_seed
         FROM invoices
        WHERE tenant_id = v_tenant AND reference LIKE p_prefix || '-' || p_year || '-%';
+    -- M3. The seed writes demo contracts directly, so the first allocation
+    -- after a seeded database must start above them or it hands out a number
+    -- already printed on a signed contract.
+    WHEN 'CON' THEN
+      SELECT coalesce(max((regexp_match(reference, '(\d+)$'))[1]::int), 0) INTO v_seed
+        FROM contracts
+       WHERE tenant_id = v_tenant AND reference LIKE p_prefix || '-' || p_year || '-%';
+    -- M9. Same reason as CON above, found the same way: the seed writes a demo
+    -- requisition with REQ-2026-00001 already on it, so the first allocation
+    -- after seeding collided on the unique index and the whole action failed.
+    -- A prefix whose rows can pre-exist needs a branch here.
+    WHEN 'REQ' THEN
+      SELECT coalesce(max((regexp_match(reference, '(\d+)$'))[1]::int), 0) INTO v_seed
+        FROM job_requisitions
+       WHERE tenant_id = v_tenant AND reference LIKE p_prefix || '-' || p_year || '-%';
+    WHEN 'APP' THEN
+      SELECT coalesce(max((regexp_match(reference, '(\d+)$'))[1]::int), 0) INTO v_seed
+        FROM applications
+       WHERE tenant_id = v_tenant AND reference LIKE p_prefix || '-' || p_year || '-%';
     ELSE
       v_seed := 0;
   END CASE;

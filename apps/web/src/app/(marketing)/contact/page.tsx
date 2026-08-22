@@ -4,13 +4,14 @@ import { tenant, telLink, whatsappLink, graph, webPageSchema, breadcrumbSchema }
 import { Section } from "@/components/ui";
 import { JsonLd } from "@/components/json-ld";
 import { PhoneCall, WhatsappLogo, EnvelopeSimple, MapPin, Clock } from "@phosphor-icons/react/dist/ssr";
+import { hreflangAlternates } from "@/lib/i18n";
 
 const ANSWER = `Contact ${tenant.brandName} on ${tenant.phone} for general enquiries or ${tenant.emergencyPhone} for 24-hour emergencies. The office is at ${tenant.address.street}, ${tenant.address.city}, and the emergency line is answered by a person at any hour including public holidays.`;
 
 export const metadata: Metadata = {
   title: "Contact",
   description: ANSWER,
-  alternates: { canonical: "/contact" },
+  alternates: { canonical: "/contact", languages: hreflangAlternates("/contact") },
 };
 
 const CHANNELS = [
@@ -69,7 +70,11 @@ export default function ContactPage() {
           </p>
 
           <div className="mt-12 grid gap-4 md:grid-cols-2">
-            {CHANNELS.map((c) => (
+            {/*
+              A channel whose href is undefined has no number behind it yet, and
+              a card that looks clickable and is not is worse than an absent one.
+            */}
+            {CHANNELS.filter((c): c is typeof c & { href: string } => Boolean(c.href)).map((c) => (
               <a
                 key={c.label}
                 href={c.href}
@@ -98,9 +103,13 @@ export default function ContactPage() {
             <address className="prose-body mt-5 not-italic text-[16px]">
               {tenant.legalName}
               <br />
-              {tenant.address.street}
-              <br />
-              {tenant.address.city} {tenant.address.postalCode}
+              {tenant.address.street ? (
+                <>
+                  {tenant.address.street}
+                  <br />
+                </>
+              ) : null}
+              {tenant.address.city}
               <br />
               {tenant.address.country}
             </address>

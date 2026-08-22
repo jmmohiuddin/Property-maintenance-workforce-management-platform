@@ -9,7 +9,9 @@
 
 import { eq, inArray } from "drizzle-orm";
 import { withTenant, schema, closeConnection } from "@meridian/db";
+import { tenant } from "@meridian/core";
 import {
+  TEMPLATES,
   enqueue,
   dispatchPending,
   ConsoleTransport,
@@ -87,7 +89,35 @@ async function main(): Promise<void> {
   });
   checkTrue("quote template shows the money", msg.subject.includes("8,736.00"));
   checkTrue("quote template links to the portal", msg.body.includes("/portal/quotes/abc"));
-  checkTrue("every message carries the emergency number", msg.body.includes("Emergencies"));
+  // The number, not the label.
+  //
+  // This asserted `includes("Emergencies")` and passed for months against a
+  // signature that read `Emergencies, 24 hours: null` — the word it was looking
+  // for was always there, and the value it was standing in for was the string
+  // "null". Naming the configured number is what makes it a test.
+  checkTrue(
+    "every message carries the emergency number",
+    tenant.emergencyPhone !== null && msg.body.includes(tenant.emergencyPhone),
+  );
+  // No template may ever render an unset field as the four characters "null".
+  // This is the assertion that would have caught the signature bug directly,
+  // rather than depending on the emergency line to expose it.
+  checkTrue("and no template prints a null", !/\bnull\b/.test(msg.body));
+
+  // The customer-facing template that offers the emergency line. Checked
+  // separately because it interpolates the number into a *sentence* rather than
+  // into the signature, and the signature fix did not cover it: it read "call
+  // null — that line is answered by a person, 24 hours a day" for anyone
+  // deploying without `COMPANY_EMERGENCY_PHONE`. Of everything in that file it
+  // is the worst string to get wrong, because it reaches a customer who has
+  // just reported a problem.
+  const ack = TEMPLATES.request_received({
+    customerName: "Bay Tower Owners Association",
+    jobReference: "SATS-2026-00042",
+    jobTitle: "Lift lobby leak",
+  });
+  checkTrue("the acknowledgement offers a reachable emergency line", ack.body.includes(String(tenant.emergencyPhone)));
+  checkTrue("and never tells a customer to call a null", !/\bnull\b/.test(ack.body));
 
   // ── Happy path ────────────────────────────────────────────────────────────
   const okId = await queueOne();

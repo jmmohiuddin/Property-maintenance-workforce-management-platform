@@ -232,9 +232,84 @@ DECLARE
   audited text[] := ARRAY[
     'jobs', 'job_visits', 'job_signoffs', 'quotes', 'quote_lines',
     'contracts', 'contract_visits', 'invoices', 'invoice_lines', 'payments',
-    'customers', 'properties', 'assets', 'technicians', 'memberships', 'leave_requests'
+    'customers', 'properties', 'assets', 'technicians', 'memberships', 'leave_requests',
+    -- CON-11. The tender row stores its own outcome, reason and who decided it,
+    -- so the FACT is recorded. What was not recorded is the change: who moved a
+    -- bid from won to lost, and when. On a deadline-driven pipeline that is the
+    -- history somebody asks for after the fact.
+    'tenders',
+    -- HR-8, HR-13, HR-17. Money leaving the business towards a CUSTOMER was
+    -- audited from the start — `invoices`, `payments` above. Money leaving it
+    -- towards an EMPLOYEE was not, which is the wrong way round: a customer
+    -- receipt is settled by a bank statement, whereas a wage transfer and an
+    -- end-of-service settlement are settled by MOHRE, by a labour court, and
+    -- by an inspection that asks precisely "who marked this paid, and when".
+    --
+    -- The trigger is the only place that answer exists for some of these.
+    -- `gratuity_settlements` carries `recorded_by_id` for whoever computed the
+    -- settlement, and NOTHING for whoever later marked it paid; `salary_deductions`
+    -- names the authoriser but not whoever edits the amount afterwards. The row
+    -- states the fact; only the log states the change.
+    --
+    -- Volume is a month's payroll, not telemetry: one cycle a month, one line
+    -- per employee per month, a settlement once per employment. `overtime_records`
+    -- is the busiest at up to four bands per employee-day, and it earns its place
+    -- anyway — it is premium-rate money, and `recordWorkedDay` silently
+    -- soft-deletes bands a corrected day no longer has. `attendance_events` and
+    -- `technician_locations`, the raw clock and GPS feeds underneath it, stay out
+    -- for the reason at the top of this comment block.
+    'wage_cycles', 'wage_payments', 'salary_deductions', 'gratuity_settlements',
+    'overtime_records',
+    -- The inputs a payroll figure is computed FROM, which move after the fact and
+    -- are what a back-dated correction goes through: the basic salary gratuity
+    -- accrues on and the term that was signed (`employment_contract_terms`), the
+    -- days that get encashed on termination (`leave_balances`), and the employee
+    -- master carrying `basic_salary_minor` and `wps_iban` — the pay basis and the
+    -- account the pay lands in, which is the redirection nobody would otherwise see.
+    'employment_contract_terms', 'leave_balances', 'employees',
+    -- HR-11. At least as sensitive as the payroll tables above it, and audited
+    -- for a sharper reason than volume: this register is the evidence in a
+    -- compensation claim and in a MOHRE inspection, and the two columns anybody
+    -- would be tempted to adjust after the fact are `mohre_notified_at` and
+    -- `became_known_at` -- one decides whether the statutory notification was in
+    -- time, the other decides when the clock started at all. The row states the
+    -- fact; only the log states that somebody changed it, and when.
+    --
+    -- `hse_rams`, `toolbox_talks`, `toolbox_talk_attendees` and `ppe_issues` are
+    -- deliberately NOT here. A RAMS revision is a new row rather than an edit,
+    -- an attendance list is not the sort of record whose edit history anybody
+    -- asks for, and audit volume that buys nothing crowds out the rows that do.
+    'work_injuries'
   ];
+  stale record;
 BEGIN
+  -- Take the trigger off any table that has LEFT the array.
+  --
+  -- The loop below only DROPs a trigger it is immediately about to re-CREATE,
+  -- so it is blind in one direction: delete a name from `audited` and its
+  -- trigger keeps firing for ever, with nothing in this file mentioning the
+  -- table any more. That is the mirror of the typo hazard the EXISTS guard
+  -- creates -- a misspelled name silently gets you no trigger, a deleted name
+  -- silently gets you a permanent one -- and the second is worse, because the
+  -- log keeps filling with rows for a table somebody decided should not be
+  -- audited, and re-running this file does not correct it.
+  --
+  -- It drops nothing today. It is here so that removing a name is a decision
+  -- this file can actually carry out.
+  FOR stale IN
+    SELECT c.relname AS tbl, tg.tgname AS trg
+      FROM pg_trigger tg
+      JOIN pg_class c ON c.oid = tg.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE NOT tg.tgisinternal
+       AND n.nspname = 'public'
+       AND tg.tgname LIKE 'audit\_%'
+       AND NOT (c.relname = ANY (audited))
+  LOOP
+    RAISE NOTICE 'dropping stale audit trigger % on %', stale.trg, stale.tbl;
+    EXECUTE format('DROP TRIGGER IF EXISTS %I ON public.%I', stale.trg, stale.tbl);
+  END LOOP;
+
   FOREACH t IN ARRAY audited LOOP
     IF EXISTS (SELECT 1 FROM pg_class WHERE relname = t AND relkind = 'r') THEN
       EXECUTE format('DROP TRIGGER IF EXISTS audit_%1$s ON public.%1$I', t);

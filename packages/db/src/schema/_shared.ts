@@ -42,6 +42,12 @@ export const userRole = pgEnum("user_role", [
   "technician",
   "accountant",
   "sales",
+  // ADM-1. §5.2 adds a seventh staff persona: fill an open trade role in days,
+  // and never dispatch someone whose permit, visa, medical or certification has
+  // lapsed. The rule attached to it is that every role must have at least one
+  // screen it alone can reach — `hr` earns that with the recruitment pipeline
+  // (M9) and the workforce compliance board (M10).
+  "hr",
   "customer", // portal user belonging to a customer account
   "readonly",
 ]);
@@ -75,6 +81,46 @@ export const jobSource = pgEnum("job_source", [
   "recurring",
 ]);
 
+/**
+ * The life of one technician attendance.
+ *
+ * ── WHY `superseded` EXISTS, AND WHY IT IS NOT ONE OF THE OTHER NINE ────────
+ *
+ * A visit row is written at ASSIGNMENT, not at attendance. Reassigning a job to
+ * somebody else means calling `assignTechnician` again — `rescheduleVisit`
+ * refuses to change the technician on purpose, because moving a visit into
+ * another person's lane has to re-run skill matching, the `HR-9` block and the
+ * `JOB-8` availability rules. So a reassignment inserts a SECOND row, and until
+ * `0040` there was no state that could retire the first. It stayed `assigned`
+ * for ever, occupying the original technician's diary in `findCandidates` and
+ * `listTechnicians`, and rendering a labour form on the job card for a visit
+ * that never happened.
+ *
+ * The three existing candidates were each considered and each says something
+ * false about a person:
+ *
+ *   * `declined` means THE TECHNICIAN refused the work. Recording a
+ *     dispatcher's reassignment as a decline attributes the office's decision
+ *     to the employee, and any report counting who declines work would then be
+ *     libel with a chart on it.
+ *   * `aborted` means the visit STARTED and was abandoned — the reference data
+ *     carries `aborted_unsafe` as a job outcome for exactly that. It claims
+ *     attendance that did not occur, and it is in `SETTLED_VISIT_STATUSES`
+ *     ("already happened") for that reason.
+ *   * `cancelled` was rejected as a NEW member: it is the natural word for the
+ *     customer calling off the appointment, which is a different real event
+ *     this schema does not model yet. Spending it here would leave that event
+ *     with no honest name later.
+ *
+ * `superseded` is the word this schema already uses for "a later record
+ * replaced this one and the earlier one is kept, not deleted" — `quote_status`,
+ * `CONTRACT_TERM_STATUSES` and the field app's outcome versions all use it in
+ * exactly that sense.
+ *
+ * Appended LAST, deliberately: `ALTER TYPE ... ADD VALUE` appends, and a
+ * declaration whose order disagrees with the type in the database makes every
+ * later `drizzle-kit generate` produce a spurious diff.
+ */
 export const visitStatus = pgEnum("visit_status", [
   "proposed",
   "assigned",
@@ -85,6 +131,7 @@ export const visitStatus = pgEnum("visit_status", [
   "completed",
   "no_access",
   "aborted",
+  "superseded",
 ]);
 
 export const quoteStatus = pgEnum("quote_status", [

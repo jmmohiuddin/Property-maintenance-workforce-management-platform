@@ -1,0 +1,24 @@
+-- INV-15 / FLD-16 — make the nightly retention purge cheap enough to run.
+--
+-- `/api/cron/retention` deletes GPS traces older than 30 days, one tenant at a
+-- time. Under RLS that predicate is always `tenant_id = $1 AND recorded_at <
+-- $2`, and the only index on the table is
+-- `tech_locations_latest_idx (tenant_id, technician_id, recorded_at)`.
+--
+-- That index cannot serve this query. `technician_id` sits between the two
+-- columns the purge filters on, and Postgres does not skip-scan, so the planner
+-- falls back to a sequential scan of what is by design the largest table in the
+-- schema — a ping per van per interval, forever. A nightly full scan is how a
+-- retention job gets switched off six months after it was written, and a
+-- retention job that has been switched off is a retention policy again.
+--
+-- `(tenant_id, recorded_at)` is exactly the purge's predicate, and it also
+-- serves "where has this fleet been today" without naming a technician.
+--
+-- No new columns and no new tables. The employee clock already has
+-- `employees.delete_after` and `employees_retention_idx` from 0005, and every
+-- deletion is logged to `audit_log`, which is append-only at the database level
+-- — a second retention ledger would be one deploy away from disagreeing with
+-- the first.
+CREATE INDEX IF NOT EXISTS "tech_locations_retention_idx"
+  ON "technician_locations" USING btree ("tenant_id", "recorded_at");

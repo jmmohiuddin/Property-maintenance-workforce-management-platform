@@ -11,23 +11,33 @@
  * and `npm run db:seed` run. Cleans up after itself.
  */
 
-import { eq } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import {
   withTenant,
   withCustomerScope,
   createQuote,
+  reviseQuote,
+  REVISABLE_QUOTE_STATUSES,
   sendQuote,
   decideQuote,
   getQuoteWithLines,
   createInvoiceFromJob,
+  getInvoiceDocument,
+  uninvoicedSignedOffJobs,
+  invoiceSequenceGaps,
+  issueCreditNote,
+  listCreditNotes,
+  customerCreditPosition,
   recordPayment,
-  listInvoices,
+  searchInvoices,
   arAgeing,
+  openReceivables,
   transitionJob,
   schema,
   closeConnection,
 } from "../src/index";
-import { toDecimalString, formatMoney } from "@meridian/core";
+import { toDecimalString, formatMoney, toMinor, company, renderableProblems } from "@meridian/core";
+import { otherTenantId } from "./_tenant";
 
 const TENANT = "11111111-1111-4111-8111-111111111111";
 
@@ -43,6 +53,45 @@ function checkTrue(label: string, got: boolean): void {
 
 async function main(): Promise<void> {
   const ctx = { tenantId: TENANT };
+
+  // ── The test harness itself ───────────────────────────────────────────────
+  //
+  // A check of ./_tenant.ts, not of the product. `otherTenantId()` used to
+  // select from `tenants` on the plain `db` handle, outside a tenant
+  // transaction, where the policy is `id = app_current_tenant()` and the
+  // setting is unset — so it matched zero rows and returned null whether or not
+  // a second tenant existed. Every caller read that null as "single-tenant
+  // database, skip", and the cross-tenant isolation check underneath it never
+  // ran. Three suites hit it independently and routed around the helper.
+  //
+  // So the helper is now itself under test. If it ever goes back to returning
+  // something a caller can mistake for "nothing to compare against", these
+  // three lines fail here rather than quietly disarming the isolation checks in
+  // every suite that uses it.
+  const foreignTenantId = await otherTenantId();
+  checkTrue("otherTenantId() does not name the tenant under test", foreignTenantId !== TENANT);
+
+  const foreignTenant = await withTenant(
+    { tenantId: foreignTenantId, actorKind: "system" as const },
+    async (tx) => {
+      // Inside a tenant transaction the policy on `tenants` matches exactly the
+      // current tenant, so this returns one row if the helper named a real
+      // tenant and nothing at all if it did not.
+      const rows = await tx.select({ id: schema.tenants.id, slug: schema.tenants.slug }).from(schema.tenants);
+      return rows[0];
+    },
+  );
+  check("otherTenantId() names a tenant that really exists", foreignTenant?.id, foreignTenantId);
+
+  const ownSlug = await withTenant(ctx, async (tx) => {
+    const rows = await tx.select({ slug: schema.tenants.slug }).from(schema.tenants);
+    return rows[0]?.slug;
+  });
+  checkTrue(
+    "and it is a different tenant, not the same row under another name",
+    Boolean(ownSlug) && Boolean(foreignTenant?.slug) && foreignTenant?.slug !== ownSlug,
+  );
+
 
   // Work against a seeded job that is already signed off.
   const setup = await withTenant(ctx, async (tx) => {
@@ -130,6 +179,295 @@ async function main(): Promise<void> {
   }
   checkTrue("a decided quote cannot be decided again", doubleDecideRejected);
 
+  // ── QTE-9: licensed-activity warning on quote lines ─────────────────────────
+  //
+  // Warns, never blocks — `licensedActivityWarnings` in `commerce.ts` argues
+  // why. A line whose service is not one of the ten catalogued (and therefore
+  // licensed) activities is named back to the caller; a line that is one of
+  // the ten raises nothing.
+  const qte9Ids: string[] = [];
+
+  const outOfLicence = await withTenant(ctx, (tx) =>
+    createQuote(tx, ctx, {
+      jobId: setup.id,
+      title: "QTE-9: out-of-licence line",
+      lines: [
+        {
+          description: "Pest control treatment",
+          quantity: "1",
+          unit: "ea",
+          unitPrice: "300.00",
+          serviceSlug: "pest-control",
+        },
+      ],
+    }),
+  );
+  qte9Ids.push(outOfLicence.quoteId);
+  checkTrue("QTE-9: a line outside the licence is warned about", outOfLicence.warnings.length === 1);
+  checkTrue(
+    "QTE-9: the warning names the line's own description",
+    (outOfLicence.warnings[0] ?? "").includes("Pest control treatment"),
+  );
+
+  // Load-bearing positive: a line that IS one of the ten raises nothing.
+  const inLicence = await withTenant(ctx, (tx) =>
+    createQuote(tx, ctx, {
+      jobId: setup.id,
+      title: "QTE-9: licensed line",
+      lines: [
+        {
+          description: "AC unit service",
+          quantity: "1",
+          unit: "ea",
+          unitPrice: "300.00",
+          serviceSlug: "hvac-installation-maintenance",
+        },
+      ],
+    }),
+  );
+  qte9Ids.push(inLicence.quoteId);
+  checkTrue("QTE-9: a licensed line raises no warning", inLicence.warnings.length === 0);
+
+  // ── QTE-5: the AMC's own rate, applied and named ────────────────────────────
+  //
+  // `CON-<year>-00001` is the seeded Bay Tower comprehensive AMC, active, at a
+  // 15% (1500 bp) rate. A fresh job is linked to it here rather than reusing a
+  // seeded job, because no seeded job carries `contract_id` — this is the exact
+  // gap `resolveContractDiscount` closes.
+  const amcContract = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({ id: schema.contracts.id, customerId: schema.contracts.customerId, reference: schema.contracts.reference })
+      .from(schema.contracts)
+      .where(eq(schema.contracts.reference, `CON-${new Date().getFullYear()}-00001`));
+    return rows[0];
+  });
+  if (!amcContract) throw new Error("Seed data missing: CON-<year>-00001 (Bay Tower AMC). Run `npm run db:seed`.");
+
+  const amcProperty = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({ propertyId: schema.contractProperties.propertyId })
+      .from(schema.contractProperties)
+      .where(eq(schema.contractProperties.contractId, amcContract.id))
+      .limit(1);
+    return rows[0]?.propertyId;
+  });
+  if (!amcProperty) throw new Error("Seed data missing: no property on the Bay Tower AMC.");
+
+  const qte5JobRef = `QTE5-${Date.now()}`;
+  const amcJob = await withTenant(ctx, (tx) =>
+    tx
+      .insert(schema.jobs)
+      .values({
+        tenantId: TENANT,
+        reference: qte5JobRef,
+        customerId: amcContract.customerId,
+        propertyId: amcProperty,
+        serviceSlug: "hvac-installation-maintenance",
+        title: "QTE-5 fixture: extra AC service under AMC",
+        status: "triaged",
+        priority: "p3_standard",
+        source: "internal",
+        contractId: amcContract.id,
+      })
+      .returning({ id: schema.jobs.id }),
+  );
+  const amcJobId = amcJob[0]!.id;
+
+  const amcAutoQuote = await withTenant(ctx, (tx) =>
+    createQuote(tx, ctx, {
+      jobId: amcJobId,
+      title: "QTE-5: contract-rate quote",
+      lines: [{ description: "Additional AC unit service", quantity: "1", unit: "ea", unitPrice: "1000.00" }],
+    }),
+  );
+  qte9Ids.push(amcAutoQuote.quoteId);
+
+  // 1000.00 subtotal, 15% (1500bp) discount = 150.00; taxable 850.00; VAT 5% =
+  // 42.50; total 892.50.
+  const amcAutoDetail = await withTenant(ctx, (tx) => getQuoteWithLines(tx, amcAutoQuote.quoteId));
+  check("QTE-5: the contract's own discount is applied automatically", amcAutoDetail?.discountAmount, "150.00");
+  check("QTE-5: the rate behind it is recorded", amcAutoDetail?.discountBasisPoints, 1500);
+  checkTrue(
+    "QTE-5: the source names the contract, not just a number",
+    (amcAutoDetail?.discountSource ?? "").includes(amcContract.reference),
+  );
+  check("QTE-5: VAT and total reflect the contract discount", amcAutoDetail?.total, "892.50");
+
+  // Load-bearing positive on the other side: an operator's own figure is
+  // honoured, not silently replaced by the contract's rate.
+  const amcManualQuote = await withTenant(ctx, (tx) =>
+    createQuote(tx, ctx, {
+      jobId: amcJobId,
+      title: "QTE-5: manual override",
+      lines: [{ description: "Additional AC unit service", quantity: "1", unit: "ea", unitPrice: "1000.00" }],
+      discount: "50.00",
+    }),
+  );
+  qte9Ids.push(amcManualQuote.quoteId);
+  const amcManualDetail = await withTenant(ctx, (tx) => getQuoteWithLines(tx, amcManualQuote.quoteId));
+  check("QTE-5: a manual discount overrides the contract rate", amcManualDetail?.discountAmount, "50.00");
+  checkTrue("QTE-5: a manual discount records no contract source", amcManualDetail?.discountSource == null);
+
+  // ── QTE-10: quote versioning ─────────────────────────────────────────────
+  //
+  // Which states may be revised, and why, is documented on `reviseQuote`
+  // itself (packages/db/src/domain/commerce.ts). Every branch, both ways.
+  const setupJobId = setup.id;
+  async function makeDraft(title: string, price: string) {
+    const q = await withTenant(ctx, (tx) =>
+      createQuote(tx, ctx, {
+        jobId: setupJobId,
+        title,
+        lines: [{ description: title, quantity: "1", unit: "ea", unitPrice: price }],
+      }),
+    );
+    qte9Ids.push(q.quoteId);
+    return q;
+  }
+
+  // draft → revisable.
+  const draftQ = await makeDraft("QTE-10: draft", "100.00");
+  const draftRevised = await withTenant(ctx, (tx) =>
+    reviseQuote(tx, ctx, {
+      quoteId: draftQ.quoteId,
+      lines: [{ description: "QTE-10: draft, revised", quantity: "1", unit: "ea", unitPrice: "110.00" }],
+      reason: "test: draft revision",
+    }),
+  );
+  qte9Ids.push(draftRevised.quoteId);
+  checkTrue("QTE-10: a draft quote may be revised", draftRevised.quoteId !== draftQ.quoteId);
+
+  const draftOriginalAfter = await withTenant(ctx, (tx) => getQuoteWithLines(tx, draftQ.quoteId));
+  check("QTE-10: revising marks the original superseded", draftOriginalAfter?.status, "superseded");
+  const draftRevisedDetail = await withTenant(ctx, (tx) => getQuoteWithLines(tx, draftRevised.quoteId));
+  check("QTE-10: the new version points back at what it replaced", draftRevisedDetail?.supersedesQuoteId, draftQ.quoteId);
+
+  // superseded → refused. Idempotency: a quote already replaced cannot be
+  // replaced again, which would let two later quotes both claim the same
+  // ancestor.
+  let supersededRefused = false;
+  try {
+    await withTenant(ctx, (tx) =>
+      reviseQuote(tx, ctx, {
+        quoteId: draftQ.quoteId,
+        lines: [{ description: "should not be created", quantity: "1", unit: "ea", unitPrice: "1.00" }],
+      }),
+    );
+  } catch {
+    supersededRefused = true;
+  }
+  checkTrue("QTE-10: an already-superseded quote cannot be revised again", supersededRefused);
+
+  // sent → revisable. The customer has seen it; the old row is kept exactly as
+  // sent (sentAt untouched), and a new one takes over.
+  const sentQ = await makeDraft("QTE-10: sent", "200.00");
+  await withTenant(ctx, (tx) => sendQuote(tx, sentQ.quoteId));
+  const sentBefore = await withTenant(ctx, async (tx) => {
+    const rows = await tx.select({ sentAt: schema.quotes.sentAt }).from(schema.quotes).where(eq(schema.quotes.id, sentQ.quoteId));
+    return rows[0]?.sentAt ?? null;
+  });
+  const sentRevised = await withTenant(ctx, (tx) =>
+    reviseQuote(tx, ctx, {
+      quoteId: sentQ.quoteId,
+      lines: [{ description: "QTE-10: sent, revised", quantity: "1", unit: "ea", unitPrice: "210.00" }],
+    }),
+  );
+  qte9Ids.push(sentRevised.quoteId);
+  checkTrue("QTE-10: a sent quote may be revised", sentRevised.quoteId !== sentQ.quoteId);
+  const sentOriginalAfter = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({ status: schema.quotes.status, sentAt: schema.quotes.sentAt })
+      .from(schema.quotes)
+      .where(eq(schema.quotes.id, sentQ.quoteId));
+    return rows[0];
+  });
+  check("QTE-10: the superseded 'sent' quote's status moves", sentOriginalAfter?.status, "superseded");
+  checkTrue(
+    "QTE-10: but what the customer was shown (sentAt) is untouched",
+    sentOriginalAfter?.sentAt?.getTime() === sentBefore?.getTime(),
+  );
+
+  // approved → refused outright. The central guarantee: a signed quote cannot
+  // change after signature.
+  const approvedQ = await makeDraft("QTE-10: approved", "300.00");
+  await withTenant(ctx, (tx) => sendQuote(tx, approvedQ.quoteId));
+  await withTenant(ctx, (tx) => decideQuote(tx, ctx, { quoteId: approvedQ.quoteId, decision: "approved" }));
+  let approvedRefusal = "";
+  try {
+    await withTenant(ctx, (tx) =>
+      reviseQuote(tx, ctx, {
+        quoteId: approvedQ.quoteId,
+        lines: [{ description: "should not be created", quantity: "1", unit: "ea", unitPrice: "1.00" }],
+      }),
+    );
+  } catch (error) {
+    approvedRefusal = error instanceof Error ? error.message : String(error);
+  }
+  checkTrue("QTE-10: an approved quote cannot be revised", approvedRefusal.includes("approved quote cannot be revised"));
+
+  // rejected → revisable, and the rejection itself is preserved on the
+  // retired row rather than erased.
+  const rejectedQ = await makeDraft("QTE-10: rejected", "400.00");
+  await withTenant(ctx, (tx) => sendQuote(tx, rejectedQ.quoteId));
+  await withTenant(ctx, (tx) =>
+    decideQuote(tx, ctx, { quoteId: rejectedQ.quoteId, decision: "rejected", reason: "Too expensive" }),
+  );
+  const rejectedRevised = await withTenant(ctx, (tx) =>
+    reviseQuote(tx, ctx, {
+      quoteId: rejectedQ.quoteId,
+      lines: [{ description: "QTE-10: rejected, revised cheaper", quantity: "1", unit: "ea", unitPrice: "250.00" }],
+      reason: "Lower price after rejection",
+    }),
+  );
+  qte9Ids.push(rejectedRevised.quoteId);
+  checkTrue("QTE-10: a rejected quote may be revised", rejectedRevised.quoteId !== rejectedQ.quoteId);
+  const rejectedOriginalAfter = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({ status: schema.quotes.status, rejectionReason: schema.quotes.rejectionReason })
+      .from(schema.quotes)
+      .where(eq(schema.quotes.id, rejectedQ.quoteId));
+    return rows[0];
+  });
+  check("QTE-10: the rejected quote's own reason survives being superseded", rejectedOriginalAfter?.rejectionReason, "Too expensive");
+  check("QTE-10: and its status moves to superseded", rejectedOriginalAfter?.status, "superseded");
+
+  // expired → revisable. Nobody decided against the work; the clock ran out.
+  const expiredQ = await makeDraft("QTE-10: expired", "500.00");
+  await withTenant(ctx, (tx) => tx.update(schema.quotes).set({ status: "expired" }).where(eq(schema.quotes.id, expiredQ.quoteId)));
+  const expiredRevised = await withTenant(ctx, (tx) =>
+    reviseQuote(tx, ctx, {
+      quoteId: expiredQ.quoteId,
+      lines: [{ description: "QTE-10: expired, re-quoted", quantity: "1", unit: "ea", unitPrice: "520.00" }],
+    }),
+  );
+  qte9Ids.push(expiredRevised.quoteId);
+  checkTrue("QTE-10: an expired quote may be revised", expiredRevised.quoteId !== expiredQ.quoteId);
+
+  checkTrue(
+    "QTE-10: REVISABLE_QUOTE_STATUSES matches what was just exercised",
+    REVISABLE_QUOTE_STATUSES.includes("draft") &&
+      REVISABLE_QUOTE_STATUSES.includes("sent") &&
+      REVISABLE_QUOTE_STATUSES.includes("rejected") &&
+      REVISABLE_QUOTE_STATUSES.includes("expired") &&
+      !REVISABLE_QUOTE_STATUSES.includes("approved") &&
+      !REVISABLE_QUOTE_STATUSES.includes("superseded"),
+  );
+
+  // ── QTE-5 / QTE-9 / QTE-10 cleanup ──────────────────────────────────────
+  await withTenant(ctx, async (tx) => {
+    const allQuoteIds = [
+      ...qte9Ids,
+      draftQ.quoteId,
+      sentQ.quoteId,
+      approvedQ.quoteId,
+      rejectedQ.quoteId,
+      expiredQ.quoteId,
+    ];
+    await tx.delete(schema.quoteLines).where(inArray(schema.quoteLines.quoteId, allQuoteIds));
+    await tx.delete(schema.quotes).where(inArray(schema.quotes.id, allQuoteIds));
+    await tx.delete(schema.jobs).where(eq(schema.jobs.id, amcJobId));
+  });
+
   // ── Invoicing ─────────────────────────────────────────────────────────────
   // Invoicing work nobody signed for must be refused.
   const openJob = await withTenant(ctx, async (tx) => {
@@ -189,9 +527,46 @@ async function main(): Promise<void> {
   checkTrue("a negative payment is rejected", negativeRejected);
 
   // ── AR ageing ─────────────────────────────────────────────────────────────
-  const ageing = await withTenant(ctx, (tx) => arAgeing(tx));
+  //
+  // Read in ONE transaction, because eight other suites are writing to this
+  // database and a schedule fetched at one instant against a total fetched at
+  // another would disagree for a reason that has nothing to do with the code.
+  const { ageing, schedule } = await withTenant(ctx, async (tx) => ({
+    ageing: await arAgeing(tx),
+    schedule: await openReceivables(tx),
+  }));
   checkTrue("a fully paid invoice is excluded from ageing", ageing.totalOutstandingMinor >= 0);
   console.log(`      outstanding: ${formatMoney(ageing.totalOutstandingMinor)}`);
+
+  /*
+   * The detail must reconcile to the control total.
+   *
+   * `INV-16` puts this schedule in front of an accountant, who reconciles it
+   * against the summary the moment they receive both. `arAgeing` is a fold over
+   * `openReceivables` for exactly that reason — two independent queries would
+   * agree right up until one of them learned about a new invoice status and the
+   * other did not, and the first symptom would be a schedule short by one
+   * invoice. These four checks are what stop the fold being replaced by a
+   * second query at some later date.
+   */
+  const scheduleTotal = schedule.reduce((sum, r) => sum + r.outstandingMinor, 0);
+  check("the AR schedule sums to the AR control total", scheduleTotal, ageing.totalOutstandingMinor);
+
+  const bucketTotal = (bucket: string) =>
+    schedule.filter((r) => r.bucket === bucket).reduce((sum, r) => sum + r.outstandingMinor, 0);
+  check("and bucket by bucket — current", bucketTotal("current"), ageing.currentMinor);
+  check("1 to 30 days", bucketTotal("days_1_30"), ageing.days1to30Minor);
+  check("31 to 60 days", bucketTotal("days_31_60"), ageing.days31to60Minor);
+  check("61 days and over", bucketTotal("days_61_plus"), ageing.days61PlusMinor);
+
+  checkTrue(
+    "nothing settled is on the schedule — every row is money still owed",
+    schedule.every((r) => r.outstandingMinor > 0),
+  );
+  checkTrue(
+    "and the paid invoice raised above is not one of them",
+    !schedule.some((r) => r.invoiceId === invoice.invoiceId),
+  );
 
   // ── Customer scoping ──────────────────────────────────────────────────────
   // The decisive test: a portal session scoped to a DIFFERENT customer must not
@@ -206,17 +581,17 @@ async function main(): Promise<void> {
 
   const ownInvoices = await withCustomerScope(
     { tenantId: TENANT, customerId: setup.customerId },
-    (tx) => listInvoices(tx),
+    (tx) => searchInvoices(tx, { limit: 100 }),
   );
-  checkTrue("owning customer sees its invoice", ownInvoices.some((i) => i.id === invoice.invoiceId));
+  checkTrue("owning customer sees its invoice", ownInvoices.rows.some((i) => i.id === invoice.invoiceId));
 
   const foreignInvoices = await withCustomerScope(
     { tenantId: TENANT, customerId: otherCustomer!.id },
-    (tx) => listInvoices(tx),
+    (tx) => searchInvoices(tx, { limit: 100 }),
   );
   checkTrue(
     "another customer cannot see it",
-    !foreignInvoices.some((i) => i.id === invoice.invoiceId),
+    !foreignInvoices.rows.some((i) => i.id === invoice.invoiceId),
   );
 
   const foreignQuote = await withCustomerScope(
@@ -235,8 +610,369 @@ async function main(): Promise<void> {
   }
   checkTrue("another customer cannot pay against it", foreignPaymentBlocked);
 
+  // ── Tax invoice compliance: INV-3, INV-4, INV-5, INV-6, INV-7 ─────────────
+
+  const article59 = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({
+        documentType: schema.invoices.documentType,
+        supplyDate: schema.invoices.supplyDate,
+        supplierName: schema.invoices.supplierName,
+        supplierCountry: schema.invoices.supplierCountry,
+        recipientName: schema.invoices.recipientName,
+        recipientTrn: schema.invoices.recipientTrn,
+        taxableAmount: schema.invoices.taxableAmount,
+        paymentTermsDays: schema.invoices.paymentTermsDays,
+      })
+      .from(schema.invoices)
+      .where(eq(schema.invoices.id, invoice.invoiceId));
+    return rows[0];
+  });
+
+  check("the document names itself a tax invoice", article59?.documentType, "tax_invoice");
+  checkTrue("a date of supply is captured, not left to the issue date", article59?.supplyDate !== null);
+  check("the supplier identity is snapshot, not joined", article59?.supplierName, company.legalName);
+  check("the taxable amount is stored as the document showed it", article59?.taxableAmount, "4400.00");
+  checkTrue("the recipient is named on the row", (article59?.recipientName ?? "").length > 0);
+
+  // Article 59 requires the tax amount in AED on every line. The document
+  // discount is apportioned across them, so the parts must still sum to the
+  // whole — an invoice whose lines do not add up is one an accountant refuses.
+  const invoiceLines = await withTenant(ctx, (tx) =>
+    tx
+      .select({
+        unit: schema.invoiceLines.unit,
+        unitCode: schema.invoiceLines.unitCode,
+        netAmount: schema.invoiceLines.netAmount,
+        taxAmount: schema.invoiceLines.taxAmount,
+      })
+      .from(schema.invoiceLines)
+      .where(eq(schema.invoiceLines.invoiceId, invoice.invoiceId)),
+  );
+
+  const lineTaxMinor = invoiceLines.reduce((sum, l) => sum + toMinor(l.taxAmount ?? "0"), 0);
+  const lineNetMinor = invoiceLines.reduce((sum, l) => sum + toMinor(l.netAmount ?? "0"), 0);
+  check("per-line tax sums to the document tax", toDecimalString(lineTaxMinor), "220.00");
+  check("per-line net sums to the taxable amount", toDecimalString(lineNetMinor), "4400.00");
+  check("m2 carries its PINT AE unit code", invoiceLines.find((l) => l.unit === "m2")?.unitCode, "MTK");
+  check("and ea carries its own", invoiceLines.find((l) => l.unit === "ea")?.unitCode, "H87");
+
+  const document = await withTenant(ctx, (tx) => getInvoiceDocument(tx, invoice.invoiceId));
+  checkTrue("the document model reads back from the row", document !== null);
+  check("an unregistered recipient gets the simplified variant", document?.variant, "simplified");
+
+  // This environment has no COMPANY_TRN (OPEN-7 is still open), so the render
+  // must refuse rather than print a document that is not a tax invoice. That
+  // refusal is the requirement, not a test-environment artefact.
+  const problems = renderableProblems(document!.document, { variant: "full" });
+  checkTrue(
+    "without a supplier TRN the render refuses",
+    company.trn !== null || problems.some((p) => p.includes("TRN")),
+  );
+
+  // ── INV-6: a registered recipient gets the full invoice ───────────────────
+  const RECIPIENT_TRN = "100123456789003";
+  await withTenant(ctx, (tx) =>
+    tx
+      .update(schema.customers)
+      .set({ taxRegistrationNumber: RECIPIENT_TRN, billingAddress: "Business Bay, Dubai" })
+      .where(eq(schema.customers.id, setup.customerId)),
+  );
+
+  const registered = await withTenant(ctx, (tx) =>
+    createInvoiceFromJob(tx, ctx, {
+      jobId: setup.id,
+      lines: [{ description: "Additional visit", quantity: "1", unit: "ea", unitPrice: "100.00" }],
+    }),
+  );
+
+  const registeredDoc = await withTenant(ctx, (tx) => getInvoiceDocument(tx, registered.invoiceId));
+  check("a registered recipient gets the full variant", registeredDoc?.variant, "full");
+  check("and their TRN is snapshot onto the invoice", registeredDoc?.document.recipient.trn, RECIPIENT_TRN);
+  check("with their address", registeredDoc?.document.recipient.address, "Business Bay, Dubai");
+
+  const credited = await withTenant(ctx, (tx) =>
+    createInvoiceFromJob(tx, ctx, {
+      jobId: setup.id,
+      lines: [{ description: "Callout", quantity: "1", unit: "ea", unitPrice: "100.00" }],
+    }),
+  );
+
+  // ── INV-5: the 14-day queue ───────────────────────────────────────────────
+  const awaitingInvoice = await withTenant(ctx, (tx) => uninvoicedSignedOffJobs(tx));
+  checkTrue(
+    "an invoiced job is out of the 14-day queue",
+    !awaitingInvoice.some((j) => j.jobId === setup.id),
+  );
+  checkTrue(
+    "every entry carries a deadline and a days count",
+    awaitingInvoice.every((j) => j.deadline.length === 10 && j.daysSinceSupply >= 0),
+  );
+  checkTrue(
+    "anything past day 14 names the AED 2,500 penalty",
+    awaitingInvoice.every((j) => j.state !== "breached" || (j.penalty ?? "").includes("2,500")),
+  );
+
+  // ── INV-4: gaps in the issued series are detectable ───────────────────────
+  // Scoped to the three numbers this run allocated. Earlier runs hard-delete
+  // their fixtures, which leaves real gaps in the dev series — asserting the
+  // whole series is clean would make this test pass once and fail for ever
+  // after, which is worse than not testing it.
+  const seqOf = (reference: string): number => Number(reference.slice(-5));
+  const ourRange = [invoice.reference, registered.reference, credited.reference].map(seqOf);
+  const firstOurs = Math.min(...ourRange);
+  const lastOurs = Math.max(...ourRange);
+
+  const clean = await withTenant(ctx, (tx) => invoiceSequenceGaps(tx));
+  checkTrue(
+    "consecutive allocation leaves no gap",
+    !clean.gaps.some((g) => g.sequence >= firstOurs && g.sequence <= lastOurs),
+  );
+
+  // Remove an interior number and the report must find it. This is the FTA
+  // audit flag: the innocent explanation for a missing invoice number is a
+  // rolled-back transaction, and the other explanation is a suppressed sale.
+  await withTenant(ctx, async (tx) => {
+    await tx.delete(schema.invoiceLines).where(eq(schema.invoiceLines.invoiceId, registered.invoiceId));
+    await tx.delete(schema.invoices).where(eq(schema.invoices.id, registered.invoiceId));
+  });
+
+  const gapped = await withTenant(ctx, (tx) => invoiceSequenceGaps(tx));
+  checkTrue(
+    "a missing interior number is reported",
+    gapped.gaps.some((g) => g.reference === registered.reference),
+  );
+
+  // ── INV-7: tax credit notes ───────────────────────────────────────────────
+  const note = await withTenant(ctx, (tx) =>
+    issueCreditNote(tx, ctx, {
+      invoiceId: credited.invoiceId,
+      reason: "correction",
+      reasonDetail: "Callout was covered by the contract",
+      lines: [{ description: "Callout, credited", quantity: "1", unit: "ea", unitPrice: "40.00" }],
+    }),
+  );
+
+  checkTrue("a credit note gets its own series", note.reference.startsWith("CRN-"));
+  check("credited amount is exact", toDecimalString(note.totalMinor), "42.00");
+  checkTrue("and its issuance clock is reported", note.issuance.deadline.length === 10);
+
+  const partiallyCredited = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({ status: schema.invoices.status })
+      .from(schema.invoices)
+      .where(eq(schema.invoices.id, credited.invoiceId));
+    return rows[0];
+  });
+  check("a part credit leaves the invoice collectable", partiallyCredited?.status, "issued");
+
+  let overCreditRejected = false;
+  try {
+    await withTenant(ctx, (tx) =>
+      issueCreditNote(tx, ctx, {
+        invoiceId: credited.invoiceId,
+        reason: "cancellation",
+        lines: [{ description: "Too much", quantity: "1", unit: "ea", unitPrice: "100.00" }],
+      }),
+    );
+  } catch {
+    overCreditRejected = true;
+  }
+  checkTrue("crediting more output tax than was charged is refused", overCreditRejected);
+
+  const finalNote = await withTenant(ctx, (tx) =>
+    issueCreditNote(tx, ctx, {
+      invoiceId: credited.invoiceId,
+      reason: "cancellation",
+      lines: [{ description: "Balance credited", quantity: "1", unit: "ea", unitPrice: "60.00" }],
+    }),
+  );
+  check("the balancing note is exact", toDecimalString(finalNote.totalMinor), "63.00");
+
+  const fullyCredited = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({ status: schema.invoices.status })
+      .from(schema.invoices)
+      .where(eq(schema.invoices.id, credited.invoiceId));
+    return rows[0];
+  });
+  check("a full credit marks the invoice credited", fullyCredited?.status, "credited");
+
+  const notes = await withTenant(ctx, (tx) => listCreditNotes(tx, { invoiceId: credited.invoiceId }));
+  check("both notes reference the original", notes.length, 2);
+  checkTrue("and name the invoice they correct", notes.every((n) => n.invoiceReference === credited.reference));
+
+  // A credit note carries the customer's name, address, TRN and the size of a
+  // dispute. The restrictive customer_scope policy has to cover it, or the
+  // portal leaks every other customer's corrections.
+  const foreignNotes = await withCustomerScope(
+    { tenantId: TENANT, customerId: otherCustomer!.id },
+    (tx) => listCreditNotes(tx, { invoiceId: credited.invoiceId }),
+  );
+  checkTrue("another customer cannot see the credit notes", foreignNotes.length === 0);
+
+  // ── Credit position (DB-4) ────────────────────────────────────────────────
+  const position = await withTenant(ctx, (tx) => customerCreditPosition(tx, setup.customerId));
+  checkTrue("credit position is computed in minor units", Number.isInteger(position.outstandingMinor));
+  checkTrue(
+    "a fully credited invoice is not outstanding",
+    position.outstandingMinor >= 0,
+  );
+
+  // Put the customer record back the way it was found.
+  await withTenant(ctx, (tx) =>
+    tx
+      .update(schema.customers)
+      .set({ taxRegistrationNumber: null, billingAddress: null })
+      .where(eq(schema.customers.id, setup.customerId)),
+  );
+
+  // ── LEAD-8. The invoice list has a second page ────────────────────────────
+  //
+  // `listInvoices` was a flat `.limit(200)`. The AR ageing tiles above the
+  // table were right, so nothing looked broken — the failure was invoices
+  // silently missing from the bottom of the list with no indicator and no way
+  // to reach them. These checks are about reachability, and about the tiles
+  // staying independent of whichever page is on screen.
+  const DAY = 24 * 60 * 60 * 1000;
+  const RUN = Date.now().toString(36);
+  const oldReference = `ZZ-PAGE-${RUN}`;
+  const draftReference = `ZZ-DRAFT-${RUN}`;
+
+  const ageingBefore = await withTenant(ctx, (tx) => arAgeing(tx));
+
+  // An issued invoice dated three months back, so it sorts last and is
+  // certainly not on the first page.
+  await withTenant(ctx, (tx) =>
+    tx.insert(schema.invoices).values({
+      tenantId: TENANT,
+      reference: oldReference,
+      customerId: setup.customerId,
+      status: "issued",
+      issuedOn: new Date(Date.now() - 90 * DAY),
+      dueOn: new Date(Date.now() - 75 * DAY),
+      subtotal: "100.00",
+      taxAmount: "5.00",
+      total: "105.00",
+      amountPaid: "0",
+    }),
+  );
+
+  const ageingAfter = await withTenant(ctx, (tx) => arAgeing(tx));
+  check(
+    "AR ageing counts an invoice that is not on the first page",
+    ageingAfter.totalOutstandingMinor - ageingBefore.totalOutstandingMinor,
+    10500,
+  );
+
+  // A draft has no issue date at all. It is in this test because the sort key
+  // is `coalesce(issued_on, created_at)`: on `issued_on` alone the row-wise
+  // cursor comparison is null for these rows, and every draft would vanish from
+  // the second page onward — the same bug, one status along.
+  await withTenant(ctx, (tx) =>
+    tx.insert(schema.invoices).values({
+      tenantId: TENANT,
+      reference: draftReference,
+      customerId: setup.customerId,
+      status: "draft",
+      subtotal: "200.00",
+      taxAmount: "10.00",
+      total: "210.00",
+    }),
+  );
+
+  const firstPage = await withTenant(ctx, (tx) => searchInvoices(tx, { limit: 1 }));
+  check("a page is the size that was asked for", firstPage.rows.length, 1);
+  checkTrue("and says there is more behind it", firstPage.nextCursor !== null);
+  checkTrue(
+    "the three-month-old invoice is not on the first page",
+    firstPage.rows[0]?.reference !== oldReference,
+  );
+
+  // Walk the whole list one row at a time. A page size of one is the harshest
+  // version of the boundary: every row is a cursor round trip.
+  const walked: string[] = [];
+  let cursor: string | undefined;
+  let pages = 0;
+  for (;;) {
+    const page = await withTenant(ctx, (tx) => searchInvoices(tx, { limit: 1, cursor }));
+    walked.push(...page.rows.map((r) => r.reference));
+    pages += 1;
+    if (!page.nextCursor || pages > 200) break;
+    cursor = page.nextCursor;
+  }
+
+  const totalInvoices = await withTenant(ctx, async (tx) => {
+    const rows = (await tx.execute<{ n: string }>(
+      sql`select count(*)::text as n from invoices where deleted_at is null`,
+    )) as unknown as { n: string }[];
+    return Number(rows[0]?.n ?? 0);
+  });
+
+  checkTrue("paging terminates", pages <= 200);
+  check("paging reaches every invoice, exactly once", walked.length, totalInvoices);
+  check("and returns none of them twice", new Set(walked).size, walked.length);
+  checkTrue("including the one behind the first page", walked.includes(oldReference));
+  checkTrue("including a draft, which has no issue date", walked.includes(draftReference));
+
+  const byReference = await withTenant(ctx, (tx) => searchInvoices(tx, { q: oldReference }));
+  check("search finds an invoice by its reference", byReference.rows.length, 1);
+  check("and it is the right one", byReference.rows[0]?.reference, oldReference);
+
+  const customerName = await withTenant(ctx, async (tx) => {
+    const rows = await tx
+      .select({ name: schema.customers.name })
+      .from(schema.customers)
+      .where(eq(schema.customers.id, setup.customerId));
+    return rows[0]?.name ?? "";
+  });
+  const byCustomer = await withTenant(ctx, (tx) =>
+    searchInvoices(tx, { q: customerName, limit: 100 }),
+  );
+  checkTrue("search finds invoices by customer name", byCustomer.rows.length > 0);
+
+  // A cursor arrives from a query string: bookmarked, pasted, or made up. The
+  // right answer for all three is the first page, not a 500.
+  const bogus = await withTenant(ctx, (tx) =>
+    searchInvoices(tx, { limit: 1, cursor: "not-a-real-cursor" }),
+  );
+  check("a junk cursor falls back to the first page", bogus.rows[0]?.id, firstPage.rows[0]?.id);
+
+  const overLimit = await withTenant(ctx, (tx) => searchInvoices(tx, { limit: 5000 }));
+  checkTrue("a caller cannot ask for an unbounded page", overLimit.rows.length <= 100);
+
+  // ── The tenant boundary, actually run ─────────────────────────────────────
+  //
+  // This is the check that used to skip. `foreignTenantId` comes from the
+  // repaired `otherTenantId()`, so if there is no second tenant this suite has
+  // already failed loudly above rather than printing a green tick here.
+  const acrossTenants = await withTenant(
+    { tenantId: foreignTenantId, actorKind: "system" as const },
+    (tx) => searchInvoices(tx, { limit: 100 }),
+  );
+  checkTrue(
+    "another tenant's invoices are not in this tenant's list",
+    !acrossTenants.rows.some((r) => r.reference === oldReference || r.reference === draftReference),
+  );
+
+  const acrossSearch = await withTenant(
+    { tenantId: foreignTenantId, actorKind: "system" as const },
+    (tx) => searchInvoices(tx, { q: oldReference }),
+  );
+  check("nor reachable by searching for one by reference", acrossSearch.rows.length, 0);
+
+  await withTenant(ctx, (tx) =>
+    tx.delete(schema.invoices).where(inArray(schema.invoices.reference, [oldReference, draftReference])),
+  );
+
   // ── Cleanup ───────────────────────────────────────────────────────────────
   await withTenant(ctx, async (tx) => {
+    await tx
+      .delete(schema.creditNoteLines)
+      .where(inArray(schema.creditNoteLines.creditNoteId, [note.creditNoteId, finalNote.creditNoteId]));
+    await tx.delete(schema.creditNotes).where(eq(schema.creditNotes.invoiceId, credited.invoiceId));
+    await tx.delete(schema.invoiceLines).where(eq(schema.invoiceLines.invoiceId, credited.invoiceId));
+    await tx.delete(schema.invoices).where(eq(schema.invoices.id, credited.invoiceId));
     await tx.delete(schema.payments).where(eq(schema.payments.invoiceId, invoice.invoiceId));
     await tx.delete(schema.invoiceLines).where(eq(schema.invoiceLines.invoiceId, invoice.invoiceId));
     await tx.delete(schema.invoices).where(eq(schema.invoices.id, invoice.invoiceId));

@@ -1,8 +1,21 @@
 "use server";
 
 import { headers } from "next/headers";
-import { quoteRequestSchema, getService, tenant } from "@meridian/core";
-import { resolvePublicTenantId, createLeadFromEnquiry, checkRateLimit } from "@meridian/db";
+import {
+  quoteRequestSchema,
+  getService,
+  tenant,
+  RESPONSE_COMMITMENT,
+  priorityForUrgency,
+} from "@meridian/core";
+import {
+  resolvePublicTenantId,
+  createLeadFromEnquiry,
+  enquiryRecipients,
+  checkRateLimit,
+  type LeadAttribution,
+} from "@meridian/db";
+import { enqueue, dispatchPending, selectTransport } from "@meridian/notify";
 
 /**
  * Five submissions per ten minutes from one address.
@@ -27,6 +40,71 @@ const QUOTE_RATE_WINDOW_SECONDS = 600;
 function clientKey(h: Headers): string {
   const forwarded = h.get("x-forwarded-for")?.split(",")[0]?.trim();
   return forwarded || h.get("x-real-ip")?.trim() || "unknown";
+}
+
+/**
+ * Where this enquiry came from (`LEAD-4`).
+ *
+ * ── WHAT IS ACTUALLY KNOWABLE HERE, AND WHAT IS NOT ─────────────────────────
+ *
+ * Two sources, in this order:
+ *
+ *  1. **Hidden fields on the form.** The only place the external referrer can
+ *     come from — `document.referrer` is a browser fact and never reaches the
+ *     server on its own — and the only place a UTM survives a visitor who
+ *     landed on a service page and clicked through to `/quote`.
+ *  2. **The `referer` header of this POST**, which is the page the form was
+ *     submitted from. This is the fallback that still works with JavaScript
+ *     switched off, and it carries the UTMs of anybody who arrived on `/quote`
+ *     directly from an advert.
+ *
+ * Neither gives genuine first-touch attribution across a multi-page visit; that
+ * needs the entry URL and referrer recorded on arrival, on every page, which is
+ * a first-party cookie and therefore a consent decision rather than a code
+ * change. It is deliberately not done here, and the gap is visible in the
+ * "no source recorded" count on `/leads` rather than hidden behind a guess.
+ *
+ * Every value is visitor-controlled — these are form fields on a public page —
+ * so nothing derived from them is trusted for anything but reporting, and the
+ * channel is fixed at `website` here rather than read from the payload.
+ */
+function attributionFrom(h: Headers, formData: FormData): LeadAttribution {
+  const field = (name: string): string | undefined =>
+    String(formData.get(name) ?? "").trim() || undefined;
+
+  let submittedFrom: URL | null = null;
+  try {
+    const referer = h.get("referer");
+    if (referer) submittedFrom = new URL(referer);
+  } catch {
+    // A malformed Referer is a header somebody hand-wrote. Attribution is worth
+    // recording, never worth failing an enquiry over.
+    submittedFrom = null;
+  }
+
+  const query = (key: string): string | undefined =>
+    submittedFrom?.searchParams.get(key)?.trim() || undefined;
+
+  const extra: Record<string, string> = {
+    userAgent: h.get("user-agent") ?? "",
+  };
+  // The identifiers no column anticipates. `gclid` is the one that exists
+  // today; the blob is what stops the next one needing a migration before its
+  // leads can be recorded at all.
+  const gclid = field("gclid") ?? query("gclid");
+  if (gclid) extra["gclid"] = gclid.slice(0, 200);
+
+  return {
+    channel: "website",
+    utmSource: field("utmSource") ?? query("utm_source"),
+    utmMedium: field("utmMedium") ?? query("utm_medium"),
+    utmCampaign: field("utmCampaign") ?? query("utm_campaign"),
+    landingPage:
+      field("landingPage") ??
+      (submittedFrom ? `${submittedFrom.pathname}${submittedFrom.search}` : undefined),
+    referrer: field("referrer"),
+    extra,
+  };
 }
 
 export interface QuoteFormState {
@@ -123,7 +201,7 @@ export async function submitQuoteRequest(
     const tenantId = await resolvePublicTenantId(slug);
     if (!tenantId) throw new Error(`No active tenant with slug "${slug}"`);
 
-    const { reference } = await createLeadFromEnquiry(tenantId, {
+    const { reference, recipients } = await createLeadFromEnquiry(tenantId, {
       name: parsed.data.name,
       phone: parsed.data.phone,
       email: parsed.data.email || undefined,
@@ -133,20 +211,63 @@ export async function submitQuoteRequest(
       city: parsed.data.city,
       area: parsed.data.area || undefined,
       details: parsed.data.details || undefined,
-      attribution: {
-        referrer: h.get("referer") ?? "",
-        userAgent: h.get("user-agent") ?? "",
+      attribution: attributionFrom(h, formData),
+    }, {
+      // LEAD-2 / LEAD-3, closing PD-3. Enqueued inside the same transaction as
+      // the lead, so the two commit together: a notification cannot promise an
+      // enquiry that rolled back, and an enquiry cannot be recorded without an
+      // alert queued for it.
+      //
+      // Done here rather than inside the domain function because notify imports
+      // db, so db importing notify would be a cycle. The transaction is handed
+      // out instead, which keeps atomicity and keeps the payload type-checked
+      // against the template.
+      onCreated: async (tx, lead) => {
+        const service = getService(parsed.data.serviceSlug);
+        const to = await enquiryRecipients(tx, lead.isEmergency);
+
+        for (const recipient of to) {
+          await enqueue(tx, { tenantId, actorKind: "system" }, {
+            channel: "email",
+            template: "lead_created",
+            to: recipient.email,
+            recipientUserId: recipient.userId,
+            subject: { table: "leads", id: lead.leadId },
+            payload: {
+              recipientName: recipient.fullName,
+              leadReference: lead.reference,
+              customerName: parsed.data.name,
+              phone: parsed.data.phone,
+              email: parsed.data.email || null,
+              serviceName: service?.name ?? parsed.data.serviceSlug,
+              area: parsed.data.area || null,
+              urgency: parsed.data.urgency,
+              isEmergency: lead.isEmergency,
+              details: parsed.data.details || null,
+              respondWithin: RESPONSE_COMMITMENT[priorityForUrgency(parsed.data.urgency)],
+            },
+          });
+        }
       },
     });
 
     const isEmergency = parsed.data.urgency === "emergency";
-    const service = getService(parsed.data.serviceSlug);
 
     console.info("[quote] lead recorded", {
       reference,
-      service: service?.slug,
+      service: parsed.data.serviceSlug,
       urgency: parsed.data.urgency,
       city: parsed.data.city,
+      recipients,
+    });
+
+    // Drained now as well as by the five-minute cron. G2 measures response time
+    // from the moment the enquiry lands, and for an emergency the difference
+    // between "within five minutes" and "now" is the product.
+    void dispatchPending(tenantId, { transport: selectTransport() }).catch((error) => {
+      // Never surfaced. The lead is committed and the cron will drain it; the
+      // customer must not see an error about an email they did not ask for.
+      console.error("[quote] immediate dispatch failed; the cron will retry", error);
     });
 
     return {

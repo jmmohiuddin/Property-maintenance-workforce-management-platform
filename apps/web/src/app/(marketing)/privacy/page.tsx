@@ -2,11 +2,12 @@ import type { Metadata } from "next";
 import { tenant, graph, webPageSchema, breadcrumbSchema } from "@meridian/core";
 import { JsonLd } from "@/components/json-ld";
 import { LegalPage, LegalSection, ReviewBanner } from "@/components/legal";
+import { hreflangAlternates } from "@/lib/i18n";
 
 export const metadata: Metadata = {
   title: "Privacy Policy",
   description: `How ${tenant.legalName} collects, uses and protects personal data.`,
-  alternates: { canonical: "/privacy" },
+  alternates: { canonical: "/privacy", languages: hreflangAlternates("/privacy") },
   // Not indexed: legal boilerplate competes with the pages that should rank,
   // and it carries no answer a search engine should surface.
   robots: { index: false, follow: true },

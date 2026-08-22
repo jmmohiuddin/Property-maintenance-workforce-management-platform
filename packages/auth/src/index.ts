@@ -4,4 +4,7 @@ export * from "./session";
 export * from "./totp";
 export * from "./mfa";
 export * from "./enrolment";
+export * from "./lockout";
 export * from "./login";
+export * from "./reset";
+export * from "./device";

@@ -19,6 +19,13 @@
 @theme {
   --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", monospace;
+  /*
+   * Arabic face for `/ar`. Defaults to the Latin sans so this variable is
+   * always defined — `app/ar/layout.tsx` overrides it via `next/font/google`
+   * (Noto Sans Arabic) on its wrapper element. Undefined has never been
+   * looked at in a browser; see the delivery report.
+   */
+  --font-arabic: var(--font-sans);
 
   --color-ink-950: #0b0e12;
   --color-ink-900: #12171d;
@@ -37,6 +44,45 @@
   --color-signal-500: #dd5514;
   --color-signal-400: #ef7434;
   --color-signal-100: #fdeadd;
+
+  /*
+   * Status ramps.
+   *
+   * `critical` is red and means URGENT — a breached SLA, an overdue invoice,
+   * something that costs money by the hour.
+   *
+   * `blocked` (D-7) is a deep indigo-slate and means IMPOSSIBLE — an expired
+   * work permit, an outdoor job inside the midday ban. It is deliberately NOT
+   * another red: a dispatcher under time pressure must never have to read
+   * carefully to tell "this is expensive to ignore" from "this cannot be done".
+   * Two reds would fail that test, and the failure mode is somebody trying to
+   * hurry past a six-figure penalty.
+   */
+  --color-critical-700: #9f1239;
+  --color-critical-500: #e11d48;
+  --color-critical-400: #fb7185;
+  --color-critical-100: #ffe4e9;
+
+  --color-blocked-700: #3730a3;
+  --color-blocked-500: #4f46e5;
+  --color-blocked-400: #a5b4fc;
+  --color-blocked-100: #e6e6fb;
+
+  /* Completing the semantic set from the design document, §2.1. */
+  --color-warning-700: #92400e;
+  --color-warning-500: #d97706;
+  --color-warning-400: #fbbf24;
+  --color-warning-100: #fdf0d5;
+
+  --color-success-700: #15803d;
+  --color-success-500: #16a34a;
+  --color-success-400: #4ade80;
+  --color-success-100: #dcfce7;
+
+  --color-info-700: #1d4ed8;
+  --color-info-500: #2563eb;
+  --color-info-400: #93c5fd;
+  --color-info-100: #dbeafe;
 
   --radius-sm: 2px;
   --radius-DEFAULT: 4px;
@@ -76,6 +122,51 @@
      4.49:1 as text on the sunken surface, so accent-coloured TEXT uses this
      darker step. Same hue, so the page still reads as one accent. */
   --accent-text: var(--color-signal-700);
+
+  /* Urgent. */
+  --status-critical: var(--color-critical-500);
+  --status-critical-text: var(--color-critical-700);
+  --status-critical-wash: var(--color-critical-100);
+
+  /*
+   * Impossible. Reserved for HARD blocks only — the three the system has, each
+   * with a named statutory penalty behind it (HR-9 blocking documents, the
+   * summer midday ban). Adding a fourth use of this token requires adding a
+   * fourth hard block, which requires naming the penalty it prevents.
+   */
+  --status-blocked: var(--color-blocked-500);
+  --status-blocked-text: var(--color-blocked-700);
+  --status-blocked-wash: var(--color-blocked-100);
+
+  /* Expiring · at limit · overdue soon. */
+  --status-warning: var(--color-warning-500);
+  --status-warning-text: var(--color-warning-700);
+  --status-warning-wash: var(--color-warning-100);
+
+  /* Complete · valid · paid. */
+  --status-success: var(--color-success-500);
+  --status-success-text: var(--color-success-700);
+  --status-success-wash: var(--color-success-100);
+
+  /* Scheduled · pending · informational. */
+  --status-info: var(--color-info-500);
+  --status-info-text: var(--color-info-700);
+  --status-info-wash: var(--color-info-100);
+
+  /* Draft · dormant · archived. Reuses the ink ramp: "nothing is happening"
+     should not have a colour of its own competing with the ones that mean
+     something. */
+  --status-neutral: var(--color-ink-500);
+  --status-neutral-text: var(--color-ink-600);
+  --status-neutral-wash: var(--color-ink-100);
+
+  /*
+   * A11Y-3. Focus was previously undefined, which the audit flagged as a real
+   * gap for keyboard users — the browser default is inconsistent and often
+   * invisible against a tinted surface. One token, applied via :focus-visible
+   * so it appears for keyboard navigation and not on mouse clicks.
+   */
+  --focus-ring: var(--color-signal-600);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -103,6 +194,32 @@
     --accent-wash: #2a1509;
     /* Already clears AA on every dark surface, so it matches --accent. */
     --accent-text: var(--color-signal-400);
+
+    --status-critical: var(--color-critical-400);
+    --status-critical-text: var(--color-critical-400);
+    --status-critical-wash: #3d1220;
+
+    --status-blocked: var(--color-blocked-400);
+    --status-blocked-text: var(--color-blocked-400);
+    --status-blocked-wash: #1e1b4b;
+
+    --status-warning: var(--color-warning-400);
+    --status-warning-text: var(--color-warning-400);
+    --status-warning-wash: #3a2a08;
+
+    --status-success: var(--color-success-400);
+    --status-success-text: var(--color-success-400);
+    --status-success-wash: #0c2f1a;
+
+    --status-info: var(--color-info-400);
+    --status-info-text: var(--color-info-400);
+    --status-info-wash: #14264d;
+
+    --status-neutral: var(--color-ink-400);
+    --status-neutral-text: var(--color-ink-400);
+    --status-neutral-wash: var(--color-ink-800);
+
+    --focus-ring: var(--color-signal-400);
   }
 }
 
@@ -136,6 +253,13 @@
     font-feature-settings: "cv11", "ss01";
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
+  }
+
+  /* `app/ar/layout.tsx` sets `dir="rtl"` on its wrapper, not on `<html>` — see
+     that file's header comment for why. This picks up the Arabic face inside
+     it; `--font-arabic` falls back to the Latin sans everywhere else. */
+  [dir="rtl"] {
+    font-family: var(--font-arabic);
   }
 
   /* Tabular figures everywhere a number is compared against another number. */
@@ -260,10 +384,10 @@
   }
   .legal-prose ul {
     list-style: none;
-    padding-left: 0;
+    padding-inline-start: 0;
   }
   .legal-prose li {
-    padding-left: 1.25rem;
+    padding-inline-start: 1.25rem;
     position: relative;
   }
   .legal-prose li + li {
@@ -272,7 +396,7 @@
   .legal-prose li::before {
     content: "";
     position: absolute;
-    left: 0;
+    inset-inline-start: 0;
     top: 0.6875em;
     width: 5px;
     height: 1px;
@@ -286,5 +410,35 @@
     color: var(--accent-text);
     text-decoration: underline;
     text-underline-offset: 2px;
+  }
+}
+
+/*
+ * A11Y-3. One focus treatment, everywhere.
+ *
+ * `:focus-visible` rather than `:focus` so the ring appears for keyboard and
+ * assistive-technology navigation and not when a mouse user clicks a button —
+ * which is the reason people historically removed focus outlines altogether and
+ * broke keyboard access in the process.
+ *
+ * `outline` rather than `box-shadow`: outline follows the element's shape,
+ * survives `overflow: hidden`, and is not repainted away by a parent.
+ */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Reduced motion, honoured globally (A11Y-10). Motion here is minimal by
+   design, so this is cheap insurance rather than a large concession. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

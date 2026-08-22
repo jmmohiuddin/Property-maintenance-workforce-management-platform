@@ -42,8 +42,33 @@ export const PERMISSIONS = [
   "properties:write",
   "technicians:read",
   "technicians:write",
+  // ADM-1 / M10. Employment records, statutory documents and their expiry
+  // dates. Separate from technicians:write because the compliance board holds
+  // passport and visa data, and a dispatcher who may correct a technician's
+  // skill list has no business reading it.
+  "workforce:read",
+  "workforce:write",
+  // ADM-1 / M9. The recruitment pipeline. Separate from workforce:* because an
+  // applicant is not an employee: the lawful basis for holding their data is
+  // pre-contractual negotiation and it expires with the vacancy (`ATS-18`), so
+  // the set of people who may read it is deliberately not the same set that may
+  // read a serving employee's statutory documents.
+  "recruitment:read",
+  "recruitment:write",
   "contracts:read",
   "contracts:write",
+  // M5. Separate from `contracts:*` on purpose, and the distinction is not
+  // cosmetic. A maintenance contract is a commercial relationship — sales owns
+  // it, which is why `contracts:write` is held by owner, admin and sales alone
+  // and an operations manager reads it without writing it.
+  //
+  // A project is a piece of work: phases, milestones, variations, retention,
+  // permits, a snag list and a project manager. Borrowing the contract's
+  // permission to reach it would have meant granting `contracts:write` to the
+  // operations manager, which moves an existing boundary as a side effect of
+  // fixing an unrelated gap — and that is how a permission model rots.
+  "projects:read",
+  "projects:write",
   "reports:read",
   "audit:read",
   "users:manage",
@@ -61,6 +86,7 @@ export type Role =
   | "technician"
   | "accountant"
   | "sales"
+  | "hr"
   | "customer"
   | "readonly";
 
@@ -78,6 +104,10 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
   admin: ALL.filter((p) => p !== "settings:write"),
 
   operations_manager: [
+    "workforce:read",
+    // Reads the pipeline because a vacancy is an operational fact — the reason
+    // a rota does not cover next month. Cannot move a candidate through it.
+    "recruitment:read",
     "jobs:read",
     "jobs:create",
     "jobs:update",
@@ -92,6 +122,11 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
     "technicians:read",
     "technicians:write",
     "contracts:read",
+    // M5's primary actor. Reads the AMC term sheet without writing it, and
+    // owns projects outright — the module is the operational half of the
+    // business, not the commercial one.
+    "projects:read",
+    "projects:write",
     "reports:read",
   ],
 
@@ -107,6 +142,7 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
   ],
 
   supervisor: [
+    "workforce:read",
     "jobs:read",
     "jobs:update",
     "jobs:close",
@@ -129,6 +165,16 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
     "payments:record",
     "customers:read",
     "contracts:read",
+    // Read-only, and that pairing is load-bearing rather than generous.
+    // `PRJ-3` splits the milestone in two: a project manager certifies that a
+    // stage of work is done (`projects:write`), and an accountant allocates the
+    // sequential tax-invoice number against it (`invoices:create`). The
+    // accountant therefore has to be able to OPEN the project to raise its
+    // invoice — without this line they hold `invoices:create` for a screen they
+    // cannot reach, and the split becomes a dead end rather than a separation
+    // of duties. They still cannot move a phase, close a snag or approve a
+    // variation.
+    "projects:read",
     "reports:read",
   ],
 
@@ -143,6 +189,30 @@ const ROLE_PERMISSIONS: Readonly<Record<Role, readonly Permission[]>> = {
     "properties:write",
     "contracts:read",
     "contracts:write",
+    // A project usually begins as a tender or a quote, so the person who won
+    // it is the person who first needs to record it.
+    "projects:read",
+    "projects:write",
+  ],
+
+  /**
+   * HR. Owns hiring and the statutory document register.
+   *
+   * Reads jobs and technicians because a compliance block has to be understood
+   * in the context of the work it stops, but holds no dispatch or money
+   * permissions — filling a role and paying an invoice are different jobs.
+   */
+  hr: [
+    "jobs:read",
+    "technicians:read",
+    "technicians:write",
+    "workforce:read",
+    "workforce:write",
+    // The screens this role alone owns end to end (§5.2's rule that every role
+    // must have at least one). M9 is the module; ATS-16 is the obligation.
+    "recruitment:read",
+    "recruitment:write",
+    "reports:read",
   ],
 
   // Portal users. Scoped to their own customer account at the query layer.
@@ -220,6 +290,13 @@ export const STAFF_ROLES: readonly Role[] = [
   "technician",
   "accountant",
   "sales",
+  // `hr` was missing from this list, which made the role unusable rather than
+  // merely limited: `requireStaffSession` sent an hr user to /portal, and
+  // `requirePortalSession` then bounced them to /denied because they have no
+  // customer_id. Every staff screen was unreachable, including the two the
+  // role was created for. Found while building M9, whose whole point is that
+  // this role has screens of its own.
+  "hr",
   "readonly",
 ];
 

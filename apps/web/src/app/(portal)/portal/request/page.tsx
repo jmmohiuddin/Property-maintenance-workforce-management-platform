@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { withCustomerScope, listCustomerProperties } from "@meridian/db";
+import { withCustomerScope, listCustomerProperties, listAssetChoices } from "@meridian/db";
 import { tenant, telLink } from "@meridian/core";
 import { requirePortalSession } from "@/lib/session";
 import { PortalShell } from "@/components/portal-shell";
@@ -13,13 +13,26 @@ export const dynamic = "force-dynamic";
 export default async function PortalRequestPage() {
   const session = await requirePortalSession();
 
-  const properties = await withCustomerScope(
+  // CON-13. The plant on the account comes down with the properties rather than
+  // on a change of the dropdown: an account has a handful of buildings and a
+  // few dozen machines between them, and a round trip per keystroke buys
+  // nothing but a spinner on a phone in a basement.
+  const { properties, assets } = await withCustomerScope(
     {
       tenantId: session.principal.tenantId,
       customerId: session.customerId,
       userId: session.principal.userId,
     },
-    (tx) => listCustomerProperties(tx),
+    async (tx) => {
+      const properties = await listCustomerProperties(tx);
+      return {
+        properties,
+        assets: await listAssetChoices(
+          tx,
+          properties.map((p) => p.id),
+        ),
+      };
+    },
   );
 
   return (
@@ -52,7 +65,7 @@ export default async function PortalRequestPage() {
                   </p>
                 </div>
               ) : (
-                <RequestForm properties={[...properties]} />
+                <RequestForm properties={[...properties]} assets={[...assets]} />
               )}
             </div>
           </div>

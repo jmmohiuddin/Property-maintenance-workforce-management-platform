@@ -17,12 +17,61 @@ import { SignOut } from "@phosphor-icons/react/dist/ssr";
  * is there and then breaks. Add each entry here as its route lands.
  */
 const NAV = [
+  // KPI-3. First, because it is the owner's screen and the owner reads it
+  // first. `reports:read` keeps it off a dispatcher's and a technician's nav —
+  // the card stack carries cash position, revenue against a tax threshold and
+  // headcount, and those are not figures every role should meet on the way to
+  // the dispatch board.
+  { href: "/reports", label: "Reports", permission: "reports:read" },
   { href: "/dispatch", label: "Dispatch", permission: "jobs:read" },
+  // JOB-7. Beside Dispatch and not inside it, because they answer different
+  // questions: dispatch is "what needs assigning now", ordered by SLA
+  // consequence; the schedule is "who is doing what, when", ordered by time.
+  { href: "/schedule", label: "Schedule", permission: "jobs:read" },
   { href: "/jobs", label: "Jobs", permission: "jobs:read" },
   { href: "/leads", label: "Leads", permission: "customers:read" },
   { href: "/customers", label: "Customers", permission: "customers:read" },
   { href: "/invoices", label: "Invoices", permission: "invoices:read" },
+  // M3. The URL is `/amc`, not `/contracts`, and the label is "Contracts".
+  // `(marketing)/contracts` already owns `/contracts` — it is a statically
+  // generated public page with a canonical URL and a sitemap entry — and two
+  // route groups resolving to the same path is a Next build error, not a
+  // precedence rule. AMC is what the business calls the thing anyway.
+  { href: "/amc", label: "Contracts", permission: "contracts:read" },
+  // CON-11. Beside contracts because a tender is how one begins, and it
+  // shares contracts:read for the same reason.
+  { href: "/tenders", label: "Tenders", permission: "contracts:read" },
+  // M5. A project is a different commercial object from an AMC — it has
+  // phases, milestones, variations and retention — so it gets its own
+  // permission rather than borrowing the contract one.
+  { href: "/projects", label: "Projects", permission: "projects:read" },
   { href: "/technicians", label: "Technicians", permission: "technicians:read" },
+  { href: "/workforce", label: "Workforce", permission: "workforce:read" },
+  { href: "/recruitment", label: "Recruitment", permission: "recruitment:read" },
+  // M10. Beside Workforce and not inside it, because the two answer different
+  // questions: `/workforce` is "may this person legally be sent to work today",
+  // which is documents and hard blocks; `/hr` is "what does the employment
+  // relationship owe, and by when" — wages due on the 1st, contract terms,
+  // leave, hours, health cover. One screen holding both would put a leave
+  // balance under a lapsed work permit.
+  { href: "/hr", label: "HR", permission: "workforce:read" },
+  // `HR-11` / `HR-12`. A third sibling rather than a section inside `/hr`, on
+  // the rule that split `/hr` from `/workforce` in the first place: the three
+  // answer different questions. "May this person be sent to work today", "what
+  // does the employment relationship owe and by when", and "what happened on
+  // site, who has been told, and what changed as a result". The third is the
+  // only one with a clock measured in hours, and putting it under a leave
+  // balance would bury it.
+  { href: "/hr/hse", label: "HSE", permission: "workforce:read" },
+  { href: "/admin/users", label: "Users", permission: "users:manage" },
+  // SEC-7. Beside Users and on the same permission, because revoking a lost
+  // handset is the same kind of act as unlocking an account or resetting a
+  // second factor: somebody reaching for a credential they are not holding.
+  { href: "/admin/devices", label: "Devices", permission: "users:manage" },
+  { href: "/admin/company", label: "Company", permission: "settings:write" },
+  // ADM-7. `audit:read`, which `readonly` also holds — this is the screen that
+  // gives that role a reason to exist (and what ADM-8 builds on).
+  { href: "/admin/audit", label: "Audit", permission: "audit:read" },
 ] as const;
 
 export function AppShell({
@@ -47,7 +96,7 @@ export function AppShell({
                 className="grid h-7 w-7 place-items-center rounded-sm font-mono text-[13px] font-bold"
                 style={{ backgroundColor: "var(--accent)", color: "var(--accent-contrast)" }}
               >
-                M
+                {session.tenant.brandName.trim().charAt(0).toUpperCase() || "?"}
               </span>
               <span className="text-[14px] font-semibold tracking-tight">{session.tenant.brandName}</span>
             </Link>

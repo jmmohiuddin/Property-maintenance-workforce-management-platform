@@ -12,7 +12,7 @@
  * Requires the schema, RLS and `npm run db:seed`. Cleans up after itself.
  */
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, like, lt } from "drizzle-orm";
 import {
   withTenant,
   listTechnicians,
@@ -31,6 +31,8 @@ import {
 const TENANT = "11111111-1111-4111-8111-111111111111";
 /** Deliberately obscure so it cannot collide with a seeded skill. */
 const TEST_SERVICE = "generator-maintenance";
+/** Unique per run, so this suite's own fixture never collides with another run's. */
+const RUN = Date.now().toString(36).slice(-6).toUpperCase();
 
 let fail = 0;
 function check(label: string, got: unknown, expected: unknown): void {
@@ -42,8 +44,33 @@ function checkTrue(label: string, got: boolean): void {
   check(label, got, true);
 }
 
+/**
+ * Reap what a killed run of this file left behind.
+ *
+ * This suite now creates its own technician (see `subjectId` below) rather
+ * than borrowing one from the seeded roster, so it can leak the same way
+ * `jobs.test.ts` and `field.test.ts` do if the process dies before reaching
+ * clean-up. Age-gated to an hour, far longer than this suite takes, so it
+ * cannot reach a concurrent run's live fixture — same shape as `sweepStale()`
+ * in `recruitment.test.ts`.
+ */
+async function sweepStale(ctx: { tenantId: string }): Promise<void> {
+  await withTenant(ctx, async (tx) => {
+    await tx
+      .delete(schema.technicians)
+      .where(
+        and(
+          like(schema.technicians.fullName, "__TEST workforce %"),
+          lt(schema.technicians.createdAt, new Date(Date.now() - 60 * 60 * 1000)),
+        ),
+      );
+  });
+}
+
 async function main(): Promise<void> {
   const ctx = { tenantId: TENANT };
+
+  await sweepStale(ctx);
 
   // ── Pure expiry logic, no database needed ────────────────────────────────
   const now = new Date("2026-06-01T00:00:00Z");
@@ -60,8 +87,46 @@ async function main(): Promise<void> {
     roster.some((t) => t.skillSlugs.length > 0),
   );
 
-  const subject = roster[0];
-  if (!subject) throw new Error("Seed data missing. Run `npm run db:seed` first.");
+  if (roster.length === 0) {
+    throw new Error("Seed data missing. Run `npm run db:seed` first.");
+  }
+
+  /*
+   * This suite's own technician, not a seeded one, and not `roster[0]` either.
+   *
+   * `roster.find((t) => !blockedIds.has(t.id))` used to pick the first
+   * unblocked row in the shared `technicians` table (`HR-9`: a blocked
+   * technician is excluded before scoring, at any skill level, so the subject
+   * had to not be one). Position in a shared table is not an identity — other
+   * suites (`jobs.test.ts`, `field.test.ts`) leave `__TEST scheduler …` and
+   * `__TEST field …` rows behind when killed mid-run, those sort ahead of the
+   * seeded roster, and `find` silently picked one of them as the subject. It
+   * has no employee row, so `blockedTechnicians` never has an opinion on it —
+   * it reads as "unblocked" without being a real candidate — and both the
+   * skill and the lapsed-certification assertions below failed against a
+   * technician this file never wrote to.
+   *
+   * The same trap, twice already: `otherTenantId()` took `activeTenantIds()[0]`
+   * and silently resolved to the wrong tenant, and `myInvoices[0]` in
+   * `portal.test.ts` started reading a zeroed row when a new fixture sorted
+   * first. Both were fixed by selecting deliberately rather than by index —
+   * here, by creating and owning the subject outright.
+   */
+  const subjectId = await withTenant(ctx, async (tx) => {
+    const [row] = await tx
+      .insert(schema.technicians)
+      .values({
+        tenantId: TENANT,
+        employeeCode: `WF-${RUN}`,
+        fullName: `__TEST workforce ${RUN}`,
+        phone: "+971500000099",
+        primaryTrade: TEST_SERVICE,
+      })
+      .returning({ id: schema.technicians.id });
+    if (!row) throw new Error("could not create the test technician");
+    return row.id;
+  });
+  const subject = { id: subjectId };
 
   // A real user id: `verified_by_id` is a foreign key, and signing off a skill
   // is meaningless without the person who vouched for it.
@@ -134,7 +199,19 @@ async function main(): Promise<void> {
   });
   checkTrue("proficiency outside 1-5 is rejected", outOfRange);
 
-  // ── A lapsed mandatory certification is a hard block ─────────────────────
+  // ── A lapsed mandatory certification needs a recorded reason ─────────────
+  //
+  // A warning, not a block, and the distinction is `HR-9`'s own: five documents
+  // hard-block a dispatch — work permit, residence visa, Emirates ID, medical
+  // fitness, health insurance — and a trade certification is not one of them.
+  // It warns, and the override carries a reason (`JOB-10`). This used to drop
+  // the technician from the list entirely, which read as safer and was not: the
+  // dispatcher who needs that person anyway phones them instead, and then
+  // nothing is recorded at all.
+  //
+  // What must NOT move is what a warning can reach. `packages/db/test/
+  // compliance.test.ts` holds the other half: a technician with an expired work
+  // permit gets no control at any score.
   const cert = await withTenant(ctx, (tx) =>
     addCertification(
       tx,
@@ -152,13 +229,23 @@ async function main(): Promise<void> {
     findCandidates(tx, { serviceSlug: TEST_SERVICE, property }),
   );
   checkTrue(
-    "a lapsed mandatory certification removes the candidate",
+    "a lapsed mandatory certification removes the one-click candidate",
     !afterLapse.candidates.some((c) => c.technicianId === subject.id),
   );
   checkTrue(
+    "and offers them against a recorded reason instead",
+    afterLapse.warned.some((c) => c.technicianId === subject.id),
+  );
+  checkTrue(
     "and says why rather than silently dropping them",
-    afterLapse.disqualified.some(
-      (d) => d.technicianId === subject.id && d.reason.includes("__TEST generator permit"),
+    afterLapse.warned.some(
+      (c) =>
+        c.technicianId === subject.id &&
+        c.requiresOverride &&
+        c.warnings.some(
+          (w) =>
+            w.type === "certification_expired" && w.detail.includes("__TEST generator permit"),
+        ),
     ),
   );
 
@@ -200,6 +287,10 @@ async function main(): Promise<void> {
   );
 
   // ── Clean-up: nothing this test wrote should outlive it ──────────────────
+  //
+  // Every delete below is scoped to `subject.id` — the technician this run
+  // created — rather than to the certification's name alone, so a concurrent
+  // run of this same file cannot delete the other's live fixture mid-test.
   await withTenant(ctx, async (tx) => {
     await tx
       .delete(schema.technicianSkills)
@@ -211,7 +302,15 @@ async function main(): Promise<void> {
       );
     await tx
       .delete(schema.technicianCertifications)
-      .where(eq(schema.technicianCertifications.name, "__TEST generator permit"));
+      .where(
+        and(
+          eq(schema.technicianCertifications.technicianId, subject.id),
+          eq(schema.technicianCertifications.name, "__TEST generator permit"),
+        ),
+      );
+    await tx
+      .delete(schema.technicians)
+      .where(and(eq(schema.technicians.id, subject.id), eq(schema.technicians.tenantId, TENANT)));
   });
 
   console.log(fail === 0 ? "\nall workforce checks passed" : `\n${fail} check(s) failed`);

@@ -29,6 +29,12 @@
       ],
       "@meridian/notify": [
         "../../packages/notify/src/index.ts"
+      ],
+      "@meridian/files": [
+        "../../packages/files/src/index.ts"
+      ],
+      "@meridian/docs": [
+        "../../packages/docs/src/index.ts"
       ]
     }
   },
@@ -40,7 +46,9 @@
     "../../packages/core/src/**/*.ts",
     "../../packages/auth/src/**/*.ts",
     "../../packages/db/src/**/*.ts",
-    "../../packages/notify/src/**/*.ts"
+    "../../packages/notify/src/**/*.ts",
+    "../../packages/files/src/**/*.ts",
+    "../../packages/docs/src/**/*.ts"
   ],
   "exclude": [
     "node_modules"

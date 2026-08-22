@@ -19,7 +19,9 @@
     "zod": "^4.4.3",
     "@meridian/auth": "*",
     "@meridian/db": "*",
-    "@meridian/notify": "*"
+    "@meridian/notify": "*",
+    "@meridian/docs": "*",
+    "@meridian/files": "*"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",

@@ -2,21 +2,40 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import {
   tenant,
+  company,
   services,
   whatsappLink,
   graph,
   webPageSchema,
   faqSchema,
   breadcrumbSchema,
+  jobPostingSchema,
 } from "@meridian/core";
 import { Section, Eyebrow, AnswerBlock } from "@/components/ui";
+import { OpenRoles } from "./open-roles";
+import { openRoles } from "./roles";
 import { FaqList } from "@/components/faq";
 import { JsonLd } from "@/components/json-ld";
 import { EnvelopeSimple, WhatsappLogo } from "@phosphor-icons/react/dist/ssr";
 
 const careersEmail = `careers@${tenant.domain.replace(/^https?:\/\//, "")}`;
 
-const ANSWER = `${tenant.legalName} employs ${tenant.employeeCount} technicians directly on UAE labour contracts and visas, across ${services.length} trades including plumbing, electrical, HVAC, carpentry and cleaning. We do not subcontract trade labour, and we sponsor visas, provide medical insurance and pay through WPS.`;
+/*
+ * The headcount claim is gone (WEB-2): "employs 180+ technicians directly" was
+ * not a measured number. What is left describes the terms of employment, which
+ * are things the company controls and can be held to — and which are what a
+ * tradesperson deciding where to apply actually wants to know.
+ *
+ * M9 has now replaced the holding page: real requisitions, `JobPosting` JSON-LD
+ * per open role (`ATS-2`, `WEB-7`), and an application form that takes under
+ * three minutes on a phone (`ATS-3`).
+ *
+ * The email and WhatsApp routes stay, and that is deliberate rather than
+ * leftover. A careers page with no open vacancy today still needs a way for a
+ * good plumber to reach a person, and `ATS-13`'s talent pool is fed by exactly
+ * those conversations. The form is the fast path, not the only path.
+ */
+const ANSWER = `${company.legalName} hires tradespeople directly onto UAE labour contracts across the ten activities on its Dubai trade licence — plumbing, HVAC, electrical fittings, carpentry, tiling, false ceilings, painting, wallpaper, electromechanical installation and building cleaning. Employment is direct: the labour contract, the visa, the medical insurance and the end-of-service accrual are the company's obligation, and salaries are paid through the Wage Protection System.`;
 
 export const metadata: Metadata = {
   title: "Careers",
@@ -70,7 +89,18 @@ const FAQS = [
   },
 ] as const;
 
-export default function CareersPage() {
+/*
+ * Rendered per request, not at build time. A vacancy that closed this morning
+ * must not still be collecting applications from a statically generated page
+ * this afternoon — every one of those is an applicant nobody is reading, which
+ * is the silent-rejection failure arriving before anyone has even applied.
+ */
+export const dynamic = "force-dynamic";
+
+export default async function CareersPage() {
+  const applyOnWhatsapp = whatsappLink("Hello, I would like to apply for a technician role.");
+  const roles = await openRoles();
+
   return (
     <>
       <JsonLd
@@ -86,6 +116,14 @@ export default function CareersPage() {
             { name: "Home", path: "/" },
             { name: "Careers", path: "/careers" },
           ]),
+          /*
+           * `ATS-2` / `WEB-7`. One `JobPosting` per open role, which is what
+           * puts these vacancies into Google Jobs and makes them citable by an
+           * assistant asked "who is hiring AC technicians in Dubai". Emitted
+           * from the same rows the list below renders, so an indexed posting
+           * and a visible one can never disagree.
+           */
+          ...roles.map((role) => jobPostingSchema(role)),
         )}
       />
 
@@ -103,16 +141,17 @@ export default function CareersPage() {
               <EnvelopeSimple size={17} weight="fill" aria-hidden />
               Send your CV
             </a>
-            <a
-              href={whatsappLink("Hello, I would like to apply for a technician role.")}
-              className="btn btn-secondary"
-            >
-              <WhatsappLogo size={17} weight="fill" aria-hidden />
-              Apply on WhatsApp
-            </a>
+            {applyOnWhatsapp ? (
+              <a href={applyOnWhatsapp} className="btn btn-secondary">
+                <WhatsappLogo size={17} weight="fill" aria-hidden />
+                Apply on WhatsApp
+              </a>
+            ) : null}
           </div>
         </div>
       </section>
+
+      <OpenRoles roles={roles} />
 
       <Section tone="sunken">
         <div className="container-page">
@@ -140,13 +179,20 @@ export default function CareersPage() {
           <div className="lg:col-span-5">
             <h2 className="text-2xl font-semibold md:text-3xl">How to apply</h2>
             <p className="prose-body mt-5">
-              There is no application portal. Send a CV, or message us on WhatsApp with your trade and
-              years of experience. If there is a fit we will arrange a trade test with a supervisor.
+              Pick a role above and fill in the form. It takes under three minutes on a phone, a CV is
+              optional, and you will get a reference and a link that shows you exactly where your
+              application has got to — no account, no password. If there is a fit we will arrange a
+              trade test with a supervisor.
             </p>
             <p className="prose-body mt-4 text-[15px]">
-              We reply to every application, including the ones we turn down. Being left waiting is the
-              most common complaint people have about applying for trade work, and it costs nothing to
-              fix.
+              We reply to every application, including the ones we turn down, and we tell you when by.
+              Being left waiting is the most common complaint people have about applying for trade
+              work, and it costs nothing to fix.
+            </p>
+            <p className="prose-body mt-4 text-[15px]">
+              We never ask you to pay anything. Recruitment, visa and permit costs are ours by law
+              and are never taken from your salary. If anyone asks you for a fee in connection with a
+              job here, tell us.
             </p>
             <a href={`mailto:${careersEmail}`} className="btn btn-primary mt-8">
               <EnvelopeSimple size={17} weight="fill" aria-hidden />
@@ -163,9 +209,8 @@ export default function CareersPage() {
         <div className="container-page">
           <h2 className="text-2xl font-semibold md:text-3xl">Trades we hire</h2>
           <ul className="mt-7 flex flex-wrap gap-2.5">
-            {services
-              .filter((s) => s.category === "MEP" || s.category === "Fit-out & Finishing" || s.category === "Cleaning & Hygiene")
-              .map((s) => (
+            {/* Every licensed activity is a trade we hire for, so no filter. */}
+            {services.map((s) => (
                 <li key={s.slug}>
                   <Link
                     href={`/services/${s.slug}`}
@@ -175,7 +220,7 @@ export default function CareersPage() {
                     {s.shortName}
                   </Link>
                 </li>
-              ))}
+            ))}
           </ul>
         </div>
       </Section>

@@ -1,0 +1,304 @@
+# Continuous integration.
+#
+# `CI-1` / `CI-2`. Both the PRD and the TRD name this as the highest-leverage
+# item in the whole backlog, and the reason is arithmetic: the repository
+# already contains 32 test suites, a 14-check adversarial row-level-security
+# harness, a 72-pair WCAG contrast gate and typechecking across seven
+# workspaces — apps/web included, which is easy to assume is skipped and is not.
+# None of it ran automatically. Every regression risk in the system was
+# human-shaped — it depended on somebody remembering.
+#
+# The RLS harness is the one that matters most. `verify-rls.sql` proves the
+# tenant boundary holds by trying to cross it fourteen different ways. A schema
+# change that quietly drops a policy produces no error, no failing feature and
+# no visible symptom; it produces one tenant able to read another's data. This
+# workflow is what turns that from a thing somebody might check into a thing
+# that cannot merge.
+#
+# `CI-2` — hermetic tests. The suites previously required a live, seeded
+# database and hand-set environment variables. The service container below plus
+# a deterministic apply-and-seed step removes that: a clean checkout on a clean
+# machine runs everything.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # A new push supersedes an in-flight run on the same ref. Nobody reads the
+  # result of a run against code that has already been replaced.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: typecheck · tests · RLS proof · contrast · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        # Pinned major. The schema uses generated columns and policy features
+        # that behave differently across majors, and "whatever latest is today"
+        # is not a reproducible test environment.
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci_only_not_a_secret
+          POSTGRES_DB: meridian_ci
+          # Pins the container's (and therefore the server's default session)
+          # timezone to the business's calendar — Dubai — not the CI runner's
+          # host timezone (UTC on GitHub-hosted runners) and not any individual
+          # developer's machine. `TZ` on the official postgres image sets the
+          # OS timezone at container start, which the server then uses as the
+          # default `timezone` setting for any session that doesn't override it
+          # itself. Neither `packages/db/src/index.ts` (the app pool) nor
+          # `packages/db/src/seed.ts` (the seed/migrate client) passes a
+          # client-side `timezone`/PGTZ, and the migration/RLS/seed steps below
+          # connect over plain `psql` with none set either — so nothing here
+          # overrides the server default, and this pin is not just reducing the
+          # surface, it is deterministic for every connection this workflow
+          # makes, both as `postgres` and as `meridian_app`.
+          #
+          # Why this matters: `current_date` and `now()` are evaluated in the
+          # session's timezone. With the runner's UTC default, any boundary
+          # test that checks "is it after midnight in Dubai yet" is correct for
+          # ~22 hours a day and wrong for the ~2-hour window where UTC and
+          # Dubai (UTC+4) disagree on what day it is — a flake that depends on
+          # what wall-clock time the CI run happens to land at, not on the code
+          # under test. Pinning removes that window in CI specifically.
+          #
+          # This does NOT fix a developer's local machine — a laptop set to
+          # Asia/Dhaka (or anything else) still has this exact bug locally, and
+          # pinning CI's Postgres container has no effect on it; the developer
+          # still needs their own Postgres session timezone set correctly, or
+          # the code needs to not depend on it at all.
+          #
+          # That's the real, durable fix, and it already exists as the
+          # convention in `packages/db/src/domain/compliance.ts`, `cron.ts` and
+          # `hr.ts`: every date-boundary comparison takes Dubai's day
+          # explicitly (`now() at time zone 'Asia/Dubai'`, or an explicit
+          # Dubai-day argument) instead of trusting `current_date` or the
+          # session's default timezone. This env var is a determinism/flake
+          # guard for the test suite that exercises that convention — it is not
+          # a substitute for it, and no code should ever come to rely on the CI
+          # database happening to be in Dubai time.
+          TZ: Asia/Dubai
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # The migrator/superuser connection. Migrations and the seed use this.
+      DATABASE_ADMIN_URL: postgres://postgres:ci_only_not_a_secret@localhost:5432/meridian_ci
+      # The application connection. `meridian_app` is created by rls.sql with
+      # NOBYPASSRLS, and it is what every test that matters connects as — a
+      # suite run as the superuser would pass while proving nothing, because a
+      # superuser ignores every policy silently.
+      DATABASE_URL: postgres://meridian_app:ci_only_not_a_secret@localhost:5432/meridian_ci
+      DATABASE_POOL_MAX: "5"
+      PUBLIC_TENANT_SLUG: meridian
+      NEXT_PUBLIC_SITE_URL: http://localhost:3000
+      # Set so the cron routes compile and the guard is exercised rather than
+      # short-circuiting on an unset secret. Not a real secret; CI has no data.
+      CRON_SECRET: ci_only_not_a_secret
+      NODE_ENV: test
+      # CI has no real company identity and is testing that the build works,
+      # not shipping it. Without this the placeholder guard fails the build —
+      # which is correct on a deploy and unhelpful here.
+      ALLOW_PLACEHOLDER_IDENTITY: "1"
+      # Obviously-fake contact details, set so the notification templates render
+      # against a *configured* identity rather than an absent one.
+      #
+      # Leaving these unset does not make the tests stricter, it makes one of
+      # them meaningless: `dispatch.test.ts` asserts "every message carries the
+      # emergency number", and with no number configured the old signature still
+      # emitted the literal text `Emergencies, 24 hours: null`. The assertion
+      # passed on the label while the number it was checking for was the word
+      # "null". A test that cannot fail is worse than no test, because it is
+      # counted.
+      COMPANY_PHONE: "+971 4 000 0000"
+      COMPANY_EMAIL: "ci@example.invalid"
+      COMPANY_EMERGENCY_PHONE: "+971 55 000 0000"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      # ── 0. The backtick trap ─────────────────────────────────────────────
+      # Runs BEFORE typecheck, because when it fires, typecheck's message is
+      # actively misleading.
+      #
+      # A backtick inside a SQL comment terminates the enclosing tagged
+      # template literal. TypeScript then reports something like "TS1005: ','
+      # expected" tens of lines further down, at a character that is not the
+      # problem, and the whole workspace stops compiling -- so every test and
+      # every consumer fails, not just the file that has the typo.
+      #
+      # This is documented in the README and it has still cost three separate
+      # blockages in one evening, in three different files, written by three
+      # different people. One of the offending comments was itself explaining a
+      # template-literal gotcha. Prose is not enough; this is the check.
+      - name: No backticks in SQL comments
+        run: |
+          # TypeScript sources only. A backtick in a plain .sql file is read by
+          # psql, not by a TypeScript parser, so it is harmless prose -- and
+          # verify-rls.sql alone has seven. A guard that fails on files which are
+          # fine is a guard people learn to ignore.
+          #
+          # The pattern anchors to a SQL comment at the START of a line, which is
+          # how they appear inside a sql template. Matching `--` anywhere flags a
+          # JSDoc mentioning a CSS custom property and an email signature
+          # separator, both harmless -- checked, both exist in this repo.
+          #
+          # Scoped to apps/*/src rather than apps/web/src so that a workspace
+          # which does not write SQL today is still covered on the day it
+          # starts. apps/field currently has none -- WatermelonDB declares its
+          # schema rather than writing DDL -- so this widening flags nothing
+          # now, which is exactly when it is cheapest to do.
+          if grep -rnE --include='*.ts' --include='*.tsx' '^[[:space:]]*--.*`' packages/*/src/ apps/*/src/; then
+            echo
+            echo "A backtick inside a SQL comment terminates the tagged template literal."
+            echo "Write identifiers in SQL comments as bare prose."
+            exit 1
+          fi
+          echo "No backticks found in SQL comments."
+
+      # ── 1. Typecheck ─────────────────────────────────────────────────────
+      # First, because it is the fastest way to fail and it fails on the widest
+      # range of mistakes.
+      - name: Typecheck all workspaces
+        run: npm run typecheck
+
+      # The root gate does NOT see the field app's screens. `apps/field`'s own
+      # tsconfig.json excludes `src/app/**`, `src/db/models/**` and
+      # `watermelon.ts`, because that config is the Node-flavoured one the test
+      # suites compile under and it carries neither JSX nor the React Native
+      # types. The exclusion is correct; running only that config is not.
+      #
+      # Without the line below, every screen in the field app -- the whole
+      # capture surface a technician touches, the job card, the camera, the
+      # signature pad -- is code CI has never compiled. It typechecks today
+      # only because it was run by hand. A gate that skips the half of a
+      # workspace most likely to break is the shape this repo keeps finding:
+      # a check that cannot fail, counted as though it had passed.
+      - name: Typecheck the field app's native half
+        run: npm run typecheck:native -w ./apps/field
+
+      # ── 2. Schema, security, and the proof it worked ─────────────────────
+      # Order is load-bearing and mirrors the deployment runbook exactly:
+      # migrations define the tables, then rls.sql applies policies to every
+      # table carrying a tenant_id via a generic loop, then the function files
+      # add the narrow SECURITY DEFINER surface the bootstrap paths need.
+      #
+      # Running them in this order in CI is also how OPS-1 gets tested: if the
+      # deploy would fail, this fails first.
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h localhost -U postgres && exit 0
+            sleep 1
+          done
+          echo "Postgres did not become ready" >&2
+          exit 1
+        env:
+          PGPASSWORD: ci_only_not_a_secret
+
+      - name: Apply migrations
+        env:
+          PGPASSWORD: ci_only_not_a_secret
+        run: |
+          set -euo pipefail
+          for f in packages/db/drizzle/*.sql; do
+            echo "── $f"
+            psql -h localhost -U postgres -d meridian_ci -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Apply security SQL
+        env:
+          PGPASSWORD: ci_only_not_a_secret
+        run: |
+          set -euo pipefail
+          # Order is load-bearing, and not only for readability. rls.sql ends
+          # with a blanket GRANT ... ON ALL TABLES, so any REVOKE a later file
+          # depends on must come after it. public-functions.sql revoking direct
+          # access to rate_limits is exactly that case: applying rls.sql on its
+          # own leaves the rate limiter bypassable by the application role.
+          # ratelimit.test.ts catches it, which is how it was found.
+          for f in rls.sql auth-functions.sql public-functions.sql customer-scope.sql reference.sql mfa-functions.sql cron-functions.sql reset-functions.sql; do
+            echo "── $f"
+            psql -h localhost -U postgres -d meridian_ci -v ON_ERROR_STOP=1 -f "packages/db/sql/$f"
+          done
+
+      - name: Give the application role a password
+        env:
+          PGPASSWORD: ci_only_not_a_secret
+        run: |
+          psql -h localhost -U postgres -d meridian_ci -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE meridian_app WITH PASSWORD 'ci_only_not_a_secret';"
+
+      # THE GATE THAT MATTERS MOST. Twelve adversarial checks that try to cross
+      # the tenant boundary. Exits non-zero if any of them succeeds in doing so.
+      - name: Prove tenant isolation (verify-rls.sql)
+        env:
+          PGPASSWORD: ci_only_not_a_secret
+        run: |
+          psql -h localhost -U postgres -d meridian_ci -v ON_ERROR_STOP=1 \
+            -f packages/db/sql/verify-rls.sql
+
+      - name: Seed
+        run: npm run db:seed
+
+      # ── 3. Test suites ───────────────────────────────────────────────────
+      # `--workspaces --if-present` runs core, db, auth and notify. The db and
+      # auth suites are integration tests against the real Postgres above,
+      # connecting as the NOBYPASSRLS application role.
+      - name: Run all suites
+        run: npm run test
+
+      # ── 4. Accessibility ─────────────────────────────────────────────────
+      # 36 foreground/background pairings against WCAG AA. A design system with
+      # a test is rare; this one has one and it should not be allowed to decay,
+      # so every new token pair joins it in the commit that introduces it.
+      - name: Contrast gate
+        run: npm run check:contrast --workspace=@meridian/web
+
+      # ── 5. Build smoke ───────────────────────────────────────────────────
+      # Catches what typechecking cannot: a static page that throws during
+      # prerender, a server-only import pulled into a client component, a route
+      # that cannot be generated. NEXT_PUBLIC_SITE_URL is read at build time and
+      # baked into every canonical URL, the sitemap and all JSON-LD, so it is
+      # set above rather than left to default.
+      - name: Build
+        run: npm run build
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+
+      # `SEC-10`. Fails on a known critical advisory only. Failing on `high`
+      # would mean the build breaks on a transitive advisory in a dev-only tool
+      # on a random Tuesday, and a red build nobody can act on is a red build
+      # people learn to ignore — which costs more than it saves.
+      - name: Audit dependencies
+        run: npm audit --audit-level=critical

@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "paths": {
+      "@meridian/core": ["../core/src/index.ts"],
+      "@meridian/db": ["../db/src/index.ts"],
+      "@meridian/files": ["../files/src/index.ts"],
+      "@meridian/docs": ["./src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules"]
+}

@@ -9,7 +9,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx test/totp.test.ts && tsx test/mfa.test.ts"
+    "test": "tsx test/totp.test.ts && tsx test/lockout.test.ts && tsx test/mfa.test.ts && tsx test/reset.test.ts && tsx test/rbac.test.ts"
   },
   "dependencies": {
     "@meridian/core": "*",

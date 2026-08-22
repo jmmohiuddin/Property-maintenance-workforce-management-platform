@@ -1,16 +1,44 @@
-import { and, eq, sql, desc, asc, inArray, isNull } from "drizzle-orm";
+import { and, eq, sql, desc, asc, inArray, isNull, type SQL, type AnyColumn } from "drizzle-orm";
 import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
 import {
   slaState,
   STATUS_LABEL,
   canTransition,
+  checkOutdoorWindow,
   InvalidTransitionError,
   OPEN_STATUSES,
+  AT_RISK_THRESHOLD,
+  UserFacingError,
+  computeSlaDeadlines,
   type SlaState,
   type JobStatus,
   type JobPriority,
+  type WorkingCalendar,
 } from "@meridian/core";
+import { loadWorkingCalendar } from "./reference";
+import { writeAuditNote } from "./staff";
+import { assertJobCardComplete } from "./jobcard";
+// The cursor codec is imported rather than re-implemented, even though
+// `leads.ts` already imports `nextJobReference` from here and this makes the
+// pair mutually importing. Both sides only touch each other inside function
+// bodies, so module evaluation order cannot bite; and the alternative — a
+// second base64url encoder for the same opaque cursor — is two things that can
+// drift apart, which is worse than one import edge that cannot.
+import { encodeCursor, decodeCursor, type Page } from "./leads";
+// The one list of "this visit is still expected to happen", imported rather
+// than restated. Its own comment in `assignment.ts` explains why: it had been
+// copied by hand into three places and `superseded` had to be excluded from
+// all of them at once. A fourth copy here would be the same mistake with a
+// worse blast radius, because this one decides whose attendance is recorded.
+//
+// This makes jobs.ts and assignment.ts mutually importing — assignment.ts
+// already imports `transitionJob` from here. That is the same edge the
+// `leads.ts` import above documents and it is safe for the same reason: both
+// sides only touch each other inside function bodies, so module evaluation
+// order cannot bite.
+import { OCCUPYING_VISIT_STATUSES } from "./assignment";
+import { rowDate, requiredRowDate } from "./_rows";
 
 /**
  * Job persistence and queries.
@@ -41,6 +69,17 @@ export async function transitionJob(
     note?: string | undefined;
     /** Set when the transition is a side effect of something else. */
     actorKind?: "user" | "system" | "ai" | "customer";
+    /**
+     * The technician this transition is being recorded BY, when the caller
+     * knows. Optional, and resolved from `ctx.userId` when it is not given —
+     * see `advanceVisitsWithJob`, which is the only thing that reads it.
+     *
+     * The field sync passes it because it already authenticated the device to
+     * a technician and that is a stronger fact than the user join. Nobody has
+     * to pass it: a caller that says nothing gets the office reading, which is
+     * the right default for the dispatch board.
+     */
+    actorTechnicianId?: string | null | undefined;
   },
 ): Promise<{ from: JobStatus; to: JobStatus }> {
   const rows = await tx
@@ -57,18 +96,69 @@ export async function transitionJob(
   const from = current.status as JobStatus;
   if (!canTransition(from, input.to)) throw new InvalidTransitionError(from, input.to);
 
+  // JOB-15 lives HERE, not only in `recordJobOutcome`.
+  //
+  // The requirement says a job cannot be completed without an outcome, an after
+  // photograph or a coded exemption, materials recorded or declared none, and
+  // labour time -- "enforced in the domain layer, not the UI". It was enforced
+  // in recordJobOutcome alone, which left this function as a second door into
+  // the same state: `on_site -> work_complete` is a legal transition, so any
+  // caller reaching for the status machine directly walked straight past the
+  // gate.
+  //
+  // That door was not hypothetical. The field sync API called this function to
+  // apply a device's status change, so a handset could have completed jobs with
+  // empty cards -- at scale, from the client hardest to observe. It closed its
+  // own side with an allow-list; this closes the door itself, for every caller
+  // that comes later and does not know the rule exists.
+  //
+  // recordJobOutcome still asserts before it writes anything, so the ordinary
+  // path fails early with nothing half-written. This is the backstop, and the
+  // duplicated read is worth what it buys.
+  if (input.to === "work_complete") await assertJobCardComplete(tx, input.jobId);
+
   const now = new Date();
   const patch: Record<string, unknown> = { status: input.to, updatedAt: now };
 
   // Timestamp columns other queries depend on. Set here so they cannot drift
   // from the status they describe.
   if (input.to === "on_site") {
-    patch["firstResponseAt"] = sql`coalesce(${schema.jobs.firstResponseAt}, ${now})`;
+    /*
+     * `${now.toISOString()}::timestamptz`, NOT `${now}`.
+     *
+     * A JS Date interpolated into a raw `sql` template is stringified by the
+     * driver as "Sat Aug 22 2026 08:59:33" and then refused before the
+     * statement is ever sent -- ERR_INVALID_ARG_TYPE, not a database error.
+     * Drizzle converts a Date correctly in a `.set({ col: date })` position;
+     * inside a tagged template it does not, and the two look identical.
+     *
+     * So every call to transitionJob(to: "on_site") threw. Not a UserFacingError
+     * either, so a field sync batch lost every mutation queued behind the
+     * arrival, and a dispatcher marking a technician on site got a 500. Found by
+     * connecting the field client to a real server over HTTP -- no unit test
+     * reached this line, because none of them moved a job to on_site.
+     *
+     * The regression test is in jobs.test.ts, and it asserts the column is set
+     * rather than merely that the call returned: an expression that silently
+     * wrote NULL would satisfy "it did not throw".
+     */
+    patch["firstResponseAt"] = sql`coalesce(${schema.jobs.firstResponseAt}, ${now.toISOString()}::timestamptz)`;
   }
   if (input.to === "work_complete") patch["completedAt"] = now;
   if (input.to === "closed" || input.to === "cancelled") patch["closedAt"] = now;
 
   await tx.update(schema.jobs).set(patch).where(eq(schema.jobs.id, input.jobId));
+
+  // The attendance record follows the status. This is the whole reason the
+  // rule sits on this function rather than on the dispatch action — see
+  // `advanceVisitsWithJob` below for what it does and what it refuses to do.
+  await advanceVisitsWithJob(tx, {
+    jobId: input.jobId,
+    to: input.to,
+    at: now,
+    actorTechnicianId: input.actorTechnicianId ?? null,
+    actorUserId: ctx.userId,
+  });
 
   await tx.insert(schema.jobEvents).values({
     tenantId: ctx.tenantId,
@@ -84,7 +174,332 @@ export async function transitionJob(
   return { from, to: input.to };
 }
 
+// ── Attendance: the visit follows the job ────────────────────────────────────
+
+/**
+ * Make `job_visits` record that somebody actually turned up.
+ *
+ * ── THE HOLE THIS FILLS ─────────────────────────────────────────────────────
+ *
+ * A `job_visits` row was written at ASSIGNMENT and nothing ever moved it. It
+ * was created `assigned` by `assignTechnician` and it stayed `assigned` until
+ * a reassignment retired it or the row was deleted. `en_route_at` and
+ * `arrived_at` have existed since `0000` and, before this function, the only
+ * writers of either column in the entire repository were `seed.ts` and the
+ * test suites. Three finished features were sitting on top of that:
+ *
+ *  1. **Customer live tracking** (`CUST-3`, `EMG-5`). Both halves of it — the
+ *     RESTRICTIVE `customer_scope` policy on `technician_locations` in
+ *     `sql/customer-scope.sql`, and `getPortalLiveTracking` in `portal.ts` —
+ *     key on `v.status IN ('en_route','arrived') AND v.en_route_at IS NOT
+ *     NULL`. With nothing writing either, the feature could never show a
+ *     customer anything, in production, ever. It passed its tests because the
+ *     tests seeded `en_route` visits by hand.
+ *  2. **`G11` first-time-fix**, which needs a visit to be an attendance rather
+ *     than a plan before either side of its fraction can be counted. See the
+ *     `DASHBOARD_GAPS` entry in `reporting.ts`.
+ *  3. **Utilisation coverage** (`reporting.ts`), which measures recorded labour
+ *     against visits that never recorded attendance.
+ *
+ * ── THIS FIXES THE FUTURE, AND ONLY THE FUTURE ──────────────────────────────
+ *
+ * No backfill, deliberately. In a database that already exists, a visit that
+ * was attended and a visit that was abandoned are byte-for-byte identical —
+ * both are `assigned` with null stamps — so any backfill would be inventing
+ * attendances at an unknown rate and there would be no way afterwards to tell
+ * the invented ones from the real ones. Rows written before this function
+ * existed stay as they are and stay uncountable, which is the honest state for
+ * them. Every visit from here forward carries the fact.
+ *
+ * ── WHICH VISIT ─────────────────────────────────────────────────────────────
+ *
+ * A job may carry several visits, and the difference between them matters
+ * because `en_route` on a visit is what publishes a named employee's live
+ * position to a member of the public.
+ *
+ *   * The candidates are the LIVE visits — `OCCUPYING_VISIT_STATUSES`. That
+ *     excludes `superseded` (a plan a reassignment replaced), `declined`, and
+ *     the three recorded outcomes. A retired plan must never be stamped with
+ *     an attendance, and a recorded outcome must never be overwritten by one.
+ *   * If the actor is a TECHNICIAN and one of those visits is theirs, only
+ *     their own is advanced. This is load bearing rather than tidy: on a
+ *     two-person job, stamping the other technician's arrival from this
+ *     technician's handset would both invent an attendance and start sharing
+ *     a second employee's location with the customer while they are still in
+ *     the depot.
+ *   * Otherwise — the office, a scheduled job, an AI actor, or a technician
+ *     with no live visit of their own — every live visit is advanced. A
+ *     dispatcher moving the job to `en_route` is making a statement about the
+ *     job, and on a two-person job that statement covers both people. The
+ *     "technician with no live visit" fallback is what keeps a working
+ *     supervisor, who has a technician row but is not on this job, behaving
+ *     like the office rather than silently advancing nothing.
+ *
+ * NONE is a no-op, not an error. A job can legitimately reach `en_route` with
+ * no visit on it at all: `triaged -> dispatched -> en_route` is a legal walk
+ * and `transitionJob` is reachable without `assignTechnician` ever running.
+ * Refusing there would break job movement to protect a record that is not
+ * required to exist, and the job's own status plus `job_events` still say what
+ * happened. SEVERAL is described above and is a real shape, not a fault.
+ *
+ * ── IDEMPOTENCY ────────────────────────────────────────────────────────────
+ *
+ * Every stamp is `coalesce(existing, new)`. The first arrival is the true one.
+ * The field app replays mutations and a technician with bad signal will send
+ * "arrived" twice; the second must not move `arrived_at` half an hour later
+ * and quietly rewrite how long the job took. `transitionJob` itself refuses a
+ * same-status move, so the replay is usually stopped before it gets here — but
+ * `on_site -> paused -> on_site` is a legal walk that arrives twice for real,
+ * and this is what makes the second arrival keep the first one's clock.
+ *
+ * That `coalesce` is also the cheapest honest answer to a real objection.
+ * `apps/field/src/domain/attendance.ts` argues, with TRD §8.4 behind it, that
+ * an arrival modelled as `job_visits.arrived_at` is "a mutable scalar two
+ * writers can disagree about" and belongs in an append-only stream instead.
+ * That is right, and the device already keeps one — but `timing_events` is a
+ * device-local table that nothing pushes: what the handset actually sends is
+ * `job_status/transition`, and the three features waiting on attendance all
+ * read the scalar. So the scalar is written, and written once, which is the
+ * property the stream was wanted for. A server-side visit timing stream would
+ * be a better shape and is a schema change, not this one.
+ *
+ * The interpolation is `${at.toISOString()}::timestamptz`, NOT `${at}`. A JS
+ * Date inside a raw `sql` template is stringified by the driver and refused
+ * with ERR_INVALID_ARG_TYPE before Postgres ever sees the statement — the bug
+ * that made every `transitionJob(to: "on_site")` call throw. See the comment
+ * on `firstResponseAt` above.
+ *
+ * ── GOING BACKWARDS ────────────────────────────────────────────────────────
+ *
+ * Only forward moves and `cancelled` are handled, and the omissions are
+ * decisions:
+ *
+ *   * `en_route -> dispatched` (a recall) and `on_site -> paused` (waiting on
+ *     parts) leave the visit exactly where it is. There is no visit state
+ *     meaning "travelled and was turned back": demoting to `assigned` would
+ *     claim the trip never happened AND would put an attended row back into
+ *     `RETIRABLE_VISIT_STATUSES`, where the next reassignment would silently
+ *     supersede a real journey — which is precisely what `0040` refuses to do.
+ *     A paused job is worse still, because the technician is usually still
+ *     standing on the site. The customer-visible exposure this leaves is
+ *     already bounded: the policy closes the window twelve hours after
+ *     `en_route_at` regardless of what anybody remembers to do.
+ *   * `cancelled` IS handled, because there the job itself says the attendance
+ *     is over and leaving a live visit standing would keep a customer watching
+ *     a technician who is no longer coming. A visit that had travelled becomes
+ *     `aborted` — the word this schema already defines as "the visit STARTED
+ *     and was abandoned" — which is in `SETTLED_VISIT_STATUSES`, so no reader
+ *     mistakes it for a plan. A visit that had NOT travelled is left alone: it
+ *     is a plan that was never acted on, and calling that "aborted" would
+ *     claim an attendance in order to tidy a row.
+ *
+ * `no_access` and `aborted` are VISIT states, not job states — a job never
+ * transitions to either, so there is no branch for them here. What a
+ * no-access job does is record an outcome code through `recordJobOutcome`,
+ * which reaches `work_complete` through this same function.
+ *
+ * ── SETTLING ───────────────────────────────────────────────────────────────
+ *
+ * On `work_complete`, only ATTENDED visits settle to `completed`. A visit
+ * still sitting at `assigned` when the job finishes is a crew member nobody
+ * recorded as having turned up, and completing it would manufacture exactly
+ * the attendance this function exists to stop manufacturing. Settling also
+ * closes the tracking window immediately rather than waiting out the twelve
+ * hours, because the policy takes `LEAST(completed_at, en_route_at + 12h)`.
+ *
+ * A settled visit is no longer live, so reopening the job (`work_complete ->
+ * on_site`) finds nothing to advance. That is correct: a second attendance is
+ * a second visit, raised through `assignTechnician`, which is what
+ * `rescheduleVisit` already tells a dispatcher when they try to move a
+ * finished one.
+ *
+ * ── NO AUDIT ROW ───────────────────────────────────────────────────────────
+ *
+ * `job_events` already records the transition that caused this, in the same
+ * transaction, and the stamps are themselves the record. A second ledger entry
+ * per visit per status change would be noise in the table that supersession
+ * and reassignment use to say something a reader cannot otherwise reconstruct.
+ */
+async function advanceVisitsWithJob(
+  tx: TenantScopedTx,
+  input: {
+    jobId: string;
+    to: JobStatus;
+    /** The transition's instant. Shared with the job row so they agree. */
+    at: Date;
+    actorTechnicianId: string | null;
+    actorUserId: string | undefined;
+  },
+): Promise<void> {
+  if (
+    input.to !== "en_route" &&
+    input.to !== "on_site" &&
+    input.to !== "work_complete" &&
+    input.to !== "cancelled"
+  ) {
+    return;
+  }
+
+  const live = await tx
+    .select({
+      id: schema.jobVisits.id,
+      status: schema.jobVisits.status,
+      technicianId: schema.jobVisits.technicianId,
+    })
+    .from(schema.jobVisits)
+    .where(
+      and(
+        eq(schema.jobVisits.jobId, input.jobId),
+        isNull(schema.jobVisits.deletedAt),
+        inArray(schema.jobVisits.status, [...OCCUPYING_VISIT_STATUSES]),
+      ),
+    )
+    .orderBy(asc(schema.jobVisits.sequence));
+
+  if (live.length === 0) return;
+
+  const stamp = input.at.toISOString();
+
+  // Settling and cancelling are statements about the job ending, so they are
+  // never narrowed to one technician: a second crew member's `arrived` row
+  // left open would go on publishing their location after the work stopped.
+  if (input.to === "work_complete" || input.to === "cancelled") {
+    const attended = live.filter((v) => v.status === "en_route" || v.status === "arrived");
+    if (attended.length === 0) return;
+
+    if (input.to === "work_complete") {
+      await tx
+        .update(schema.jobVisits)
+        .set({
+          status: "completed",
+          completedAt: sql`coalesce(${schema.jobVisits.completedAt}, ${stamp}::timestamptz)`,
+          updatedAt: input.at,
+        })
+        .where(
+          inArray(
+            schema.jobVisits.id,
+            attended.map((v) => v.id),
+          ),
+        );
+      return;
+    }
+
+    await tx
+      .update(schema.jobVisits)
+      .set({ status: "aborted", updatedAt: input.at })
+      .where(
+        inArray(
+          schema.jobVisits.id,
+          attended.map((v) => v.id),
+        ),
+      );
+    return;
+  }
+
+  // ── Attendance. Narrowed to the actor when the actor is a technician ─────
+  //
+  // The question is not "who is this user" but "does this user own one of THESE
+  // visits", so it is asked of the candidate set rather than of `technicians`
+  // at large. That matters: `technicians.user_id` is not unique, one login can
+  // sit against more than one technician row, and a bare `limit 1` on it would
+  // pick an arbitrary one and then narrow to nothing — silently recording no
+  // attendance at all, which is the failure this whole function exists to end.
+  let own = input.actorTechnicianId
+    ? live.filter((v) => v.technicianId === input.actorTechnicianId)
+    : [];
+
+  if (own.length === 0 && !input.actorTechnicianId && input.actorUserId) {
+    const rows = await tx
+      .select({ id: schema.technicians.id })
+      .from(schema.technicians)
+      .where(
+        and(
+          inArray(schema.technicians.id, [...new Set(live.map((v) => v.technicianId))]),
+          eq(schema.technicians.userId, input.actorUserId),
+          isNull(schema.technicians.deletedAt),
+        ),
+      );
+    const mine = new Set(rows.map((r) => r.id));
+    own = live.filter((v) => mine.has(v.technicianId));
+  }
+
+  const targets = own.length > 0 ? own : live;
+  const ids = targets.map((v) => v.id);
+
+  if (input.to === "en_route") {
+    await tx
+      .update(schema.jobVisits)
+      .set({
+        status: "en_route",
+        enRouteAt: sql`coalesce(${schema.jobVisits.enRouteAt}, ${stamp}::timestamptz)`,
+        updatedAt: input.at,
+      })
+      .where(inArray(schema.jobVisits.id, ids));
+    return;
+  }
+
+  // `on_site`. `en_route_at` is deliberately NOT backfilled here for a visit
+  // that never travelled — `paused -> on_site` is a legal walk that skips
+  // `en_route` entirely. Writing the arrival instant into `en_route_at` would
+  // state that the technician set off at the moment they arrived, which is
+  // false and would be costed as zero travel. The visible consequence is that
+  // such a visit is not customer-trackable, and that is the safe direction for
+  // a feature that shares an employee's location.
+  await tx
+    .update(schema.jobVisits)
+    .set({
+      status: "arrived",
+      arrivedAt: sql`coalesce(${schema.jobVisits.arrivedAt}, ${stamp}::timestamptz)`,
+      updatedAt: input.at,
+    })
+    .where(inArray(schema.jobVisits.id, ids));
+}
+
 // ── Dispatch board ───────────────────────────────────────────────────────────
+
+/**
+ * Visit statuses that mean somebody is on the hook for this job.
+ *
+ * "completed" is in the list deliberately. A job sitting in work_complete
+ * awaiting sign-off still has a technician who did the work, and showing it as
+ * unassigned both misleads the dispatcher and inflates the unassigned count
+ * they are trying to drive to zero.
+ */
+const ASSIGNED_VISIT_STATUSES = ["assigned", "accepted", "en_route", "arrived", "completed"] as const;
+
+const ASSIGNED_VISIT_STATUS_LIST = sql.join(
+  ASSIGNED_VISIT_STATUSES.map((s) => sql`${s}`),
+  sql`, `,
+);
+
+/**
+ * The technician currently carrying a job, as a correlated subquery.
+ *
+ * This used to be a LEFT JOIN through job_visits, which is wrong for the one
+ * case job_visits exists to model: `JOB-12` multi-visit work. A job with two
+ * live visits produced two board rows, and every count derived from those rows
+ * counted it twice — so a "parts on order, returning Thursday" job silently
+ * inflated the open figure the dispatcher is driving to zero.
+ *
+ * Latest visit by sequence, because that is the one still to happen.
+ */
+function assignedTechnicianName(jobIdColumn: SQL | AnyColumn) {
+  return sql<string | null>`(
+  select t.full_name
+    from job_visits v
+    join technicians t on t.id = v.technician_id
+   where v.job_id = ${jobIdColumn}
+     and v.status in (${ASSIGNED_VISIT_STATUS_LIST})
+   order by v.sequence desc
+   limit 1
+)`;
+}
+
+/** For the query builder, where the jobs table is referenced by its real name. */
+const ASSIGNED_TECHNICIAN_NAME = assignedTechnicianName(schema.jobs.id);
+
+/** For the raw queries below, where it is aliased to `j`. */
+const ASSIGNED_TECHNICIAN_NAME_J = assignedTechnicianName(sql`j.id`);
 
 export interface DispatchBoardRow {
   readonly id: string;
@@ -103,6 +518,13 @@ export interface DispatchBoardRow {
   readonly propertyArea: string | null;
   readonly propertyCity: string;
   readonly technicianName: string | null;
+  /**
+   * The AMC this job was raised under, or null. `CON-6` is what stops contract
+   * work being absorbed, and a dispatcher who cannot tell a contract job from
+   * any other one has no reason to look for it — so the reference travels with
+   * the row rather than being fetched by whoever remembers to ask.
+   */
+  readonly contractReference: string | null;
   readonly sla: SlaState;
 }
 
@@ -113,6 +535,26 @@ export interface DispatchBoardRow {
  * SLA state is computed in application code rather than SQL on purpose: it
  * depends on "now", so doing it in the query would make the result
  * uncacheable and the logic untestable without a database.
+ *
+ * ── WHY THIS ONE IS CAPPED AND NOT PAGED (`LEAD-8`) ─────────────────────────
+ *
+ * `LEAD-8` requires keyset pagination on the jobs list, and `searchJobs` below
+ * is that. This function is deliberately not it.
+ *
+ * The board's ORDER BY is `priority, resolve_by_at, created_at` — operational
+ * ordering, `JOB-11`, the best decision in the existing product and explicitly
+ * not to be "improved" into a generic sortable table. It is also a poor keyset
+ * key: `priority` is a four-value enum, so a cursor on it lands in the middle
+ * of a tie thousands of rows wide, and `resolve_by_at` is nullable, so the
+ * row-wise comparison that makes keyset work stops being a total order.
+ *
+ * More to the point, the board is a *top N by urgency* view. A dispatcher who
+ * has reached the bottom of it has reached the work that does not need a
+ * dispatcher, and page two of "least urgent open jobs" is a screen nobody
+ * opens. A cap is the right shape here — as long as it is visible, which is
+ * what `dispatchBoardCounts` is for: it counts tenant-wide with its own
+ * aggregate, so the board can say "showing 200 of 431" rather than quietly
+ * presenting 200 as the total.
  */
 export async function listDispatchBoard(
   tx: TenantScopedTx,
@@ -138,23 +580,16 @@ export async function listDispatchBoard(
       propertyName: schema.properties.name,
       propertyArea: schema.properties.area,
       propertyCity: schema.properties.city,
-      technicianName: schema.technicians.fullName,
+      technicianName: ASSIGNED_TECHNICIAN_NAME,
+      contractReference: schema.contracts.reference,
     })
     .from(schema.jobs)
     .innerJoin(schema.customers, eq(schema.customers.id, schema.jobs.customerId))
     .innerJoin(schema.properties, eq(schema.properties.id, schema.jobs.propertyId))
-    .leftJoin(
-      schema.jobVisits,
-      and(
-        eq(schema.jobVisits.jobId, schema.jobs.id),
-        // "completed" is included deliberately. A job sitting in work_complete
-        // awaiting sign-off still has a technician who did the work, and
-        // showing it as unassigned both misleads the dispatcher and inflates
-        // the unassigned count they are trying to drive to zero.
-        inArray(schema.jobVisits.status, ["assigned", "accepted", "en_route", "arrived", "completed"]),
-      ),
-    )
-    .leftJoin(schema.technicians, eq(schema.technicians.id, schema.jobVisits.technicianId))
+    // One join, both surfaces: the dispatch board and the jobs list call this
+    // function, so the AMC chip appears on each without either page knowing
+    // anything about contracts.
+    .leftJoin(schema.contracts, eq(schema.contracts.id, schema.jobs.contractId))
     .where(and(inArray(schema.jobs.status, [...statuses]), isNull(schema.jobs.deletedAt)))
     .orderBy(asc(schema.jobs.priority), asc(schema.jobs.resolveByAt), desc(schema.jobs.createdAt))
     .limit(options?.limit ?? 200);
@@ -193,6 +628,10 @@ export interface JobDetail {
   readonly propertyLat: number | null;
   readonly propertyLng: number | null;
   readonly accessInstructions: string | null;
+  /** `Revisit tracking`. Set only from `raiseReturnVisit` onward — never backfilled. */
+  readonly parentJobId: string | null;
+  readonly parentJobReference: string | null;
+  readonly isRevisit: boolean;
   readonly sla: SlaState;
   readonly visits: readonly {
     readonly id: string;
@@ -243,6 +682,8 @@ export async function getJobDetail(
       propertyLat: schema.properties.lat,
       propertyLng: schema.properties.lng,
       accessInstructions: schema.properties.accessInstructions,
+      parentJobId: schema.jobs.parentJobId,
+      isRevisit: schema.jobs.isRevisit,
     })
     .from(schema.jobs)
     .innerJoin(schema.customers, eq(schema.customers.id, schema.jobs.customerId))
@@ -252,6 +693,19 @@ export async function getJobDetail(
 
   const job = rows[0];
   if (!job) return null;
+
+  // A second, tiny query rather than a self-join: most jobs have no parent, so
+  // the common case pays nothing and the uncommon one pays one indexed lookup
+  // by primary key.
+  let parentJobReference: string | null = null;
+  if (job.parentJobId) {
+    const parentRows = await tx
+      .select({ reference: schema.jobs.reference })
+      .from(schema.jobs)
+      .where(eq(schema.jobs.id, job.parentJobId))
+      .limit(1);
+    parentJobReference = parentRows[0]?.reference ?? null;
+  }
 
   const visits = await tx
     .select({
@@ -287,6 +741,7 @@ export async function getJobDetail(
     ...job,
     status: job.status as JobStatus,
     priority: job.priority as JobPriority,
+    parentJobReference,
     sla: slaState({
       createdAt: job.createdAt,
       resolveByAt: job.resolveByAt,
@@ -298,18 +753,153 @@ export async function getJobDetail(
   };
 }
 
-/** Counts for the board header. One query, not one per status. */
+/**
+ * Counts for the board header (`LEAD-8`, and the trap it names).
+ *
+ * ── WHY THIS IS AN AGGREGATE AND NOT A `.filter()` ──────────────────────────
+ *
+ * It used to be `listDispatchBoard(tx, { limit: 1000 })` and four array
+ * filters. That is the same trap `LEAD-8` describes on the customers page: the
+ * headline figures were not tenant-wide totals, they were totals *of the first
+ * thousand rows*, and at the PRD's own stated volume — 5,000 jobs a year, §9 —
+ * the first number a dispatcher trusts each morning would have quietly become
+ * a page total inside year one. Worse, it would have gone on rising to exactly
+ * 1000 and then stopped, which reads as a plateau rather than as a cap.
+ *
+ * So the counts are computed by Postgres over every matching row, independent
+ * of any page or cap, and `open` is what tells the board its own list is
+ * truncated.
+ *
+ * ── THE SLA ARITHMETIC IS MIRRORED, AND THE MIRROR IS TESTED ────────────────
+ *
+ * `slaState` in `@meridian/core` is the definition, and it stays there because
+ * a browser needs it. The FILTER clauses below restate it in SQL, which is a
+ * duplication with a real risk of drift — so `test/jobs.test.ts` classifies the
+ * same rows both ways and fails if the two ever disagree. The threshold itself
+ * is imported rather than typed as `0.8` twice.
+ */
+/**
+ * The board's own test for "past its deadline", as one SQL expression.
+ *
+ * Extracted so that the header's total and the dashboard's per-priority
+ * breakdown cannot disagree about the same job: they are not two restatements
+ * of `slaState`, they are one restatement used twice. See the note above
+ * `dispatchBoardCounts` for why a restatement exists at all and what stops it
+ * drifting from the definition in `@meridian/core`.
+ *
+ * `at` is passed already stringified so both callers bind the same instant.
+ */
+function breachedInSql(at: string) {
+  return sql`(
+    j.resolve_by_at is not null
+      and case
+            when j.completed_at is not null then j.completed_at > j.resolve_by_at
+            when ${at}::timestamptz > j.resolve_by_at then true
+            -- slaState treats a non-positive window as already breached:
+            -- a deadline at or before creation was never achievable.
+            else j.resolve_by_at <= j.created_at
+          end
+  )`;
+}
+
 export async function dispatchBoardCounts(
   tx: TenantScopedTx,
   now: Date = new Date(),
+  statuses: readonly JobStatus[] = OPEN_STATUSES,
 ): Promise<{ open: number; breached: number; atRisk: number; unassigned: number }> {
-  const rows = await listDispatchBoard(tx, { now, limit: 1000 });
+  const at = now.toISOString();
+  const statusList = sql.join(
+    statuses.map((s) => sql`${s}`),
+    sql`, `,
+  );
+
+  const rows = (await tx.execute<Record<string, never>>(sql`
+    select
+      count(*) as open,
+      count(*) filter (where ${breachedInSql(at)}) as breached,
+      count(*) filter (
+        where j.resolve_by_at is not null
+          and j.completed_at is null
+          and ${at}::timestamptz <= j.resolve_by_at
+          and j.resolve_by_at > j.created_at
+          and extract(epoch from (${at}::timestamptz - j.created_at))
+              / extract(epoch from (j.resolve_by_at - j.created_at)) >= ${AT_RISK_THRESHOLD}
+      ) as at_risk,
+      count(*) filter (
+        where not exists (
+          select 1 from job_visits v
+           where v.job_id = j.id and v.status in (${ASSIGNED_VISIT_STATUS_LIST})
+        )
+      ) as unassigned
+    from jobs j
+   where j.deleted_at is null
+     and j.status::text in (${statusList})
+  `)) as unknown as {
+    open: string;
+    breached: string;
+    at_risk: string;
+    unassigned: string;
+  }[];
+
+  const row = rows[0];
   return {
-    open: rows.length,
-    breached: rows.filter((r) => r.sla === "breached").length,
-    atRisk: rows.filter((r) => r.sla === "at_risk").length,
-    unassigned: rows.filter((r) => r.technicianName === null).length,
+    open: Number(row?.open ?? 0),
+    breached: Number(row?.breached ?? 0),
+    atRisk: Number(row?.at_risk ?? 0),
+    unassigned: Number(row?.unassigned ?? 0),
   };
+}
+
+/**
+ * The same counts, split by priority (`KPI-3`'s Work card).
+ *
+ * The owner dashboard used to build this by reading `listDispatchBoard` with a
+ * limit of 1000 and filtering the array four ways. That is the `LEAD-8` trap
+ * described above, one screen further on: past a thousand open jobs the
+ * per-priority figures would have stopped rising, and a number that stops
+ * rising does not look truncated — it looks like a plateau, which is the
+ * failure mode nobody investigates. At the PRD's stated 5,000 jobs a year
+ * (§9) the owner's weekly read would have quietly become a page total.
+ *
+ * It lives here rather than in `reporting.ts` so that one place knows how to
+ * count the board. The dashboard's intent was always "the dispatch board is
+ * the source of truth, so the two cannot disagree" — and agreeing with the
+ * board means asking the same question of the same table, not reading its rows.
+ *
+ * Only priorities with at least one open job come back, which is what the
+ * dashboard renders: `group by` produces no row for a priority with no jobs,
+ * so the caller needs no filter of its own.
+ */
+export async function dispatchBoardCountsByPriority(
+  tx: TenantScopedTx,
+  now: Date = new Date(),
+  statuses: readonly JobStatus[] = OPEN_STATUSES,
+): Promise<readonly { priority: JobPriority; jobs: number; breached: number }[]> {
+  const at = now.toISOString();
+  const statusList = sql.join(
+    statuses.map((s) => sql`${s}`),
+    sql`, `,
+  );
+
+  const rows = (await tx.execute<{ priority: string; jobs: string; breached: string }>(sql`
+    select j.priority::text                                as priority,
+           count(*)::text                                  as jobs,
+           count(*) filter (where ${breachedInSql(at)})::text as breached
+      from jobs j
+     where j.deleted_at is null
+       and j.status::text in (${statusList})
+     group by j.priority
+     -- By the enum column, which is declared emergency-first, rather than by
+     -- the text it was cast to. They agree today only because the names happen
+     -- to be numbered, and the board orders by the enum too.
+     order by j.priority
+  `)) as unknown as { priority: string; jobs: string; breached: string }[];
+
+  return rows.map((r) => ({
+    priority: r.priority as JobPriority,
+    jobs: Number(r.jobs),
+    breached: Number(r.breached),
+  }));
 }
 
 /**
@@ -328,4 +918,1031 @@ export async function nextJobReference(tx: TenantScopedTx, year = new Date().get
   const reference = rows[0]?.reference;
   if (!reference) throw new Error("Could not allocate a job reference");
   return reference;
+}
+
+// ── Revisit tracking ─────────────────────────────────────────────────────────
+
+/**
+ * Raise a return visit for work already done, and say so on the new job.
+ *
+ * ── THE GAP THIS CLOSES ──────────────────────────────────────────────────────
+ *
+ * `jobs.parent_job_id` and `jobs.is_revisit` have existed since `0000_init`.
+ * Nothing has ever written either — every job raised by any path in this
+ * codebase leaves both null, `parent_job_id` is named only in a design-
+ * rationale comment (`domain/contracts.ts`), and `DASHBOARD_GAPS` names the
+ * consequence: "reactive" has no marker, so a job that is a return visit to
+ * work already done is indistinguishable from fresh work in every count that
+ * cares — PPM compliance, and any reactive-vs-planned split. This is the first
+ * writer.
+ *
+ * ── WHY THE GATE IS `requiresReturnVisit`, NOT AN OPERATOR'S SAY-SO ─────────
+ *
+ * A revisit is not "any job raised against the same property soon after
+ * another one" — that would tag genuinely unrelated work by coincidence of
+ * timing. It is specifically work owed because the LAST visit did not finish
+ * the job, and `JOB-13`'s outcome codes are where that fact already lives:
+ * `job_outcome_codes.requires_return_visit`, recorded by `recordJobOutcome`
+ * against the parent job's own `outcome_code`. Gating on it here is what makes
+ * `is_revisit` mean something rather than being a checkbox an operator can
+ * tick on any job for any reason — the same distinction `JOB-13`'s outcome
+ * vocabulary itself protects by refusing free text.
+ *
+ * A parent with no recorded outcome, or an outcome that does not call for one
+ * (`fixed_first_visit`, for instance) is refused: raising a "return visit"
+ * off nothing said would defeat the entire point of recording outcomes, which
+ * is that the return-visit rate (`outcomePosition`, `domain/reporting.ts`) can
+ * be trusted.
+ *
+ * ── WHY THIS DOES NOT TOUCH ANY EXISTING ROW ────────────────────────────────
+ *
+ * No backfill. Every job raised before this function existed has
+ * `parent_job_id` and `is_revisit` null, and a genuine revisit raised by hand
+ * (a dispatcher creating a plain new job for work already attempted) is
+ * byte-for-byte identical to fresh work in those rows — nothing distinguishes
+ * the two populations, which is the same shape of problem `0040` refused to
+ * backfill for `job_visits.arrived_at`. `G11` (first-time-fix rate) is not
+ * built from this either, for the separate and already-documented reason in
+ * `DASHBOARD_GAPS`: it needs a per-visit outcome and enough post-cutover
+ * history, neither of which exists yet. What this DOES support, from today
+ * forward, is `outcomePosition`'s return-visit rate actually meaning
+ * "work that came back", instead of counting outcome codes with no way to
+ * confirm the return visit it predicted ever happened.
+ */
+export async function raiseReturnVisit(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    parentJobId: string;
+    title?: string | undefined;
+    scheduledFor?: Date | undefined;
+    priority?: JobPriority | undefined;
+  },
+): Promise<{ jobId: string; reference: string }> {
+  const parentRows = await tx
+    .select({
+      id: schema.jobs.id,
+      reference: schema.jobs.reference,
+      customerId: schema.jobs.customerId,
+      propertyId: schema.jobs.propertyId,
+      unitId: schema.jobs.unitId,
+      assetId: schema.jobs.assetId,
+      serviceSlug: schema.jobs.serviceSlug,
+      title: schema.jobs.title,
+      priority: schema.jobs.priority,
+      isOutdoor: schema.jobs.isOutdoor,
+      outcomeCode: schema.jobs.outcomeCode,
+      contractId: schema.jobs.contractId,
+    })
+    .from(schema.jobs)
+    .where(eq(schema.jobs.id, input.parentJobId))
+    .limit(1);
+
+  const parent = parentRows[0];
+  if (!parent) throw new Error("Job not found in this tenant");
+
+  if (!parent.outcomeCode) {
+    throw new UserFacingError(
+      "This job has no recorded outcome yet. Record what happened on the visit before raising a " +
+        "return visit against it.",
+    );
+  }
+
+  const outcomeRows = await tx
+    .select({
+      label: schema.jobOutcomeCodes.label,
+      requiresReturnVisit: schema.jobOutcomeCodes.requiresReturnVisit,
+    })
+    .from(schema.jobOutcomeCodes)
+    .where(eq(schema.jobOutcomeCodes.code, parent.outcomeCode))
+    .limit(1);
+
+  const outcome = outcomeRows[0];
+  if (!outcome?.requiresReturnVisit) {
+    throw new UserFacingError(
+      `"${outcome?.label ?? parent.outcomeCode}" does not call for a return visit. Raise an ` +
+        "ordinary job instead if more work is genuinely needed.",
+    );
+  }
+
+  const calendar = await loadWorkingCalendar(tx);
+  const priority = input.priority ?? (parent.priority as JobPriority);
+  const { respondByAt, resolveByAt } = computeSlaDeadlines(priority, new Date(), undefined, calendar);
+  const reference = await nextJobReference(tx);
+
+  const [job] = await tx
+    .insert(schema.jobs)
+    .values({
+      tenantId: ctx.tenantId,
+      reference,
+      customerId: parent.customerId,
+      propertyId: parent.propertyId,
+      unitId: parent.unitId,
+      assetId: parent.assetId,
+      serviceSlug: parent.serviceSlug,
+      title: input.title ?? `Return visit: ${parent.title}`,
+      status: "triaged",
+      priority,
+      source: "internal",
+      isOutdoor: parent.isOutdoor,
+      contractId: parent.contractId,
+      scheduledFor: input.scheduledFor ?? null,
+      respondByAt,
+      resolveByAt,
+      // The whole point: named to its parent and flagged, so PPM compliance,
+      // first-time-fix maths and any reactive/planned split can tell this
+      // apart from fresh work.
+      parentJobId: parent.id,
+      isRevisit: true,
+      createdById: ctx.userId ?? null,
+    })
+    .returning({ id: schema.jobs.id });
+
+  if (!job) throw new Error("Failed to create the return-visit job");
+
+  await tx.insert(schema.jobEvents).values({
+    tenantId: ctx.tenantId,
+    jobId: job.id,
+    fromStatus: null,
+    toStatus: "triaged",
+    note: `Return visit for ${parent.reference} — ${outcome.label}`,
+    actorId: ctx.userId ?? null,
+    actorKind: "user",
+  });
+
+  return { jobId: job.id, reference };
+}
+
+// ── The jobs list: search and keyset pagination (`LEAD-8`) ───────────────────
+
+export interface JobSearchRow {
+  readonly id: string;
+  readonly createdAt: Date;
+  readonly reference: string;
+  readonly title: string;
+  readonly status: JobStatus;
+  readonly priority: JobPriority;
+  readonly serviceSlug: string;
+  readonly isOutdoor: boolean;
+  readonly scheduledFor: Date | null;
+  readonly respondByAt: Date | null;
+  readonly resolveByAt: Date | null;
+  readonly completedAt: Date | null;
+  readonly customerName: string;
+  readonly propertyName: string;
+  readonly propertyArea: string | null;
+  readonly propertyCity: string;
+  readonly technicianName: string | null;
+  readonly contractReference: string | null;
+  readonly sla: SlaState;
+}
+
+/** The largest page anybody may ask for. A limit a caller can set is not a limit. */
+const MAX_JOB_PAGE = 100;
+
+/**
+ * Search and page the jobs list (`LEAD-8`, closing `TD-10`).
+ *
+ * ── WHAT THIS REPLACES ──────────────────────────────────────────────────────
+ *
+ * The jobs screen called `listDispatchBoard` with `limit: 300`. That is not
+ * "the first three hundred jobs" — it is "every job after the three hundredth
+ * is unreachable", with nothing on the screen saying so and no next page to
+ * reach it by. At 5,000 jobs a year (PRD §9) the cap is hit inside the first
+ * year, and the jobs it hides are the oldest ones: exactly the rows somebody
+ * is looking for when they open this screen with a reference in their hand.
+ *
+ * ── WHY THE ORDER IS created_at DESC AND NOT THE BOARD'S ────────────────────
+ *
+ * The dispatch board sorts by SLA consequence and stays capped — see the note
+ * on `listDispatchBoard`. This is the other question: a list somebody reads or
+ * searches, where newest-first is the only ordering that makes a cursor a total
+ * order and therefore the only one that can page without skipping rows. The two
+ * screens shared one function; they now share joins and a row shape instead,
+ * which is the part that was actually worth sharing.
+ *
+ * The cursor is (created_at, id), row-wise, driving off jobs_keyset_idx.
+ */
+export async function searchJobs(
+  tx: TenantScopedTx,
+  options?: {
+    q?: string | undefined;
+    statuses?: readonly JobStatus[] | undefined;
+    cursor?: string | undefined;
+    limit?: number | undefined;
+    now?: Date | undefined;
+  },
+): Promise<Page<JobSearchRow>> {
+  const limit = Math.min(Math.max(options?.limit ?? 25, 1), MAX_JOB_PAGE);
+  const cursor = decodeCursor(options?.cursor);
+  const now = options?.now ?? new Date();
+
+  const statusFilter = jobStatusFilter(options?.statuses);
+  const search = jobSearchPredicate(options?.q);
+
+  // Row-wise, not created_at < x OR (created_at = x AND id < y). Postgres can
+  // drive the tuple comparison straight off the composite index; the OR form
+  // usually cannot.
+  const keyset = cursor
+    ? sql`and (j.created_at, j.id) < (${cursor.createdAt.toISOString()}::timestamptz, ${cursor.id}::uuid)`
+    : sql``;
+
+  const rows = (await tx.execute<Record<string, never>>(sql`
+    select j.id, j.created_at, j.reference, j.title, j.status::text as status,
+           j.priority::text as priority, j.service_slug, j.is_outdoor,
+           j.scheduled_for, j.respond_by_at, j.resolve_by_at, j.completed_at,
+           c.name as customer_name,
+           p.name as property_name, p.area as property_area, p.city as property_city,
+           ct.reference as contract_reference,
+           ${ASSIGNED_TECHNICIAN_NAME_J} as technician_name
+      from jobs j
+      join customers c on c.id = j.customer_id
+      join properties p on p.id = j.property_id
+      left join contracts ct on ct.id = j.contract_id
+     where j.deleted_at is null
+       ${statusFilter}
+       ${search}
+       ${keyset}
+     order by j.created_at desc, j.id desc
+     limit ${limit + 1}
+  `)) as unknown as {
+    id: string;
+    created_at: string;
+    reference: string;
+    title: string;
+    status: string;
+    priority: string;
+    service_slug: string;
+    is_outdoor: boolean;
+    scheduled_for: string | null;
+    respond_by_at: string | null;
+    resolve_by_at: string | null;
+    completed_at: string | null;
+    customer_name: string;
+    property_name: string;
+    property_area: string | null;
+    property_city: string;
+    contract_reference: string | null;
+    technician_name: string | null;
+  }[];
+
+  const mapped: JobSearchRow[] = rows.map((r) => {
+    const createdAt = requiredRowDate(r.created_at);
+    const resolveByAt = rowDate(r.resolve_by_at);
+    const completedAt = rowDate(r.completed_at);
+    return {
+      id: r.id,
+      createdAt,
+      reference: r.reference,
+      title: r.title,
+      status: r.status as JobStatus,
+      priority: r.priority as JobPriority,
+      serviceSlug: r.service_slug,
+      isOutdoor: r.is_outdoor,
+      scheduledFor: rowDate(r.scheduled_for),
+      respondByAt: rowDate(r.respond_by_at),
+      resolveByAt,
+      completedAt,
+      customerName: r.customer_name,
+      propertyName: r.property_name,
+      propertyArea: r.property_area,
+      propertyCity: r.property_city,
+      technicianName: r.technician_name,
+      contractReference: r.contract_reference,
+      sla: slaState({ createdAt, resolveByAt, completedAt, now }),
+    };
+  });
+
+  // The LIMIT n + 1 trick: asking for one more row than the page needs makes
+  // "is there a next page" a fact rather than a guess, without a second count.
+  if (mapped.length <= limit) return { rows: mapped, nextCursor: null };
+  const page = mapped.slice(0, limit);
+  const last = page[page.length - 1];
+  return {
+    rows: page,
+    nextCursor: last ? encodeCursor({ createdAt: last.createdAt, id: last.id }) : null,
+  };
+}
+
+/**
+ * How many jobs match, tenant-wide.
+ *
+ * A deliberate second query, and the reason is the trap `LEAD-8` names: a
+ * headline figure derived from the page is not a total, it is a page size
+ * wearing a total's clothing, and the moment paging exists the number silently
+ * becomes wrong. So the count is computed over every matching row and the page
+ * is computed separately; neither can turn into the other by accident.
+ */
+export async function countJobs(
+  tx: TenantScopedTx,
+  options?: { q?: string | undefined; statuses?: readonly JobStatus[] | undefined },
+): Promise<number> {
+  const statusFilter = jobStatusFilter(options?.statuses);
+  const search = jobSearchPredicate(options?.q);
+
+  const rows = (await tx.execute<Record<string, never>>(sql`
+    select count(*) as total
+      from jobs j
+     where j.deleted_at is null
+       ${statusFilter}
+       ${search}
+  `)) as unknown as { total: string }[];
+
+  return Number(rows[0]?.total ?? 0);
+}
+
+function jobStatusFilter(statuses: readonly JobStatus[] | undefined) {
+  if (!statuses || statuses.length === 0) return sql``;
+  const list = sql.join(
+    statuses.map((s) => sql`${s}`),
+    sql`, `,
+  );
+  return sql`and j.status::text in (${list})`;
+}
+
+/**
+ * One box, two kinds of match.
+ *
+ * Somebody searching jobs types a reference they were quoted on the phone or a
+ * few words of what went wrong, and does not think of those as different
+ * questions. Both are ILIKE with a leading wildcard, which no btree index can
+ * serve — which is why migration 0023 puts trigram GIN indexes on both columns
+ * rather than leaving this a sequential scan wearing a WHERE clause.
+ */
+function jobSearchPredicate(q: string | undefined) {
+  const term = q?.trim();
+  if (!term) return sql``;
+  const like = `%${term.replace(/[%_\\]/g, (m) => `\\${m}`)}%`;
+  return sql`and (j.reference ilike ${like} or j.title ilike ${like})`;
+}
+
+// ── JOB-7. The schedule ──────────────────────────────────────────────────────
+
+/**
+ * ── WHERE THE SCHEDULE ENDS AND THE DISPATCH BOARD BEGINS ───────────────────
+ *
+ * These are two screens over the same table and they are not the same screen,
+ * so the boundary is worth stating rather than discovering later.
+ *
+ * The **dispatch board** answers *what needs a decision now*. Its unit is the
+ * **job**, its axis is **urgency** — priority then time-to-breach — it has no
+ * date range at all, and it is at its best when it is empty. A job that is
+ * fully scheduled with a technician on the way has stopped being the
+ * dispatcher's problem, and it is still on that board only because the SLA
+ * clock has not stopped.
+ *
+ * The **schedule** answers *who is doing what, when*. Its unit is the **visit**
+ * (`job_visits`, which is why `JOB-12` multi-visit work has a place here and
+ * nowhere on the board), its axis is **time within a bounded window**, and its
+ * rows are **people**. It is at its best when it is full and even. Urgency is
+ * not its ordering — a P1 and a P4 in the same hour occupy the same amount of
+ * that hour.
+ *
+ * The practical test used when deciding what belongs where: if the answer
+ * changes when you change the date range, it belongs to the schedule; if it
+ * changes when the clock ticks, it belongs to the board. Unassigned work is the
+ * one thing both need, and it appears here as `unplaced` — a bounded rail of
+ * work to place, not a second copy of the board's ordering.
+ */
+
+/** A visit on the schedule grid. Times are pre-resolved to Dubai by Postgres. */
+export interface ScheduledVisit {
+  readonly visitId: string;
+  readonly jobId: string;
+  readonly reference: string;
+  readonly title: string;
+  readonly jobStatus: JobStatus;
+  readonly visitStatus: string;
+  readonly priority: JobPriority;
+  readonly serviceSlug: string;
+  readonly isOutdoor: boolean;
+  readonly technicianId: string;
+  readonly technicianName: string;
+  readonly customerName: string;
+  readonly propertyName: string;
+  readonly propertyArea: string | null;
+  /** Dubai-local `YYYY-MM-DD` the visit starts on, computed in SQL. */
+  readonly day: string;
+  /** Dubai-local minutes past midnight, computed in SQL. */
+  readonly startMinute: number;
+  /** End minute, clamped to the start's own day so a block never wraps. */
+  readonly endMinute: number;
+  readonly scheduledStart: Date;
+  readonly scheduledEnd: Date | null;
+}
+
+/** A lane on the schedule: one technician, and the days they are unavailable. */
+export interface ScheduleLane {
+  readonly technicianId: string;
+  readonly fullName: string;
+  readonly primaryTrade: string;
+  readonly grade: string;
+  /** `HR-7` approved leave, expanded to Dubai-local days inside the window. */
+  readonly leaveDays: readonly { readonly day: string; readonly kind: string }[];
+  /** Planned shifts inside the window, as Dubai-local day and minute spans. */
+  readonly shifts: readonly {
+    readonly day: string;
+    readonly startMinute: number;
+    readonly endMinute: number;
+    readonly kind: string;
+  }[];
+}
+
+/** Work with no visit yet: the rail the dispatcher drags from. */
+export interface UnplacedJob {
+  readonly id: string;
+  readonly reference: string;
+  readonly title: string;
+  readonly status: JobStatus;
+  readonly priority: JobPriority;
+  readonly serviceSlug: string;
+  readonly isOutdoor: boolean;
+  readonly customerName: string;
+  readonly propertyName: string;
+  readonly resolveByAt: Date | null;
+  readonly sla: SlaState;
+}
+
+export interface Schedule {
+  /** Dubai-local `YYYY-MM-DD`, inclusive at both ends. */
+  readonly from: string;
+  readonly to: string;
+  /** Every day in the window, generated by Postgres, never by JavaScript. */
+  readonly days: readonly string[];
+  /** The window before and after this one, and today, all in Dubai. */
+  readonly previousFrom: string;
+  readonly nextFrom: string;
+  readonly today: string;
+  readonly lanes: readonly ScheduleLane[];
+  readonly visits: readonly ScheduledVisit[];
+  readonly unplaced: readonly UnplacedJob[];
+  /** Tenant-wide, so the rail can say how much it is not showing. */
+  readonly unplacedTotal: number;
+  /** The tenant's calendar, so the view draws the ban band it actually has. */
+  readonly calendar: WorkingCalendar;
+}
+
+/** How many unplaced jobs the rail shows before it starts saying "and N more". */
+const UNPLACED_RAIL_LIMIT = 25;
+
+/**
+ * The widest window anybody may ask for.
+ *
+ * The range arrives in a query string, so it is attacker-controlled and much
+ * more often simply a typo. A month is more schedule than a person reads and
+ * far more than a `generate_series` should be asked to cross with a lateral
+ * join on every lane.
+ */
+const MAX_SCHEDULE_DAYS = 31;
+
+/**
+ * Everything the schedule view renders, for one Dubai-local date range.
+ *
+ * ── WHY EVERY DATE BOUNDARY IS IN SQL ───────────────────────────────────────
+ *
+ * A visit at 00:30 Dubai is 20:30 the previous day in UTC. Bucketing visits
+ * into days in JavaScript means doing that conversion on a server whose zone is
+ * whatever the platform set, and the bug it produces is not a crash: it is a
+ * visit that appears on the wrong day, once, for the people who start early.
+ * So Postgres does it — `at time zone 'Asia/Dubai'` for the bucket, and
+ * `generate_series` for the list of days — and the range predicate is written
+ * against the raw timestamptz column so it still uses an index.
+ *
+ * ── WHAT THE CALENDAR IS DOING IN A QUERY FUNCTION ──────────────────────────
+ *
+ * It is returned, not applied. The summer midday ban is a property of the
+ * tenant's configured calendar (`ADM-10`), and the view has to draw it as a
+ * blocked band; reading it here rather than in the page is what stops a screen
+ * quietly falling back to `DEFAULT_CALENDAR` and drawing a band that is not the
+ * one this tenant is inspected against.
+ */
+export async function loadSchedule(
+  tx: TenantScopedTx,
+  options: {
+    /** Dubai-local `YYYY-MM-DD`, the first day of the window. */
+    from: string;
+    /** How many days the window covers. 1 for a day view, 7 for a week. */
+    days: number;
+    now?: Date | undefined;
+    calendar?: WorkingCalendar | undefined;
+  },
+): Promise<Schedule> {
+  const { from } = options;
+  const now = options.now ?? new Date();
+  const dayCount = Math.min(Math.max(Math.trunc(options.days), 1), MAX_SCHEDULE_DAYS);
+
+  // The last day of the window, as a SQL expression rather than a JavaScript
+  // value. Every date boundary on this screen is Postgres arithmetic on a date,
+  // including this one — adding days in JavaScript is how a schedule ends up
+  // one day wide at the end of a month.
+  const toDate = sql`(${from}::date + ${dayCount - 1}::int)`;
+
+  const [
+    calendar,
+    dayRows,
+    boundaryRows,
+    visitRows,
+    laneRows,
+    leaveRows,
+    shiftRows,
+    unplacedRows,
+    unplacedTotal,
+  ] = await Promise.all([
+      options.calendar ? Promise.resolve(options.calendar) : loadWorkingCalendar(tx),
+
+      tx.execute<Record<string, never>>(sql`
+        select to_char(d, 'YYYY-MM-DD') as day
+          from generate_series(${from}::date, ${toDate}, interval '1 day') d
+      `) as unknown as Promise<{ day: string }[]>,
+
+      // Where the previous and next windows start, and what day it is in
+      // Dubai — so the paging controls on the screen never need a date
+      // calculation in JavaScript either.
+      tx.execute<Record<string, never>>(sql`
+        select to_char(${from}::date - ${dayCount}::int, 'YYYY-MM-DD') as previous_from,
+               to_char(${from}::date + ${dayCount}::int, 'YYYY-MM-DD') as next_from,
+               to_char((${now.toISOString()}::timestamptz at time zone 'Asia/Dubai')::date, 'YYYY-MM-DD') as today
+      `) as unknown as Promise<{ previous_from: string; next_from: string; today: string }[]>,
+
+      // The range is expressed against the raw column, so the composite index
+      // on (tenant_id, scheduled_start, technician_id) still drives it. Writing
+      // it as a predicate on the converted value would force a scan.
+      tx.execute<Record<string, never>>(sql`
+        select v.id as visit_id, v.job_id, v.technician_id,
+               v.status::text as visit_status,
+               v.scheduled_start, v.scheduled_end,
+               to_char(v.scheduled_start at time zone 'Asia/Dubai', 'YYYY-MM-DD') as day,
+               extract(hour from (v.scheduled_start at time zone 'Asia/Dubai')) * 60
+                 + extract(minute from (v.scheduled_start at time zone 'Asia/Dubai')) as start_minute,
+               -- Clamped to the start's own day. A visit running past midnight
+               -- would otherwise produce an end minute smaller than its start
+               -- and a block that renders inside out.
+               least(
+                 1440,
+                 case
+                   when v.scheduled_end is null then null
+                   else extract(epoch from (v.scheduled_end - v.scheduled_start)) / 60
+                        + extract(hour from (v.scheduled_start at time zone 'Asia/Dubai')) * 60
+                        + extract(minute from (v.scheduled_start at time zone 'Asia/Dubai'))
+                 end
+               ) as end_minute,
+               j.reference, j.title, j.status::text as job_status,
+               j.priority::text as priority, j.service_slug, j.is_outdoor,
+               c.name as customer_name, p.name as property_name, p.area as property_area,
+               t.full_name as technician_name
+          from job_visits v
+          join jobs j on j.id = v.job_id
+          join customers c on c.id = j.customer_id
+          join properties p on p.id = j.property_id
+          join technicians t on t.id = v.technician_id
+         where j.deleted_at is null
+           and v.scheduled_start is not null
+           and v.scheduled_start >= (${from}::date::timestamp at time zone 'Asia/Dubai')
+           and v.scheduled_start < ((${toDate} + 1)::timestamp at time zone 'Asia/Dubai')
+           -- Retired plans are not on anyone's day. 'superseded' (0040) is a
+           -- visit a reassignment replaced before it began; leaving it here
+           -- would draw a block in the original technician's lane for work
+           -- somebody else is doing.
+           and v.status::text not in ('declined', 'aborted', 'superseded')
+         order by v.scheduled_start asc, t.full_name asc
+      `) as unknown as Promise<
+        {
+          visit_id: string;
+          job_id: string;
+          technician_id: string;
+          visit_status: string;
+          scheduled_start: string;
+          scheduled_end: string | null;
+          day: string;
+          start_minute: string;
+          end_minute: string | null;
+          reference: string;
+          title: string;
+          job_status: string;
+          priority: string;
+          service_slug: string;
+          is_outdoor: boolean;
+          customer_name: string;
+          property_name: string;
+          property_area: string | null;
+          technician_name: string;
+        }[]
+      >,
+
+      tx.execute<Record<string, never>>(sql`
+        select t.id, t.full_name, t.primary_trade, t.grade
+          from technicians t
+         where t.is_active and t.deleted_at is null
+         order by t.full_name asc
+      `) as unknown as Promise<
+        { id: string; full_name: string; primary_trade: string; grade: string }[]
+      >,
+
+      // HR-7. Approved leave only: a pending request is a request, and greying
+      // out a lane for one would have the dispatcher planning around an absence
+      // nobody has agreed to. Expanded to days in SQL because the span is
+      // half-open at neither end and the arithmetic is a date arithmetic.
+      tx.execute<Record<string, never>>(sql`
+        select l.technician_id, l.kind, to_char(d, 'YYYY-MM-DD') as day
+          from leave_requests l
+          cross join lateral generate_series(
+            greatest((l.starts_on at time zone 'Asia/Dubai')::date, ${from}::date),
+            least((l.ends_on at time zone 'Asia/Dubai')::date, ${toDate}),
+            interval '1 day'
+          ) d
+         where l.status = 'approved'
+           and l.deleted_at is null
+           and (l.starts_on at time zone 'Asia/Dubai')::date <= ${toDate}
+           and (l.ends_on at time zone 'Asia/Dubai')::date >= ${from}::date
+      `) as unknown as Promise<{ technician_id: string; kind: string; day: string }[]>,
+
+      tx.execute<Record<string, never>>(sql`
+        select s.technician_id, s.kind,
+               to_char(s.starts_at at time zone 'Asia/Dubai', 'YYYY-MM-DD') as day,
+               extract(hour from (s.starts_at at time zone 'Asia/Dubai')) * 60
+                 + extract(minute from (s.starts_at at time zone 'Asia/Dubai')) as start_minute,
+               least(
+                 1440,
+                 extract(epoch from (s.ends_at - s.starts_at)) / 60
+                   + extract(hour from (s.starts_at at time zone 'Asia/Dubai')) * 60
+                   + extract(minute from (s.starts_at at time zone 'Asia/Dubai'))
+               ) as end_minute
+          from shifts s
+         where s.deleted_at is null
+           and s.starts_at >= (${from}::date::timestamp at time zone 'Asia/Dubai')
+           and s.starts_at < ((${toDate} + 1)::timestamp at time zone 'Asia/Dubai')
+      `) as unknown as Promise<
+        {
+          technician_id: string;
+          kind: string;
+          day: string;
+          start_minute: string;
+          end_minute: string;
+        }[]
+      >,
+
+      tx.execute<Record<string, never>>(sql`
+        select j.id, j.reference, j.title, j.status::text as status,
+               j.priority::text as priority, j.service_slug, j.is_outdoor,
+               j.created_at, j.resolve_by_at, j.completed_at,
+               c.name as customer_name, p.name as property_name
+          from jobs j
+          join customers c on c.id = j.customer_id
+          join properties p on p.id = j.property_id
+         where j.deleted_at is null
+           and j.status::text in (${sql.join(
+             OPEN_STATUSES.map((s) => sql`${s}`),
+             sql`, `,
+           )})
+           and not exists (
+             select 1 from job_visits v
+              where v.job_id = j.id and v.status in (${ASSIGNED_VISIT_STATUS_LIST})
+           )
+         order by j.priority asc, j.resolve_by_at asc nulls last, j.created_at asc
+         limit ${UNPLACED_RAIL_LIMIT}
+      `) as unknown as Promise<
+        {
+          id: string;
+          reference: string;
+          title: string;
+          status: string;
+          priority: string;
+          service_slug: string;
+          is_outdoor: boolean;
+          created_at: string;
+          resolve_by_at: string | null;
+          completed_at: string | null;
+          customer_name: string;
+          property_name: string;
+        }[]
+      >,
+
+      // Its own aggregate, not the rail's length. The rail is capped at 25 and
+      // the number beside it has to be the truth about the tenant.
+      tx.execute<Record<string, never>>(sql`
+        select count(*) as total
+          from jobs j
+         where j.deleted_at is null
+           and j.status::text in (${sql.join(
+             OPEN_STATUSES.map((s) => sql`${s}`),
+             sql`, `,
+           )})
+           and not exists (
+             select 1 from job_visits v
+              where v.job_id = j.id and v.status in (${ASSIGNED_VISIT_STATUS_LIST})
+           )
+      `) as unknown as Promise<{ total: string }[]>,
+    ]);
+
+  const leaveByTechnician = new Map<string, { day: string; kind: string }[]>();
+  for (const row of leaveRows) {
+    const list = leaveByTechnician.get(row.technician_id) ?? [];
+    list.push({ day: row.day, kind: row.kind });
+    leaveByTechnician.set(row.technician_id, list);
+  }
+
+  const shiftsByTechnician = new Map<
+    string,
+    { day: string; startMinute: number; endMinute: number; kind: string }[]
+  >();
+  for (const row of shiftRows) {
+    const list = shiftsByTechnician.get(row.technician_id) ?? [];
+    list.push({
+      day: row.day,
+      startMinute: Number(row.start_minute),
+      endMinute: Number(row.end_minute),
+      kind: row.kind,
+    });
+    shiftsByTechnician.set(row.technician_id, list);
+  }
+
+  const days = dayRows.map((d) => d.day);
+  const boundary = boundaryRows[0];
+
+  return {
+    from,
+    // The last generated day, not a computed one: if the two ever disagreed
+    // the header would be describing a window the rows do not come from.
+    to: days[days.length - 1] ?? from,
+    days,
+    previousFrom: boundary?.previous_from ?? from,
+    nextFrom: boundary?.next_from ?? from,
+    today: boundary?.today ?? from,
+    lanes: laneRows.map((t) => ({
+      technicianId: t.id,
+      fullName: t.full_name,
+      primaryTrade: t.primary_trade,
+      grade: t.grade,
+      leaveDays: leaveByTechnician.get(t.id) ?? [],
+      shifts: shiftsByTechnician.get(t.id) ?? [],
+    })),
+    visits: visitRows.map((r) => {
+      const startMinute = Number(r.start_minute);
+      return {
+        visitId: r.visit_id,
+        jobId: r.job_id,
+        reference: r.reference,
+        title: r.title,
+        jobStatus: r.job_status as JobStatus,
+        visitStatus: r.visit_status,
+        priority: r.priority as JobPriority,
+        serviceSlug: r.service_slug,
+        isOutdoor: r.is_outdoor,
+        technicianId: r.technician_id,
+        technicianName: r.technician_name,
+        customerName: r.customer_name,
+        propertyName: r.property_name,
+        propertyArea: r.property_area,
+        day: r.day,
+        startMinute,
+        // A visit with no end is shown as an hour: long enough to be a block a
+        // person can see and click, short enough that it does not claim time
+        // nobody has actually committed.
+        endMinute: r.end_minute === null ? startMinute + 60 : Number(r.end_minute),
+        scheduledStart: requiredRowDate(r.scheduled_start),
+        scheduledEnd: rowDate(r.scheduled_end),
+      };
+    }),
+    unplaced: unplacedRows.map((r) => ({
+      id: r.id,
+      reference: r.reference,
+      title: r.title,
+      status: r.status as JobStatus,
+      priority: r.priority as JobPriority,
+      serviceSlug: r.service_slug,
+      isOutdoor: r.is_outdoor,
+      customerName: r.customer_name,
+      propertyName: r.property_name,
+      resolveByAt: rowDate(r.resolve_by_at),
+      sla: slaState({
+        createdAt: requiredRowDate(r.created_at),
+        resolveByAt: rowDate(r.resolve_by_at),
+        completedAt: rowDate(r.completed_at),
+        now,
+      }),
+    })),
+    unplacedTotal: Number(unplacedTotal[0]?.total ?? 0),
+    calendar,
+  };
+}
+
+/**
+ * Visit states that have already happened, been refused, or been retired.
+ * Not movable.
+ *
+ * `superseded` (`0040`) is the odd one out and belongs here anyway: it has not
+ * happened and never will. A dispatcher dragging it across the grid is moving a
+ * plan that was replaced, and the honest refusal is that there is nothing there
+ * to move rather than a silent reschedule of a visit nobody will attend.
+ */
+const SETTLED_VISIT_STATUSES = ["completed", "no_access", "aborted", "declined", "superseded"];
+
+/** Job states in which moving a visit still means anything. */
+const RESCHEDULABLE_JOB_STATUSES: readonly JobStatus[] = [
+  "submitted",
+  "triaged",
+  "scheduled",
+  "dispatched",
+  "en_route",
+  "on_site",
+  "paused",
+];
+
+/**
+ * Move an existing visit to a new window (`JOB-7`, "drag to reschedule").
+ *
+ * ── WHY THE CHECKS ARE HERE AND NOT IN THE DROP HANDLER ─────────────────────
+ *
+ * The grid the dispatcher dragged across was rendered at some point in the
+ * past, against a calendar that may since have gained a public holiday and a
+ * technician who may since have had leave approved. A check that lives in the
+ * component is an affordance; this is the control. `TRD §7.3` is explicit that
+ * it belongs in the domain layer.
+ *
+ * Three refusals, in descending order of consequence:
+ *
+ *  1. **The summer midday ban** (`JOB-6`), for outdoor work only. AED 5,000 per
+ *     worker, capped at AED 50,000, plus a company classification downgrade.
+ *     A hard block — there is no override argument on this function, because a
+ *     block a caller can pass a flag to skip is a warning wearing a costume.
+ *     Indoor work moves through the window normally, which is the half people
+ *     get wrong in the other direction.
+ *  2. **Approved leave** (`HR-7` feeding `JOB-8`). Not a statutory penalty, but
+ *     a visit booked onto somebody's approved annual leave is a visit that will
+ *     not happen, and finding that out on the day costs a customer.
+ *  3. **A visit that has already happened.** Completed, aborted, refused for
+ *     no access — the record of what occurred is not a plan to be edited.
+ *
+ * This deliberately does NOT change the technician. Moving a visit into another
+ * person's lane is re-assignment: it has to re-run skill matching, the `HR-9`
+ * certification block and the availability rules of `JOB-8`, all of which live
+ * in `assignment.ts`. Doing it here would mean a second, weaker assignment path
+ * that skips those — so the schedule refuses cross-lane moves rather than
+ * quietly performing a worse version of one.
+ */
+export async function rescheduleVisit(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    visitId: string;
+    scheduledStart: Date;
+    scheduledEnd?: Date | undefined;
+    /** Supplied by callers that already loaded it; read here otherwise. */
+    calendar?: WorkingCalendar | undefined;
+  },
+): Promise<{
+  jobId: string;
+  jobReference: string;
+  technicianId: string;
+  technicianName: string;
+  from: Date | null;
+  scheduledStart: Date;
+  scheduledEnd: Date;
+}> {
+  const rows = (await tx.execute<Record<string, never>>(sql`
+    select v.id, v.job_id, v.technician_id, v.status::text as visit_status,
+           v.scheduled_start, v.scheduled_end,
+           j.reference, j.status::text as job_status, j.is_outdoor,
+           t.full_name as technician_name
+      from job_visits v
+      join jobs j on j.id = v.job_id
+      join technicians t on t.id = v.technician_id
+     where v.id = ${input.visitId}::uuid
+     limit 1
+  `)) as unknown as {
+    id: string;
+    job_id: string;
+    technician_id: string;
+    visit_status: string;
+    scheduled_start: string | null;
+    scheduled_end: string | null;
+    reference: string;
+    job_status: string;
+    is_outdoor: boolean;
+    technician_name: string;
+  }[];
+
+  const visit = rows[0];
+  // RLS makes "not found" and "belongs to another tenant" indistinguishable
+  // here, which is the intended behaviour.
+  if (!visit) throw new UserFacingError("That visit is not in this tenant.");
+
+  // Superseded gets its own sentence, because the shared one would be a small
+  // lie: nothing happened on a retired visit. The grid no longer draws them at
+  // all, so reaching this is a stale page rather than a misclick, and saying so
+  // is what stops the dispatcher dragging it again.
+  if (visit.visit_status === "superseded") {
+    throw new UserFacingError(
+      "This visit was replaced when the job was reassigned, so there is nothing here to move. " +
+        "Reload the schedule — the technician who has the job now is on it.",
+    );
+  }
+
+  if (SETTLED_VISIT_STATUSES.includes(visit.visit_status)) {
+    throw new UserFacingError(
+      `This visit is already ${visit.visit_status.replace("_", " ")} — what happened cannot be rescheduled. ` +
+        "Raise a return visit instead.",
+    );
+  }
+
+  if (!RESCHEDULABLE_JOB_STATUSES.includes(visit.job_status as JobStatus)) {
+    throw new UserFacingError(
+      `${visit.reference} is ${STATUS_LABEL[visit.job_status as JobStatus] ?? visit.job_status} and its visits are no longer scheduled.`,
+    );
+  }
+
+  // Two hours is what assignTechnician assumes when it is given no end, and the
+  // two have to agree or a dragged visit would silently change length.
+  const scheduledEnd =
+    input.scheduledEnd ?? new Date(input.scheduledStart.getTime() + 2 * 60 * 60 * 1000);
+
+  if (scheduledEnd <= input.scheduledStart) {
+    throw new UserFacingError("A visit has to end after it starts.");
+  }
+
+  const calendar = input.calendar ?? (await loadWorkingCalendar(tx));
+
+  // JOB-6. The hard block.
+  if (visit.is_outdoor) {
+    const check = checkOutdoorWindow(input.scheduledStart, scheduledEnd, calendar);
+    if (!check.allowed) {
+      throw new UserFacingError(
+        check.nextAllowed
+          ? `${check.message} The first legal start after that is ${check.nextAllowed.toISOString()}.`
+          : (check.message ?? "That window is not permitted for outdoor work."),
+      );
+    }
+  }
+
+  // HR-7 into JOB-8. Approved leave, on the Dubai-local day the visit starts.
+  const leave = (await tx.execute<Record<string, never>>(sql`
+    select l.kind
+      from leave_requests l
+     where l.technician_id = ${visit.technician_id}::uuid
+       and l.status = 'approved'
+       and l.deleted_at is null
+       and (l.starts_on at time zone 'Asia/Dubai')::date
+           <= (${input.scheduledStart.toISOString()}::timestamptz at time zone 'Asia/Dubai')::date
+       and (l.ends_on at time zone 'Asia/Dubai')::date
+           >= (${input.scheduledStart.toISOString()}::timestamptz at time zone 'Asia/Dubai')::date
+     limit 1
+  `)) as unknown as { kind: string }[];
+
+  const onLeave = leave[0];
+  if (onLeave) {
+    throw new UserFacingError(
+      `${visit.technician_name} is on approved ${onLeave.kind} leave that day. Move the visit or assign somebody else.`,
+    );
+  }
+
+  await tx.execute(sql`
+    update job_visits
+       set scheduled_start = ${input.scheduledStart.toISOString()}::timestamptz,
+           scheduled_end = ${scheduledEnd.toISOString()}::timestamptz,
+           updated_at = now()
+     where id = ${input.visitId}::uuid
+  `);
+
+  // The job's own scheduled_for is what the dispatch board and the customer
+  // notification read, so it follows the earliest live visit rather than being
+  // left to disagree with the grid.
+  await tx.execute(sql`
+    update jobs j
+       set scheduled_for = (
+             select min(v.scheduled_start)
+               from job_visits v
+              where v.job_id = j.id
+                and v.status::text not in ('declined', 'aborted', 'no_access', 'superseded')
+           ),
+           updated_at = now()
+     where j.id = ${visit.job_id}::uuid
+  `);
+
+  await writeAuditNote(tx, ctx, {
+    tableName: "job_visits",
+    recordId: input.visitId,
+    // Eleven characters. audit_log.action is varchar(16), which rules out
+    // "visit_rescheduled".
+    action: "rescheduled",
+    detail: {
+      rule: "JOB-7",
+      jobId: visit.job_id,
+      jobReference: visit.reference,
+      technicianId: visit.technician_id,
+      from: visit.scheduled_start,
+      to: input.scheduledStart.toISOString(),
+      end: scheduledEnd.toISOString(),
+      isOutdoor: visit.is_outdoor,
+    },
+  });
+
+  return {
+    jobId: visit.job_id,
+    jobReference: visit.reference,
+    technicianId: visit.technician_id,
+    technicianName: visit.technician_name,
+    from: rowDate(visit.scheduled_start),
+    scheduledStart: input.scheduledStart,
+    scheduledEnd,
+  };
 }

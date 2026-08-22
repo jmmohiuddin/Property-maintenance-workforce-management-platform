@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState, useId } from "react";
+import { useActionState, useId, useState } from "react";
 import { services, URGENCY, URGENCY_LABEL } from "@meridian/core";
 import { raiseRequest, type RequestState } from "./actions";
 import { Warning } from "@phosphor-icons/react/dist/ssr";
@@ -15,13 +15,42 @@ const inputStyle: React.CSSProperties = {
   borderColor: "var(--border-strong)",
 };
 
+/**
+ * `CON-13`. The equipment picker, and why it is here and not on triage.
+ *
+ * This is the one intake path where a registered asset can already exist —
+ * lead conversion creates the property alongside the job, so its picker would
+ * be empty every time. The person filling this in is usually standing in front
+ * of the machine, which makes them the best-placed person in the whole flow to
+ * say which one it is.
+ *
+ * It is optional, and stays optional. "I don't know" is an honest answer to
+ * "which chiller", and a required dropdown would collect a guess instead of a
+ * blank — a guess that writes a visit into the wrong plant's history, which is
+ * worse than no history at all because a tender gets priced off it.
+ *
+ * Filtered from an already-loaded list rather than fetched per property. The
+ * account's whole register came down with the page; see the server component.
+ */
 export function RequestForm({
   properties,
+  assets,
 }: {
   properties: { id: string; name: string; area: string | null; city: string }[];
+  assets: {
+    id: string;
+    propertyId: string;
+    name: string;
+    categoryLabel: string | null;
+    location: string | null;
+  }[];
 }) {
   const [state, formAction, pending] = useActionState(raiseRequest, INITIAL);
   const id = useId();
+
+  const onlyProperty = properties.length === 1 ? properties[0]!.id : "";
+  const [propertyId, setPropertyId] = useState(onlyProperty);
+  const here = assets.filter((a) => a.propertyId === propertyId);
 
   return (
     <form action={formAction} className="space-y-6">
@@ -50,7 +79,8 @@ export function RequestForm({
           id={`${id}-property`}
           name="propertyId"
           required
-          defaultValue={properties.length === 1 ? properties[0]!.id : ""}
+          value={propertyId}
+          onChange={(e) => setPropertyId(e.target.value)}
           className={inputClass}
           style={inputStyle}
         >
@@ -67,6 +97,42 @@ export function RequestForm({
           ))}
         </select>
       </div>
+
+      {/* CON-13. Only where there is plant on the register to point at. A
+          heading followed by "nothing here" on every request from every
+          customer without an asset register is how a field gets scrolled
+          past by the customers it was written for. `key` on the select
+          clears a stale choice when the property above changes — without
+          it, React keeps the old value and the request carries an asset
+          from the building the customer just navigated away from. */}
+      {here.length > 0 ? (
+        <div className="flex flex-col gap-2">
+          <label htmlFor={`${id}-asset`} className="text-[14px] font-medium">
+            Which equipment is it? (optional)
+          </label>
+          <select
+            key={propertyId}
+            id={`${id}-asset`}
+            name="assetId"
+            defaultValue=""
+            className={inputClass}
+            style={inputStyle}
+          >
+            <option value="">I am not sure / something else</option>
+            {here.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.name}
+                {a.categoryLabel ? ` — ${a.categoryLabel}` : ""}
+                {a.location ? ` (${a.location})` : ""}
+              </option>
+            ))}
+          </select>
+          <p className="text-[13px]" style={{ color: "var(--text-muted)" }}>
+            Telling us which unit puts this visit on that unit&rsquo;s service record. Leave it if
+            you are not sure — we will work it out on site.
+          </p>
+        </div>
+      ) : null}
 
       <div className="flex flex-col gap-2">
         <label htmlFor={`${id}-service`} className="text-[14px] font-medium">

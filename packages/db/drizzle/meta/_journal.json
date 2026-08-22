@@ -29,6 +29,265 @@
       "when": 1786031489813,
       "tag": "0003_curved_anita_blake",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1786100000000,
+      "tag": "0004_phase0_stabilise",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786200000000,
+      "tag": "0005_workforce_compliance",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1786300000000,
+      "tag": "0006_auth_flows",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786350000000,
+      "tag": "0007_tax_invoice",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1786350000000,
+      "tag": "0008_reference_data",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1786400000000,
+      "tag": "0009_portal_invitations",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1786425000000,
+      "tag": "0010_document_storage",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1786450000000,
+      "tag": "0011_retention",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1786475000000,
+      "tag": "0012_taxonomies",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1786500000000,
+      "tag": "0013_contracts_amc",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1786525000000,
+      "tag": "0014_recruitment",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1786550000000,
+      "tag": "0015_hr_lifecycle",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1786575000000,
+      "tag": "0016_portal_and_leads",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1786600000000,
+      "tag": "0017_kpi_and_admin",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1786625000000,
+      "tag": "0018_ats_product_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1786650000000,
+      "tag": "0019_sick_leave_and_weekly_hours",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1786675000000,
+      "tag": "0020_ats_cooloff_and_interviews",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1786700000000,
+      "tag": "0021_asset_register",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1786725000000,
+      "tag": "0022_invoice_keyset",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1786750000000,
+      "tag": "0023_schedule_and_job_paging",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1786775000000,
+      "tag": "0024_outcome_capture",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1786800000000,
+      "tag": "0025_job_card",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1786825000000,
+      "tag": "0026_media_pipeline_and_scanning",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1786875000000,
+      "tag": "0028_field_sync",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1786900000000,
+      "tag": "0029_projects",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1786925000000,
+      "tag": "0030_tenders",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1786950000000,
+      "tag": "0031_invoice_write_off_date",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1786975000000,
+      "tag": "0032_gratuity_emiratisation_subcontractors",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1787000000000,
+      "tag": "0033_project_subcontracts",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1787025000000,
+      "tag": "0034_job_attachment_recommendation",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1787630000000,
+      "tag": "0036_project_chase_timestamps",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1787655000000,
+      "tag": "0037_signed_job_sheet",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1787640000000,
+      "tag": "0038_material_provenance",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1787740000000,
+      "tag": "0039_live_technician_tracking",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1787830000000,
+      "tag": "0040_visit_superseded",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1787920000000,
+      "tag": "0041_work_injuries_hse_records",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1787950000000,
+      "tag": "0042_quote_versioning_and_discount",
+      "breakpoints": true
     }
   ]
 }

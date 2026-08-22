@@ -10,13 +10,25 @@ import {
 } from "@meridian/core";
 import { Section, ServiceCard, AnswerBlock } from "@/components/ui";
 import { JsonLd } from "@/components/json-ld";
+import { hreflangAlternates } from "@/lib/i18n";
 
-const ANSWER = `${tenant.brandName} provides ${services.length} maintenance and technical services across ${tenant.serviceAreas.map((a) => a.name).join(", ")}, spanning plumbing, electrical, HVAC, carpentry, painting, waterproofing, cleaning, pest control, CCTV and smart-home installation, plus annual maintenance contracts, full facility management and contract workforce supply.`;
+// Built from the catalogue rather than written out, because the written-out
+// version drifted and became false. It advertised pest control, CCTV,
+// smart-home installation, full facility management and contract workforce
+// supply -- none of which are on the DET licence, and the first of which
+// `/about` simultaneously lists under "What we are not licensed for". This
+// string is the meta description, the JSON-LD `description` and
+// `primaryAnswer`, and the visible answer block, so the claim was reaching
+// search engines and answer engines as structured fact. Deriving it means a
+// service that leaves the licence leaves this sentence in the same commit.
+const ANSWER = `${tenant.brandName} provides ${services.length} licensed maintenance and technical services across ${tenant.serviceAreas
+  .map((a) => a.name)
+  .join(", ")}: ${services.map((s) => s.shortName.toLowerCase()).join(", ")}.`;
 
 export const metadata: Metadata = {
   title: "All Services",
   description: ANSWER,
-  alternates: { canonical: "/services" },
+  alternates: { canonical: "/services", languages: hreflangAlternates("/services") },
 };
 
 export default function ServicesIndexPage() {
@@ -60,13 +72,10 @@ export default function ServicesIndexPage() {
               </p>
             </div>
             <p className="prose-body mt-4">{CATEGORY_BLURB[group.category]}</p>
+            {/* Placeholder photography removed — WEB-3 / D-5. */}
             <div className="mt-10 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {group.items.map((service, j) => (
-                <ServiceCard
-                  key={service.slug}
-                  service={service}
-                  image={j === 0 ? `https://picsum.photos/seed/meridian-${service.slug}/640/288` : undefined}
-                />
+              {group.items.map((service) => (
+                <ServiceCard key={service.slug} service={service} />
               ))}
             </div>
           </div>

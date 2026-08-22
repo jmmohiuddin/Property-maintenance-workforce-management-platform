@@ -1,5 +1,6 @@
 "use client";
 
+import { Field, TextInput, SubmitButton } from "@/components/form";
 import { useActionState, useId, useState } from "react";
 import { PROPERTY_TYPE_LABEL, type PropertyType } from "@meridian/core";
 import {
@@ -7,6 +8,8 @@ import {
   createContact,
   deleteContact,
   createProperty,
+  grantPortalAccess,
+  togglePortalAccess,
   type CustomerState,
 } from "./actions";
 import { Trash, Plus, Star } from "@phosphor-icons/react/dist/ssr";
@@ -545,5 +548,140 @@ export function AddPropertyForm({ customerId }: { customerId: string }) {
         </button>
       </div>
     </form>
+  );
+}
+
+/**
+ * Portal access (`POR-8`).
+ *
+ * The screen that replaces an INSERT. Before this, granting somebody portal
+ * access meant writing SQL, so nobody did it — and a portal built to answer
+ * "what did you actually do" before it is asked was reachable by almost no one.
+ *
+ * Revoking is the half that matters most and is easiest to under-build: it
+ * deactivates the membership AND kills their sessions, because a building
+ * manager who changes jobs on Monday should not still be reading this
+ * customer's invoices on Tuesday.
+ */
+export function PortalAccessPanel({
+  customerId,
+  users,
+  contacts,
+}: {
+  customerId: string;
+  users: {
+    userId: string;
+    fullName: string;
+    email: string;
+    isActive: boolean;
+    lastLoginAt: Date | null;
+    hasPassword: boolean;
+  }[];
+  contacts: { fullName: string; email: string | null }[];
+}) {
+  const [grantState, grantAction, granting] = useActionState(grantPortalAccess, INITIAL);
+  const [toggleState, toggleAction, toggling] = useActionState(togglePortalAccess, INITIAL);
+
+  // Contacts we already hold an address for and who have no account yet. This
+  // is the whole friction: staff should not have to retype an email they
+  // already entered on the contacts panel two inches above.
+  const withAccounts = new Set(users.map((u) => u.email.toLowerCase()));
+  const candidates = contacts.filter(
+    (c) => c.email && !withAccounts.has(c.email.toLowerCase()),
+  );
+
+  return (
+    <section className="rounded border p-5" style={{ backgroundColor: "var(--surface-raised)" }}>
+      <h2 className="text-[15px] font-semibold">Portal access</h2>
+      <p className="mt-1.5 text-[13px]" style={{ color: "var(--text-muted)" }}>
+        They can raise requests, approve quotes and see their own invoices. They see nothing
+        belonging to any other customer — that is enforced in the database, not by this screen.
+      </p>
+
+      <Message state={grantState} />
+      <Message state={toggleState} />
+
+      {users.length === 0 ? (
+        <p className="prose-body mt-4 text-[14px]">
+          Nobody here can sign in yet. Every status question they have becomes a phone call until
+          somebody does.
+        </p>
+      ) : (
+        <ul className="mt-4 divide-y border-y">
+          {users.map((u) => (
+            <li key={u.userId} className="flex flex-wrap items-baseline justify-between gap-3 py-3">
+              <div>
+                <p className="text-[14px] font-medium">
+                  {u.fullName}
+                  {!u.isActive ? (
+                    <span
+                      className="ml-2 rounded-sm px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide"
+                      style={{
+                        backgroundColor: "var(--status-neutral-wash)",
+                        color: "var(--status-neutral-text)",
+                      }}
+                    >
+                      Revoked
+                    </span>
+                  ) : null}
+                </p>
+                <p className="text-[13px]" style={{ color: "var(--text-muted)" }}>
+                  {u.email} ·{" "}
+                  {!u.hasPassword
+                    ? "invitation not yet accepted"
+                    : u.lastLoginAt
+                      ? `last signed in ${u.lastLoginAt.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}`
+                      : "never signed in"}
+                </p>
+              </div>
+
+              <form action={toggleAction} className="shrink-0">
+                <input type="hidden" name="customerId" value={customerId} />
+                <input type="hidden" name="userId" value={u.userId} />
+                <input type="hidden" name="isActive" value={String(!u.isActive)} />
+                <button
+                  type="submit"
+                  disabled={toggling}
+                  className="text-[13px] font-medium underline underline-offset-2 disabled:opacity-60"
+                  style={{
+                    color: u.isActive ? "var(--status-critical-text)" : "var(--accent-text)",
+                  }}
+                >
+                  {toggling ? "Saving…" : u.isActive ? "Revoke access" : "Restore access"}
+                </button>
+              </form>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <form action={grantAction} className="mt-5 space-y-4 border-t pt-5">
+        <input type="hidden" name="customerId" value={customerId} />
+
+        {candidates.length > 0 ? (
+          <p className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
+            Contacts on file without an account:{" "}
+            {candidates.map((c) => `${c.fullName} (${c.email})`).join(", ")}
+          </p>
+        ) : null}
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label="Name">
+            {({ id }) => <TextInput id={id} name="fullName" required autoComplete="off" />}
+          </Field>
+          <Field label="Email">
+            {({ id }) => <TextInput id={id} name="email" type="email" required autoComplete="off" />}
+          </Field>
+        </div>
+
+        <SubmitButton
+          pending={granting}
+          pendingLabel="Sending…"
+          className="btn btn-secondary disabled:opacity-60"
+        >
+          Send portal invitation
+        </SubmitButton>
+      </form>
+    </section>
   );
 }

@@ -24,34 +24,42 @@ type Json = Record<string, unknown>;
 const ORG_ID = absoluteUrl("/#organization");
 const SITE_ID = absoluteUrl("/#website");
 
-export function organizationSchema(): Json {
+export function organizationSchema(options?: { readonly description?: string }): Json {
   return {
     "@type": ["Organization", "LocalBusiness", "HomeAndConstructionBusiness"],
     "@id": ORG_ID,
     name: tenant.brandName,
     legalName: tenant.legalName,
-    description: tenant.elevatorAnswer,
+    description: options?.description ?? tenant.elevatorAnswer,
     url: absoluteUrl("/"),
-    telephone: tenant.phone,
-    email: tenant.email,
-    foundingDate: String(tenant.foundedYear),
-    numberOfEmployees: { "@type": "QuantitativeValue", value: tenant.employeeCount },
-    priceRange: "$$",
+    // `?? undefined`, never `null` and never a placeholder. `graph()`
+    // serialises with JSON.stringify, which drops undefined properties
+    // entirely — so an unconfigured fact becomes an absent property rather than
+    // a null or an invented value. Structured data is a claim made to a search
+    // engine in machine-readable form; a wrong one is worse than a missing one.
+    telephone: tenant.phone ?? undefined,
+    email: tenant.email ?? undefined,
+    // `foundingDate` and `numberOfEmployees` are deliberately absent. The
+    // previous values — founded 2014, "180+" employees — were invented, and
+    // WEB-2 deletes an unevidenced claim rather than softening it.
     currenciesAccepted: tenant.currency,
-    paymentAccepted: "Cash, Credit Card, Bank Transfer, Online Payment",
+    paymentAccepted: "Cash, Bank Transfer, Cheque",
     address: {
       "@type": "PostalAddress",
-      streetAddress: tenant.address.street,
+      streetAddress: tenant.address.street ?? undefined,
       addressLocality: tenant.address.city,
       addressRegion: tenant.address.region,
-      postalCode: tenant.address.postalCode,
       addressCountry: tenant.address.countryCode,
     },
-    geo: {
-      "@type": "GeoCoordinates",
-      latitude: tenant.address.lat,
-      longitude: tenant.address.lng,
-    },
+    ...(tenant.address.lat !== null && tenant.address.lng !== null
+      ? {
+          geo: {
+            "@type": "GeoCoordinates",
+            latitude: tenant.address.lat,
+            longitude: tenant.address.lng,
+          },
+        }
+      : {}),
     openingHoursSpecification: tenant.hours.map((h) => ({
       "@type": "OpeningHoursSpecification",
       dayOfWeek: h.days,
@@ -96,15 +104,15 @@ export function organizationSchema(): Json {
   };
 }
 
-export function websiteSchema(): Json {
+export function websiteSchema(options?: { readonly description?: string; readonly inLanguage?: string }): Json {
   return {
     "@type": "WebSite",
     "@id": SITE_ID,
     url: absoluteUrl("/"),
     name: tenant.brandName,
-    description: tenant.elevatorAnswer,
+    description: options?.description ?? tenant.elevatorAnswer,
     publisher: { "@id": ORG_ID },
-    inLanguage: tenant.locale,
+    inLanguage: options?.inLanguage ?? tenant.locale,
     potentialAction: {
       "@type": "SearchAction",
       target: { "@type": "EntryPoint", urlTemplate: absoluteUrl("/search?q={search_term_string}") },
@@ -120,12 +128,11 @@ export function serviceSchema(service: Service): Json {
     name: service.name,
     alternateName: service.aliases,
     serviceType: service.name,
-    category: service.category,
+    category: service.family,
     description: service.answer,
     url: absoluteUrl(`/services/${service.slug}`),
     provider: { "@id": ORG_ID },
     areaServed: tenant.serviceAreas.map((a) => ({ "@type": "City", name: a.name })),
-    audience: service.industries.map((i) => ({ "@type": "Audience", audienceType: i })),
     hoursAvailable: service.emergency
       ? {
           "@type": "OpeningHoursSpecification",
@@ -134,11 +141,17 @@ export function serviceSchema(service: Service): Json {
           closes: "23:59",
         }
       : undefined,
+    // An Offer with no `price`. The catalogue publishes no prices, because the
+    // ones it used to publish were invented (see catalog.ts). Emitting a made-up
+    // `price` here would be the same fabrication, made to Google in a format it
+    // treats as a factual assertion and may show in a result.
+    //
+    // WEB-16 adds a published AED schedule of rates generated from the system's
+    // own rate card; when that lands, `priceSpecification` belongs here and will
+    // be true by construction.
     offers: {
       "@type": "Offer",
       priceCurrency: tenant.currency,
-      price: service.priceFrom.amount,
-      description: `From ${tenant.currencySymbol} ${service.priceFrom.amount} ${service.priceFrom.unit}`,
       availability: "https://schema.org/InStock",
       url: absoluteUrl(`/quote?service=${service.slug}`),
     },
@@ -195,7 +208,6 @@ export function areaServiceSchema(area: Area, servicesOffered: readonly Service[
         "@type": "Offer",
         position: i + 1,
         priceCurrency: tenant.currency,
-        price: s.priceFrom.amount,
         itemOffered: {
           "@type": "Service",
           name: s.name,
@@ -259,6 +271,8 @@ export function webPageSchema(input: {
   description: string;
   /** The one-paragraph answer this page exists to give. */
   primaryAnswer?: string;
+  /** Overrides `tenant.locale` — set to `"ar-AE"` for pages under `/ar`. */
+  inLanguage?: string;
 }): Json {
   return {
     "@type": "WebPage",
@@ -268,10 +282,56 @@ export function webPageSchema(input: {
     description: input.description,
     isPartOf: { "@id": SITE_ID },
     about: { "@id": ORG_ID },
-    inLanguage: tenant.locale,
+    inLanguage: input.inLanguage ?? tenant.locale,
     ...(input.primaryAnswer
       ? { mainContentOfPage: { "@type": "WebPageElement", text: input.primaryAnswer } }
       : {}),
+  };
+}
+
+/**
+ * One published, in-force line of the rate card — the plain shape
+ * `listPublicRateCard` (`packages/db/src/domain/reference.ts`) returns, restated
+ * here so `packages/core` (zero runtime dependencies) never has to import the
+ * database package to describe it.
+ */
+export interface RateCardEntry {
+  readonly serviceSlug: string;
+  /** Includes the rate band already, e.g. "Plumbing labour — Emergency". */
+  readonly label: string;
+  readonly unit: string;
+  /** Decimal string, e.g. "150.00". VAT-exclusive, matching the visible price. */
+  readonly priceAed: string;
+}
+
+/**
+ * `OfferCatalog` for the published schedule of rates (`WEB-16`).
+ *
+ * Built from the exact rows the page renders — the same array, not a
+ * re-fetch — so the structured data cannot say a price the visible table does
+ * not. Each line carries a `UnitPriceSpecification` rather than a bare `price`,
+ * because a rate is always per something (per hour, per visit) and a schema.org
+ * consumer that drops the unit would read AED 150 as the whole job.
+ */
+export function rateCardSchema(entries: readonly RateCardEntry[]): Json {
+  return {
+    "@type": "OfferCatalog",
+    "@id": absoluteUrl("/rates#schedule"),
+    name: "Published schedule of rates",
+    itemListElement: entries.map((e, i) => ({
+      "@type": "Offer",
+      position: i + 1,
+      name: e.label,
+      priceCurrency: tenant.currency,
+      price: e.priceAed,
+      priceSpecification: {
+        "@type": "UnitPriceSpecification",
+        price: e.priceAed,
+        priceCurrency: tenant.currency,
+        unitText: e.unit,
+      },
+      itemOffered: { "@type": "Service", "@id": absoluteUrl(`/services/${e.serviceSlug}#service`) },
+    })),
   };
 }
 

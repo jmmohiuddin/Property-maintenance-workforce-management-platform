@@ -36,13 +36,33 @@ export function PortalShell({
           </Link>
 
           <div className="flex items-center gap-4">
-            <Link
-              href="/portal/request"
-              className="text-[14px] font-medium"
-              style={{ color: active === "request" ? "var(--text-primary)" : "var(--text-secondary)" }}
-            >
-              Raise a request
-            </Link>
+            {/*
+              POR-3, POR-4 and POR-5 each add a screen, and a screen with no
+              way to reach it is not shipped. Rendered as a scrolling row rather
+              than wrapping: POR-10's users are on phones, and a header that
+              grows to two lines pushes the content below the fold on every
+              page.
+            */}
+            <nav className="-mx-1 flex items-center gap-4 overflow-x-auto px-1">
+              {[
+                { href: "/portal/requests", label: "Requests", key: "requests" },
+                { href: "/portal/invoices", label: "Invoices", key: "invoices" },
+                { href: "/portal/reports", label: "Monthly report", key: "reports" },
+                { href: "/portal/notifications", label: "Notifications", key: "notifications" },
+                { href: "/portal/request", label: "Raise a request", key: "request" },
+              ].map((item) => (
+                <Link
+                  key={item.key}
+                  href={item.href}
+                  className="shrink-0 text-[14px] font-medium"
+                  style={{
+                    color: active === item.key ? "var(--text-primary)" : "var(--text-secondary)",
+                  }}
+                >
+                  {item.label}
+                </Link>
+              ))}
+            </nav>
             <a
               href={telLink(tenant.emergencyPhone)}
               className="hidden items-center gap-2 text-[13px] font-semibold tabular-nums sm:inline-flex"

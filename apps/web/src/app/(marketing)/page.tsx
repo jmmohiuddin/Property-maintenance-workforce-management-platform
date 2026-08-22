@@ -2,55 +2,56 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import {
   tenant,
+  company,
   services,
   groupedServices,
   CATEGORY_BLURB,
   emergencyServices,
   areas,
   areasInCity,
-  industries,
   telLink,
   whatsappLink,
   graph,
   webPageSchema,
   faqSchema,
 } from "@meridian/core";
-import { Section, Eyebrow, ServiceCard, AnswerBlock } from "@/components/ui";
+import { Section, Eyebrow, ServiceCard, AnswerBlock, CallLink } from "@/components/ui";
 import { FaqList } from "@/components/faq";
 import { JsonLd } from "@/components/json-ld";
 import { PhoneCall, WhatsappLogo, ShieldCheck, MapPin } from "@phosphor-icons/react/dist/ssr";
+import { hreflangAlternates } from "@/lib/i18n";
 
 export const metadata: Metadata = {
   title: `Property Maintenance & Facility Management in ${tenant.address.city}`,
   description: tenant.elevatorAnswer,
-  alternates: { canonical: "/" },
+  alternates: { canonical: "/", languages: hreflangAlternates("/") },
 };
 
 /** Pulled up to the homepage so the highest-intent questions get FAQ markup. */
 const HOME_FAQS = [
   {
     q: "What does a property maintenance company do?",
-    a: `A property maintenance company keeps a building and its systems working: plumbing, electrical, air conditioning, carpentry, cleaning and structural upkeep, delivered either as one-off repairs or under an ongoing contract. ${tenant.brandName} covers all of these with directly employed technicians rather than subcontracted labour.`,
+    a: `A property maintenance company keeps a building and its systems working: plumbing, air conditioning, electrical fittings, carpentry, finishes and cleaning, delivered either as one-off repairs or under an ongoing contract. ${tenant.brandName} is licensed by ${company.licenceIssuer} for ten of those activities, and quotes only for work on that licence.`,
   },
   {
     q: "How fast can someone come out for an emergency?",
-    a: `Our median arrival time for emergency call-outs inside ${tenant.address.city} is under ${tenant.emergencyResponseMinutes} minutes, 24 hours a day including public holidays. Abu Dhabi and Sharjah are typically attended within 90 minutes. The emergency line is answered by a person, not a callback form.`,
+    a: `Our commitment for a P1 emergency — an active leak, a total loss of cooling, an electrical fault — is a response within 30 to 60 minutes, 24 hours a day including public holidays. That is a commitment we measure ourselves against on every job, not an average we quote.`,
   },
   {
     q: "Is an annual maintenance contract worth it?",
-    a: "For most occupied properties, yes. Four AC services alone at ad-hoc rates cost roughly AED 1,000 for a one-bedroom, so a contract from AED 1,200 effectively adds plumbing and electrical inspections plus unlimited free emergency attendance. If your property is new and you have had no call-outs in two years, ad-hoc may genuinely suit you better.",
+    a: "It depends on how much reactive work the property already generates, and the honest test is arithmetic rather than persuasion: add up last year's callouts and compare. A contract is worth it when scheduled visits would have prevented some of them. If your property is new and you have had no callouts in two years, ad-hoc genuinely suits you better and we will say so.",
   },
   {
     q: "Do you work with property developers and owners associations?",
-    a: "Yes. Roughly two thirds of our work is contracted through developers, owners associations, property management companies and hotel groups, covering planned maintenance, common areas and MEP plant, with monthly SLA reporting produced from job records rather than written up afterwards.",
+    a: "Yes. Owners association work in Dubai runs on an annual budget cycle and a RERA-mandated three-bid process through Mollak, so it is won by being on the approved-vendor list before budget season with current licence, insurance and accreditation documents. We produce SLA and PPM completion reporting from the job records themselves rather than writing it up afterwards.",
   },
   {
     q: "Which areas do you cover?",
-    a: `${tenant.serviceAreas.map((a) => a.name).join(", ")}. Within ${tenant.address.city} that includes ${tenant.serviceAreas[0]?.areas.slice(0, 5).join(", ")} and surrounding communities. Emergency cover is available across all listed areas 24 hours a day.`,
+    a: `Dubai. That includes ${tenant.serviceAreas[0]?.areas.slice(0, 5).join(", ")} and the surrounding communities listed on our areas page. We hold a Dubai mainland licence and do not claim coverage in emirates we are not licensed to work in.`,
   },
   {
-    q: "Are your technicians directly employed or subcontracted?",
-    a: "Directly employed, on our own UAE labour contracts and visas, with police clearance, uniform and ID. We do not subcontract trade labour. That is what allows us to tell you in advance who is coming and to stand behind the work.",
+    q: "What are you actually licensed to do?",
+    a: `Ten activities, named on our ${company.licenceIssuer} trade licence${company.licenceNumber ? ` number ${company.licenceNumber}` : ""}: painting, wallpaper, false ceilings, tiling, plumbing and sanitary works, carpentry, electrical fittings repair, electromechanical installation, HVAC installation and maintenance, and building cleaning. If you ask us for something outside that list — glass and aluminium, pest control, facade cleaning at height — we will tell you at the enquiry, not at the invoice.`,
   },
 ] as const;
 
@@ -75,6 +76,7 @@ const DISPATCH_STEPS = [
 
 export default function HomePage() {
   const groups = groupedServices();
+  const whatsappHref = whatsappLink(`Hello ${tenant.brandName}, I need help with a maintenance issue.`);
 
   return (
     <>
@@ -94,21 +96,21 @@ export default function HomePage() {
       <section className="border-b">
         <div className="container-page grid gap-12 pt-16 pb-20 md:pt-24 md:pb-28 lg:grid-cols-12 lg:gap-16">
           <div className="lg:col-span-7">
-            <Eyebrow>Operating since {tenant.foundedYear}</Eyebrow>
+            <Eyebrow>
+              {company.licenceIssuer} licence
+              {company.licenceNumber ? ` ${company.licenceNumber}` : ""}
+            </Eyebrow>
             <h1 className="mt-5 text-4xl font-semibold md:text-5xl lg:text-6xl">
               Property maintenance
               <br />
               that answers at 3am.
             </h1>
             <p className="prose-body mt-6 text-[17px] md:text-[18px]">
-              Licensed plumbers, electricians and HVAC engineers across {tenant.address.city}, Abu Dhabi and
-              Sharjah. Directly employed, never subcontracted.
+              Plumbing, HVAC, electrical fittings, carpentry, tiling, ceilings, painting and building
+              cleaning across Dubai — ten licensed activities, one contractor accountable for all of them.
             </p>
             <div className="mt-9 flex flex-wrap items-center gap-3">
-              <a href={telLink(tenant.emergencyPhone)} className="btn btn-primary">
-                <PhoneCall size={17} weight="fill" aria-hidden />
-                {tenant.emergencyPhone}
-              </a>
+              <CallLink phone={tenant.emergencyPhone} />
               <Link href="/quote" className="btn btn-secondary">
                 Get a quote
               </Link>
@@ -121,11 +123,18 @@ export default function HomePage() {
           >
             <h2 className="text-[15px] font-semibold">Response commitments</h2>
             <dl className="mt-5 space-y-4">
+              {/*
+                These are the JOB-4 SLA tiers — the same deadlines the dispatch
+                board sorts by and the SLA sweep alerts on. They are commitments
+                the system measures us against, which is why they can be
+                published. The previous version of this block quoted a "median"
+                arrival time nobody had measured.
+              */}
               {[
-                { t: "Emergency call-out", v: `Under ${tenant.emergencyResponseMinutes} min`, d: `median, inside ${tenant.address.city}` },
-                { t: "Standard repair", v: "Same day", d: "logged before 15:00" },
-                { t: "Quotation", v: "Within 24 hrs", d: "after site survey" },
-                { t: "Contract mobilisation", v: "10 working days", d: "asset survey to first visit" },
+                { t: "P1 emergency", v: "30–60 min", d: "response, 24 hours a day" },
+                { t: "P2 urgent", v: "2–4 hrs", d: "response, working hours" },
+                { t: "P3 routine", v: "24 hrs", d: "response" },
+                { t: "P4 planned", v: "By agreement", d: "scheduled with you" },
               ].map((row) => (
                 <div key={row.t} className="flex items-baseline justify-between gap-4 border-b pb-4 last:border-0 last:pb-0">
                   <dt className="text-[14px]" style={{ color: "var(--text-secondary)" }}>
@@ -140,31 +149,41 @@ export default function HomePage() {
                 </div>
               ))}
             </dl>
-            <a
-              href={whatsappLink(`Hello ${tenant.brandName}, I need help with a maintenance issue.`)}
-              className="btn btn-secondary mt-6 w-full"
-            >
-              <WhatsappLogo size={17} weight="fill" aria-hidden />
-              Message on WhatsApp
-            </a>
+            {whatsappHref ? (
+              <a href={whatsappHref} className="btn btn-secondary mt-6 w-full">
+                <WhatsappLogo size={17} weight="fill" aria-hidden />
+                Message on WhatsApp
+              </a>
+            ) : null}
           </aside>
         </div>
       </section>
 
-      {/* ── Credentials band ───────────────────────────────────────────── */}
-      <div className="border-b" style={{ backgroundColor: "var(--surface-sunken)" }}>
-        <div className="container-page grid gap-8 py-10 sm:grid-cols-2 lg:grid-cols-4">
-          {tenant.stats.map((stat) => (
-            <div key={stat.label}>
-              <p className="tnum text-2xl font-semibold tracking-tight">{stat.value}</p>
-              <p className="mt-1 text-[14px] font-medium">{stat.label}</p>
-              <p className="text-[13px]" style={{ color: "var(--text-muted)" }}>
-                {stat.detail}
-              </p>
-            </div>
-          ))}
+      {/*
+        The credentials band rendered four headline statistics — 62,000 jobs
+        completed, 900+ buildings, 180+ directly employed technicians, a 94%
+        renewal rate. None were measured. `tenant.stats` is now empty and this
+        band renders nothing rather than showing invented numbers or hedged
+        replacements for them (WEB-2).
+
+        It returns when KPI-2 has a quarter of product_events behind it, at
+        which point the numbers will be real and can be cited.
+      */}
+      {tenant.stats.length > 0 ? (
+        <div className="border-b" style={{ backgroundColor: "var(--surface-sunken)" }}>
+          <div className="container-page grid gap-8 py-10 sm:grid-cols-2 lg:grid-cols-4">
+            {tenant.stats.map((stat) => (
+              <div key={stat.label}>
+                <p className="tnum text-2xl font-semibold tracking-tight">{stat.value}</p>
+                <p className="mt-1 text-[14px] font-medium">{stat.label}</p>
+                <p className="text-[13px]" style={{ color: "var(--text-muted)" }}>
+                  {stat.detail}
+                </p>
+              </div>
+            ))}
+          </div>
         </div>
-      </div>
+      ) : null}
 
       {/* ── The answer block ───────────────────────────────────────────── */}
       <Section className="!py-16 md:!py-20">
@@ -177,11 +196,12 @@ export default function HomePage() {
       <Section tone="sunken" className="!pt-4">
         <div className="container-page">
           <h2 className="text-3xl font-semibold md:text-4xl">
-            {services.length} services, one accountable contractor
+            {services.length} licensed activities, one accountable contractor
           </h2>
           <p className="prose-body mt-4">
-            Every trade below is delivered by our own staff. Where a job spans several trades, one supervisor
-            owns it end to end rather than handing you between contractors.
+            Every service below maps to a named activity on our trade licence. Where a job spans several of
+            them — a leak that takes out a ceiling and its paint — one contractor owns the whole repair
+            rather than handing you between three.
           </p>
 
           <div className="mt-14 space-y-14">
@@ -195,18 +215,16 @@ export default function HomePage() {
                 </div>
                 <p className="prose-body mt-4 text-[15px]">{CATEGORY_BLURB[group.category]}</p>
                 <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                  {group.items.map((service, i) => (
-                    <ServiceCard
-                      key={service.slug}
-                      service={service}
-                      // Photography on the lead card of each group gives the
-                      // grid rhythm without turning it into a stock-image wall.
-                      image={
-                        i === 0
-                          ? `https://picsum.photos/seed/meridian-${service.slug}/640/288`
-                          : undefined
-                      }
-                    />
+                  {/*
+                    Photography removed (WEB-3 / D-5). Every image here was a
+                    random picsum.photos placeholder — an external request on
+                    every page view, and a picture of somebody else's building
+                    presented as our work. Until there are photographs of real
+                    jobs, the cards carry type alone; a stock photo of a smiling
+                    electrician is a trust liability in this market.
+                  */}
+                  {group.items.map((service) => (
+                    <ServiceCard key={service.slug} service={service} />
                   ))}
                 </div>
               </div>
@@ -226,10 +244,7 @@ export default function HomePage() {
               SMS before you hang up.
             </p>
             <div className="mt-8 flex flex-wrap gap-3">
-              <a href={telLink(tenant.emergencyPhone)} className="btn btn-primary">
-                <PhoneCall size={17} weight="fill" aria-hidden />
-                {tenant.emergencyPhone}
-              </a>
+              <CallLink phone={tenant.emergencyPhone} />
               <Link href="/emergency" className="btn btn-inverse">
                 What counts as an emergency
               </Link>
@@ -372,26 +387,6 @@ export default function HomePage() {
               </Link>
             </div>
           </div>
-        </div>
-      </Section>
-
-      {/* ── Industries ─────────────────────────────────────────────────── */}
-      <Section tone="sunken" className="!py-16">
-        <div className="container-page">
-          <h2 className="text-2xl font-semibold md:text-3xl">Who we work for</h2>
-          <ul className="mt-7 flex flex-wrap gap-2.5">
-            {industries.map((industry) => (
-              <li key={industry}>
-                <Link
-                  href={`/industries#${industry.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}
-                  className="inline-block rounded-sm border px-3.5 py-2 text-[14px] transition-colors hover:border-[var(--accent)]"
-                  style={{ backgroundColor: "var(--surface-raised)" }}
-                >
-                  {industry}
-                </Link>
-              </li>
-            ))}
-          </ul>
         </div>
       </Section>
 

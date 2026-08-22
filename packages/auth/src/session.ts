@@ -19,8 +19,46 @@ import type { Principal, Role } from "./rbac";
  */
 
 const TOKEN_BYTES = 32;
-const SESSION_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
 export const SESSION_COOKIE = "meridian_session";
+
+/**
+ * Two clocks, and both are enforced (`SEC-11`, closing `TD-12`).
+ *
+ * The session used to have a single fixed 12-hour TTL with no renewal. A
+ * coordinator who signed in at 07:00 was signed out at 19:00 — mid-shift, with
+ * no warning, losing whatever was in the form they were filling in. That is an
+ * availability failure dressed as a security control, because the twelve hours
+ * were not protecting anything: the risk from a stolen token is the same at
+ * hour 11 as at hour 13.
+ *
+ * What actually helps is the pair:
+ *
+ *  * **`SLIDE_MS` — the idle window.** Renewed on activity. A session dies
+ *    eight hours after the person stops using it, which is the property that
+ *    protects an unattended machine.
+ *  * **`ABSOLUTE_MS` — the hard ceiling.** Never moves. This is what stops
+ *    "sliding" degrading into "never expires", which would make a stolen token
+ *    permanent as long as the thief kept using it.
+ *
+ * The database enforces the ceiling too — `app_auth_touch_session` clamps with
+ * `LEAST(...)` and `app_auth_resolve_session` refuses a session past it. Doing
+ * it in both places is deliberate: the clamp is the mechanism, the read check
+ * is the guarantee.
+ */
+const SLIDE_MS = 1000 * 60 * 60 * 8; // 8 hours idle
+const ABSOLUTE_MS = 1000 * 60 * 60 * 24; // 24 hours total
+
+/**
+ * How close to expiry a session has to be before activity renews it.
+ *
+ * Renewing on every single request would mean a write on every page view for no
+ * benefit. Renewing only in the last quarter of the window keeps the write rate
+ * low while making it impossible for an active user to be signed out.
+ */
+const RENEW_WHEN_REMAINING_MS = SLIDE_MS * 0.25;
+
+/** Warn the user this long before their session ends (`D-11`). */
+export const SESSION_WARNING_MS = 5 * 60 * 1000;
 
 function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
@@ -31,13 +69,17 @@ export interface SessionContext {
   readonly principal: Principal;
   readonly user: { readonly id: string; readonly fullName: string; readonly email: string };
   readonly tenant: { readonly id: string; readonly brandName: string };
+  /** The sliding expiry, as of this request. Moves forward on activity. */
   readonly expiresAt: Date;
+  /** The hard ceiling. Never moves, and is what the warning banner counts to. */
+  readonly absoluteExpiresAt: Date | null;
 }
 
 export interface CreatedSession {
   /** Give this to the client once. It is never recoverable afterwards. */
   readonly token: string;
   readonly expiresAt: Date;
+  readonly absoluteExpiresAt: Date;
 }
 
 export async function createSession(input: {
@@ -47,7 +89,9 @@ export async function createSession(input: {
   ipAddress?: string | undefined;
 }): Promise<CreatedSession> {
   const token = randomBytes(TOKEN_BYTES).toString("base64url");
-  const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
+  const now = Date.now();
+  const expiresAt = new Date(now + SLIDE_MS);
+  const absoluteExpiresAt = new Date(now + ABSOLUTE_MS);
 
   await db.execute(sql`
     select app_auth_create_session(
@@ -56,16 +100,37 @@ export async function createSession(input: {
       ${hashToken(token)},
       ${input.userAgent ?? null},
       ${input.ipAddress ?? null},
-      ${expiresAt.toISOString()}::timestamptz
+      ${expiresAt.toISOString()}::timestamptz,
+      ${absoluteExpiresAt.toISOString()}::timestamptz
     )
   `);
 
-  return { token, expiresAt };
+  return { token, expiresAt, absoluteExpiresAt };
+}
+
+/**
+ * Extend a session on activity, if it is close enough to expiry to be worth a
+ * write. Returns the new expiry, or null when nothing changed.
+ *
+ * Clamped to the absolute ceiling inside the SQL function rather than here, so
+ * a caller cannot extend past it by passing a large slide.
+ */
+export async function touchSession(token: string, expiresAt: Date): Promise<Date | null> {
+  const remaining = expiresAt.getTime() - Date.now();
+  if (remaining > RENEW_WHEN_REMAINING_MS) return null;
+
+  const rows = (await db.execute<{ app_auth_touch_session: string | null }>(
+    sql`select app_auth_touch_session(${hashToken(token)}, ${Math.floor(SLIDE_MS / 1000)})`,
+  )) as unknown as { app_auth_touch_session: string | null }[];
+
+  const next = rows[0]?.app_auth_touch_session;
+  return next ? new Date(next) : null;
 }
 
 interface ResolveRow extends Record<string, unknown> {
   session_id: string;
   expires_at: string | Date;
+  absolute_expires_at: string | Date | null;
   user_id: string;
   full_name: string;
   email: string;
@@ -96,6 +161,7 @@ export async function resolveSession(token: string | undefined): Promise<Session
   return {
     sessionId: row.session_id,
     expiresAt: new Date(row.expires_at),
+    absoluteExpiresAt: row.absolute_expires_at ? new Date(row.absolute_expires_at) : null,
     user: { id: row.user_id, fullName: row.full_name, email: row.email },
     tenant: { id: row.tenant_id, brandName: row.brand_name },
     principal: {

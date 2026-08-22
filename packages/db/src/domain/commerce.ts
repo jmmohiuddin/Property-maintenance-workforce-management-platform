@@ -1,7 +1,10 @@
 import { randomBytes, createHash } from "node:crypto";
-import { and, eq, desc, sql, inArray, isNull } from "drizzle-orm";
+import { and, count, eq, desc, sql, inArray, isNull, type SQL } from "drizzle-orm";
 import type { TenantScopedTx, TenantContext } from "../index";
 import * as schema from "../schema";
+import { decodeCursor, encodeCursor, type Page } from "./leads";
+import { rowDate, requiredRowDate } from "./_rows";
+import { writeAuditNote } from "./staff";
 import {
   computeTotals,
   toMinor,
@@ -9,6 +12,17 @@ import {
   UAE_VAT_BASIS_POINTS,
   type LineInput,
   UserFacingError,
+  company,
+  apportionLines,
+  unitCodeFor,
+  defaultInvoiceVariant,
+  issuanceClock,
+  dubaiDateKey,
+  ISSUANCE_ALERT_DAYS,
+  LATE_ISSUANCE_PENALTY,
+  type InvoiceVariant,
+  type TaxDocumentDraft,
+  LICENSED_ACTIVITIES,
 } from "@meridian/core";
 
 /**
@@ -59,6 +73,16 @@ export const QUOTE_STATUS_LABEL: Readonly<Record<QuoteStatus, string>> = {
   superseded: "Superseded",
 };
 
+/**
+ * The two statuses that mean the ball is in the customer's court.
+ *
+ * Named here rather than written as a literal at each call site, because it is
+ * a fact about the vocabulary above and not about any one screen: `draft` is
+ * ours and unfinished, `expired` and `superseded` are past, `approved` and
+ * `rejected` are decided. Only `sent` and `viewed` are waiting on somebody.
+ */
+export const QUOTE_AWAITING_DECISION: readonly QuoteStatus[] = ["sent", "viewed"];
+
 export interface DraftLine {
   readonly description: string;
   readonly quantity: string;
@@ -66,6 +90,113 @@ export interface DraftLine {
   /** Decimal string as entered, e.g. "150.00". */
   readonly unitPrice: string;
   readonly serviceSlug?: string | undefined;
+}
+
+// ── QTE-9: licensed-activity warning ────────────────────────────────────────
+
+/**
+ * Warn (`QTE-9`), never block, a quote line whose service falls outside the
+ * ten activities the DET licence permits (`LICENSED_ACTIVITIES`,
+ * `packages/core/src/company.ts`).
+ *
+ * ── WHY THIS WARNS RATHER THAN REFUSES ──────────────────────────────────────
+ *
+ * This system has exactly three hard blocks, and each stops the unlawful act
+ * ITSELF at the point it would happen: an expired blocking document or work
+ * permit stops a *dispatch* that would send someone to work unlawfully, and
+ * the summer midday ban stops *outdoor work* at an hour the law forbids it
+ * (`JOB-15`'s job-card gate is the same shape — it stops a job reaching
+ * `work_complete` with no evidence of what was done, not a proposal). Quoting
+ * is neither of those. A quote is a proposal to a customer, not the
+ * performance of work, and this company legitimately raises exactly that
+ * proposal and then subcontracts the labour — `project_subcontracts` exists
+ * for that reason. Refusing to create the quote at all would stop real,
+ * lawful business (subcontracted work) to prevent a violation that has not
+ * happened yet and might never happen, which is precisely the asymmetry
+ * `assessWpsCycle`'s docstring argues against for late wages.
+ *
+ * What IS real, and what `catalog.ts`'s rebuild happened over: `/services`
+ * advertised pest control while `/about` disclaimed it by name, in public,
+ * with a URL attached. A quote line is the same exposure with a customer's
+ * signature attached instead. So every line whose service does not resolve to
+ * one of the ten is named back to the caller — on creation and on revision —
+ * and the caller decides: subcontract it and note that, or don't raise it.
+ *
+ * A line with no service at all, on a job whose own service is also unset,
+ * cannot be classified and is not warned about — inventing a violation from
+ * an absence would be the exact fabrication `company.ts`'s "no invented
+ * default" rule exists to forbid, applied to a warning instead of a fact.
+ */
+export function licensedActivityWarnings(
+  lines: readonly { readonly description: string; readonly serviceSlug?: string | undefined }[],
+  fallbackServiceSlug: string,
+): readonly string[] {
+  const licensed = new Set<string>(LICENSED_ACTIVITIES);
+  const warnings: string[] = [];
+  lines.forEach((line, i) => {
+    const slug = line.serviceSlug ?? fallbackServiceSlug;
+    if (!slug || licensed.has(slug)) return;
+    warnings.push(
+      `Line ${i + 1} ("${line.description}") is not one of the company's ten DET-licensed ` +
+        `activities. Raise it only if the work is being subcontracted, and note that on the quote.`,
+    );
+  });
+  return warnings;
+}
+
+// ── QTE-5: the contract's own rate, shown rather than silently applied ─────
+
+interface ResolvedContractDiscount {
+  readonly discountMinor: number;
+  readonly discountBasisPoints: number;
+  readonly source: string;
+}
+
+/**
+ * The rate an AMC customer is actually entitled to on a quote for their
+ * contract work, and where it came from — never re-typed by an operator who
+ * has to remember it, and never a number the quote states without saying why.
+ *
+ * Only an ACTIVE contract prices anything. A draft, pending-signature,
+ * suspended, expired or cancelled contract is not a live commercial agreement,
+ * so pricing off its terms would apply a rate nobody currently holds — exactly
+ * the "different number" `QTE-5` exists to stop a quote silently applying.
+ *
+ * Returns null when the job carries no contract, or the contract found is not
+ * active, or it carries no terms row (`contract_terms` is created with the
+ * contract, but a row from before that pairing, or a deleted one, should not
+ * silently price work at zero). `createQuote` and `reviseQuote` both fall back
+ * to whatever the caller typed when this returns null — unchanged behaviour
+ * for every quote that is not against a live AMC.
+ */
+async function resolveContractDiscount(
+  tx: TenantScopedTx,
+  jobId: string,
+  subtotalMinor: number,
+): Promise<ResolvedContractDiscount | null> {
+  const rows = await tx.execute<{
+    reference: string;
+    status: string;
+    discount_rate_basis_points: number | null;
+  }>(sql`
+    select c.reference, c.status, t.discount_rate_basis_points
+      from jobs j
+      join contracts c on c.id = j.contract_id and c.deleted_at is null
+      left join contract_terms t on t.contract_id = c.id and t.deleted_at is null
+     where j.id = ${jobId} and j.deleted_at is null
+  `);
+
+  const row = rows[0];
+  if (!row || row.status !== "active" || row.discount_rate_basis_points == null) return null;
+
+  const basisPoints = row.discount_rate_basis_points;
+  const discountMinor = Math.round((subtotalMinor * basisPoints) / 10_000);
+
+  return {
+    discountMinor,
+    discountBasisPoints: basisPoints,
+    source: `Contract ${row.reference} · ${(basisPoints / 100).toFixed(2)}% AMC rate`,
+  };
 }
 
 /** Create a draft quote against a job, with its lines and computed totals. */
@@ -80,7 +211,7 @@ export async function createQuote(
     validForDays?: number;
     notes?: string | undefined;
   },
-): Promise<{ quoteId: string; reference: string; totalMinor: number }> {
+): Promise<{ quoteId: string; reference: string; totalMinor: number; warnings: readonly string[] }> {
   if (input.lines.length === 0) throw new UserFacingError("A quote needs at least one line");
 
   const jobRows = await tx
@@ -100,10 +231,27 @@ export async function createQuote(
     quantity: l.quantity,
     unitPriceMinor: toMinor(l.unitPrice),
   }));
+  const grossSubtotal = computeTotals({ lines: lineInputs, taxRateBasisPoints: 0 }).subtotalMinor;
+
+  // QTE-5. A manually typed figure is an operator's deliberate override and
+  // wins outright; only in its absence does the contract's own rate step in,
+  // so an AMC customer's rate is never silently replaced by a number nobody
+  // chose, and an operator's own number is never silently replaced either.
+  let discountMinor = input.discount ? toMinor(input.discount) : 0;
+  let discountBasisPoints: number | null = null;
+  let discountSource: string | null = null;
+  if (!input.discount) {
+    const contractDiscount = await resolveContractDiscount(tx, input.jobId, grossSubtotal);
+    if (contractDiscount) {
+      discountMinor = contractDiscount.discountMinor;
+      discountBasisPoints = contractDiscount.discountBasisPoints;
+      discountSource = contractDiscount.source;
+    }
+  }
 
   const totals = computeTotals({
     lines: lineInputs,
-    discountMinor: input.discount ? toMinor(input.discount) : 0,
+    discountMinor,
     taxRateBasisPoints: UAE_VAT_BASIS_POINTS,
   });
 
@@ -122,6 +270,8 @@ export async function createQuote(
       status: "draft",
       subtotal: toDecimalString(totals.subtotalMinor),
       discountAmount: toDecimalString(totals.discountMinor),
+      discountBasisPoints,
+      discountSource,
       taxRateBasisPoints: UAE_VAT_BASIS_POINTS,
       taxAmount: toDecimalString(totals.taxMinor),
       total: toDecimalString(totals.totalMinor),
@@ -147,7 +297,221 @@ export async function createQuote(
     })),
   );
 
-  return { quoteId: quote.id, reference, totalMinor: totals.totalMinor };
+  return {
+    quoteId: quote.id,
+    reference,
+    totalMinor: totals.totalMinor,
+    warnings: licensedActivityWarnings(input.lines, job.serviceSlug),
+  };
+}
+
+/** Quote states from which a revision may be raised (`QTE-10`). */
+export const REVISABLE_QUOTE_STATUSES: readonly QuoteStatus[] = [
+  "draft",
+  "sent",
+  "viewed",
+  "rejected",
+  "expired",
+];
+
+/**
+ * Replace a quote with a new version, rather than overwriting it in place
+ * (`QTE-10`).
+ *
+ * ── WHICH STATES MAY BE REVISED, AND WHY ────────────────────────────────────
+ *
+ *  * `draft` — never shown to a customer, so there is nothing on file yet to
+ *    protect. Revising one costs nothing extra; the same rule that governs
+ *    every other state applies to it too, rather than a silent-edit exception
+ *    that would have to be remembered as a special case forever.
+ *  * `sent` / `viewed` — the customer HAS seen this and is deciding. A price
+ *    error found now must not vanish into the row the customer already has
+ *    open in their portal; the old one is kept exactly as it was sent, and a
+ *    new one is raised and sent in its place.
+ *  * `rejected` — a decision was made, and it stays made: `decidedAt` and
+ *    `rejectionReason` are untouched on the retired row. A follow-up quote
+ *    after "too expensive" is ordinary business, and forbidding it would force
+ *    every renegotiation to start a brand-new, unlinked quote with no record
+ *    that it answers a specific rejection.
+ *  * `expired` — the same reasoning as `rejected`: nobody decided against the
+ *    work, the clock on it simply ran out, and re-quoting it is routine.
+ *
+ * ── WHICH STATES MAY NOT, AND WHY ───────────────────────────────────────────
+ *
+ *  * `approved` is refused outright, and this is the line the ticket exists to
+ *    draw. An approved quote is what the customer agreed to pay. Rewriting it
+ *    afterwards — even by "superseding" rather than overwriting — is a
+ *    contract that changes after signature. Anyone who genuinely needs to
+ *    change approved work raises a NEW, independent quote against the job, on
+ *    purpose, so the record shows two documents and a reason, not one document
+ *    that quietly grew a second version nobody signed.
+ *  * `superseded` is refused for a different reason: idempotency. A superseded
+ *    quote is already a dead end in the chain; revising it again would let two
+ *    later quotes both claim to replace the same ancestor, silently forking
+ *    history instead of telling the caller to look at the current version.
+ *    `RETIRABLE_VISIT_STATUSES` (`0040`, `domain/assignment.ts`) excludes its
+ *    own terminal state for the same reason, so a retirement is idempotent.
+ */
+export async function reviseQuote(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    quoteId: string;
+    title?: string | undefined;
+    lines: readonly DraftLine[];
+    discount?: string | undefined;
+    validForDays?: number;
+    notes?: string | undefined;
+    /** Why this quote needed a new version. Carried onto the audit trail. */
+    reason?: string | undefined;
+  },
+): Promise<{ quoteId: string; reference: string; totalMinor: number; warnings: readonly string[] }> {
+  if (input.lines.length === 0) throw new UserFacingError("A quote needs at least one line");
+
+  const originalRows = await tx
+    .select({
+      id: schema.quotes.id,
+      status: schema.quotes.status,
+      jobId: schema.quotes.jobId,
+      title: schema.quotes.title,
+    })
+    .from(schema.quotes)
+    .where(eq(schema.quotes.id, input.quoteId))
+    .limit(1);
+
+  const original = originalRows[0];
+  if (!original) throw new Error("Quote not found in this tenant");
+  if (!original.jobId) {
+    throw new UserFacingError("This quote has no job linked to it, so it cannot be revised.");
+  }
+
+  const status = original.status as QuoteStatus;
+  if (status === "approved") {
+    throw new UserFacingError(
+      "An approved quote cannot be revised. The customer agreed to this document — raise a new " +
+        "quote against the job instead, so the record shows two documents and why.",
+    );
+  }
+  if (!REVISABLE_QUOTE_STATUSES.includes(status)) {
+    throw new UserFacingError(
+      `This quote is ${QUOTE_STATUS_LABEL[status].toLowerCase()} and cannot be revised. Look up ` +
+        "the current version and revise that one instead.",
+    );
+  }
+
+  const jobRows = await tx
+    .select({
+      customerId: schema.jobs.customerId,
+      propertyId: schema.jobs.propertyId,
+      serviceSlug: schema.jobs.serviceSlug,
+    })
+    .from(schema.jobs)
+    .where(eq(schema.jobs.id, original.jobId))
+    .limit(1);
+
+  const job = jobRows[0];
+  if (!job) throw new Error("Job not found in this tenant");
+
+  const lineInputs: LineInput[] = input.lines.map((l) => ({
+    quantity: l.quantity,
+    unitPriceMinor: toMinor(l.unitPrice),
+  }));
+  const grossSubtotal = computeTotals({ lines: lineInputs, taxRateBasisPoints: 0 }).subtotalMinor;
+
+  let discountMinor = input.discount ? toMinor(input.discount) : 0;
+  let discountBasisPoints: number | null = null;
+  let discountSource: string | null = null;
+  if (!input.discount) {
+    const contractDiscount = await resolveContractDiscount(tx, original.jobId, grossSubtotal);
+    if (contractDiscount) {
+      discountMinor = contractDiscount.discountMinor;
+      discountBasisPoints = contractDiscount.discountBasisPoints;
+      discountSource = contractDiscount.source;
+    }
+  }
+
+  const totals = computeTotals({
+    lines: lineInputs,
+    discountMinor,
+    taxRateBasisPoints: UAE_VAT_BASIS_POINTS,
+  });
+
+  const reference = await nextReference(tx, "QUO", new Date().getFullYear());
+  const validUntil = new Date(Date.now() + (input.validForDays ?? 30) * 24 * 60 * 60 * 1000);
+
+  const [quote] = await tx
+    .insert(schema.quotes)
+    .values({
+      tenantId: ctx.tenantId,
+      reference,
+      customerId: job.customerId,
+      propertyId: job.propertyId,
+      jobId: original.jobId,
+      title: input.title ?? original.title,
+      status: "draft",
+      subtotal: toDecimalString(totals.subtotalMinor),
+      discountAmount: toDecimalString(totals.discountMinor),
+      discountBasisPoints,
+      discountSource,
+      taxRateBasisPoints: UAE_VAT_BASIS_POINTS,
+      taxAmount: toDecimalString(totals.taxMinor),
+      total: toDecimalString(totals.totalMinor),
+      validUntil,
+      notes: input.notes ?? null,
+      supersedesQuoteId: original.id,
+      preparedById: ctx.userId ?? null,
+    })
+    .returning({ id: schema.quotes.id });
+
+  if (!quote) throw new Error("Failed to create the revised quote");
+
+  await tx.insert(schema.quoteLines).values(
+    input.lines.map((l, i) => ({
+      tenantId: ctx.tenantId,
+      quoteId: quote.id,
+      position: i + 1,
+      serviceSlug: l.serviceSlug ?? job.serviceSlug,
+      description: l.description,
+      quantity: l.quantity,
+      unit: l.unit,
+      unitPrice: toDecimalString(toMinor(l.unitPrice)),
+      lineTotal: toDecimalString(
+        lineInputs[i] ? computeTotals({ lines: [lineInputs[i]!], taxRateBasisPoints: 0 }).subtotalMinor : 0,
+      ),
+    })),
+  );
+
+  // The original is retired, never edited or removed: what the customer was
+  // shown when they decided (or when the clock ran out on it) stays on file
+  // exactly as it was. `sentAt`, `viewedAt`, `decidedAt` and `rejectionReason`
+  // are all untouched by this update — only `status` and `updatedAt` move.
+  await tx
+    .update(schema.quotes)
+    .set({ status: "superseded", updatedAt: new Date() })
+    .where(eq(schema.quotes.id, original.id));
+
+  // One note against the retired quote, matching the pattern `0040` set for
+  // retired visits: the question asked later is "why was MY quote replaced",
+  // and the generic row-diff `audit_log` trigger cannot answer that.
+  await writeAuditNote(tx, ctx, {
+    tableName: "quotes",
+    recordId: original.id,
+    action: "superseded",
+    detail: {
+      rule: "QTE-10",
+      newQuoteId: quote.id,
+      newReference: reference,
+      previousStatus: status,
+      reason: input.reason ?? null,
+    },
+  });
+
+  return {
+    quoteId: quote.id,
+    reference,
+    totalMinor: totals.totalMinor,
+    warnings: licensedActivityWarnings(input.lines, job.serviceSlug),
+  };
 }
 
 /**
@@ -224,6 +588,18 @@ export async function decideQuote(
  *
  * Lives here rather than in the notify package because notify depends on db;
  * the reverse would be a cycle. The app layer joins the two.
+ *
+ * ── WHY `customerId` IS HERE AND `customerEmail` IS NO LONGER THE ADDRESS ──
+ *
+ * `POR-5` is a preference held by the customer, so anything about to send this
+ * has to be able to name the customer — and to name the right one, from the
+ * quote rather than from whatever the caller happened to have to hand.
+ *
+ * `customerEmail` stays, because the jobs screen shows it, but it is no longer
+ * where a notification gets its recipient. Emailing the billing address from
+ * here was how the immediate send came to disagree with the sweep, which
+ * resolves the contacts flagged `notify_on_jobs` and falls back to billing only
+ * when there are none. `customerNotificationRecipients` is the one rule now.
  */
 export async function getQuoteForNotification(
   tx: TenantScopedTx,
@@ -235,6 +611,7 @@ export async function getQuoteForNotification(
   total: string;
   currency: string;
   validUntil: Date | null;
+  customerId: string;
   customerName: string;
   customerEmail: string | null;
 } | null> {
@@ -246,6 +623,10 @@ export async function getQuoteForNotification(
       total: schema.quotes.total,
       currency: schema.quotes.currency,
       validUntil: schema.quotes.validUntil,
+      // From `customers`, not `quotes.customer_id`: the join has already proved
+      // the row exists, and the column on `quotes` is nullable while this one
+      // is not — so the type says `string` and means it.
+      customerId: schema.customers.id,
       customerName: schema.customers.name,
       customerEmail: schema.customers.billingEmail,
     })
@@ -268,11 +649,17 @@ export interface QuoteRow {
   readonly createdAt: Date;
   readonly customerName: string;
   readonly jobId: string | null;
+  /** `QTE-10`. The quote this one replaced, or null on a first version. */
+  readonly supersedesQuoteId: string | null;
+  /** `QTE-5`. Basis points behind `discountAmount`, only when it is a contract rate. */
+  readonly discountBasisPoints: number | null;
+  /** `QTE-5`. Where the discount came from, in words — null when it is manual or there is none. */
+  readonly discountSource: string | null;
 }
 
 export async function listQuotes(
   tx: TenantScopedTx,
-  options?: { jobId?: string; limit?: number },
+  options?: { jobId?: string; limit?: number; statuses?: readonly QuoteStatus[] },
 ): Promise<readonly QuoteRow[]> {
   const rows = await tx
     .select({
@@ -286,18 +673,57 @@ export async function listQuotes(
       createdAt: schema.quotes.createdAt,
       customerName: schema.customers.name,
       jobId: schema.quotes.jobId,
+      supersedesQuoteId: schema.quotes.supersedesQuoteId,
+      discountBasisPoints: schema.quotes.discountBasisPoints,
+      discountSource: schema.quotes.discountSource,
     })
     .from(schema.quotes)
     .innerJoin(schema.customers, eq(schema.customers.id, schema.quotes.customerId))
-    .where(
-      options?.jobId
-        ? and(isNull(schema.quotes.deletedAt), eq(schema.quotes.jobId, options.jobId))
-        : isNull(schema.quotes.deletedAt),
-    )
+    .where(quotePredicate(options))
     .orderBy(desc(schema.quotes.createdAt))
     .limit(options?.limit ?? 100);
 
   return rows.map((r) => ({ ...r, status: r.status as QuoteStatus }));
+}
+
+/**
+ * How many quotes match, independently of any page.
+ *
+ * ── WHY FILTERING THE LIST IS NOT THE SAME ANSWER ───────────────────────────
+ *
+ * `listQuotes` is capped and ordered newest-first across every status, so a
+ * caller that reads a page and counts the `sent` and `viewed` rows in it is
+ * answering "how many are awaiting a decision among the most recent N", which
+ * is a different question and a smaller number. It goes wrong long before the
+ * cap is reached: a customer with a run of recent approved and rejected quotes
+ * has the waiting ones pushed off the page, and the count reads zero while two
+ * are genuinely sitting with them.
+ *
+ * Same shape as `countJobs` in domain/jobs.ts, for the same `LEAD-8` reason: a
+ * headline figure is counted over every matching row, never measured off a
+ * page, and the two are separate queries so neither can quietly become the
+ * other.
+ */
+export async function countQuotes(
+  tx: TenantScopedTx,
+  options?: { jobId?: string; statuses?: readonly QuoteStatus[] },
+): Promise<number> {
+  const [row] = await tx
+    .select({ total: count() })
+    .from(schema.quotes)
+    .where(quotePredicate(options));
+
+  return Number(row?.total ?? 0);
+}
+
+/** The one WHERE both of the above use, so a page and its total cannot diverge. */
+function quotePredicate(options?: { jobId?: string; statuses?: readonly QuoteStatus[] }) {
+  const clauses = [isNull(schema.quotes.deletedAt)];
+  if (options?.jobId) clauses.push(eq(schema.quotes.jobId, options.jobId));
+  if (options?.statuses && options.statuses.length > 0) {
+    clauses.push(inArray(schema.quotes.status, [...options.statuses]));
+  }
+  return and(...clauses);
 }
 
 export async function getQuoteWithLines(
@@ -338,6 +764,9 @@ export async function getQuoteWithLines(
       notes: schema.quotes.notes,
       customerName: schema.customers.name,
       jobId: schema.quotes.jobId,
+      supersedesQuoteId: schema.quotes.supersedesQuoteId,
+      discountBasisPoints: schema.quotes.discountBasisPoints,
+      discountSource: schema.quotes.discountSource,
     })
     .from(schema.quotes)
     .innerJoin(schema.customers, eq(schema.customers.id, schema.quotes.customerId))
@@ -385,26 +814,122 @@ export const INVOICE_STATUS_LABEL: Readonly<Record<InvoiceStatus, string>> = {
 };
 
 /**
+ * The supplier block, as it stands right now.
+ *
+ * Read once, at issue, and written onto the invoice row. `company.ts` is
+ * configuration — it changes when a licence renews or the office moves — and an
+ * invoice is a legal artefact that must keep saying what it said. Reading it at
+ * render time instead would rewrite every historical document the next time an
+ * environment variable changed, invisibly, because the new values would look
+ * every bit as plausible as the old ones.
+ *
+ * Unset values stay null. `DED-000000` on a tax invoice is worse than no
+ * licence line at all, and `assertPublishableIdentity` already refuses
+ * placeholders in production.
+ */
+function supplierSnapshot(): {
+  supplierName: string;
+  supplierTrn: string | null;
+  supplierAddress: string | null;
+  supplierLicenceNumber: string | null;
+  supplierCrNumber: string | null;
+  supplierPhone: string | null;
+  supplierEmail: string | null;
+  supplierCountry: string;
+} {
+  const a = company.address;
+  // Only when there is a street. "Dubai, United Arab Emirates" is a region, not
+  // an address, and Article 59 asks for an address.
+  const address = a.street ? [a.street, a.city, a.region, a.country].filter(Boolean).join(", ") : null;
+
+  return {
+    supplierName: company.legalName,
+    supplierTrn: company.trn,
+    supplierAddress: address,
+    supplierLicenceNumber: company.licenceNumber,
+    supplierCrNumber: company.crNumber,
+    supplierPhone: company.phone,
+    supplierEmail: company.email,
+    supplierCountry: a.countryCode,
+  };
+}
+
+/** The date of supply, in Dubai, for a service job. */
+async function supplyDateForJob(
+  tx: TenantScopedTx,
+  jobId: string,
+  fallback: Date,
+): Promise<string> {
+  // The customer's signature is the moment of supply for a service, not the
+  // moment somebody got round to the paperwork. INV-5's 14-day clock runs from
+  // this date, so taking it from `issued_on` would make every invoice look
+  // punctual by construction.
+  const rows = await tx
+    .select({ signedAt: schema.jobSignoffs.signedAt })
+    .from(schema.jobSignoffs)
+    .where(eq(schema.jobSignoffs.jobId, jobId))
+    .orderBy(schema.jobSignoffs.signedAt)
+    .limit(1);
+
+  return dubaiDateKey(rows[0]?.signedAt ?? fallback);
+}
+
+/**
  * Raise an invoice against a job.
  *
- * The customer's tax registration number is copied onto the invoice at issue
- * time rather than read from the customer record on display. A reissued or
- * reprinted invoice has to show the TRN that applied when it was raised, not
- * whatever the customer record says today.
+ * Everything Article 59 requires is captured here, at the one moment all of it
+ * is knowable: the supplier and recipient identity as they stand today, the
+ * date of supply from the customer's signature, and per-line tax in AED.
+ *
+ * The per-line tax is apportioned rather than computed line by line, because
+ * the discount is a document-level amount. `apportionLines` distributes it and
+ * its VAT with a largest-remainder split, so the lines sum to the document
+ * totals exactly — an invoice whose lines do not add up to its total is one an
+ * accountant refuses, and correctly.
+ *
+ * The invoice is issued, not drafted. A tax invoice with a sequential number on
+ * it is a document, not a workspace: allocating a number to something that may
+ * never be issued puts a gap in the series, and a gap is an FTA audit flag.
  */
 export async function createInvoiceFromJob(
   tx: TenantScopedTx,
   ctx: TenantContext,
-  input: { jobId: string; lines: readonly DraftLine[]; discount?: string | undefined },
+  input: {
+    jobId: string;
+    lines: readonly DraftLine[];
+    discount?: string | undefined;
+    /** ISO date. Overrides the sign-off date where supply genuinely differs. */
+    supplyDate?: string | undefined;
+    /** The customer's own reference, which is what gets an invoice paid. */
+    buyerReference?: string | undefined;
+    purchaseOrderReference?: string | undefined;
+    /** Article 59: required together where an amount originates elsewhere. */
+    sourceCurrency?: string | undefined;
+    exchangeRate?: string | undefined;
+    exchangeRateSource?: string | undefined;
+  },
 ): Promise<{ invoiceId: string; reference: string; totalMinor: number }> {
   if (input.lines.length === 0) throw new UserFacingError("An invoice needs at least one line");
+
+  // Both or neither. Half an exchange-rate disclosure reads as an omission to
+  // an auditor, and the database constraint says the same thing.
+  if (Boolean(input.sourceCurrency) !== Boolean(input.exchangeRate)) {
+    throw new UserFacingError(
+      "Give both the source currency and the exchange rate, or neither — Article 59 requires the rate wherever an amount originates in another currency.",
+    );
+  }
 
   const jobRows = await tx
     .select({
       customerId: schema.jobs.customerId,
       status: schema.jobs.status,
       serviceSlug: schema.jobs.serviceSlug,
+      completedAt: schema.jobs.completedAt,
+      customerName: schema.customers.name,
       trn: schema.customers.taxRegistrationNumber,
+      billingAddress: schema.customers.billingAddress,
+      billingCity: schema.customers.billingCity,
+      billingCountry: schema.customers.billingCountry,
       terms: schema.customers.paymentTermsDays,
     })
     .from(schema.jobs)
@@ -427,7 +952,7 @@ export async function createInvoiceFromJob(
     unitPriceMinor: toMinor(l.unitPrice),
   }));
 
-  const totals = computeTotals({
+  const { lines: apportioned, totals } = apportionLines({
     lines: lineInputs,
     discountMinor: input.discount ? toMinor(input.discount) : 0,
     taxRateBasisPoints: UAE_VAT_BASIS_POINTS,
@@ -436,41 +961,68 @@ export async function createInvoiceFromJob(
   const reference = await nextReference(tx, "INV", new Date().getFullYear());
   const issuedOn = new Date();
   const dueOn = new Date(issuedOn.getTime() + (job.terms ?? 30) * 24 * 60 * 60 * 1000);
+  const supplyDate = input.supplyDate ?? (await supplyDateForJob(tx, input.jobId, job.completedAt ?? issuedOn));
+
+  const recipientAddress =
+    [job.billingAddress, job.billingCity].filter(Boolean).join(", ") || null;
 
   const [invoice] = await tx
     .insert(schema.invoices)
     .values({
       tenantId: ctx.tenantId,
       reference,
+      documentType: "tax_invoice",
       customerId: job.customerId,
       jobId: input.jobId,
       status: "issued",
       issuedOn,
       dueOn,
+      supplyDate,
       subtotal: toDecimalString(totals.subtotalMinor),
       discountAmount: toDecimalString(totals.discountMinor),
+      taxableAmount: toDecimalString(totals.subtotalMinor - totals.discountMinor),
       taxRateBasisPoints: UAE_VAT_BASIS_POINTS,
       taxAmount: toDecimalString(totals.taxMinor),
       total: toDecimalString(totals.totalMinor),
       amountPaid: "0.00",
-      customerTrn: job.trn,
+      ...supplierSnapshot(),
+      recipientName: job.customerName,
+      recipientTrn: job.trn,
+      recipientAddress,
+      recipientCountry: job.billingCountry ?? "AE",
+      paymentTermsDays: job.terms ?? 30,
+      buyerReference: input.buyerReference ?? null,
+      purchaseOrderReference: input.purchaseOrderReference ?? null,
+      sourceCurrency: input.sourceCurrency ?? null,
+      exchangeRate: input.exchangeRate ?? null,
+      exchangeRateSource: input.exchangeRateSource ?? null,
+      issuedById: ctx.userId ?? null,
     })
     .returning({ id: schema.invoices.id });
 
   if (!invoice) throw new Error("Failed to create invoice");
 
   await tx.insert(schema.invoiceLines).values(
-    input.lines.map((l, i) => ({
-      tenantId: ctx.tenantId,
-      invoiceId: invoice.id,
-      position: i + 1,
-      serviceSlug: l.serviceSlug ?? job.serviceSlug,
-      description: l.description,
-      quantity: l.quantity,
-      unit: l.unit,
-      unitPrice: toDecimalString(toMinor(l.unitPrice)),
-      lineTotal: toDecimalString(lineInputs[i] ? computeTotals({ lines: [lineInputs[i]!], taxRateBasisPoints: 0 }).subtotalMinor : 0),
-    })),
+    input.lines.map((l, i) => {
+      const share = apportioned[i];
+      return {
+        tenantId: ctx.tenantId,
+        invoiceId: invoice.id,
+        jobId: input.jobId,
+        position: i + 1,
+        serviceSlug: l.serviceSlug ?? job.serviceSlug,
+        description: l.description,
+        quantity: l.quantity,
+        unit: l.unit,
+        unitCode: unitCodeFor(l.unit),
+        unitPrice: toDecimalString(toMinor(l.unitPrice)),
+        lineTotal: toDecimalString(share?.lineTotalMinor ?? 0),
+        discountAmount: toDecimalString(share?.discountMinor ?? 0),
+        netAmount: toDecimalString(share?.netMinor ?? 0),
+        taxRateBasisPoints: UAE_VAT_BASIS_POINTS,
+        taxAmount: toDecimalString(share?.taxMinor ?? 0),
+      };
+    }),
   );
 
   return { invoiceId: invoice.id, reference, totalMinor: totals.totalMinor };
@@ -546,11 +1098,22 @@ export interface InvoiceRow {
   readonly daysUntilDue: number | null;
 }
 
+/**
+ * Every invoice raised against one job.
+ *
+ * Bounded by the job rather than by a `LIMIT`: a job carries a handful of
+ * invoices — usually one, occasionally a re-issue after a credit — so this is
+ * a list that cannot grow without bound and does not need a cursor. The whole
+ * invoice list is `searchInvoices` below, which does.
+ *
+ * `jobId` is required for that reason. It used to be optional, and the call
+ * without one was the capped, unpageable list that `searchInvoices` replaces.
+ */
 export async function listInvoices(
   tx: TenantScopedTx,
-  options?: { limit?: number; now?: Date; jobId?: string },
+  options: { jobId: string; now?: Date },
 ): Promise<readonly InvoiceRow[]> {
-  const now = options?.now ?? new Date();
+  const now = options.now ?? new Date();
 
   const rows = await tx
     .select({
@@ -566,13 +1129,8 @@ export async function listInvoices(
     })
     .from(schema.invoices)
     .innerJoin(schema.customers, eq(schema.customers.id, schema.invoices.customerId))
-    .where(
-      options?.jobId
-        ? and(isNull(schema.invoices.deletedAt), eq(schema.invoices.jobId, options.jobId))
-        : isNull(schema.invoices.deletedAt),
-    )
-    .orderBy(desc(schema.invoices.issuedOn))
-    .limit(options?.limit ?? 200);
+    .where(and(isNull(schema.invoices.deletedAt), eq(schema.invoices.jobId, options.jobId)))
+    .orderBy(desc(schema.invoices.issuedOn));
 
   return rows.map((r) => ({
     ...r,
@@ -584,11 +1142,273 @@ export async function listInvoices(
 }
 
 /**
+ * Search and page the invoice list (`LEAD-8`, closing `TD-10` on this screen).
+ *
+ * ── WHAT WAS WRONG ─────────────────────────────────────────────────────────
+ *
+ * `listInvoices` took a limit defaulting to 200 and had no second page. That
+ * is not "the newest two hundred invoices": it is "every invoice after the two
+ * hundredth is unreachable", with nothing on the screen admitting it. On a
+ * business raising a few invoices a day it is a little under a year before the
+ * oldest ones start disappearing, and the first symptom is somebody unable to
+ * find a document a customer is disputing.
+ *
+ * The AR ageing tiles above the table were never affected and still are not:
+ * `arAgeing` is its own aggregate over every open invoice, not a sum of this
+ * page. Keep it that way. Totalling a paginated array is how a page number
+ * ends up changing a headline figure.
+ *
+ * ── THE CURSOR, AND WHY IT COALESCES ───────────────────────────────────────
+ *
+ * `encodeCursor`/`decodeCursor` come from `./leads`, which is where `LEAD-8`
+ * was first built. One cursor format across the leads, customers and invoice
+ * lists is the point: three encodings would be three sets of edge cases.
+ *
+ * The sort key is `coalesce(issued_on, created_at)`, not `issued_on` alone,
+ * and that matters more than it looks. A draft invoice has no issue date, so
+ * `issued_on` is null; `(issued_on, id) < (…, …)` is null for those rows and
+ * null is not true, so a plain `issued_on` cursor would drop every draft from
+ * page two onward — the exact bug being fixed here, reintroduced for the
+ * documents nobody has sent yet. Coalescing gives every row a non-null key,
+ * and a draft sorts by when it was raised, which is what "newest first" means
+ * for a document that has no other date.
+ *
+ * `0022` indexes that expression exactly, so the ordering is an index scan
+ * rather than a sort of the whole table.
+ */
+export async function searchInvoices(
+  tx: TenantScopedTx,
+  options?: {
+    /** Matches an invoice reference or the customer's name. */
+    q?: string | undefined;
+    cursor?: string | undefined;
+    limit?: number | undefined;
+    now?: Date | undefined;
+  },
+): Promise<Page<InvoiceRow>> {
+  // The same ceiling `searchLeads` and `searchCustomers` apply. A limit the
+  // caller chooses is not a limit.
+  const limit = Math.min(Math.max(options?.limit ?? 25, 1), 100);
+  const cursor = decodeCursor(options?.cursor);
+  const now = options?.now ?? new Date();
+
+  const term = options?.q?.trim();
+  const like = term ? `%${term.replace(/[%_\\]/g, (m) => `\\${m}`)}%` : null;
+  // Reference or customer name, one box. Somebody looking for an invoice has
+  // either the document in front of them or the customer on the phone.
+  const search = like
+    ? sql`and (i.reference ilike ${like} or c.name ilike ${like})`
+    : sql``;
+
+  // Row-wise, so Postgres can drive it straight off the composite index; the
+  // `a < x OR (a = x AND b < y)` spelling usually cannot use one.
+  const keyset = cursor
+    ? sql`and (coalesce(i.issued_on, i.created_at), i.id) < (${cursor.createdAt.toISOString()}::timestamptz, ${cursor.id}::uuid)`
+    : sql``;
+
+  // Raw rather than the query builder because the ordering key is an
+  // expression and the cursor compares against the same expression; the two
+  // have to be written once, together, or they drift.
+  const rows = (await tx.execute<Record<string, never>>(sql`
+    select i.id, i.reference, i.status::text as status, i.total, i.amount_paid,
+           i.currency, i.issued_on, i.due_on, i.created_at,
+           coalesce(i.issued_on, i.created_at) as sort_at,
+           c.name as customer_name
+      from invoices i
+      join customers c on c.id = i.customer_id
+     where i.deleted_at is null
+       ${search}
+       ${keyset}
+     order by coalesce(i.issued_on, i.created_at) desc, i.id desc
+     limit ${limit + 1}
+  `)) as unknown as {
+    id: string;
+    reference: string;
+    status: string;
+    total: string;
+    amount_paid: string;
+    currency: string;
+    // Timestamps arrive from `tx.execute` as strings, never Dates. See _rows.ts.
+    issued_on: string | null;
+    due_on: string | null;
+    created_at: string;
+    sort_at: string;
+    customer_name: string;
+  }[];
+
+  const mapped = rows.map((r) => {
+    const dueOn = rowDate(r.due_on);
+    return {
+      sortAt: requiredRowDate(r.sort_at),
+      row: {
+        id: r.id,
+        reference: r.reference,
+        status: r.status as InvoiceStatus,
+        total: r.total,
+        amountPaid: r.amount_paid,
+        currency: r.currency,
+        issuedOn: rowDate(r.issued_on),
+        dueOn,
+        customerName: r.customer_name,
+        daysUntilDue: dueOn
+          ? Math.round((dueOn.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))
+          : null,
+      } satisfies InvoiceRow,
+    };
+  });
+
+  // The `limit + 1` trick, as in `./leads`: asking for one row more than the
+  // page needs makes "is there another page" a fact rather than a guess, and
+  // costs nothing next to a `count(*)` over the same filter. `toPage` there is
+  // not exported and keys on `created_at`; this one keys on the coalesced sort
+  // column, which is why it is spelled out rather than reused.
+  if (mapped.length <= limit) return { rows: mapped.map((m) => m.row), nextCursor: null };
+  const page = mapped.slice(0, limit);
+  const last = page[page.length - 1]!;
+  return {
+    rows: page.map((m) => m.row),
+    nextCursor: encodeCursor({ createdAt: last.sortAt, id: last.row.id }),
+  };
+}
+
+/** Which ageing column an open balance falls in. */
+export type AgeingBucket = "current" | "days_1_30" | "days_31_60" | "days_61_plus";
+
+/**
+ * One open invoice, with the arithmetic that puts it in an ageing bucket.
+ *
+ * The row the accounting export writes and the row `arAgeing` counts. See the
+ * note on `arAgeing` for why there is only one of these functions.
+ */
+export interface ReceivableRow {
+  readonly invoiceId: string;
+  readonly reference: string;
+  readonly customerName: string;
+  readonly customerCode: string | null;
+  readonly customerTrn: string | null;
+  readonly issuedOn: Date | null;
+  readonly dueOn: Date | null;
+  readonly status: string;
+  readonly currency: string;
+  /** Tax-INCLUSIVE, as stored on the document. */
+  readonly totalMinor: number;
+  readonly paidMinor: number;
+  /** Tax-inclusive value of credit notes against this invoice. Positive. */
+  readonly creditedMinor: number;
+  /** total - paid - credited. Always greater than zero; settled rows are absent. */
+  readonly outstandingMinor: number;
+  /** Days past the due date. Zero or negative means not yet due. */
+  readonly overdueDays: number;
+  readonly bucket: AgeingBucket;
+}
+
+/**
+ * Every invoice with money still owed on it, aged.
+ *
+ * ── WHY THIS EXISTS SEPARATELY FROM `arAgeing` ──────────────────────────────
+ *
+ * It does not, really — `arAgeing` is a fold over this list, and that is the
+ * point. `INV-16` puts an AR schedule in front of an accountant, and an
+ * accountant reconciles the detail against the summary the moment they receive
+ * both. Two functions computing "outstanding" independently would agree until
+ * the day one of them learned about a new status and the other did not, and the
+ * first symptom would be a schedule that misses the control total by one
+ * invoice — the single most credibility-destroying thing this export could do.
+ *
+ * There is no `limit`. A capped receivables list is a wrong control total, and
+ * the number of invoices a maintenance contractor has open at once is bounded
+ * by its collections process rather than by its history.
+ */
+export async function openReceivables(
+  tx: TenantScopedTx,
+  now: Date = new Date(),
+): Promise<readonly ReceivableRow[]> {
+  const rows = await tx
+    .select({
+      id: schema.invoices.id,
+      reference: schema.invoices.reference,
+      customerName: schema.customers.name,
+      customerCode: schema.customers.code,
+      customerTrn: schema.customers.taxRegistrationNumber,
+      total: schema.invoices.total,
+      amountPaid: schema.invoices.amountPaid,
+      issuedOn: schema.invoices.issuedOn,
+      dueOn: schema.invoices.dueOn,
+      status: schema.invoices.status,
+      currency: schema.invoices.currency,
+    })
+    .from(schema.invoices)
+    .innerJoin(schema.customers, eq(schema.customers.id, schema.invoices.customerId))
+    .where(isNull(schema.invoices.deletedAt));
+
+  // A partly credited invoice is still collectable for the remainder, so the
+  // credit is netted off the balance rather than removing the invoice from the
+  // report. Only a full credit flips the status, and the status filter below
+  // handles that case.
+  const creditRows = await tx
+    .select({ invoiceId: schema.creditNotes.invoiceId, total: schema.creditNotes.total })
+    .from(schema.creditNotes)
+    .where(isNull(schema.creditNotes.deletedAt));
+
+  const creditedByInvoice = new Map<string, number>();
+  for (const c of creditRows) {
+    creditedByInvoice.set(c.invoiceId, (creditedByInvoice.get(c.invoiceId) ?? 0) + toMinor(c.total));
+  }
+
+  const open: ReceivableRow[] = [];
+
+  for (const r of rows) {
+    if (r.status === "paid" || r.status === "written_off" || r.status === "credited") continue;
+    const creditedMinor = creditedByInvoice.get(r.id) ?? 0;
+    const outstandingMinor = toMinor(r.total) - toMinor(r.amountPaid) - creditedMinor;
+    if (outstandingMinor <= 0) continue;
+
+    const overdueDays = r.dueOn
+      ? Math.floor((now.getTime() - r.dueOn.getTime()) / (24 * 60 * 60 * 1000))
+      : 0;
+
+    const bucket: AgeingBucket =
+      overdueDays <= 0
+        ? "current"
+        : overdueDays <= 30
+          ? "days_1_30"
+          : overdueDays <= 60
+            ? "days_31_60"
+            : "days_61_plus";
+
+    open.push({
+      invoiceId: r.id,
+      reference: r.reference,
+      customerName: r.customerName,
+      customerCode: r.customerCode,
+      customerTrn: r.customerTrn,
+      issuedOn: r.issuedOn,
+      dueOn: r.dueOn,
+      status: r.status,
+      currency: r.currency,
+      totalMinor: toMinor(r.total),
+      paidMinor: toMinor(r.amountPaid),
+      creditedMinor,
+      outstandingMinor,
+      overdueDays,
+      bucket,
+    });
+  }
+
+  // Oldest first: the order a collections call list is worked in, and the order
+  // an accountant expects an aged schedule to arrive in.
+  return open.sort((a, b) => b.overdueDays - a.overdueDays);
+}
+
+/**
  * Accounts receivable ageing.
  *
  * Computed from the invoice rows rather than by a stored status, because
  * "overdue" is a function of today's date and drifts the moment a status column
  * stops being updated by a nightly job nobody is watching.
+ *
+ * A fold over `openReceivables` rather than its own query, so the totals on the
+ * dashboard and the detail in the accounting export cannot disagree.
  */
 export async function arAgeing(
   tx: TenantScopedTx,
@@ -600,34 +1420,18 @@ export async function arAgeing(
   days61PlusMinor: number;
   totalOutstandingMinor: number;
 }> {
-  const rows = await tx
-    .select({
-      total: schema.invoices.total,
-      amountPaid: schema.invoices.amountPaid,
-      dueOn: schema.invoices.dueOn,
-      status: schema.invoices.status,
-    })
-    .from(schema.invoices)
-    .where(isNull(schema.invoices.deletedAt));
+  const open = await openReceivables(tx, now);
 
   let currentMinor = 0;
   let days1to30Minor = 0;
   let days31to60Minor = 0;
   let days61PlusMinor = 0;
 
-  for (const r of rows) {
-    if (r.status === "paid" || r.status === "written_off" || r.status === "credited") continue;
-    const outstanding = toMinor(r.total) - toMinor(r.amountPaid);
-    if (outstanding <= 0) continue;
-
-    const overdueDays = r.dueOn
-      ? Math.floor((now.getTime() - r.dueOn.getTime()) / (24 * 60 * 60 * 1000))
-      : 0;
-
-    if (overdueDays <= 0) currentMinor += outstanding;
-    else if (overdueDays <= 30) days1to30Minor += outstanding;
-    else if (overdueDays <= 60) days31to60Minor += outstanding;
-    else days61PlusMinor += outstanding;
+  for (const r of open) {
+    if (r.bucket === "current") currentMinor += r.outstandingMinor;
+    else if (r.bucket === "days_1_30") days1to30Minor += r.outstandingMinor;
+    else if (r.bucket === "days_31_60") days31to60Minor += r.outstandingMinor;
+    else days61PlusMinor += r.outstandingMinor;
   }
 
   return {
@@ -644,6 +1448,11 @@ export async function arAgeing(
  *
  * Separate from `listInvoices` because a notification must not depend on a
  * list query's filters or ordering ever changing.
+ *
+ * `customerId` for the same reason as `getQuoteForNotification`: the `POR-5`
+ * opt-out is the customer's, so the sender has to be able to name the customer,
+ * and the invoice is the only trustworthy source of which one. `customerEmail`
+ * is no longer the recipient — see the note there.
  */
 export async function getInvoiceForNotification(
   tx: TenantScopedTx,
@@ -653,6 +1462,7 @@ export async function getInvoiceForNotification(
   total: string;
   currency: string;
   dueOn: Date | null;
+  customerId: string;
   customerName: string;
   customerEmail: string | null;
 } | null> {
@@ -662,6 +1472,7 @@ export async function getInvoiceForNotification(
       total: schema.invoices.total,
       currency: schema.invoices.currency,
       dueOn: schema.invoices.dueOn,
+      customerId: schema.customers.id,
       customerName: schema.customers.name,
       customerEmail: schema.customers.billingEmail,
     })
@@ -671,4 +1482,1200 @@ export async function getInvoiceForNotification(
     .limit(1);
 
   return rows[0] ?? null;
+}
+
+// ── The tax invoice document (INV-3, INV-6) ──────────────────────────────────
+
+export interface InvoiceDetail {
+  readonly invoiceId: string;
+  readonly customerId: string;
+  readonly jobId: string | null;
+  readonly status: InvoiceStatus;
+  readonly issuedOn: Date | null;
+  readonly dueOn: Date | null;
+  readonly amountPaidMinor: number;
+  readonly creditedMinor: number;
+  readonly outstandingMinor: number;
+  readonly pdfStorageKey: string | null;
+  readonly notes: string | null;
+  /** Which of the two renderings applies. `INV-6` — one object, two layouts. */
+  readonly variant: InvoiceVariant;
+  /** Everything on the face of the document, ready for validation and render. */
+  readonly document: TaxDocumentDraft;
+}
+
+/**
+ * One invoice, as the document it is.
+ *
+ * Reads only from the invoice row, never from `customers` or `company.ts`. The
+ * identity was snapshot at issue precisely so that a reprint two years later is
+ * the same document, and joining back to the live customer record here would
+ * undo that in the one place it matters most.
+ *
+ * The customer join that does happen is for `customerId` and navigation, not
+ * for anything that appears on the document.
+ */
+export async function getInvoiceDocument(
+  tx: TenantScopedTx,
+  invoiceId: string,
+): Promise<InvoiceDetail | null> {
+  const rows = await tx
+    .select({
+      id: schema.invoices.id,
+      reference: schema.invoices.reference,
+      documentType: schema.invoices.documentType,
+      customerId: schema.invoices.customerId,
+      jobId: schema.invoices.jobId,
+      status: schema.invoices.status,
+      issuedOn: schema.invoices.issuedOn,
+      dueOn: schema.invoices.dueOn,
+      supplyDate: schema.invoices.supplyDate,
+      subtotal: schema.invoices.subtotal,
+      discountAmount: schema.invoices.discountAmount,
+      taxableAmount: schema.invoices.taxableAmount,
+      taxRateBasisPoints: schema.invoices.taxRateBasisPoints,
+      taxAmount: schema.invoices.taxAmount,
+      total: schema.invoices.total,
+      amountPaid: schema.invoices.amountPaid,
+      currency: schema.invoices.currency,
+      sourceCurrency: schema.invoices.sourceCurrency,
+      exchangeRate: schema.invoices.exchangeRate,
+      supplierName: schema.invoices.supplierName,
+      supplierTrn: schema.invoices.supplierTrn,
+      supplierAddress: schema.invoices.supplierAddress,
+      supplierLicenceNumber: schema.invoices.supplierLicenceNumber,
+      supplierCrNumber: schema.invoices.supplierCrNumber,
+      supplierPhone: schema.invoices.supplierPhone,
+      supplierEmail: schema.invoices.supplierEmail,
+      supplierCountry: schema.invoices.supplierCountry,
+      recipientName: schema.invoices.recipientName,
+      recipientTrn: schema.invoices.recipientTrn,
+      recipientAddress: schema.invoices.recipientAddress,
+      recipientCountry: schema.invoices.recipientCountry,
+      pdfStorageKey: schema.invoices.pdfStorageKey,
+      notes: schema.invoices.notes,
+    })
+    .from(schema.invoices)
+    .where(eq(schema.invoices.id, invoiceId))
+    .limit(1);
+
+  const inv = rows[0];
+  if (!inv) return null;
+
+  const lineRows = await tx
+    .select({
+      position: schema.invoiceLines.position,
+      description: schema.invoiceLines.description,
+      quantity: schema.invoiceLines.quantity,
+      unit: schema.invoiceLines.unit,
+      unitCode: schema.invoiceLines.unitCode,
+      unitPrice: schema.invoiceLines.unitPrice,
+      lineTotal: schema.invoiceLines.lineTotal,
+      discountAmount: schema.invoiceLines.discountAmount,
+      netAmount: schema.invoiceLines.netAmount,
+      taxRateBasisPoints: schema.invoiceLines.taxRateBasisPoints,
+      taxAmount: schema.invoiceLines.taxAmount,
+      taxCategoryCode: schema.invoiceLines.taxCategoryCode,
+      jobReference: schema.jobs.reference,
+    })
+    .from(schema.invoiceLines)
+    .leftJoin(schema.jobs, eq(schema.jobs.id, schema.invoiceLines.jobId))
+    .where(eq(schema.invoiceLines.invoiceId, invoiceId))
+    .orderBy(schema.invoiceLines.position);
+
+  const totalMinor = toMinor(inv.total);
+  const amountPaidMinor = toMinor(inv.amountPaid);
+  const creditedMinor = await creditedTotalMinor(tx, invoiceId);
+
+  const document: TaxDocumentDraft = {
+    documentType: inv.documentType === "tax_credit_note" ? "tax_credit_note" : "tax_invoice",
+    reference: inv.reference,
+    issueDate: inv.issuedOn ? dubaiDateKey(inv.issuedOn) : null,
+    supplyDate: inv.supplyDate,
+    dueDate: inv.dueOn ? dubaiDateKey(inv.dueOn) : null,
+    supplier: {
+      name: inv.supplierName,
+      trn: inv.supplierTrn,
+      address: inv.supplierAddress,
+      country: inv.supplierCountry,
+      phone: inv.supplierPhone,
+      email: inv.supplierEmail,
+      licenceNumber: inv.supplierLicenceNumber,
+      crNumber: inv.supplierCrNumber,
+    },
+    recipient: {
+      name: inv.recipientName,
+      trn: inv.recipientTrn,
+      address: inv.recipientAddress,
+      country: inv.recipientCountry,
+    },
+    currency: inv.currency,
+    sourceCurrency: inv.sourceCurrency,
+    exchangeRate: inv.exchangeRate,
+    lines: lineRows.map((l) => ({
+      position: l.position,
+      description: l.description,
+      quantity: l.quantity,
+      unit: l.unit,
+      unitCode: l.unitCode,
+      unitPriceMinor: toMinor(l.unitPrice),
+      lineTotalMinor: toMinor(l.lineTotal),
+      // Null, not zero. These lines predate 0007 and never carried per-line
+      // tax; a zero here would assert that no tax was charged on them.
+      discountMinor: l.discountAmount === null ? null : toMinor(l.discountAmount),
+      netMinor: l.netAmount === null ? null : toMinor(l.netAmount),
+      taxRateBasisPoints: l.taxRateBasisPoints,
+      taxMinor: l.taxAmount === null ? null : toMinor(l.taxAmount),
+      taxCategoryCode: l.taxCategoryCode,
+      jobReference: l.jobReference,
+    })),
+    subtotalMinor: toMinor(inv.subtotal),
+    discountMinor: toMinor(inv.discountAmount),
+    taxableMinor: toMinor(inv.taxableAmount),
+    taxRateBasisPoints: inv.taxRateBasisPoints,
+    taxMinor: toMinor(inv.taxAmount),
+    totalMinor,
+    creditedInvoiceReference: null,
+    creditReason: null,
+  };
+
+  return {
+    invoiceId: inv.id,
+    customerId: inv.customerId,
+    jobId: inv.jobId,
+    status: inv.status as InvoiceStatus,
+    issuedOn: inv.issuedOn,
+    dueOn: inv.dueOn,
+    amountPaidMinor,
+    creditedMinor,
+    outstandingMinor: Math.max(0, totalMinor - amountPaidMinor - creditedMinor),
+    pdfStorageKey: inv.pdfStorageKey,
+    notes: inv.notes,
+    variant: defaultInvoiceVariant(inv.recipientTrn),
+    document,
+  };
+}
+
+// ── The 14-day issuance clock (INV-5) ────────────────────────────────────────
+
+export interface UninvoicedSupply {
+  readonly jobId: string;
+  readonly jobReference: string;
+  readonly jobTitle: string;
+  readonly customerId: string;
+  readonly customerName: string;
+  /** ISO date, in Dubai. The customer's signature is the moment of supply. */
+  readonly supplyDate: string;
+  readonly daysSinceSupply: number;
+  readonly daysRemaining: number;
+  readonly deadline: string;
+  readonly state: "within_window" | "approaching" | "breached";
+  readonly penalty: string | null;
+}
+
+/**
+ * Signed-off jobs with no invoice, and how long they have been that way.
+ *
+ * `INV-5`. A tax invoice must be issued within 14 days of the date of supply,
+ * and failing to carries AED 2,500 — per invoice, so a quiet fortnight in
+ * accounts is a five-figure number rather than an embarrassment.
+ *
+ * The alert fires at day 10 rather than day 14. Four days of margin, because
+ * raising an invoice needs a person, that person takes leave, and an alert that
+ * arrives on the deadline has already failed.
+ *
+ * Day counting happens in SQL as date arithmetic in Asia/Dubai rather than by
+ * subtracting timestamps in JavaScript. Two reasons: flooring a millisecond
+ * difference reports thirteen days for a supply that happened fourteen days ago
+ * at 18:00, and this database does not run in Dubai — casting a timestamptz to
+ * a date without naming the zone silently uses the server's, which is how a
+ * deadline slips by a day without anyone touching the code.
+ */
+export async function uninvoicedSignedOffJobs(
+  tx: TenantScopedTx,
+  options?: { alertFromDays?: number },
+): Promise<readonly UninvoicedSupply[]> {
+  const rows = (await tx.execute<{
+    job_id: string;
+    job_reference: string;
+    job_title: string;
+    customer_id: string;
+    customer_name: string;
+    supply_date: string;
+    days_since_supply: number;
+  }>(sql`
+    select j.id             as job_id,
+           j.reference      as job_reference,
+           j.title          as job_title,
+           c.id             as customer_id,
+           c.name           as customer_name,
+           s.supply_date,
+           ((now() at time zone 'Asia/Dubai')::date - s.supply_date)::int as days_since_supply
+      from jobs j
+      join customers c on c.id = j.customer_id
+      join lateral (
+             select (min(signed_at) at time zone 'Asia/Dubai')::date as supply_date
+               from job_signoffs
+              where job_id = j.id and deleted_at is null
+           ) s on s.supply_date is not null
+     where j.status = 'signed_off'::job_status
+       and j.deleted_at is null
+       and not exists (
+             select 1 from invoices i
+              where i.job_id = j.id and i.deleted_at is null
+           )
+     order by s.supply_date
+  `)) as unknown as {
+    job_id: string;
+    job_reference: string;
+    job_title: string;
+    customer_id: string;
+    customer_name: string;
+    supply_date: string;
+    days_since_supply: number;
+  }[];
+
+  const alertFrom = options?.alertFromDays ?? ISSUANCE_ALERT_DAYS;
+
+  return rows.map((r) => {
+    // The clock is recomputed in core rather than trusted from the SQL day
+    // count, so the rule lives in exactly one place. The SQL count is what the
+    // ordering and the index are for.
+    const clock = issuanceClock(r.supply_date, addDubaiDays(r.supply_date, r.days_since_supply));
+    return {
+      jobId: r.job_id,
+      jobReference: r.job_reference,
+      jobTitle: r.job_title,
+      customerId: r.customer_id,
+      customerName: r.customer_name,
+      supplyDate: r.supply_date,
+      daysSinceSupply: clock.daysSinceSupply,
+      daysRemaining: clock.daysRemaining,
+      deadline: clock.deadline,
+      state:
+        clock.state === "within_window" && clock.daysSinceSupply >= alertFrom
+          ? "approaching"
+          : clock.state,
+      penalty: clock.daysSinceSupply >= alertFrom ? LATE_ISSUANCE_PENALTY : null,
+    };
+  });
+}
+
+function addDubaiDays(date: string, days: number): string {
+  return new Date(Date.parse(`${date}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
+}
+
+// ── Sequence gap detection (INV-4) ───────────────────────────────────────────
+
+export interface SequenceGap {
+  /** The missing number, formatted the way the series formats them. */
+  readonly reference: string;
+  readonly sequence: number;
+}
+
+export interface SequenceReport {
+  readonly prefix: string;
+  readonly year: number;
+  readonly issuedCount: number;
+  readonly firstSequence: number | null;
+  readonly lastSequence: number | null;
+  /** Numbers absent from the issued series. An FTA audit flag. */
+  readonly gaps: readonly SequenceGap[];
+  /**
+   * Numbers the counter handed out that never reached a document.
+   *
+   * Not the same fault as a gap and not an error. `sql/reference.sql` is
+   * explicit that a number may be skipped on rollback — a gap is a question an
+   * accountant can answer, a duplicate is one they cannot. This is reported so
+   * the answer is available before an auditor asks for it.
+   */
+  readonly allocatedNotIssued: number;
+}
+
+/**
+ * Gaps in the issued document series (`INV-4`).
+ *
+ * A gap is an audit flag because the obvious explanation for a missing invoice
+ * number is a suppressed sale. The usual innocent explanation — a rolled-back
+ * transaction — is real, which is exactly why this needs to be a report someone
+ * can run and answer from, rather than a question asked for the first time
+ * during an audit two years later.
+ *
+ * Soft-deleted rows count as issued. Their number was on a document that left
+ * the building; hiding it from the report would manufacture a gap.
+ */
+export async function invoiceSequenceGaps(
+  tx: TenantScopedTx,
+  options?: { year?: number; prefix?: string },
+): Promise<SequenceReport> {
+  const year = options?.year ?? new Date().getFullYear();
+  const prefix = options?.prefix ?? "INV";
+  const pattern = `${prefix}-${year}-%`;
+
+  const issuedRows = (await tx.execute<{ sequence: number }>(sql`
+    select (regexp_match(reference, '(\\d+)$'))[1]::int as sequence
+      from invoices
+     where reference like ${pattern}
+       and status <> 'draft'
+     order by 1
+  `)) as unknown as { sequence: number }[];
+
+  const counterRows = (await tx.execute<{ last_value: number }>(sql`
+    select last_value
+      from reference_counters
+     where prefix = ${prefix} and year = ${year}
+  `)) as unknown as { last_value: number }[];
+
+  const issued = issuedRows.map((r) => Number(r.sequence)).filter((n) => Number.isFinite(n));
+  const seen = new Set(issued);
+  const first = issued.length > 0 ? Math.min(...issued) : null;
+  const last = issued.length > 0 ? Math.max(...issued) : null;
+
+  const gaps: SequenceGap[] = [];
+  if (first !== null && last !== null) {
+    for (let n = first; n <= last; n++) {
+      if (!seen.has(n)) {
+        gaps.push({ sequence: n, reference: `${prefix}-${year}-${String(n).padStart(5, "0")}` });
+      }
+    }
+  }
+
+  const allocated = counterRows[0]?.last_value ?? 0;
+
+  return {
+    prefix,
+    year,
+    issuedCount: issued.length,
+    firstSequence: first,
+    lastSequence: last,
+    gaps,
+    allocatedNotIssued: Math.max(0, Number(allocated) - (last ?? 0)),
+  };
+}
+
+// ── Tax credit notes (INV-7) ─────────────────────────────────────────────────
+
+export type CreditReason = "return" | "discount" | "cancellation" | "correction";
+
+export const CREDIT_REASON_LABEL: Readonly<Record<CreditReason, string>> = {
+  return: "Return",
+  discount: "Post-issue discount",
+  cancellation: "Cancellation",
+  correction: "Correction",
+};
+
+/** What has already been credited against an invoice, in minor units. */
+async function creditedTotalMinor(tx: TenantScopedTx, invoiceId: string): Promise<number> {
+  const rows = await tx
+    .select({ total: schema.creditNotes.total })
+    .from(schema.creditNotes)
+    .where(and(eq(schema.creditNotes.invoiceId, invoiceId), isNull(schema.creditNotes.deletedAt)));
+
+  return rows.reduce((sum, r) => sum + toMinor(r.total), 0);
+}
+
+/**
+ * Issue a tax credit note against an invoice (`INV-7`).
+ *
+ * Required for any reduction in output tax — a return, a discount agreed after
+ * issue, a cancellation, a correction — within 14 days, referencing the
+ * original, in its own sequential series.
+ *
+ * ── WHY THE IDENTITY COMES FROM THE INVOICE, NOT FROM CONFIGURATION ─────────
+ *
+ * A credit note corrects a specific document and has to agree with it. If the
+ * office moved between the invoice and the correction, the credit note carrying
+ * the *new* address would leave a customer holding two documents that appear to
+ * come from two different companies. So the supplier and recipient blocks are
+ * copied from the invoice row, not re-read from `company.ts`.
+ *
+ * ── WHY LATE ISSUANCE IS REPORTED AND NOT REFUSED ──────────────────────────
+ *
+ * Past day 14 the penalty has already been incurred. Refusing the credit note
+ * at that point would leave output tax overstated on the VAT return as well —
+ * two failures instead of one. The caller gets the clock and decides.
+ */
+export async function issueCreditNote(
+  tx: TenantScopedTx,
+  ctx: TenantContext,
+  input: {
+    invoiceId: string;
+    reason: CreditReason;
+    reasonDetail?: string | undefined;
+    lines: readonly DraftLine[];
+    discount?: string | undefined;
+    /** ISO date of the event being credited. Defaults to the invoice's supply date. */
+    supplyDate?: string | undefined;
+  },
+): Promise<{
+  creditNoteId: string;
+  reference: string;
+  totalMinor: number;
+  issuance: ReturnType<typeof issuanceClock>;
+}> {
+  if (input.lines.length === 0) throw new UserFacingError("A credit note needs at least one line");
+
+  const rows = await tx
+    .select({
+      id: schema.invoices.id,
+      reference: schema.invoices.reference,
+      customerId: schema.invoices.customerId,
+      total: schema.invoices.total,
+      currency: schema.invoices.currency,
+      supplyDate: schema.invoices.supplyDate,
+      taxRateBasisPoints: schema.invoices.taxRateBasisPoints,
+      taxCategoryCode: schema.invoices.taxCategoryCode,
+      sourceCurrency: schema.invoices.sourceCurrency,
+      exchangeRate: schema.invoices.exchangeRate,
+      exchangeRateSource: schema.invoices.exchangeRateSource,
+      supplierName: schema.invoices.supplierName,
+      supplierTrn: schema.invoices.supplierTrn,
+      supplierAddress: schema.invoices.supplierAddress,
+      supplierLicenceNumber: schema.invoices.supplierLicenceNumber,
+      supplierCrNumber: schema.invoices.supplierCrNumber,
+      supplierPhone: schema.invoices.supplierPhone,
+      supplierEmail: schema.invoices.supplierEmail,
+      supplierCountry: schema.invoices.supplierCountry,
+      recipientName: schema.invoices.recipientName,
+      recipientTrn: schema.invoices.recipientTrn,
+      recipientAddress: schema.invoices.recipientAddress,
+      recipientCountry: schema.invoices.recipientCountry,
+    })
+    .from(schema.invoices)
+    .where(eq(schema.invoices.id, input.invoiceId))
+    .limit(1);
+
+  const invoice = rows[0];
+  if (!invoice) throw new Error("Invoice not found in this tenant");
+
+  const lineInputs: LineInput[] = input.lines.map((l) => ({
+    quantity: l.quantity,
+    unitPriceMinor: toMinor(l.unitPrice),
+  }));
+
+  const { lines: apportioned, totals } = apportionLines({
+    lines: lineInputs,
+    discountMinor: input.discount ? toMinor(input.discount) : 0,
+    taxRateBasisPoints: invoice.taxRateBasisPoints,
+  });
+
+  // Crediting more than was charged reverses output tax that was never
+  // declared. The VAT return would not reconcile, and the discrepancy would
+  // surface as a query from the FTA rather than as an error here.
+  const invoiceTotalMinor = toMinor(invoice.total);
+  const alreadyCredited = await creditedTotalMinor(tx, input.invoiceId);
+  if (alreadyCredited + totals.totalMinor > invoiceTotalMinor) {
+    throw new UserFacingError(
+      `This would credit more than ${invoice.reference} charged. ` +
+        `Invoice total ${toDecimalString(invoiceTotalMinor)}, already credited ${toDecimalString(alreadyCredited)}, ` +
+        `this note ${toDecimalString(totals.totalMinor)}.`,
+    );
+  }
+
+  const reference = await nextReference(tx, "CRN", new Date().getFullYear());
+  const issuedOn = new Date();
+  const supplyDate = input.supplyDate ?? invoice.supplyDate ?? dubaiDateKey(issuedOn);
+
+  const [note] = await tx
+    .insert(schema.creditNotes)
+    .values({
+      tenantId: ctx.tenantId,
+      reference,
+      documentType: "tax_credit_note",
+      invoiceId: input.invoiceId,
+      customerId: invoice.customerId,
+      status: "issued",
+      reason: input.reason,
+      reasonDetail: input.reasonDetail ?? null,
+      issuedOn,
+      supplyDate,
+      subtotal: toDecimalString(totals.subtotalMinor),
+      discountAmount: toDecimalString(totals.discountMinor),
+      taxableAmount: toDecimalString(totals.subtotalMinor - totals.discountMinor),
+      taxRateBasisPoints: invoice.taxRateBasisPoints,
+      taxAmount: toDecimalString(totals.taxMinor),
+      total: toDecimalString(totals.totalMinor),
+      currency: invoice.currency,
+      sourceCurrency: invoice.sourceCurrency,
+      exchangeRate: invoice.exchangeRate,
+      exchangeRateSource: invoice.exchangeRateSource,
+      taxCategoryCode: invoice.taxCategoryCode,
+      supplierName: invoice.supplierName,
+      supplierTrn: invoice.supplierTrn,
+      supplierAddress: invoice.supplierAddress,
+      supplierLicenceNumber: invoice.supplierLicenceNumber,
+      supplierCrNumber: invoice.supplierCrNumber,
+      supplierPhone: invoice.supplierPhone,
+      supplierEmail: invoice.supplierEmail,
+      supplierCountry: invoice.supplierCountry,
+      recipientName: invoice.recipientName,
+      recipientTrn: invoice.recipientTrn,
+      recipientAddress: invoice.recipientAddress,
+      recipientCountry: invoice.recipientCountry,
+      issuedById: ctx.userId ?? null,
+    })
+    .returning({ id: schema.creditNotes.id });
+
+  if (!note) throw new Error("Failed to create credit note");
+
+  await tx.insert(schema.creditNoteLines).values(
+    input.lines.map((l, i) => {
+      const share = apportioned[i];
+      return {
+        tenantId: ctx.tenantId,
+        creditNoteId: note.id,
+        position: i + 1,
+        serviceSlug: l.serviceSlug ?? null,
+        description: l.description,
+        quantity: l.quantity,
+        unit: l.unit,
+        unitCode: unitCodeFor(l.unit),
+        unitPrice: toDecimalString(toMinor(l.unitPrice)),
+        lineTotal: toDecimalString(share?.lineTotalMinor ?? 0),
+        discountAmount: toDecimalString(share?.discountMinor ?? 0),
+        netAmount: toDecimalString(share?.netMinor ?? 0),
+        taxRateBasisPoints: invoice.taxRateBasisPoints,
+        taxAmount: toDecimalString(share?.taxMinor ?? 0),
+        taxCategoryCode: invoice.taxCategoryCode,
+      };
+    }),
+  );
+
+  // Only a full credit changes the invoice's status. A partial one leaves it
+  // collectable, and `arAgeing` nets the credit off the outstanding balance
+  // instead — marking a part-credited invoice "credited" would drop the rest of
+  // the debt out of the ageing report entirely.
+  if (alreadyCredited + totals.totalMinor >= invoiceTotalMinor) {
+    await tx
+      .update(schema.invoices)
+      .set({ status: "credited", updatedAt: new Date() })
+      .where(eq(schema.invoices.id, input.invoiceId));
+  }
+
+  return {
+    creditNoteId: note.id,
+    reference,
+    totalMinor: totals.totalMinor,
+    issuance: issuanceClock(supplyDate, dubaiDateKey(issuedOn)),
+  };
+}
+
+export interface CreditNoteRow {
+  readonly id: string;
+  readonly reference: string;
+  readonly invoiceReference: string;
+  readonly reason: CreditReason;
+  readonly reasonDetail: string | null;
+  readonly total: string;
+  readonly currency: string;
+  readonly issuedOn: Date | null;
+  readonly customerName: string;
+}
+
+export async function listCreditNotes(
+  tx: TenantScopedTx,
+  options?: { invoiceId?: string; limit?: number },
+): Promise<readonly CreditNoteRow[]> {
+  const scope = options?.invoiceId
+    ? and(isNull(schema.creditNotes.deletedAt), eq(schema.creditNotes.invoiceId, options.invoiceId))
+    : isNull(schema.creditNotes.deletedAt);
+
+  const rows = await tx
+    .select({
+      id: schema.creditNotes.id,
+      reference: schema.creditNotes.reference,
+      invoiceReference: schema.invoices.reference,
+      reason: schema.creditNotes.reason,
+      reasonDetail: schema.creditNotes.reasonDetail,
+      total: schema.creditNotes.total,
+      currency: schema.creditNotes.currency,
+      issuedOn: schema.creditNotes.issuedOn,
+      customerName: schema.customers.name,
+    })
+    .from(schema.creditNotes)
+    .innerJoin(schema.invoices, eq(schema.invoices.id, schema.creditNotes.invoiceId))
+    .innerJoin(schema.customers, eq(schema.customers.id, schema.creditNotes.customerId))
+    .where(scope)
+    .orderBy(desc(schema.creditNotes.issuedOn))
+    .limit(options?.limit ?? 100);
+
+  return rows.map((r) => ({ ...r, reason: r.reason as CreditReason }));
+}
+
+// ── Credit position (DB-4, LEAD-10) ──────────────────────────────────────────
+
+export interface CreditPosition {
+  /** Null means no limit has been set, which is not the same as a limit of zero. */
+  readonly creditLimitMinor: number | null;
+  readonly outstandingMinor: number;
+  /** Null when there is no limit to have headroom against. */
+  readonly headroomMinor: number | null;
+  readonly overLimit: boolean;
+}
+
+/**
+ * A customer's credit limit and what is currently drawn against it.
+ *
+ * The limit is stored as `numeric(14,2)` like every other amount and converted
+ * here, which is why there is no `credit_limit_minor` column: two columns
+ * holding the same amount in two scales is how an off-by-one-hundred bug gets
+ * written, and nothing fails when the two disagree.
+ *
+ * Written-off debt is excluded, and issued credit notes are netted off, so this
+ * answers "how much would we be exposed to if we took this job" rather than
+ * "what does the ledger add up to".
+ */
+export async function customerCreditPosition(
+  tx: TenantScopedTx,
+  customerId: string,
+): Promise<CreditPosition> {
+  const customerRows = await tx
+    .select({ creditLimit: schema.customers.creditLimit })
+    .from(schema.customers)
+    .where(eq(schema.customers.id, customerId))
+    .limit(1);
+
+  const invoiceRows = await tx
+    .select({
+      id: schema.invoices.id,
+      total: schema.invoices.total,
+      amountPaid: schema.invoices.amountPaid,
+      status: schema.invoices.status,
+    })
+    .from(schema.invoices)
+    .where(and(eq(schema.invoices.customerId, customerId), isNull(schema.invoices.deletedAt)));
+
+  const creditRows = await tx
+    .select({ invoiceId: schema.creditNotes.invoiceId, total: schema.creditNotes.total })
+    .from(schema.creditNotes)
+    .where(and(eq(schema.creditNotes.customerId, customerId), isNull(schema.creditNotes.deletedAt)));
+
+  const creditedByInvoice = new Map<string, number>();
+  for (const c of creditRows) {
+    creditedByInvoice.set(c.invoiceId, (creditedByInvoice.get(c.invoiceId) ?? 0) + toMinor(c.total));
+  }
+
+  let outstandingMinor = 0;
+  for (const i of invoiceRows) {
+    if (i.status === "paid" || i.status === "written_off" || i.status === "credited") continue;
+    const owed = toMinor(i.total) - toMinor(i.amountPaid) - (creditedByInvoice.get(i.id) ?? 0);
+    if (owed > 0) outstandingMinor += owed;
+  }
+
+  const limit = customerRows[0]?.creditLimit;
+  const creditLimitMinor = limit === null || limit === undefined ? null : toMinor(limit);
+
+  return {
+    creditLimitMinor,
+    outstandingMinor,
+    headroomMinor: creditLimitMinor === null ? null : creditLimitMinor - outstandingMinor,
+    overLimit: creditLimitMinor !== null && outstandingMinor > creditLimitMinor,
+  };
+}
+
+// ── The statement of account (INV-13) ────────────────────────────────────────
+
+/** Who the statement is addressed to. Read at generation, not snapshotted. */
+export interface StatementParty {
+  readonly customerId: string;
+  readonly code: string;
+  readonly name: string;
+  readonly trn: string | null;
+  readonly address: string | null;
+  readonly billingEmail: string | null;
+  readonly paymentTermsDays: number;
+}
+
+export interface StatementLine {
+  readonly kind: "invoice" | "credit_note" | "payment" | "write_off";
+  readonly reference: string;
+  readonly occurredAt: Date;
+  /** Dubai calendar day of `occurredAt`, which is the date the document shows. */
+  readonly occurredOn: string;
+  /** Positive increases what is owed, negative reduces it. VAT-inclusive. */
+  readonly amountMinor: number;
+  readonly detail: string | null;
+  /** The balance after this line, opening balance included. */
+  readonly balanceMinor: number;
+}
+
+export interface StatementAgeing {
+  readonly currentMinor: number;
+  readonly days1to30Minor: number;
+  readonly days31to60Minor: number;
+  readonly days61PlusMinor: number;
+  readonly totalMinor: number;
+}
+
+export interface CustomerStatement {
+  readonly customer: StatementParty;
+  /** Inclusive Dubai day, or null for "everything from the beginning". */
+  readonly from: string | null;
+  /** Inclusive Dubai day. Nothing after this appears or is counted. */
+  readonly to: string;
+  readonly generatedAt: Date;
+  readonly currency: string;
+  /** What was owed the instant before `from`. Zero when `from` is null. */
+  readonly openingBalanceMinor: number;
+  /** EVERY movement in the range, oldest first. Never capped — see below. */
+  readonly entries: readonly StatementLine[];
+  readonly invoicedMinor: number;
+  readonly creditedMinor: number;
+  readonly paidMinor: number;
+  readonly writtenOffMinor: number;
+  /** Opening plus every movement. Negative means the customer is in credit. */
+  readonly closingBalanceMinor: number;
+  /**
+   * How the closing balance is aged, as at `to` — reconstructed from the dated
+   * events rather than read from today's position, so a statement for a past
+   * quarter ages the way it did then.
+   */
+  readonly ageing: StatementAgeing;
+  /** Invoices still open at `to` and past their due date, oldest first. */
+  readonly oldestOverdue: { reference: string; dueOn: string; daysOverdue: number } | null;
+}
+
+/**
+ * The point at which a statement refuses rather than truncates.
+ *
+ * A statement of account is a document that gets emailed to a customer and paid
+ * against, so it must contain every movement in its range — a capped one is a
+ * demand for the wrong amount. This is therefore not a page size: the query
+ * asks for one row more than this, and finding it throws. Two thousand
+ * movements is roughly a decade of monthly billing on one account, so reaching
+ * it means the range is wrong, and the honest response is to say so rather than
+ * to send a document that silently omits the oldest half of the ledger.
+ */
+const STATEMENT_MAX_ENTRIES = 2_000;
+
+/**
+ * The statement of account (`INV-13`).
+ *
+ * ── HOW THIS DIFFERS FROM `portalStatement`, AND WHY BOTH EXIST ─────────────
+ *
+ * `portalStatement` in `domain/portal.ts` is a SCREEN for the signed-in
+ * customer: it takes no customer argument at all, because the customer is the
+ * session — customer-scope RLS makes every other customer's rows absent — and
+ * it deliberately CAPS its entry list because a screen has to end somewhere,
+ * publishing `truncated` so the page can say so.
+ *
+ * This is a DOCUMENT, produced by staff, for one named customer, over a chosen
+ * range, to be emailed and paid against. Three consequences follow, and each is
+ * why this is not the same function with an argument added:
+ *
+ *  1. **It cannot be capped.** A statement missing movements is a demand for
+ *     the wrong amount. So it refuses beyond `STATEMENT_MAX_ENTRIES` instead of
+ *     truncating, and there is no `truncated` flag to ignore.
+ *  2. **It has an opening balance.** A range that starts in April has to say
+ *     what was owed on 31 March, or the closing balance cannot be checked. That
+ *     is its own aggregate over every movement before the range.
+ *  3. **It is as at a date, not as at now.** The ageing is reconstructed from
+ *     the dated payments and credit notes, so a statement reissued for last
+ *     quarter shows last quarter's ageing rather than today's.
+ *
+ * ── THE TOTALS ARE AGGREGATES, NOT SUMS OF THE ROWS ─────────────────────────
+ *
+ * Even though the entry list is complete, the four totals below come from their
+ * own `group by` over the same predicate rather than from a fold over the rows.
+ * That is deliberate: it makes the document self-checking. `customerStatement`
+ * computes the closing balance twice by two different routes — the aggregate,
+ * and the running balance down the rows — and the test asserts they agree to
+ * the fil. A single route cannot catch a missing row; two can.
+ *
+ * ── DUBAI, EVERY TIME ───────────────────────────────────────────────────────
+ *
+ * A statement for "March" must contain an invoice issued at 23:30 Dubai on 31
+ * March and must not contain one issued at 00:30 Dubai on 1 April. This session
+ * runs in a timezone AHEAD of Dubai, so a boundary taken from the host clock
+ * would put the first in April and could pass a test written the same way. Both
+ * boundaries are `at time zone 'Asia/Dubai'` in SQL, half-open at the top.
+ */
+export async function customerStatement(
+  tx: TenantScopedTx,
+  options: { customerId: string; from?: string | null; to: string; now?: Date },
+): Promise<CustomerStatement> {
+  const { customerId, to } = options;
+  const from = options.from ?? null;
+  const generatedAt = options.now ?? new Date();
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(to) || (from !== null && !/^\d{4}-\d{2}-\d{2}$/.test(from))) {
+    throw new UserFacingError("Give the statement period as dates, each YYYY-MM-DD.");
+  }
+  if (from !== null && from > to) {
+    throw new UserFacingError("That statement period starts after it ends.");
+  }
+
+  const customerRows = await tx
+    .select({
+      id: schema.customers.id,
+      code: schema.customers.code,
+      name: schema.customers.name,
+      trn: schema.customers.taxRegistrationNumber,
+      address: schema.customers.billingAddress,
+      city: schema.customers.billingCity,
+      country: schema.customers.billingCountry,
+      billingEmail: schema.customers.billingEmail,
+      paymentTermsDays: schema.customers.paymentTermsDays,
+      currency: schema.customers.currency,
+    })
+    .from(schema.customers)
+    .where(and(eq(schema.customers.id, customerId), isNull(schema.customers.deletedAt)))
+    .limit(1);
+
+  const customerRow = customerRows[0];
+  if (!customerRow) {
+    // Absent, not forbidden. Under customer-scope RLS a portal session asking
+    // about somebody else's account reaches this branch because the row is not
+    // visible, which is the behaviour that file is written to produce — so the
+    // message must not confirm that the customer exists.
+    throw new UserFacingError("No such customer on this account.");
+  }
+
+  const ledger = statementLedger(customerId);
+
+  // ── The opening balance ───────────────────────────────────────────────────
+  //
+  // Its own aggregate over every movement strictly before the range. Zero when
+  // there is no start date, because then there is nothing before the range.
+  let openingBalanceMinor = 0;
+  if (from !== null) {
+    const openingRows = (await tx.execute<{ opening: string }>(sql`
+      with ${ledger}
+      select coalesce(sum(amount_minor), 0)::text as opening
+        from movements
+       where (occurred_at at time zone 'Asia/Dubai') < ${from}::date
+    `)) as unknown as { opening: string }[];
+    openingBalanceMinor = Number(openingRows[0]?.opening ?? 0);
+  }
+
+  // ── The movements in the range ────────────────────────────────────────────
+
+  type EntryRow = {
+    kind: string;
+    reference: string;
+    occurred_at: string;
+    occurred_on: string;
+    amount_minor: string;
+    detail: string | null;
+  };
+
+  const entryRows = (await tx.execute<EntryRow>(sql`
+    with ${ledger}
+    select kind,
+           reference,
+           occurred_at,
+           to_char(occurred_at at time zone 'Asia/Dubai', 'YYYY-MM-DD') as occurred_on,
+           amount_minor::text                                          as amount_minor,
+           detail
+      from movements
+     where (${from === null}::boolean or (occurred_at at time zone 'Asia/Dubai') >= ${from ?? to}::date)
+       and (occurred_at at time zone 'Asia/Dubai') < ${to}::date + interval '1 day'
+     order by occurred_at asc, reference asc, kind asc
+     limit ${STATEMENT_MAX_ENTRIES + 1}
+  `)) as unknown as EntryRow[];
+
+  if (entryRows.length > STATEMENT_MAX_ENTRIES) {
+    throw new UserFacingError(
+      `This account has more than ${STATEMENT_MAX_ENTRIES} movements in that period. ` +
+        `Narrow the range — a statement that quietly left some of them out would be a ` +
+        `demand for the wrong amount.`,
+    );
+  }
+
+  let running = openingBalanceMinor;
+  const entries: StatementLine[] = entryRows.map((r) => {
+    const amountMinor = Number(r.amount_minor);
+    running += amountMinor;
+    return {
+      kind: r.kind as StatementLine["kind"],
+      reference: r.reference,
+      occurredAt: requiredRowDate(r.occurred_at),
+      occurredOn: r.occurred_on,
+      amountMinor,
+      detail: r.detail,
+      balanceMinor: running,
+    };
+  });
+
+  // ── The totals, computed independently of the rows above ──────────────────
+
+  type TotalRow = { kind: string; total: string; currency: string | null };
+  const totalRows = (await tx.execute<TotalRow>(sql`
+    with ${ledger}
+    select kind,
+           coalesce(sum(amount_minor), 0)::text as total,
+           min(currency)                        as currency
+      from movements
+     where (${from === null}::boolean or (occurred_at at time zone 'Asia/Dubai') >= ${from ?? to}::date)
+       and (occurred_at at time zone 'Asia/Dubai') < ${to}::date + interval '1 day'
+     group by kind
+  `)) as unknown as TotalRow[];
+
+  const byKind = new Map(totalRows.map((r) => [r.kind, Number(r.total)]));
+  const invoicedMinor = byKind.get("invoice") ?? 0;
+  // Stored positive on the statement even though the movements are signed, so
+  // the footer reads as four columns a reader adds up rather than as three
+  // positives and a negative they have to notice.
+  const creditedMinor = -(byKind.get("credit_note") ?? 0);
+  const paidMinor = -(byKind.get("payment") ?? 0);
+  const writtenOffMinor = -(byKind.get("write_off") ?? 0);
+
+  const ageing = await statementAgeing(tx, customerId, to);
+
+  return {
+    customer: {
+      customerId: customerRow.id,
+      code: customerRow.code,
+      name: customerRow.name,
+      trn: customerRow.trn,
+      address:
+        [customerRow.address, customerRow.city, customerRow.country].filter(Boolean).join(", ") ||
+        null,
+      billingEmail: customerRow.billingEmail,
+      paymentTermsDays: customerRow.paymentTermsDays,
+    },
+    from,
+    to,
+    generatedAt,
+    currency: totalRows.find((r) => r.currency)?.currency ?? customerRow.currency ?? "AED",
+    openingBalanceMinor,
+    entries,
+    invoicedMinor,
+    creditedMinor,
+    paidMinor,
+    writtenOffMinor,
+    closingBalanceMinor:
+      openingBalanceMinor + invoicedMinor - creditedMinor - paidMinor - writtenOffMinor,
+    ageing,
+    oldestOverdue: ageing.oldestOverdue,
+  };
+}
+
+/**
+ * One customer's ledger, as signed VAT-inclusive minor units.
+ *
+ * A CTE builder rather than three near-identical queries, so the opening
+ * balance, the entry list and the totals cannot disagree about what a movement
+ * is. Every caller applies its own date predicate to the same rows.
+ *
+ * NO BACKTICKS IN ANY COMMENT BELOW. This sits inside a tagged template
+ * literal, and one backtick ends the template — the error then surfaces as a
+ * syntax failure dozens of lines away from the mistake.
+ */
+function statementLedger(customerId: string): SQL {
+  return sql`
+    movements as (
+      select 'invoice'::text                                as kind,
+             i.reference                                    as reference,
+             coalesce(i.issued_on, i.created_at)            as occurred_at,
+             -- Never ::int: a decade of one owners association's invoices in
+             -- fils passes int4 in the sum long before it passes belief.
+             (i.total * 100)::bigint                        as amount_minor,
+             null::text                                     as detail,
+             i.currency                                     as currency
+        from invoices i
+       where i.customer_id = ${customerId}::uuid
+         and i.deleted_at is null
+         -- A draft is not a document and has no place on a demand for payment.
+         and i.status <> 'draft'
+
+      union all
+
+      select 'credit_note',
+             n.reference,
+             coalesce(n.issued_on, n.created_at),
+             -(n.total * 100)::bigint,
+             n.reason::text,
+             n.currency
+        from credit_notes n
+       where n.customer_id = ${customerId}::uuid
+         and n.deleted_at is null
+
+      union all
+
+      -- Reached through the invoice, because a payment carries no customer_id
+      -- of its own; the invoice reference is what the statement has to show
+      -- anyway so the customer can see what their money was applied to.
+      select 'payment',
+             i.reference,
+             p.received_at,
+             -(p.amount * 100)::bigint,
+             p.method::text,
+             p.currency
+        from payments p
+        join invoices i on i.id = p.invoice_id
+       where i.customer_id = ${customerId}::uuid
+         and p.deleted_at is null
+         and i.deleted_at is null
+
+      union all
+
+      -- Debt the business stopped pursuing, as the ledger event it is.
+      --
+      -- The amount is the FORGIVEN portion measured at the moment of the
+      -- write-off: the total, less what had been paid by then, less what had
+      -- been credited by then. Subtracting the whole total would double-count
+      -- the payments that are already rows in this same ledger and show the
+      -- customer as in credit.
+      --
+      -- Dated by written_off_at rather than updated_at, which moves on a
+      -- re-rendered PDF or a reminder count. A write-off filed at the wrong
+      -- date makes every later row's running balance wrong.
+      --
+      -- The detail is null on purpose. written_off_reason is internal free text
+      -- of the "customer dissolved, uncollectable" kind, and this document goes
+      -- to the customer. They are told the debt was written off, which is the
+      -- part that concerns them, and not what was said about them while doing
+      -- it.
+      select 'write_off',
+             w.reference,
+             coalesce(w.written_off_at, w.updated_at),
+             -greatest(
+                (w.total * 100)::bigint
+                - coalesce((select sum((p2.amount * 100)::bigint) from payments p2
+                             where p2.invoice_id = w.id
+                               and p2.deleted_at is null
+                               and p2.received_at <= coalesce(w.written_off_at, w.updated_at)), 0)
+                - coalesce((select sum((n2.total * 100)::bigint) from credit_notes n2
+                             where n2.invoice_id = w.id
+                               and n2.deleted_at is null
+                               and coalesce(n2.issued_on, n2.created_at) <= coalesce(w.written_off_at, w.updated_at)), 0),
+                0),
+             null::text,
+             w.currency
+        from invoices w
+       where w.customer_id = ${customerId}::uuid
+         and w.deleted_at is null
+         and w.status = 'written_off'
+         -- A zero-value write-off moves nothing, and a 0.00 row on a statement
+         -- reads as an error rather than as a non-event.
+         and greatest(
+               (w.total * 100)::bigint
+               - coalesce((select sum((p3.amount * 100)::bigint) from payments p3
+                            where p3.invoice_id = w.id
+                              and p3.deleted_at is null
+                              and p3.received_at <= coalesce(w.written_off_at, w.updated_at)), 0)
+               - coalesce((select sum((n3.total * 100)::bigint) from credit_notes n3
+                            where n3.invoice_id = w.id
+                              and n3.deleted_at is null
+                              and coalesce(n3.issued_on, n3.created_at) <= coalesce(w.written_off_at, w.updated_at)), 0),
+               0) > 0
+    )`;
+}
+
+/**
+ * How the closing balance is aged, as at a Dubai day.
+ *
+ * Reconstructed from the dated events, not read from `invoices.amount_paid`.
+ * That column is today's position: using it would age a statement for last
+ * quarter using this quarter's receipts, so an invoice paid in July would show
+ * as settled on a statement dated 30 June. The accounting export's receivables
+ * schedule cannot do this and says so; here it is possible because payments and
+ * credit notes both carry their own dates.
+ *
+ * The buckets are the same four `arAgeing` uses, so the two screens cannot
+ * disagree about what "31 to 60 days" means.
+ */
+async function statementAgeing(
+  tx: TenantScopedTx,
+  customerId: string,
+  to: string,
+): Promise<StatementAgeing & { oldestOverdue: CustomerStatement["oldestOverdue"] }> {
+  type Row = {
+    current_minor: string;
+    days_1_30_minor: string;
+    days_31_60_minor: string;
+    days_61_plus_minor: string;
+    total_minor: string;
+    oldest_reference: string | null;
+    oldest_due_on: string | null;
+    oldest_days_overdue: string | null;
+  };
+
+  const rows = (await tx.execute<Row>(sql`
+    with asof as (
+      -- The last instant of the statement day, in Dubai. The half-open bound
+      -- is applied to each event below rather than to a truncated date, so an
+      -- invoice issued at 23:30 Dubai on the closing day is aged on that
+      -- statement and not carried into the next.
+      select ${to}::date + interval '1 day' as day_after
+    ),
+    open_invoices as (
+      select i.reference,
+             i.due_on,
+             (i.total * 100)::bigint
+             - coalesce((select sum((p.amount * 100)::bigint) from payments p
+                          where p.invoice_id = i.id
+                            and p.deleted_at is null
+                            and (p.received_at at time zone 'Asia/Dubai') < (select day_after from asof)), 0)
+             - coalesce((select sum((n.total * 100)::bigint) from credit_notes n
+                          where n.invoice_id = i.id
+                            and n.deleted_at is null
+                            and (coalesce(n.issued_on, n.created_at) at time zone 'Asia/Dubai') < (select day_after from asof)), 0)
+               as outstanding_minor,
+             -- Whole days between the due date and the statement day, both
+             -- taken as Dubai calendar days so a due date stored at a UTC
+             -- instant cannot shift the bucket by one.
+             (${to}::date - (i.due_on at time zone 'Asia/Dubai')::date) as days_overdue
+        from invoices i
+       where i.customer_id = ${customerId}::uuid
+         and i.deleted_at is null
+         and i.status <> 'draft'
+         and i.issued_on is not null
+         and (i.issued_on at time zone 'Asia/Dubai') < (select day_after from asof)
+         -- Written off ON OR BEFORE the statement day is no longer receivable;
+         -- written off afterwards was still owed on the day, so it is aged.
+         and not (i.status = 'written_off'
+                  and (coalesce(i.written_off_at, i.updated_at) at time zone 'Asia/Dubai')
+                        < (select day_after from asof))
+    ),
+    aged as (
+      select * from open_invoices where outstanding_minor > 0
+    ),
+    -- ONE row, picked once, and all three fields taken from it.
+    --
+    -- This was three separate scalar subqueries, each with its own
+    -- order by days_overdue desc. The one selecting days_overdue::text named
+    -- its output column days_overdue as well, and Postgres resolves an
+    -- ORDER BY name against the OUTPUT list first — so that subquery sorted
+    -- the ages as TEXT, where "60" comes after "273", and returned the age of
+    -- a different invoice from the one the other two named. The statement then
+    -- said the oldest overdue document was 60 days old when it was 273. Caught
+    -- by a hand-computed assertion; invisible to any check that compared the
+    -- output to itself.
+    oldest as (
+      select reference, due_on, days_overdue
+        from aged
+       where days_overdue > 0
+       order by days_overdue desc, reference
+       limit 1
+    )
+    select
+      coalesce(sum(outstanding_minor) filter (where days_overdue is null or days_overdue <= 0), 0)::text as current_minor,
+      coalesce(sum(outstanding_minor) filter (where days_overdue between 1 and 30), 0)::text            as days_1_30_minor,
+      coalesce(sum(outstanding_minor) filter (where days_overdue between 31 and 60), 0)::text           as days_31_60_minor,
+      coalesce(sum(outstanding_minor) filter (where days_overdue > 60), 0)::text                        as days_61_plus_minor,
+      coalesce(sum(outstanding_minor), 0)::text                                                         as total_minor,
+      (select reference from oldest)                                                                    as oldest_reference,
+      (select to_char(due_on at time zone 'Asia/Dubai', 'YYYY-MM-DD') from oldest)                      as oldest_due_on,
+      (select days_overdue::text from oldest)                                                           as oldest_days_overdue
+      from aged
+  `)) as unknown as Row[];
+
+  const r = rows[0];
+  return {
+    currentMinor: Number(r?.current_minor ?? 0),
+    days1to30Minor: Number(r?.days_1_30_minor ?? 0),
+    days31to60Minor: Number(r?.days_31_60_minor ?? 0),
+    days61PlusMinor: Number(r?.days_61_plus_minor ?? 0),
+    totalMinor: Number(r?.total_minor ?? 0),
+    oldestOverdue:
+      r?.oldest_reference && r.oldest_due_on
+        ? {
+            reference: r.oldest_reference,
+            dueOn: r.oldest_due_on,
+            daysOverdue: Number(r.oldest_days_overdue ?? 0),
+          }
+        : null,
+  };
 }
