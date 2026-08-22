@@ -121,6 +121,26 @@ export const RETENTION_PROTECTED_TABLES = [
   // to is deleted two years after termination, but the settlement is a tax
   // record and the seven-year floor governs it, not the two-year clock.
   "gratuity_settlements",
+  // `HR-11`. The one entry on this list that is not a financial record, and it
+  // is here for a longer clock rather than for a shorter one.
+  //
+  // A work injury or an occupational disease is evidence in a compensation
+  // claim, and both of those outlive the employment by a long way: a disease
+  // can be diagnosed a decade after the exposure that caused it, and a claim
+  // can be brought long after the person has left. Deleting the register on any
+  // employment clock destroys the evidence in the dispute the register exists
+  // to settle — which is the failure this whole file is written against, stated
+  // at the top: a job that deletes the wrong thing cannot be undone.
+  //
+  // This entry alone would not be enough, and the other half is in the schema:
+  // `work_injuries.employee_id` is ON DELETE SET NULL where every other child of
+  // `employees` cascades. A protected table is not protected from a cascade —
+  // `purgeExpiredEmployees` deletes the parent, and anything hanging off it by
+  // ON DELETE CASCADE goes too, whatever this array says. So the register entry
+  // survives `HR-15` with its link to the person severed by the purge itself:
+  // the OSH record and the notification history stay, the personal data goes.
+  // That is the outcome both rules actually want.
+  "work_injuries",
   // Append-only by construction; the application role has no DELETE on it.
   "audit_log",
 ] as const;

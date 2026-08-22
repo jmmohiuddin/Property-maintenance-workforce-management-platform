@@ -79,6 +79,23 @@ export const CRON_JOBS = [
   // alerts when it stops) or is invisible to `/api/cron/health` (here, absent
   // from vercel.json — `ATS-16` was zeroed exactly this way).
   "monthly-pack",
+  // `HR-11` / `HR-12`. The work injury notification clock, and the day-valued
+  // HSE clocks that ride with it.
+  //
+  // The ONLY sub-daily job on this list that is not an operational queue drain,
+  // and the reason is the fuse. A work injury has to reach MOHRE inside 48
+  // hours; a nightly job gets two attempts at that window and can be up to
+  // twenty-four hours late on each, so the final band — the twelve hours before
+  // the establishment is in breach — would be skipped routinely rather than
+  // occasionally.
+  //
+  // Registered here AND in vercel.json, in the same commit, for the reason the
+  // four comments above give and with the sharpest consequence of any of them:
+  // in this list and absent from vercel.json it never runs and health merely
+  // red-lights (`ATS-16`); in vercel.json and absent from here it runs but
+  // nothing notices when it stops — and what stops is the only thing telling
+  // anybody that a statutory clock is running down on an injured worker.
+  "hse",
 ] as const;
 export type CronJob = (typeof CRON_JOBS)[number];
 
@@ -118,6 +135,10 @@ export const CRON_MAX_AGE_MINUTES: Readonly<Record<CronJob, number>> = {
   // somebody mutes, and this job has a whole month before the next customer
   // notices it did not arrive.
   "monthly-pack": 5 * 24 * 60,
+  // Hourly. Three missed runs, matching `sweep` — an allowance tight enough to
+  // fire on one late invocation is an allowance somebody mutes, and three hours
+  // is still well inside a 48-hour window.
+  hse: 200,
 };
 
 export async function startRun(job: CronJob): Promise<string> {

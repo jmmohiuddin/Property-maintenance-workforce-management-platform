@@ -2319,3 +2319,511 @@ export function assessEmiratisation(input: {
     caveat: caveats.length > 0 ? caveats.join(" ") : null,
   };
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HR-11 — The work injury register and the MOHRE notification clock
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * The statutory notification window for a work injury or occupational disease.
+ *
+ * ── THE BASIS, AND WHERE IT IS SOFT ─────────────────────────────────────────
+ *
+ * Article 37 of Federal Decree-Law No. 33 of 2021 obliges an employer whose
+ * worker suffers a work injury or an occupational disease to notify the
+ * competent authorities and to bear the cost of treatment, and its Implementing
+ * Regulation (Cabinet Resolution No. 1 of 2022) is what carries the mechanics —
+ * including the obligation to keep a REGISTER of work injuries and occupational
+ * diseases, which is the table this constant exists to police.
+ *
+ * Forty-eight hours is the window this system enforces. It is not a number this
+ * codebase should pretend to be certain about, and the honest position is
+ * written down here rather than buried:
+ *
+ *   * The police notification for a serious injury or a death is "immediately"
+ *     in every reading of it. This clock does not model that at all, and
+ *     `police_reference` on the register is a field with no countdown behind it
+ *     for exactly that reason — a 48-hour countdown against an obligation that
+ *     is actually "now" would be worse than no countdown, because it would read
+ *     as permission to wait two days.
+ *   * The insurer's window is contractual, not statutory. A workmen's
+ *     compensation policy typically voids cover on late notice, which is a
+ *     bigger practical exposure than the administrative fine — so the insurer
+ *     is tracked as an outstanding obligation on the same record, and it keeps
+ *     the entry alerting, but it does not drive the statutory stage.
+ *   * Whether the MOHRE window runs from the incident or from the employer
+ *     learning of it is genuinely ambiguous, and for an occupational disease
+ *     those can be years apart. The register stores both instants and runs the
+ *     clock from the later one — `becameKnownAt` — because a clock started
+ *     before anybody could act on it is a clock that reports every historic
+ *     diagnosis as an immediate statutory breach.
+ *
+ * If MOHRE's window turns out to be shorter, this constant is the only edit,
+ * and `INJURY_ESCALATION` below is derived from it rather than restating it.
+ */
+export const MOHRE_INJURY_NOTIFICATION_HOURS = 48;
+
+/**
+ * How the countdown reads as it runs down.
+ *
+ * The same shape as `WPS_ESCALATION`, and for the same reason: a single "late"
+ * boolean throws away the only information anybody acts on. The difference is
+ * the fuse. WPS is measured in days and the first consequence lands on day 5;
+ * this is measured in HOURS and the whole window is shorter than the gap
+ * between two rungs of the payroll ladder, which is why the job that reads it
+ * runs hourly rather than nightly.
+ *
+ * `hour` is hours elapsed since the employer knew.
+ */
+export interface InjuryEscalationBand {
+  readonly hour: number;
+  readonly stage: InjuryStage;
+  readonly consequence: string;
+  readonly severity: "info" | "warning" | "critical" | "alarm";
+}
+
+export type InjuryStage =
+  /** Recorded, inside the window, more than half of it left. */
+  | "recorded"
+  /** Half the window gone. */
+  | "half_elapsed"
+  /** Twelve hours or less remain. */
+  | "final_hours"
+  /** The window closed and MOHRE has still not been told. */
+  | "overdue"
+  /** Notified inside the window. The only good outcome. */
+  | "notified"
+  /** Notified, but after the window closed. Recorded as such, permanently. */
+  | "notified_late";
+
+const INJURY_HALF_WINDOW_HOURS = Math.floor(MOHRE_INJURY_NOTIFICATION_HOURS / 2);
+const INJURY_FINAL_HOURS = MOHRE_INJURY_NOTIFICATION_HOURS - 12;
+
+export const INJURY_ESCALATION: readonly InjuryEscalationBand[] = [
+  {
+    hour: 0,
+    stage: "recorded",
+    consequence:
+      `Notify MOHRE and the insurer within ${MOHRE_INJURY_NOTIFICATION_HOURS} hours. A serious injury or a death must also be reported to the police immediately — that obligation is not a countdown and this register does not treat it as one.`,
+    severity: "warning",
+  },
+  {
+    hour: INJURY_HALF_WINDOW_HOURS,
+    stage: "half_elapsed",
+    consequence: `Half the notification window has gone. ${MOHRE_INJURY_NOTIFICATION_HOURS - INJURY_HALF_WINDOW_HOURS} hours remain to notify MOHRE.`,
+    severity: "critical",
+  },
+  {
+    hour: INJURY_FINAL_HOURS,
+    stage: "final_hours",
+    consequence:
+      "Twelve hours or less remain. After that the establishment is in breach of its notification duty under Article 37, and a notification made afterwards is a late notification for ever — it cannot be brought back inside the window.",
+    severity: "alarm",
+  },
+  {
+    hour: MOHRE_INJURY_NOTIFICATION_HOURS,
+    stage: "overdue",
+    consequence:
+      "The notification window has closed and MOHRE has not been told. Notify now: a late notification is a lesser exposure than no notification, and the insurer may decline the claim outright on late notice, which puts the whole cost of treatment and compensation on the establishment.",
+    severity: "alarm",
+  },
+];
+
+/** The band in force at `hoursElapsed`. */
+export function injuryBandFor(hoursElapsed: number): InjuryEscalationBand {
+  let band = INJURY_ESCALATION[0]!;
+  for (const candidate of INJURY_ESCALATION) {
+    if (hoursElapsed >= candidate.hour) band = candidate;
+  }
+  return band;
+}
+
+export interface InjuryNotificationInput {
+  /** When the incident happened. */
+  readonly occurredAt: Date;
+  /**
+   * When the employer learned of it. The clock starts here.
+   *
+   * Equal to `occurredAt` for an ordinary injury — a technician who falls does
+   * not keep it to himself. Later for an occupational disease, which is
+   * diagnosed rather than witnessed, and which is the case that makes this a
+   * separate column rather than an assumption.
+   */
+  readonly becameKnownAt: Date;
+  /** Null while MOHRE has not been told. That is the state the alarm is about. */
+  readonly mohreNotifiedAt: Date | null;
+  /** Contractual rather than statutory, but it can void the cover. */
+  readonly insurerNotifiedAt: Date | null;
+}
+
+export interface InjuryAssessment {
+  readonly stage: InjuryStage;
+  readonly severity: "info" | "warning" | "critical" | "alarm";
+  /** The instant the window closes. */
+  readonly dueAt: Date;
+  /** Whole hours since the employer knew. Never negative. */
+  readonly hoursElapsed: number;
+  /** Whole hours left. Negative once the window has closed. */
+  readonly hoursRemaining: number;
+  /** 0 until the window closes, then whole hours past it. */
+  readonly hoursLate: number;
+  /**
+   * The window has closed and MOHRE has not been told.
+   *
+   * Keyed on the instant rather than on `hoursLate`, which is 0 for the first
+   * sixty minutes after the deadline — reading the breach off that number would
+   * report the whole of hour 49 as still inside the window.
+   *
+   * False once notified, whether the notification was in time or not: a record
+   * that has been notified is not still running out of time, it is either
+   * `notified` or `notified_late` and it stays that way.
+   */
+  readonly overdue: boolean;
+  readonly mohreNotified: boolean;
+  readonly insurerNotified: boolean;
+  /** True while anything on this record is still owed to anybody. */
+  readonly alerting: boolean;
+  readonly headline: string;
+  readonly consequence: string;
+}
+
+const HOUR_MS = 3_600_000;
+
+/**
+ * Where one injury record stands against the notification clock.
+ *
+ * ── WHY THIS IS A RECORD AND A COUNTDOWN, AND NOT A BLOCK ───────────────────
+ *
+ * There is nothing here to block. The three hard blocks in this system each
+ * refuse an act that is itself unlawful at the moment it happens — dispatching
+ * a worker whose permit has lapsed, or any worker into the summer midday ban.
+ * A missed injury notification is a failure to *report* something that already
+ * happened; there is no future act that becomes lawful by being refused, and
+ * refusing dispatches would punish the injured worker's colleagues for an
+ * administrative omission in an office.
+ *
+ * More concretely: the one thing a system must never do is make recording an
+ * injury expensive. A register that stopped work would be a register people
+ * stopped writing in, and an unwritten register is precisely the failure the
+ * statutory obligation exists to prevent. So this escalates loudly, to people
+ * who can pick up a phone, and blocks nothing at all.
+ *
+ * `now` is an instant rather than a calendar day, and that is deliberate: 48
+ * hours is 48 hours in any timezone, and rounding it to Dubai's calendar day
+ * would either give away eight hours or take fourteen. Dubai's day is used for
+ * the *register* — which day an injury is filed under, and the day-valued HSE
+ * clocks — where the calendar genuinely is the unit.
+ */
+export function assessInjuryNotification(
+  input: InjuryNotificationInput,
+  now: Date = new Date(),
+): InjuryAssessment {
+  const start = input.becameKnownAt.getTime();
+  const dueAt = new Date(start + MOHRE_INJURY_NOTIFICATION_HOURS * HOUR_MS);
+
+  // Floored, so an injury 47 minutes old reads as 0 hours elapsed and 48 hours
+  // remaining. Rounding would report the window as one hour further through
+  // than it is, in the direction that makes a breach look further away.
+  const hoursElapsed = Math.max(0, Math.floor((now.getTime() - start) / HOUR_MS));
+  // Floored too, so at 47 hours and 59 minutes this reads 0 rather than 1. Both
+  // roundings lean the same way — towards less time in hand than there really
+  // is — because the only expensive direction for this number to be wrong in is
+  // the reassuring one.
+  const hoursRemaining = Math.floor((dueAt.getTime() - now.getTime()) / HOUR_MS);
+  // The instant, not the floored hour count. `hoursLate` is 0 for the first
+  // sixty minutes after the window closes, and a test that keyed "overdue" off
+  // that number would report the whole of hour 49 as still inside the window.
+  const overdue = now.getTime() >= dueAt.getTime();
+  const hoursLate = overdue ? Math.floor((now.getTime() - dueAt.getTime()) / HOUR_MS) : 0;
+
+  const mohreNotified = input.mohreNotifiedAt !== null;
+  const insurerNotified = input.insurerNotifiedAt !== null;
+  const insurerOutstanding = !insurerNotified;
+
+  if (mohreNotified) {
+    // Whether it was in time is decided by the notification instant, not by
+    // when anybody looks at the record afterwards. A late notification stays
+    // late for ever, and a record that quietly re-graded itself to "notified"
+    // once enough time had passed would erase the only evidence of the breach.
+    const inTime = input.mohreNotifiedAt!.getTime() <= dueAt.getTime();
+    const lateBy = Math.max(
+      0,
+      Math.floor((input.mohreNotifiedAt!.getTime() - dueAt.getTime()) / HOUR_MS),
+    );
+    return {
+      stage: inTime ? "notified" : "notified_late",
+      severity: inTime ? (insurerOutstanding ? "warning" : "info") : "critical",
+      dueAt,
+      hoursElapsed,
+      hoursRemaining,
+      hoursLate: inTime ? 0 : lateBy,
+      overdue: false,
+      mohreNotified: true,
+      insurerNotified,
+      alerting: insurerOutstanding,
+      headline: inTime
+        ? `MOHRE notified within the ${MOHRE_INJURY_NOTIFICATION_HOURS}-hour window.`
+        : `MOHRE notified ${lateBy} hour${lateBy === 1 ? "" : "s"} after the window closed.`,
+      consequence: insurerOutstanding
+        ? "The insurer has still not been notified. Late notice can void the cover, which puts the treatment and compensation cost on the establishment."
+        : "",
+    };
+  }
+
+  const band = injuryBandFor(hoursElapsed);
+
+  return {
+    stage: band.stage,
+    severity: band.severity,
+    dueAt,
+    hoursElapsed,
+    hoursRemaining,
+    hoursLate,
+    overdue,
+    mohreNotified: false,
+    insurerNotified,
+    // Always. An unnotified injury is an open statutory obligation from the
+    // moment it is recorded, and the whole point of an hourly job is that the
+    // first rung is loud rather than a quiet row on a board somebody opens on
+    // Tuesday.
+    alerting: true,
+    headline: overdue
+      ? hoursLate === 0
+        ? `The ${MOHRE_INJURY_NOTIFICATION_HOURS}-hour MOHRE notification window has closed.`
+        : `MOHRE notification is ${hoursLate} hour${hoursLate === 1 ? "" : "s"} overdue.`
+      : `MOHRE notification due in ${hoursRemaining} hour${hoursRemaining === 1 ? "" : "s"}.`,
+    consequence:
+      band.consequence +
+      (insurerOutstanding ? " The insurer has not been notified either." : ""),
+  };
+}
+
+/**
+ * What happened, in the words a notification form asks for.
+ *
+ * Deliberately a mechanism list rather than a body-part list. The mechanism is
+ * what a risk assessment can be rewritten against — it is the join between this
+ * register and `HR-12` — and it carries no health information about the person.
+ * See the register's own comment for what is NOT collected and why.
+ *
+ * These are the maintenance trades' mechanisms specifically: working at height,
+ * live electrical fittings, plant rooms and refrigerant. A generic list would
+ * have offered `other` to most of them.
+ */
+export const INJURY_CAUSES = [
+  "fall_from_height",
+  "fall_same_level",
+  "electrical",
+  "struck_by_object",
+  "caught_in_machinery",
+  "manual_handling",
+  "hand_tool",
+  "chemical_exposure",
+  "refrigerant_exposure",
+  "confined_space",
+  "heat_illness",
+  "road_traffic",
+  "fire_explosion",
+  "other",
+] as const;
+
+export type InjuryCause = (typeof INJURY_CAUSES)[number];
+
+export const INJURY_CAUSE_LABEL: Readonly<Record<InjuryCause, string>> = {
+  fall_from_height: "Fall from height",
+  fall_same_level: "Slip, trip or fall on the level",
+  electrical: "Electric shock or arc flash",
+  struck_by_object: "Struck by an object",
+  caught_in_machinery: "Caught in or between machinery",
+  manual_handling: "Manual handling",
+  hand_tool: "Hand or power tool",
+  chemical_exposure: "Chemical exposure",
+  refrigerant_exposure: "Refrigerant release or exposure",
+  confined_space: "Confined space",
+  heat_illness: "Heat illness",
+  road_traffic: "Road traffic",
+  fire_explosion: "Fire or explosion",
+  other: "Other",
+};
+
+/**
+ * Article 37 covers both, and they are not the same event.
+ *
+ * An injury has an instant. A disease has a diagnosis, and the gap between it
+ * and the exposure that caused it can be a decade — which is why the clock runs
+ * from `becameKnownAt` and why this register is not deleted on the two-year
+ * `HR-15` employee clock.
+ */
+export const WORK_INJURY_KINDS = ["work_injury", "occupational_disease"] as const;
+export type WorkInjuryKind = (typeof WORK_INJURY_KINDS)[number];
+
+export const WORK_INJURY_KIND_LABEL: Readonly<Record<WorkInjuryKind, string>> = {
+  work_injury: "Work injury",
+  occupational_disease: "Occupational disease",
+};
+
+/**
+ * How bad it was, in the categories that change what has to be done.
+ *
+ * Not a medical grading and not a diagnosis. Each of these five decides
+ * something administrative: whether there is lost time to count, whether the
+ * police have to be told, whether a claim goes to the insurer at all.
+ */
+export const INJURY_SEVERITIES = [
+  "first_aid",
+  "medical_treatment",
+  "lost_time",
+  "serious",
+  "fatal",
+] as const;
+
+export type InjurySeverity = (typeof INJURY_SEVERITIES)[number];
+
+export const INJURY_SEVERITY_LABEL: Readonly<Record<InjurySeverity, string>> = {
+  first_aid: "First aid only",
+  medical_treatment: "Medical treatment",
+  lost_time: "Lost time",
+  serious: "Serious",
+  fatal: "Fatal",
+};
+
+/**
+ * The two that must also go to the police, immediately.
+ *
+ * Exported as data and used only to raise a warning on the record — never as a
+ * countdown, because "immediately" is not a countdown, and never as a block.
+ */
+export const POLICE_REPORTABLE_SEVERITIES: readonly InjurySeverity[] = ["serious", "fatal"];
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HR-12 — HSE records: RAMS, toolbox talks, PPE, rope access
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Risk assessments and method statements.
+ *
+ * One vocabulary rather than two tables, because in practice they are issued as
+ * one document — the "RAMS" pack — and splitting them would mean a method
+ * statement whose risk assessment was reviewed on a different date, which is
+ * the state the review clock exists to prevent.
+ */
+export const RAMS_KINDS = ["risk_assessment", "method_statement", "rams"] as const;
+export type RamsKind = (typeof RAMS_KINDS)[number];
+
+export const RAMS_KIND_LABEL: Readonly<Record<RamsKind, string>> = {
+  risk_assessment: "Risk assessment",
+  method_statement: "Method statement",
+  rams: "Risk assessment & method statement",
+};
+
+export const RAMS_STATUSES = ["draft", "approved", "superseded", "withdrawn"] as const;
+export type RamsStatus = (typeof RAMS_STATUSES)[number];
+
+/**
+ * How far ahead a RAMS review is surfaced.
+ *
+ * Thirty days. The action at the other end is a competent person re-reading the
+ * assessment against how the work is actually being done, which is an
+ * appointment rather than a click — and a document that goes out of review on a
+ * site that is still running is a document an inspector reads as evidence that
+ * nobody was assessing anything.
+ */
+export const RAMS_REVIEW_WARN_DAYS = 30;
+
+/**
+ * PPE, by the category the issue register has to distinguish.
+ *
+ * The categories are here rather than free text because the replacement clock
+ * differs by category and because "did this person have fall arrest" is a
+ * question that gets asked after a fall, when a free-text column reading
+ * "harness (blue)" is not an answer.
+ *
+ * There is no cost column anywhere in the PPE register, and that is a rule
+ * rather than an omission: PPE is provided at the employer's expense, and
+ * `LAWFUL_DEDUCTION_KINDS` is a positive list that makes recovering it from a
+ * wage unrepresentable. A cost column here would be the first step towards
+ * somebody recording it as `damage_recovery`.
+ */
+export const PPE_ITEM_KINDS = [
+  "head",
+  "eye",
+  "hearing",
+  "respiratory",
+  "hand",
+  "foot",
+  "body",
+  "fall_arrest",
+  "electrical",
+  "high_visibility",
+] as const;
+
+export type PpeItemKind = (typeof PPE_ITEM_KINDS)[number];
+
+export const PPE_ITEM_LABEL: Readonly<Record<PpeItemKind, string>> = {
+  head: "Head protection",
+  eye: "Eye and face protection",
+  hearing: "Hearing protection",
+  respiratory: "Respiratory protection",
+  hand: "Hand protection",
+  foot: "Foot protection",
+  body: "Protective clothing",
+  fall_arrest: "Fall arrest — harness and lanyard",
+  electrical: "Arc flash and electrical PPE",
+  high_visibility: "High-visibility clothing",
+};
+
+/** How far ahead a PPE replacement date is surfaced. */
+export const PPE_REPLACEMENT_WARN_DAYS = 30;
+
+/**
+ * IRATA rope access levels.
+ *
+ * ── WHY THERE IS NO IRATA TABLE, AND NO FOURTH DISPATCH BLOCK ───────────────
+ *
+ * An IRATA ticket is a certification held by a person, with an issuer, a
+ * reference and an expiry, that is mandatory for certain services.
+ * `technician_certifications` is exactly that table, it already carries
+ * `required_for_services`, and `assignmentWarnings` already raises
+ * `certification_expired` — which `WARNING_REQUIRES_OVERRIDE` marks as needing
+ * a recorded reason before an assignment goes through. The nightly compliance
+ * sweep already sends `certification_expiring` before it lapses.
+ *
+ * So rope access is recorded there, and the only thing this module adds is the
+ * vocabulary and the service slugs, so that a rope-access job and an IRATA
+ * ticket can be made to refer to each other without either being free text.
+ *
+ * Building a second certification table would have produced two answers to
+ * "is this technician's ticket current", and the second answer is always the
+ * stale one. It would also have been invisible to the dispatch gate, which is
+ * the one place the answer changes anybody's behaviour.
+ *
+ * It is deliberately NOT promoted to a sixth hard block. The five hard blocks
+ * are the five statutory documents whose absence carries AED 100,000 to AED
+ * 1,000,000 under Article 60, and the rule this codebase set itself is that a
+ * new hard block has to name the statutory penalty it prevents. IRATA is a
+ * scheme certification issued by a private body; whether Dubai Municipality's
+ * façade-access rules make an equivalent ticket mandatory for a given building
+ * is a question this codebase cannot answer from a database, so it does not
+ * pretend to. An override with a recorded reason is what that uncertainty
+ * earns, and it is what the existing mechanism already gives.
+ */
+export const IRATA_LEVELS = [1, 2, 3] as const;
+export type IrataLevel = (typeof IRATA_LEVELS)[number];
+
+/**
+ * Service slugs that mean somebody is going over the edge on a rope.
+ *
+ * Matched case-insensitively against `technician_certifications.
+ * required_for_services` so that the HSE board can show "who may work at
+ * height, and until when" without a second register.
+ */
+export const ROPE_ACCESS_SERVICE_SLUGS: readonly string[] = [
+  "rope-access",
+  "facade-cleaning",
+  "facade-inspection",
+  "high-level-cleaning",
+  "working-at-height",
+];
+
+/** IRATA tickets are valid for three years. Used only to explain the date. */
+export const IRATA_VALIDITY_YEARS = 3;

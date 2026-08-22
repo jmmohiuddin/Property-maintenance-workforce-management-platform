@@ -16,6 +16,15 @@ import {
   recordGratuitySettlement,
   markGratuitySettlementPaid,
   saveOccupationClassification,
+  // HR-11 / HR-12
+  recordWorkInjury,
+  recordMohreNotification,
+  recordInsurerNotification,
+  recordInjuryInvestigation,
+  recordRams,
+  approveRams,
+  recordToolboxTalk,
+  recordPpeIssue,
 } from "@meridian/db";
 import {
   toMinor,
@@ -28,6 +37,18 @@ import {
   WPS_MINIMUM_TRANSFER_PERCENT,
   type HealthPlan,
   type PayBand,
+  // HR-11 / HR-12
+  INJURY_CAUSES,
+  INJURY_SEVERITIES,
+  MOHRE_INJURY_NOTIFICATION_HOURS,
+  POLICE_REPORTABLE_SEVERITIES,
+  PPE_ITEM_KINDS,
+  RAMS_KINDS,
+  type InjuryCause,
+  type InjurySeverity,
+  type PpeItemKind,
+  type RamsKind,
+  type WorkInjuryKind,
 } from "@meridian/core";
 import { requireSessionWith } from "@/lib/session";
 import { userMessage } from "@/lib/errors";
@@ -76,6 +97,31 @@ function calendarDate(value: FormDataEntryValue | null): string | undefined | nu
   const parsed = new Date(`${raw}T00:00:00Z`);
   if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== raw) return null;
   return raw;
+}
+
+/**
+ * A wall-clock `datetime-local` value, read as **Dubai** time.
+ *
+ * The opposite decision from `calendarDate` above, and both are right for what
+ * they carry. A wage deadline is a calendar day and putting a timezone on it
+ * moves it; an injury is an instant and 48 hours is a duration, so rounding it
+ * to a day would hand over — or take away — most of the first band of the
+ * countdown.
+ *
+ * `<input type="datetime-local">` submits `YYYY-MM-DDTHH:mm` with **no zone at
+ * all**, so something has to supply one. `new Date(raw)` would supply the
+ * server's, which on Vercel is UTC and on this development machine is
+ * Asia/Dhaka — four and six hours off the wall clock of the person who typed
+ * it. `fromDubai` supplies the only zone that is ever right here: the one the
+ * person filling in the form is standing in.
+ */
+function dubaiInstant(value: FormDataEntryValue | null): Date | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(raw);
+  if (!m) return null;
+  const [, y, mo, d, hh, mm] = m;
+  return fromDubai(Number(y), Number(mo), Number(d), Number(hh) * 60 + Number(mm));
 }
 
 /**
@@ -778,5 +824,325 @@ export async function classifyOccupation(_prev: HrFormState, formData: FormData)
     return { ok: "Occupational classification saved." };
   } catch (error) {
     return { error: userMessage(error, "Could not save the classification.", "hr") };
+  }
+}
+
+// ── HR-11 / HR-12: injuries and HSE records ─────────────────────────────────
+
+/**
+ * Record a work injury or occupational disease (`HR-11`).
+ *
+ * ── WHY THE TWO INSTANTS ARE TWO FIELDS ─────────────────────────────────────
+ *
+ * The 48-hour MOHRE clock runs from when the employer *knew*, not from when the
+ * injury happened, and for an occupational disease those can be years apart.
+ * The form defaults the second to the first — which is right for every injury
+ * somebody witnessed — so the ordinary case is unchanged, and the field is only
+ * touched when the answer is genuinely different.
+ *
+ * ── AND WHY THE INSTANTS ARE INSTANTS AND NOT DAYS ──────────────────────────
+ *
+ * Every other date in this file is a calendar day kept as the string the
+ * browser sent, deliberately, because a wage deadline is a day and putting a
+ * timezone on it moves it. These two are the opposite case: 48 hours is a
+ * duration, so the moment matters, and rounding an injury at 23:30 to a day
+ * would hand over — or take away — most of the first band. `datetime-local`
+ * submits a wall-clock string with no zone, so it is read as **Dubai** wall
+ * time, which is where the person filling the form is standing.
+ */
+export async function recordInjury(
+  _prev: HrFormState,
+  formData: FormData,
+): Promise<HrFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const employeeId = text(formData, "employeeId");
+  const occurredAt = dubaiInstant(formData.get("occurredAt"));
+  const becameKnownRaw = String(formData.get("becameKnownAt") ?? "").trim();
+  const becameKnownAt = becameKnownRaw ? dubaiInstant(formData.get("becameKnownAt")) : occurredAt;
+  const description = text(formData, "description");
+  const severity = text(formData, "severity") as InjurySeverity;
+  const cause = text(formData, "cause") as InjuryCause;
+  const kind = (text(formData, "kind") || "work_injury") as WorkInjuryKind;
+
+  if (!employeeId) return { error: "Choose who was injured." };
+  if (!occurredAt) return { error: "Give the date and time it happened." };
+  if (becameKnownAt === null) return { error: "That is not a valid date and time." };
+  if (!INJURY_SEVERITIES.includes(severity)) return { error: "Choose how serious it was." };
+  if (!INJURY_CAUSES.includes(cause)) return { error: "Choose what caused it." };
+  if (!description) return { error: "Describe what happened." };
+
+  try {
+    const result = await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) =>
+        recordWorkInjury(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          {
+            employeeId,
+            kind,
+            occurredAt,
+            becameKnownAt,
+            severity,
+            cause,
+            location: text(formData, "location") || null,
+            description,
+          },
+        ),
+    );
+
+    revalidatePath("/hr/hse");
+    revalidatePath("/hr");
+
+    // The message states the deadline as an instant, not as "within 48 hours".
+    // A person reading "by 03:40 on Thursday" knows whether they have time to
+    // do it after lunch; a person reading "within 48 hours" has to do the
+    // arithmetic, and that is the arithmetic this whole feature exists because
+    // nobody does.
+    const dueAt = new Date(becameKnownAt.getTime() + MOHRE_INJURY_NOTIFICATION_HOURS * 3_600_000);
+    return {
+      ok:
+        `Recorded as ${result.reference}. MOHRE and the insurer must be notified by ` +
+        `${dueAt.toLocaleString("en-GB", { timeZone: "Asia/Dubai", dateStyle: "medium", timeStyle: "short" })} ` +
+        `Dubai time.` +
+        (POLICE_REPORTABLE_SEVERITIES.includes(severity)
+          ? " This severity must also be reported to the police immediately — that is not a 48-hour window."
+          : ""),
+    };
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the injury.", "hr") };
+  }
+}
+
+/**
+ * Record that MOHRE, or the insurer, has been told (`HR-11`).
+ *
+ * One action for both because they are the same act against two recipients, and
+ * the form asks which. **Nothing else in this system may set these columns** —
+ * in particular the hourly job must not, and says so: a notification is a
+ * submission a person made, and a job that stamped it would replace a live
+ * statutory obligation with a tidy screen.
+ */
+export async function recordInjuryNotified(
+  _prev: HrFormState,
+  formData: FormData,
+): Promise<HrFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const injuryId = text(formData, "injuryId");
+  const recipient = text(formData, "recipient");
+  const reference = text(formData, "reference") || null;
+
+  if (!injuryId) return { error: "Which record?" };
+  if (recipient !== "mohre" && recipient !== "insurer") {
+    return { error: "Say whether this is the MOHRE notification or the insurer's." };
+  }
+  // Refused here as well as by the CHECK constraint, so the person gets a
+  // sentence rather than a constraint violation. The constraint is what makes
+  // it true; this is what makes it legible.
+  if (recipient === "mohre" && !reference) {
+    return {
+      error:
+        "Record the MOHRE reference. A notification with no reference is an assertion, and it is the first thing an inspection asks evidence for.",
+    };
+  }
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) =>
+        recipient === "mohre"
+          ? recordMohreNotification(tx, injuryId, { reference })
+          : recordInsurerNotification(tx, injuryId, { claimReference: reference }),
+    );
+
+    revalidatePath("/hr/hse");
+    return {
+      ok:
+        recipient === "mohre"
+          ? "MOHRE notification recorded. The statutory clock on this record has stopped."
+          : "Insurer notification recorded.",
+    };
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the notification.", "hr") };
+  }
+}
+
+/** Close out an investigation and say what was changed (`HR-11` into `HR-12`). */
+export async function closeInjuryInvestigation(
+  _prev: HrFormState,
+  formData: FormData,
+): Promise<HrFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const injuryId = text(formData, "injuryId");
+  const correctiveAction = text(formData, "correctiveAction");
+  const daysLostRaw = text(formData, "daysLost");
+  const daysLost = daysLostRaw ? Number(daysLostRaw) : null;
+
+  if (!injuryId) return { error: "Which record?" };
+  if (!correctiveAction) {
+    return {
+      error:
+        "Say what was changed. An investigation closed with no corrective action is a record that nothing happened.",
+    };
+  }
+  if (daysLost !== null && (!Number.isInteger(daysLost) || daysLost < 0)) {
+    return { error: "Days lost has to be a whole number of days." };
+  }
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) =>
+        recordInjuryInvestigation(tx, injuryId, {
+          correctiveAction,
+          daysLost,
+          ramsId: text(formData, "ramsId") || null,
+          policeReference: text(formData, "policeReference") || null,
+        }),
+    );
+
+    revalidatePath("/hr/hse");
+    return { ok: "Investigation closed." };
+  } catch (error) {
+    return { error: userMessage(error, "Could not close the investigation.", "hr") };
+  }
+}
+
+/** Record a risk assessment or method statement, and approve it (`HR-12`). */
+export async function addRams(_prev: HrFormState, formData: FormData): Promise<HrFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const title = text(formData, "title");
+  const kind = (text(formData, "kind") || "rams") as RamsKind;
+  const reviewDueOn = calendarDate(formData.get("reviewDueOn"));
+
+  if (!title) return { error: "Give the assessment a title." };
+  if (!RAMS_KINDS.includes(kind)) return { error: "Choose a document kind." };
+  if (reviewDueOn === null) return { error: "That is not a valid review date." };
+
+  try {
+    const result = await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      async (tx) => {
+        const rams = await recordRams(
+          tx,
+          { tenantId: session.principal.tenantId },
+          {
+            title,
+            kind,
+            tradeSlug: text(formData, "tradeSlug") || null,
+            serviceSlug: text(formData, "serviceSlug") || null,
+          },
+        );
+        // Approved in the same transaction. A draft that nobody approves is
+        // invisible to the review clock — `listRams({ withinDays })` only ever
+        // looks at approved packs — so a form that could only create drafts
+        // would produce records the sweep can never see.
+        await approveRams(tx, rams.id, {
+          approvedById: session.principal.userId,
+          ...(reviewDueOn ? { reviewDueOn } : {}),
+        });
+        return rams;
+      },
+    );
+
+    revalidatePath("/hr/hse");
+    return { ok: `Recorded and approved as ${result.reference}.` };
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the risk assessment.", "hr") };
+  }
+}
+
+/**
+ * Record a toolbox talk and who was at it (`HR-12`).
+ *
+ * The attendance goes in with the talk, in one transaction. A talk row with no
+ * attendees is a plan, and the question after an incident is "was this person
+ * briefed" — which a topic and a date cannot answer. The domain refuses an
+ * empty attendee list outright, so the empty state is not reachable from here.
+ */
+export async function addToolboxTalk(
+  _prev: HrFormState,
+  formData: FormData,
+): Promise<HrFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const topic = text(formData, "topic");
+  const heldOn = calendarDate(formData.get("heldOn"));
+  const employeeIds = formData.getAll("employeeIds").map((v) => String(v)).filter(Boolean);
+
+  if (!topic) return { error: "What was the talk about?" };
+  if (heldOn === null) return { error: "That is not a valid date." };
+  if (employeeIds.length === 0) {
+    return {
+      error:
+        "Tick who was there. A toolbox talk with no attendees proves nothing, and proving who was briefed is the only reason this record exists.",
+    };
+  }
+
+  try {
+    const result = await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) =>
+        recordToolboxTalk(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          {
+            topic,
+            ...(heldOn ? { heldOn } : {}),
+            employeeIds,
+            ramsId: text(formData, "ramsId") || null,
+          },
+        ),
+    );
+
+    revalidatePath("/hr/hse");
+    return {
+      ok: `Recorded, with ${result.attendees} attendee${result.attendees === 1 ? "" : "s"}.`,
+    };
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the toolbox talk.", "hr") };
+  }
+}
+
+/** Issue PPE to one employee (`HR-12`). */
+export async function issuePpe(_prev: HrFormState, formData: FormData): Promise<HrFormState> {
+  const session = await requireSessionWith("workforce:write");
+
+  const employeeId = text(formData, "employeeId");
+  const itemKind = text(formData, "itemKind") as PpeItemKind;
+  const issuedOn = calendarDate(formData.get("issuedOn"));
+  const replaceDueOn = calendarDate(formData.get("replaceDueOn"));
+
+  if (!employeeId) return { error: "Choose who it was issued to." };
+  if (!PPE_ITEM_KINDS.includes(itemKind)) return { error: "Choose what was issued." };
+  if (issuedOn === null || replaceDueOn === null) return { error: "That is not a valid date." };
+
+  try {
+    await withTenant(
+      { tenantId: session.principal.tenantId, userId: session.principal.userId },
+      (tx) =>
+        recordPpeIssue(
+          tx,
+          { tenantId: session.principal.tenantId, userId: session.principal.userId },
+          {
+            employeeId,
+            itemKind,
+            itemDescription: text(formData, "itemDescription") || null,
+            size: text(formData, "size") || null,
+            ...(issuedOn ? { issuedOn } : {}),
+            replaceDueOn: replaceDueOn ?? null,
+            acknowledged: formData.get("acknowledged") !== null,
+          },
+        ),
+    );
+
+    revalidatePath("/hr/hse");
+    return { ok: "PPE issue recorded." };
+  } catch (error) {
+    return { error: userMessage(error, "Could not record the PPE issue.", "hr") };
   }
 }

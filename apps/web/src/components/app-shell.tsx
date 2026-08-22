@@ -55,6 +55,14 @@ const NAV = [
   // leave, hours, health cover. One screen holding both would put a leave
   // balance under a lapsed work permit.
   { href: "/hr", label: "HR", permission: "workforce:read" },
+  // `HR-11` / `HR-12`. A third sibling rather than a section inside `/hr`, on
+  // the rule that split `/hr` from `/workforce` in the first place: the three
+  // answer different questions. "May this person be sent to work today", "what
+  // does the employment relationship owe and by when", and "what happened on
+  // site, who has been told, and what changed as a result". The third is the
+  // only one with a clock measured in hours, and putting it under a leave
+  // balance would bury it.
+  { href: "/hr/hse", label: "HSE", permission: "workforce:read" },
   { href: "/admin/users", label: "Users", permission: "users:manage" },
   // SEC-7. Beside Users and on the same permission, because revoking a lost
   // handset is the same kind of act as unlocking an account or resetting a

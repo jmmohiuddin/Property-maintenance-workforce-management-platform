@@ -83,6 +83,14 @@ export default async function HrPage() {
             <Link href="/workforce" style={{ color: "var(--accent-text)" }}>
               Workforce compliance &mdash; documents and dispatch blocks &rarr;
             </Link>
+            <br />
+            {/* HR-11 / HR-12. Linked from here as well as from the nav, because
+                the person who opens this board after an incident is looking for
+                the injury register and would otherwise read the whole page
+                first to find out it is not on it. */}
+            <Link href="/hr/hse" style={{ color: "var(--accent-text)" }}>
+              Health &amp; safety &mdash; injury register and HSE records &rarr;
+            </Link>
           </p>
         </div>
 

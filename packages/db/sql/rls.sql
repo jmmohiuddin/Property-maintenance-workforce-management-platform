@@ -266,7 +266,20 @@ DECLARE
     -- days that get encashed on termination (`leave_balances`), and the employee
     -- master carrying `basic_salary_minor` and `wps_iban` — the pay basis and the
     -- account the pay lands in, which is the redirection nobody would otherwise see.
-    'employment_contract_terms', 'leave_balances', 'employees'
+    'employment_contract_terms', 'leave_balances', 'employees',
+    -- HR-11. At least as sensitive as the payroll tables above it, and audited
+    -- for a sharper reason than volume: this register is the evidence in a
+    -- compensation claim and in a MOHRE inspection, and the two columns anybody
+    -- would be tempted to adjust after the fact are `mohre_notified_at` and
+    -- `became_known_at` -- one decides whether the statutory notification was in
+    -- time, the other decides when the clock started at all. The row states the
+    -- fact; only the log states that somebody changed it, and when.
+    --
+    -- `hse_rams`, `toolbox_talks`, `toolbox_talk_attendees` and `ppe_issues` are
+    -- deliberately NOT here. A RAMS revision is a new row rather than an edit,
+    -- an attendance list is not the sort of record whose edit history anybody
+    -- asks for, and audit volume that buys nothing crowds out the rows that do.
+    'work_injuries'
   ];
   stale record;
 BEGIN

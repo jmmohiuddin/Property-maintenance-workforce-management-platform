@@ -137,7 +137,23 @@ export type TemplateId =
   // actually behind it: jobs raised and closed, response and resolution
   // against the SLA, PPM visits due against visits completed, outstanding
   // recommendations, and spend, for the previous calendar month.
-  | "property_manager_monthly_pack";
+  | "property_manager_monthly_pack"
+  // `HR-11`. The 48-hour MOHRE notification clock on a work injury.
+  //
+  // ONE template with a stage field, the `wps_payroll_countdown` call rather
+  // than the `retention_release_due` one, and the argument is the same: the
+  // alarm at hour 36 is the message from hour 0 thirty-six hours later — same
+  // fact, same recipient, same act — and two templates would be two suppression
+  // windows with the louder one silenced by the quieter one that arrived first.
+  //
+  // It is NOT folded into `compliance_expiry`, which carries document and
+  // subcontractor expiries to HR on a nightly cadence. That message answers
+  // "whose paperwork lapses this month"; this one answers "somebody was hurt
+  // and the statutory clock is running", it goes out hourly, and its
+  // suppression window is measured in hours rather than in a day. Behind one
+  // ledger row keyed on template and recipient, the injury alert would be
+  // dropped for the rest of the day by the nightly digest that fired first.
+  | "work_injury_notification";
 
 export interface RenderedMessage {
   readonly subject: string;
@@ -750,6 +766,45 @@ export interface TemplatePayloads {
    * capped field, and `outstanding.truncated` says when it is not the whole
    * list, matching `outstanding.total` on the source type.
    */
+  work_injury_notification: {
+    recipientName: string;
+    /** `INJ-2026-00001`. The register's serial. */
+    reference: string;
+    /**
+     * The injured person's name.
+     *
+     * The ONLY personal datum in this payload, and it is here because an alert
+     * that says "an employee" cannot be acted on — the recipient has to know
+     * who to ask about. No diagnosis, no treatment, no body part: the register
+     * does not hold them, so a notification could not leak them.
+     */
+    employeeName: string;
+    /** `work_injury` or `occupational_disease`. */
+    kind: string;
+    /** Human label for the mechanism, e.g. "Fall from height". */
+    cause: string;
+    severity: string;
+    /** ISO instant. */
+    occurredAt: string;
+    /** Dubai's calendar day of the incident. */
+    occurredOn: string;
+    /** ISO instant the window closes. */
+    dueAt: string;
+    stage: string;
+    severityTone: "info" | "warning" | "critical" | "alarm";
+    /** Whole hours left. Negative once the window has closed. */
+    hoursRemaining: number;
+    /** 0 until the window closes, then whole hours past it. */
+    hoursLate: number;
+    /** 48. Passed in so the statutory number lives in `core` only. */
+    windowHours: number;
+    mohreNotified: boolean;
+    insurerNotified: boolean;
+    /** True while the severity is police-reportable and no reference is held. */
+    policeReportOutstanding: boolean;
+    headline: string;
+    consequence: string;
+  };
   property_manager_monthly_pack: {
     recipientName: string;
     /** The account name — `customerAccountName`, not the portal login's name. */
@@ -1859,6 +1914,32 @@ export const TEMPLATES: {
    * about, and printing 0% would tell an SLA-paying customer their contractor
    * failed every call when in fact no call fell due.
    */
+  work_injury_notification: (p) => ({
+    subject:
+      p.hoursLate > 0
+        ? `ALARM: ${p.reference} — MOHRE notification ${p.hoursLate} hour${p.hoursLate === 1 ? "" : "s"} OVERDUE`
+        : `${p.hoursRemaining <= 12 ? "URGENT" : "Work injury"}: ${p.reference} — MOHRE notification due in ${p.hoursRemaining} hour${p.hoursRemaining === 1 ? "" : "s"}`,
+    body:
+      `${p.recipientName},\n\n` +
+      `${p.headline}\n\n` +
+      `${p.consequence}\n\n` +
+      `Register entry: ${p.reference}\n` +
+      `Person: ${p.employeeName}\n` +
+      `What: ${p.kind === "occupational_disease" ? "Occupational disease" : "Work injury"} — ${p.cause}, ${p.severity}\n` +
+      `When: ${p.occurredOn}\n` +
+      `Notification window closes: ${p.dueAt} (${p.windowHours} hours from when the employer knew)\n` +
+      `MOHRE: ${p.mohreNotified ? "notified" : "NOT NOTIFIED"}\n` +
+      `Insurer: ${p.insurerNotified ? "notified" : "NOT NOTIFIED — late notice can void the cover"}\n` +
+      (p.policeReportOutstanding
+        ? `\nTHE POLICE MUST BE TOLD, AND IMMEDIATELY.\n` +
+          `  This severity is police-reportable and no police reference is recorded. That obligation is not\n` +
+          `  a countdown and this system does not run one against it — do not read the hours above as time\n` +
+          `  in hand for the police report.\n`
+        : "") +
+      `\n${absoluteUrl("/hr/hse")}` +
+      sign,
+  }),
+
   property_manager_monthly_pack: (p) => {
     const m = (minor: number): string => formatMoney(minor, p.currency);
 
