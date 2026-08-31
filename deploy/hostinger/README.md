@@ -1,35 +1,67 @@
 # Hostinger VPS deployment
 
-The web app runs on a Hostinger VPS as a three-container Compose stack —
-`caddy` (TLS + reverse proxy), `web` (Next.js standalone image built from this
-repo's `Dockerfile`), `cron` (busybox crond standing in for Vercel Cron). The
-database stays on Neon; this deployment points at the same `meridian_app`
-role the Vercel deployment uses.
+**As deployed (2026-08-31):** `https://sats.phoyev.com` on the shared VPS
+`voltix-prod` (1942134, 200.234.43.179). That VPS already runs two production
+stacks behind ONE Caddy that owns ports 80/443, so this deployment does NOT
+run its own Caddy — it joins the existing one, exactly the way Meraki PMS
+does (the pattern is documented inside
+`/opt/voltix/infra/production/Caddyfile` itself).
 
-## How a deploy happens
+The live shape:
 
-1. `deploy/hostinger/docker-compose.template.yml` has every real value as a
-   `${...}` placeholder. Substitute them all (site host, database URL, cron
-   secret, identity flag) — the result is never committed.
-2. Post the substituted compose to the VPS through Hostinger's Docker Manager
-   API (`POST /api/vps/v1/virtual-machines/{id}/docker` with `project_name`
-   and `content`). Deploying the same project name replaces the stack.
-3. The VPS builds the image straight from the public GitHub repo (`main`).
-   To ship new code: push to `main`, then `POST .../docker/{name}/update`.
+- `/opt/meridian-sats/docker-compose.yml` — two services: `web`
+  (image `meridian-sats:prod`, container name `meridian-sats`, joined to the
+  external `voltix-prod_voltix` network, host-debug port `127.0.0.1:3200`)
+  and `cron` (busybox crond, 13 schedules mirroring `apps/web/vercel.json`).
+- `/opt/meridian-sats/.env` — runtime secrets, `chmod 600`, never committed.
+- One site block appended to the shared Caddyfile:
+  `sats.phoyev.com { reverse_proxy meridian-sats:3000 }` — Caddy resolves the
+  container name over the shared network and terminates TLS.
+- The image is **built off-box** (`docker build --platform linux/amd64`,
+  build args from the Dockerfile) and shipped with
+  `docker save | gzip | ssh root@VPS "gunzip | docker load"`. The VPS never
+  spends CPU building; the two production stacks never feel a deploy. On
+  Apple Silicon the `--platform linux/amd64` flag is NOT optional — an arm64
+  image dies on the VPS with `exec format error`.
+
+## Shipping new code
+
+```
+docker build --platform linux/amd64 \
+  --build-arg NEXT_PUBLIC_SITE_URL=https://sats.phoyev.com \
+  --build-arg ALLOW_PLACEHOLDER_IDENTITY=1 \
+  -t meridian-sats:prod-amd64 .
+docker save meridian-sats:prod-amd64 | gzip | \
+  ssh root@200.234.43.179 "gunzip | docker load \
+    && docker tag meridian-sats:prod-amd64 meridian-sats:prod \
+    && cd /opt/meridian-sats && docker compose up -d web \
+    && docker image prune -f"
+```
+
+Remember the database: new migrations must be applied to Neon (in filename
+order, then ALL `packages/db/sql/*.sql` files in the README's order, then
+`verify-rls.sql` must pass) **before** shipping code that expects them.
+
+## Touching the shared Caddy
+
+The Caddyfile belongs to the voltix stack and fronts every site on the box.
+Any edit follows the same discipline used to add this site: back the file up,
+append, `caddy validate --config /etc/caddy/Caddyfile` inside the container,
+and only then `caddy reload`. A reload with an invalid config is refused by
+Caddy, but validate-first means never finding that out in production.
 
 ## DNS
 
-One `A` record on the subdomain → the VPS IPv4, TTL as low as Hostinger
-allows, proxying/CDN off. Caddy obtains and renews the Let's Encrypt
-certificate on first request; the record must exist and resolve before the
-stack starts, or the ACME challenge fails (it retries, so late DNS heals
-itself within minutes).
+`sats` is one `A` record → 200.234.43.179 (TTL 300), added via the DNS API
+with `"overwrite": false` — the flag that appends instead of replacing, on a
+zone that also carries five other production hostnames.
 
-## Firewall
+## The template file
 
-Hostinger VPS firewalls default to dropping nothing until one is attached.
-If a firewall is active on the VM it must accept TCP 80 and 443 (and 22 if
-SSH access matters), then be **synced** — rule edits do not apply themselves.
+`docker-compose.template.yml` in this directory describes the ORIGINAL
+standalone design (own Caddy, build-from-git on the VPS). It remains correct
+for a dedicated VPS with free ports 80/443; it is NOT what runs on
+`voltix-prod`, and deploying it there would collide with the existing Caddy.
 
 ## Things that are true and easy to forget
 
