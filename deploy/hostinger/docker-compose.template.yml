@@ -1,0 +1,91 @@
+# Docker Compose stack for the Hostinger VPS deployment.
+#
+# This file is a TEMPLATE: every ${...} placeholder is substituted with real
+# values when the stack is posted to the VPS through Hostinger's Docker
+# Manager API. Do not put real secrets in this file — it is committed.
+#
+# Shape:
+#   caddy  — terminates TLS (automatic Let's Encrypt) for ${SITE_HOST} and
+#            proxies to the app. Ports 80/443 are the only ones exposed.
+#   web    — the Next.js server, built from the public GitHub repo. Identity
+#            and canonical URLs are BUILD args (baked into static HTML);
+#            database and secrets are RUNTIME env.
+#   cron   — busybox crond mirroring apps/web/vercel.json's schedules,
+#            calling the app's /api/cron/* routes with x-cron-secret.
+#            Vercel Cron does this job on Vercel; on a VPS nobody else will.
+
+services:
+  web:
+    build:
+      context: https://github.com/jmmohiuddin/Property-maintenance-workforce-management-platform.git#main
+      args:
+        NEXT_PUBLIC_SITE_URL: https://${SITE_HOST}
+        ALLOW_PLACEHOLDER_IDENTITY: "${ALLOW_PLACEHOLDER_IDENTITY}"
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL}
+      DATABASE_POOL_MAX: "5"
+      PUBLIC_TENANT_SLUG: ${PUBLIC_TENANT_SLUG}
+      NEXT_PUBLIC_SITE_URL: https://${SITE_HOST}
+      CRON_SECRET: ${CRON_SECRET}
+      FILES_DRIVER: local
+      FILES_LOCAL_ROOT: /data/files
+      ALLOW_PLACEHOLDER_IDENTITY: "${ALLOW_PLACEHOLDER_IDENTITY}"
+      # RESEND_API_KEY / NOTIFY_FROM: add both to send real email.
+    volumes:
+      - files_data:/data/files
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://127.0.0.1:3000/robots.txt"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    command: caddy reverse-proxy --from https://${SITE_HOST} --to web:3000
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+
+  cron:
+    image: alpine:3.20
+    restart: unless-stopped
+    depends_on:
+      - web
+    # Schedules mirror apps/web/vercel.json. If a schedule changes there,
+    # change it here too — this container is the VPS's Vercel Cron.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        cat > /etc/crontabs/root <<'CRONTAB'
+        */5 * * * * wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/dispatch
+        */10 * * * * wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/sla
+        */5 * * * * wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/health
+        */10 * * * * wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/scan
+        */15 * * * * wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/recruitment
+        0 * * * * wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/sweep
+        0 2 * * * wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/compliance
+        0 22 * * * wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/retention
+        30 1 * * * wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/contracts
+        0 5 * * 0 wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/weekly-digest
+        15 3 * * * wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/projects
+        0 5 1 * * wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/monthly-pack
+        20 * * * * wget -qO- --header "x-cron-secret: ${CRON_SECRET}" http://web:3000/api/cron/hse
+        CRONTAB
+        crond -f -l 8
+
+volumes:
+  files_data:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,17 @@
+node_modules
+**/node_modules
+.next
+**/.next
+.git
+.env
+.env.*
+!.env.example
+docs
+apps/field
+!apps/field/package.json
+*.md
+.vercel
+.claude
+.agents
+coverage
+.object-store

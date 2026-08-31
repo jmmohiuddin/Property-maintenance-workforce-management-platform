@@ -31,6 +31,12 @@ loadRootEnv();
 const config: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
+  // Self-contained server build for Docker/VPS deployment. Vercel ignores this
+  // and keeps doing its own thing, so one config serves both targets.
+  output: "standalone",
+  // The monorepo root, so file tracing includes the workspace packages
+  // (@meridian/core, db, auth, notify) in the standalone output.
+  outputFileTracingRoot: resolve(__dirname, "../../"),
   // The marketing site is statically rendered. AI crawlers frequently do not
   // execute JavaScript, so anything they need to read has to exist in the HTML
   // response, not be hydrated in.
